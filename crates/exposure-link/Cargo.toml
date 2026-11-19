@@ -1,0 +1,23 @@
+[package]
+name = "exposure-link"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+exposure-core.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+ipnet.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+yamux.workspace = true

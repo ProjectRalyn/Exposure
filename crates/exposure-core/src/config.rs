@@ -1,0 +1,733 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+fn default_ttl() -> u8 {
+    16
+}
+fn default_true() -> bool {
+    true
+}
+fn default_weight() -> u32 {
+    100
+}
+fn default_priority() -> u32 {
+    10
+}
+fn default_probe_interval_ms() -> u64 {
+    5000
+}
+fn default_probe_timeout_ms() -> u64 {
+    2000
+}
+fn default_degraded_rtt_ms() -> u64 {
+    250
+}
+fn default_degraded_loss_rate() -> f64 {
+    0.05
+}
+fn default_down_failures() -> u32 {
+    3
+}
+fn default_recover_successes() -> u32 {
+    2
+}
+fn default_pow_difficulty() -> u8 {
+    16
+}
+fn default_clearance_ttl_secs() -> u64 {
+    1800
+}
+fn default_hll_precision() -> u8 {
+    12
+}
+fn default_hll_seed() -> u64 {
+    0x517c_c1b7_2722_0a95
+}
+fn default_histogram_buckets() -> Vec<f64> {
+    vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
+}
+fn default_sample_rate() -> f64 {
+    1.0
+}
+fn default_flush_interval_secs() -> u64 {
+    10
+}
+fn default_max_batch_records() -> usize {
+    512
+}
+fn default_max_segment_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_max_disk_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_retention_hours() -> u64 {
+    72
+}
+fn default_renew_before_days() -> u32 {
+    30
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeRoles {
+    #[serde(default)]
+    pub ingress: bool,
+    #[serde(default)]
+    pub egress: bool,
+    #[serde(default)]
+    pub relay: bool,
+    #[serde(default)]
+    pub maintainer: bool,
+}
+
+impl NodeRoles {
+    pub fn names(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if self.ingress {
+            v.push("ingress".into());
+        }
+        if self.egress {
+            v.push("egress".into());
+        }
+        if self.relay {
+            v.push("relay".into());
+        }
+        if self.maintainer {
+            v.push("maintainer".into());
+        }
+        v
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LinkMode {
+    OnDemand,
+    Tunnel,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelDirection {
+    Outbound,
+    Inbound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEndpoint {
+    pub address: String,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Logical peer tag used in local rules (defaults to node_tag when omitted by compiler).
+    pub peer_tag: String,
+    /// Target peer's unique Node Tag (used for Hop Table routing).
+    pub node_tag: String,
+    /// Expected ed25519 public key (base64) or SHA-256 fingerprint hex.
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub pubkey_fingerprint: Option<String>,
+    pub mode: LinkMode,
+    #[serde(default)]
+    pub tunnel_direction: Option<TunnelDirection>,
+    /// Optional auxiliary expected client IP/CIDR for inbound tunnels (mismatch logs WARN, keeps conn).
+    #[serde(default)]
+    pub expected_client_addr: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<PeerEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeConfig {
+    #[serde(default = "default_probe_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_probe_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_degraded_rtt_ms")]
+    pub degraded_rtt_ms: u64,
+    #[serde(default = "default_degraded_loss_rate")]
+    pub degraded_loss_rate: f64,
+    #[serde(default = "default_down_failures")]
+    pub down_failures: u32,
+    #[serde(default = "default_recover_successes")]
+    pub recover_successes: u32,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_probe_interval_ms(),
+            timeout_ms: default_probe_timeout_ms(),
+            degraded_rtt_ms: default_degraded_rtt_ms(),
+            degraded_loss_rate: default_degraded_loss_rate(),
+            down_failures: default_down_failures(),
+            recover_successes: default_recover_successes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkListenConfig {
+    pub listen_addr: String,
+    #[serde(default = "default_true")]
+    pub allow_on_demand: bool,
+    #[serde(default = "default_true")]
+    pub allow_tunnel: bool,
+    #[serde(default)]
+    pub allow_bootstrap: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AntibotMode {
+    #[default]
+    Off,
+    Silent,
+    Challenge,
+    /// Always require PoW clearance cookie regardless of browser fingerprint score (Under Attack mode).
+    Always,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitBucket {
+    pub capacity: f64,
+    pub refill_per_sec: f64,
+    #[serde(default = "default_true")]
+    pub per_ip: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GuardProfile {
+    #[serde(default)]
+    pub antibot: AntibotMode,
+    #[serde(default)]
+    pub rate_limit_bucket: Option<String>,
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
+    /// Minimum suspicion score (0..100) to trigger PoW challenge or silent reject.
+    #[serde(default = "default_challenge_threshold")]
+    pub challenge_threshold: u8,
+    /// Minimum suspicion score (0..100) to reject immediately (403).
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: u8,
+    #[serde(default = "default_pow_difficulty")]
+    pub pow_difficulty: u8,
+    #[serde(default = "default_clearance_ttl_secs")]
+    pub clearance_ttl_secs: u64,
+    #[serde(default = "default_true")]
+    pub bind_ua: bool,
+    #[serde(default)]
+    pub bind_ip_prefix: bool,
+    /// Optional header or path exceptions for API clients.
+    #[serde(default)]
+    pub api_bypass_headers: Vec<String>,
+    /// Block known bot/scraper User-Agents.
+    #[serde(default)]
+    pub block_bots: bool,
+    /// Reject headless/automated browsers detected via JS WebGL/webdriver/platform cross-check.
+    #[serde(default)]
+    pub block_headless: bool,
+    /// Require a verified browser JS fingerprint bound to the clearance cookie.
+    #[serde(default)]
+    pub require_client_fp: bool,
+}
+
+fn default_challenge_threshold() -> u8 {
+    50
+}
+fn default_reject_threshold() -> u8 {
+    85
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuleMatch {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub url_prefix: Option<String>,
+    #[serde(default)]
+    pub source_cidrs: Vec<String>,
+    #[serde(default)]
+    pub sni: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressRule {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub r#match: RuleMatch,
+    pub service_tag: String,
+    /// Next hop Peer Tag, or this node's own `node_tag` / `"local"` for co-located egress.
+    pub next_peer: String,
+    #[serde(default)]
+    pub guard: Option<String>,
+    #[serde(default)]
+    pub intercept_errors: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsCertEntry {
+    pub domain: String,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressListener {
+    pub listen_addr: String,
+    #[serde(default)]
+    pub tls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IngressConfig {
+    #[serde(default)]
+    pub listeners: Vec<IngressListener>,
+    #[serde(default)]
+    pub rules: Vec<IngressRule>,
+    #[serde(default)]
+    pub guards: BTreeMap<String, GuardProfile>,
+    #[serde(default)]
+    pub rate_limit_buckets: BTreeMap<String, RateLimitBucket>,
+    #[serde(default)]
+    pub tls_certs: Vec<TlsCertEntry>,
+    #[serde(default = "default_clearance_secret")]
+    pub clearance_secret: String,
+    #[serde(default)]
+    pub cert_store_dir: Option<String>,
+    #[serde(default = "default_server_header")]
+    pub server_header: String,
+}
+
+fn default_server_header() -> String {
+    "nginx".into()
+}
+
+fn default_clearance_secret() -> String {
+    "exposure-default-clearance-secret-change-me".into()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendProtocol {
+    #[default]
+    Http1,
+    H2,
+    Auto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalHealthCheckConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_hc_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "default_hc_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub http_path: Option<String>,
+}
+
+fn default_hc_interval() -> u64 {
+    10
+}
+fn default_hc_timeout() -> u64 {
+    2000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressServiceConfig {
+    pub backend: String,
+    #[serde(default)]
+    pub protocol: BackendProtocol,
+    #[serde(default)]
+    pub tls: bool,
+    /// Allowed origin ingress Node Tags. Empty => deny unless `allow_any_origin: true`.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub allow_any_origin: bool,
+    #[serde(default = "default_backend_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub intercept_errors: bool,
+    #[serde(default)]
+    pub local_health_check: Option<LocalHealthCheckConfig>,
+}
+
+fn default_backend_timeout_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EgressConfig {
+    #[serde(default)]
+    pub services: BTreeMap<String, EgressServiceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayRule {
+    pub service_tag: String,
+    pub next_peer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RelayConfig {
+    #[serde(default)]
+    pub rules: Vec<RelayRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentConfig {
+    #[serde(default = "default_segment_dir")]
+    pub dir: String,
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
+    #[serde(default = "default_max_batch_records")]
+    pub max_batch_records: usize,
+    #[serde(default = "default_max_segment_bytes")]
+    pub max_segment_bytes: u64,
+    #[serde(default = "default_max_disk_bytes")]
+    pub max_disk_bytes: u64,
+    #[serde(default = "default_retention_hours")]
+    pub retention_hours: u64,
+}
+
+fn default_segment_dir() -> String {
+    "./data/segments".into()
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_segment_dir(),
+            flush_interval_secs: default_flush_interval_secs(),
+            max_batch_records: default_max_batch_records(),
+            max_segment_bytes: default_max_segment_bytes(),
+            max_disk_bytes: default_max_disk_bytes(),
+            retention_hours: default_retention_hours(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggerConfig {
+    #[serde(default = "default_hmac_key")]
+    pub hmac_key: String,
+    #[serde(default)]
+    pub store_raw_ip: bool,
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+    #[serde(default = "default_hll_precision")]
+    pub hll_precision: u8,
+    #[serde(default = "default_hll_seed")]
+    pub hll_seed: u64,
+    #[serde(default = "default_histogram_buckets")]
+    pub histogram_buckets_ms: Vec<f64>,
+    #[serde(default)]
+    pub segment: SegmentConfig,
+}
+
+fn default_hmac_key() -> String {
+    "exposure-default-hmac-key".into()
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self {
+            hmac_key: default_hmac_key(),
+            store_raw_ip: false,
+            sample_rate: default_sample_rate(),
+            hll_precision: default_hll_precision(),
+            hll_seed: default_hll_seed(),
+            histogram_buckets_ms: default_histogram_buckets(),
+            segment: SegmentConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Dns01ProviderConfig {
+    Cloudflare {
+        api_token: String,
+        zone_id: String,
+    },
+    Webhook {
+        present_url: String,
+        cleanup_url: String,
+        #[serde(default)]
+        auth_header: Option<String>,
+    },
+    Exec {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertOrderConfig {
+    pub domain: String,
+    pub provider: String,
+    #[serde(default)]
+    pub target_nodes: Vec<String>,
+    /// Explicit Hop Table from Maintainer to each target node (keyed by target node_tag).
+    #[serde(default)]
+    pub target_hops: BTreeMap<String, Vec<String>>,
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub directory_url: String,
+    #[serde(default)]
+    pub contact_email: String,
+    #[serde(default)]
+    pub providers: BTreeMap<String, Dns01ProviderConfig>,
+    #[serde(default)]
+    pub orders: Vec<CertOrderConfig>,
+    #[serde(default = "default_cert_dir")]
+    pub storage_dir: String,
+}
+
+fn default_cert_dir() -> String {
+    "./data/certs".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MaintainerConfig {
+    /// Ed25519 private key (base64) generated and provisioned by Control for signing cert bundles.
+    #[serde(default)]
+    pub cert_signing_secret_key: Option<String>,
+    #[serde(default)]
+    pub is_primary_cert_manager: bool,
+    #[serde(default)]
+    pub logger: LoggerConfig,
+    #[serde(default)]
+    pub acme: AcmeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedMaintainer {
+    pub node_tag: String,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub node_tag: String,
+    /// Ed25519 link identity secret key (base64).
+    pub identity_secret_key: String,
+    /// Control's Ed25519 config-signing public key (installed during onboarding or pre-configured).
+    #[serde(default)]
+    pub control_public_key: Option<String>,
+    #[serde(default)]
+    pub roles: NodeRoles,
+    #[serde(default)]
+    pub link_listener: Option<LinkListenConfig>,
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub probe: ProbeConfig,
+    #[serde(default = "default_ttl")]
+    pub default_ttl: u8,
+    /// Explicit Hop Table from this node to Maintainer for log & telemetry delivery.
+    #[serde(default)]
+    pub maintainer_hops: Vec<String>,
+    #[serde(default)]
+    pub trusted_maintainers: Vec<TrustedMaintainer>,
+    #[serde(default)]
+    pub logger: LoggerConfig,
+    #[serde(default)]
+    pub ingress: IngressConfig,
+    #[serde(default)]
+    pub egress: EgressConfig,
+    #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
+    pub maintainer: Option<MaintainerConfig>,
+    /// Bootstrap node address for initial active onboarding (cleared once enrolled).
+    #[serde(default)]
+    pub bootstrap_tunnel_addr: Option<String>,
+    /// Config sequence currently applied (monotonic anti-rollback).
+    #[serde(default)]
+    pub config_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedConfigBundle {
+    pub node_tag: String,
+    pub sequence: u64,
+    pub min_sequence: u64,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub config: NodeConfig,
+    pub signature: String,
+}
+
+impl SignedConfigBundle {
+    pub fn canonical_bytes(&self) -> crate::Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct SigningPayload<'a> {
+            node_tag: &'a str,
+            sequence: u64,
+            min_sequence: u64,
+            issued_at: i64,
+            expires_at: i64,
+            config: &'a NodeConfig,
+        }
+        serde_json::to_vec(&SigningPayload {
+            node_tag: &self.node_tag,
+            sequence: self.sequence,
+            min_sequence: self.min_sequence,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            config: &self.config,
+        })
+        .map_err(|e| crate::ExposureError::Config(format!("canonical config encode: {e}")))
+    }
+
+    pub fn verify(&self, control_pubkey_b64: &str, current_seq: u64, now_ts: i64) -> crate::Result<()> {
+        if self.sequence <= current_seq {
+            return Err(crate::ExposureError::Auth(format!(
+                "config rollback rejected: incoming seq {} <= current {}",
+                self.sequence, current_seq
+            )));
+        }
+        if self.sequence < self.min_sequence {
+            return Err(crate::ExposureError::Auth(format!(
+                "config seq {} below min_sequence {}",
+                self.sequence, self.min_sequence
+            )));
+        }
+        if now_ts > self.expires_at {
+            return Err(crate::ExposureError::Auth(format!(
+                "config bundle expired at {} (now {})",
+                self.expires_at, now_ts
+            )));
+        }
+        let payload = self.canonical_bytes()?;
+        crate::crypto::verify_signature_b64(control_pubkey_b64, &payload, &self.signature)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControlRole {
+    #[default]
+    Active,
+    Standby,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAuthConfig {
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_jwt_secret")]
+    pub token_secret: String,
+}
+
+fn default_jwt_secret() -> String {
+    "exposure-control-session-secret".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapNodeTarget {
+    pub node_tag: String,
+    pub address: String,
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlConfig {
+    pub control_id: String,
+    #[serde(default)]
+    pub role: ControlRole,
+    pub panel_listen_addr: String,
+    pub sqlite_path: String,
+    /// Ed25519 config-signing secret key (base64).
+    pub signing_secret_key: String,
+    /// Ed25519 link client secret key (base64).
+    pub link_secret_key: String,
+    pub admin: AdminAuthConfig,
+    /// Bootstrap tunnel-listening nodes (supports primary + backups).
+    #[serde(default)]
+    pub bootstrap_nodes: Vec<BootstrapNodeTarget>,
+    #[serde(default = "default_pull_interval")]
+    pub telemetry_pull_interval_secs: u64,
+    #[serde(default)]
+    pub initial_topology_path: Option<String>,
+}
+
+fn default_pull_interval() -> u64 {
+    30
+}
+
+/// High-level topology table edited in Control and compiled into per-node configs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TopologySpec {
+    #[serde(default)]
+    pub nodes: BTreeMap<String, TopologyNodeSpec>,
+    #[serde(default)]
+    pub links: Vec<TopologyLinkSpec>,
+    #[serde(default)]
+    pub maintainer_templates: BTreeMap<String, MaintainerConfig>,
+    #[serde(default)]
+    pub global_logger: Option<LoggerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TopologyNodeSpec {
+    #[serde(default)]
+    pub roles: NodeRoles,
+    #[serde(default)]
+    pub link_listener: Option<LinkListenConfig>,
+    #[serde(default)]
+    pub ingress: IngressConfig,
+    #[serde(default)]
+    pub egress: EgressConfig,
+    #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
+    pub maintainer_template: Option<String>,
+    #[serde(default)]
+    pub maintainer_hops: Vec<String>,
+    #[serde(default)]
+    pub probe: Option<ProbeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyLinkSpec {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub peer_tag: Option<String>,
+    pub mode: LinkMode,
+    #[serde(default)]
+    pub tunnel_direction: Option<TunnelDirection>,
+    /// For `on-demand` links: defaults to `true` (bidirectional single-line link).
+    #[serde(default = "default_true")]
+    pub bidirectional: bool,
+    #[serde(default)]
+    pub endpoints: Vec<PeerEndpoint>,
+    /// Optional reverse endpoints (`to -> from`) when `bidirectional: true` on `on-demand` links.
+    #[serde(default)]
+    pub reverse_endpoints: Vec<PeerEndpoint>,
+    #[serde(default)]
+    pub expected_client_addr: Option<String>,
+}

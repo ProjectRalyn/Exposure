@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Security Check</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="card">
+    <div class="badge">SECURITY CHECK</div>
+    <h1>Verifying your browser…</h1>
+    <p id="status-text">Completing a lightweight proof-of-work verification before forwarding your request.</p>
+    <div class="progress-track">
+      <div id="progress-bar" class="progress-bar"></div>
+    </div>
+    <div class="meta">
+      <span id="meta-difficulty">Difficulty: --</span>
+      <span id="meta-hashes">Hashes: 0</span>
+    </div>
+    <p id="error-text" class="error hidden"></p>
+  </main>
+  <script type="module" src="./pow.js"></script>
+</body>
+</html>

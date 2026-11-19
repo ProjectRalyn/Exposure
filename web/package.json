@@ -1,0 +1,14 @@
+{
+  "name": "exposure-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev:control": "vite control",
+    "dev:challenge": "vite challenge"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

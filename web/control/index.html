@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Exposure Control</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <section id="login-view" class="login-shell">
+    <form id="login-form" class="login-card">
+      <div class="brand-tag">EXPOSURE CONTROL</div>
+      <h1>Sign in to Control Plane</h1>
+      <p class="muted-sm">Authenticate to manage mesh topology, traffic guards, telemetry, and certificates.</p>
+      <label>
+        <span>Username</span>
+        <input id="login-user" type="text" autocomplete="username" required value="admin" />
+      </label>
+      <label>
+        <span>Password</span>
+        <input id="login-pass" type="password" autocomplete="current-password" required />
+      </label>
+      <button type="submit" class="btn primary">Sign In</button>
+      <p id="login-error" class="error hidden"></p>
+    </form>
+  </section>
+
+  <div id="app-view" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="brand">EXPOSURE</div>
+        <span id="control-role-badge" class="pill ok">ACTIVE</span>
+      </div>
+      <div id="sidebar-bootstrap-status" class="bootstrap-card">
+        <span class="live-dot draft"></span>
+        <div class="bootstrap-card-text">
+          <div class="bootstrap-card-lbl">Bootstrap Link</div>
+          <div class="bootstrap-card-val">Checking…</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-tab="overview">Overview</button>
+        <button class="nav-item" data-tab="topology">Topology Studio</button>
+        <button class="nav-item" data-tab="observability">Analytics &amp; Certs</button>
+        <button class="nav-item" data-tab="nodes">Nodes &amp; Links</button>
+        <button class="nav-item" data-tab="onboarding">Onboarding</button>
+        <button class="nav-item" data-tab="audit">Audit Log</button>
+      </nav>
+      <div class="sidebar-foot">
+        <button id="btn-logout" class="btn ghost full">Sign Out</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <h2 id="page-title">Overview</h2>
+          <span id="topbar-updated" class="topbar-meta"></span>
+        </div>
+        <div class="topbar-actions">
+          <select id="sel-time-window" class="select-sm" title="Stats time window">
+            <option value="300">Window: 5m</option>
+            <option value="900">Window: 15m</option>
+            <option value="3600" selected>Window: 1h</option>
+            <option value="86400">Window: 24h</option>
+            <option value="0">Window: All</option>
+          </select>
+          <select id="sel-auto-refresh" class="select-sm" title="Auto refresh interval">
+            <option value="0">Auto: Off</option>
+            <option value="10000">Auto: 10s</option>
+            <option value="30000" selected>Auto: 30s</option>
+          </select>
+          <button id="btn-pull-all" class="btn">Pull Telemetry</button>
+          <button id="btn-discover" class="btn">Run Discovery</button>
+          <button id="btn-refresh" class="btn primary">Refresh</button>
+        </div>
+      </header>
+
+      <!-- Overview NOC Dashboard -->
+      <section id="tab-overview" class="tab-panel">
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="kpi-label">Mesh Nodes</div>
+            <div id="kpi-nodes" class="kpi-val">0 / 0</div>
+            <div id="kpi-nodes-sub" class="kpi-sub">Online / Registered</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Link Health</div>
+            <div id="kpi-links" class="kpi-val">0 / 0 / 0</div>
+            <div id="kpi-links-sub" class="kpi-sub">UP / DEGRADED / DOWN</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Total Requests</div>
+            <div id="kpi-requests" class="kpi-val">0</div>
+            <div id="kpi-requests-sub" class="kpi-sub">0.0% error · 0 rate-limited</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Unique Visitors (HLL)</div>
+            <div id="kpi-uv" class="kpi-val">0</div>
+            <div id="kpi-uv-sub" class="kpi-sub">0 B in · 0 B out</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Latency (p50 / p95)</div>
+            <div id="kpi-latency" class="kpi-val">0 / 0 ms</div>
+            <div id="kpi-latency-sub" class="kpi-sub">p99: 0.0 ms</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Certs &amp; Config Seq</div>
+            <div id="kpi-certs" class="kpi-val">#0</div>
+            <div id="kpi-certs-sub" class="kpi-sub">0 valid certs · 0 alerts</div>
+          </div>
+        </div>
+
+        <div class="dashboard-grid-2">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Traffic &amp; Protection Trend</h3>
+              <span class="muted-sm">Aggregated per minute</span>
+            </div>
+            <div id="ov-traffic-chart" class="chart-box"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Latency Percentiles (ms)</h3>
+              <span class="muted-sm">Merged histogram quantiles</span>
+            </div>
+            <div id="ov-latency-chart" class="chart-box"></div>
+          </div>
+        </div>
+
+        <div class="dashboard-grid-3">
+          <div class="panel span-2">
+            <div class="panel-header">
+              <h3>Live Mesh Health Map</h3>
+              <span class="muted-sm">Click a node to open in Topology Studio</span>
+            </div>
+            <div id="ov-mini-topo" class="mini-topo-box"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Link Status Mix</h3>
+            </div>
+            <div id="ov-link-donut"></div>
+          </div>
+        </div>
+
+        <div class="dashboard-grid-2">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Top Services by Traffic</h3>
+            </div>
+            <div id="ov-top-services"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Recent Alerts</h3>
+              <select id="ov-alert-filter" class="select-sm">
+                <option value="all">All Severities</option>
+                <option value="error">Errors Only</option>
+                <option value="warn">Warnings Only</option>
+              </select>
+            </div>
+            <div id="ov-maintainer-strip" class="maint-strip hidden"></div>
+            <div class="table-scroll">
+              <table class="table">
+                <thead><tr><th>Time</th><th>Source</th><th>Severity</th><th>Message</th></tr></thead>
+                <tbody id="alerts-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Topology Studio -->
+      <section id="tab-topology" class="tab-panel hidden">
+        <div class="panel topo-panel">
+          <div class="topo-toolbar">
+            <div class="btn-row">
+              <div class="seg-group">
+                <button id="btn-mode-visual" class="btn sm primary">Visual Graph</button>
+                <button id="btn-mode-yaml" class="btn sm">YAML Source</button>
+              </div>
+              <span id="topo-dirty-badge" class="pill warn hidden">UNSAVED</span>
+              <div class="toolbar-sep"></div>
+              <button id="btn-connect-mode" class="btn sm">Connect</button>
+              <button id="btn-import-nodes" class="btn sm">Sync Live</button>
+              <button id="btn-auto-layout" class="btn sm">Auto Layout</button>
+              <div class="toolbar-sep"></div>
+              <button id="btn-topo-undo" class="btn sm" disabled title="Undo (Ctrl+Z)">↶</button>
+              <button id="btn-topo-redo" class="btn sm" disabled title="Redo (Ctrl+Y)">↷</button>
+              <select id="topo-trace-select" class="select-sm" title="Highlight compiled service path">
+                <option value="">Trace Service: Off</option>
+              </select>
+            </div>
+            <div class="btn-row">
+              <button id="btn-validate-topo" class="btn sm">Validate</button>
+              <button id="btn-preflight-topo" class="btn sm">Preflight</button>
+              <button id="btn-save-draft" class="btn sm">Save Draft</button>
+              <button id="btn-save-topo" class="btn sm primary">Save &amp; Push All</button>
+            </div>
+          </div>
+
+          <div id="topo-validation-bar" class="val-bar hidden"></div>
+
+          <div id="topo-visual-wrap" class="topo-workspace">
+            <div id="topo-canvas" class="topo-canvas">
+              <div id="topo-viewport" class="topo-viewport">
+                <svg id="topo-svg" class="topo-svg" viewBox="-4000 -4000 8000 8000">
+                  <defs>
+                    <marker id="arrow-ondemand" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#4DA9D6"></path>
+                    </marker>
+                    <marker id="arrow-tunnel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#009F6B"></path>
+                    </marker>
+                    <marker id="arrow-selected" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#FAC800"></path>
+                    </marker>
+                    <marker id="arrow-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                      <path d="M 0 1 L 10 5 L 0 9 z" fill="#C40233"></path>
+                    </marker>
+                  </defs>
+                </svg>
+                <div id="topo-nodes-layer" class="topo-nodes-layer"></div>
+              </div>
+
+              <div class="topo-float-bar">
+                <button id="btn-zoom-out" class="btn sm" title="Zoom Out">−</button>
+                <span id="topo-zoom-label" class="zoom-lbl">100%</span>
+                <button id="btn-zoom-in" class="btn sm" title="Zoom In">+</button>
+                <button id="btn-zoom-fit" class="btn sm" title="Fit to View (F)">Fit</button>
+                <button id="btn-toggle-grid" class="btn sm active" title="Snap to Grid">Grid</button>
+                <button id="btn-toggle-live" class="btn sm active" title="Toggle Live Health Overlay">Live</button>
+              </div>
+              <div id="topo-minimap" class="topo-minimap"></div>
+              <div id="topo-connect-hint" class="topo-hint hidden">Click source node, then click target node to create a link (Esc to cancel)</div>
+            </div>
+            <aside id="topo-inspector" class="topo-inspector"></aside>
+          </div>
+
+          <div id="topo-yaml-wrap" class="hidden">
+            <textarea id="topology-editor" class="code-editor" spellcheck="false"></textarea>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Config Version History</h3>
+            <span class="muted-sm">Preview snapshot or safely rollback any node</span>
+          </div>
+          <table class="table">
+            <thead><tr><th>Seq</th><th>Node Tag</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="versions-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Analytics & Certs (Cloudflare-style Visual Dashboard) -->
+      <section id="tab-observability" class="tab-panel hidden">
+        <div class="filter-bar">
+          <label class="filter-inline">
+            <span>Node</span>
+            <select id="obs-node-filter"><option value="all">All Nodes</option></select>
+          </label>
+          <label class="filter-inline">
+            <span>Service</span>
+            <select id="obs-svc-filter"><option value="all">All Services</option></select>
+          </label>
+          <label class="filter-inline">
+            <span>Time Window</span>
+            <select id="obs-window-filter">
+              <option value="0">All Available</option>
+              <option value="900">Last 15 min</option>
+              <option value="3600">Last 1 hour</option>
+              <option value="21600">Last 6 hours</option>
+              <option value="86400">Last 24 hours</option>
+            </select>
+          </label>
+          <div id="obs-maint-strip" class="maint-inline"></div>
+        </div>
+
+        <!-- Cloudflare-style Interactive Hero Metric Tabs + Full-Width Primary Chart -->
+        <div class="panel cf-hero-panel">
+          <div class="cf-metric-tabs">
+            <button type="button" class="cf-metric-tab active" data-cf-metric="requests">
+              <span class="cf-mt-label">Total Requests</span>
+              <span id="cf-val-requests" class="cf-mt-val">0</span>
+              <span id="cf-sub-requests" class="cf-mt-sub">0.0% errors</span>
+            </button>
+            <button type="button" class="cf-metric-tab" data-cf-metric="uv">
+              <span class="cf-mt-label">Unique Visitors</span>
+              <span id="cf-val-uv" class="cf-mt-val">0</span>
+              <span id="cf-sub-uv" class="cf-mt-sub">HyperLogLog union</span>
+            </button>
+            <button type="button" class="cf-metric-tab" data-cf-metric="bandwidth">
+              <span class="cf-mt-label">Total Data Served</span>
+              <span id="cf-val-bandwidth" class="cf-mt-val">0 B</span>
+              <span id="cf-sub-bandwidth" class="cf-mt-sub">0 B in · 0 B out</span>
+            </button>
+            <button type="button" class="cf-metric-tab" data-cf-metric="guard">
+              <span class="cf-mt-label">Guard Mitigations</span>
+              <span id="cf-val-guard" class="cf-mt-val">0</span>
+              <span id="cf-sub-guard" class="cf-mt-sub">0 PoW · 0 rate-limited</span>
+            </button>
+            <button type="button" class="cf-metric-tab" data-cf-metric="latency">
+              <span class="cf-mt-label">Origin Latency (p95)</span>
+              <span id="cf-val-latency" class="cf-mt-val">0 ms</span>
+              <span id="cf-sub-latency" class="cf-mt-sub">p50 0ms · p99 0ms</span>
+            </button>
+          </div>
+          <div id="obs-hero-chart" class="cf-hero-chart"></div>
+        </div>
+
+        <!-- Secondary Breakdown Visual Row -->
+        <div class="dashboard-grid-2">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Traffic by Service Tag</h3>
+              <span class="muted-sm">Share, error rate &amp; p95</span>
+            </div>
+            <div id="obs-service-bars"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Traffic by Node</h3>
+              <span class="muted-sm">Ingress / Egress distribution</span>
+            </div>
+            <div id="obs-node-bars"></div>
+          </div>
+        </div>
+
+        <div class="dashboard-grid-2">
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Security &amp; Guard Funnel</h3>
+              <span class="muted-sm">PoW challenges &amp; rate limiting</span>
+            </div>
+            <div id="obs-guard-funnel"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Traffic Outcome Mix</h3>
+              <span class="muted-sm">Clean vs Mitigated vs Errors</span>
+            </div>
+            <div id="obs-outcome-donut"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Client Fingerprints (Devices · Browsers · OS)</h3>
+            <span id="obs-fp-verified-badge" class="muted-sm">0 JS-verified</span>
+          </div>
+          <div id="obs-fp-breakdown" class="dashboard-grid-3" style="margin-bottom:0;"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>SSL / TLS Certificates</h3>
+            <span class="muted-sm">Automated DNS01 issuance &amp; Hop-Table distribution</span>
+          </div>
+          <div id="obs-certs-grid" class="certs-grid"></div>
+        </div>
+
+        <details class="panel">
+          <summary class="panel-summary">Raw Minute Buckets (Export / Debug Table)</summary>
+          <div class="table-scroll" style="margin-top:12px;">
+            <table class="table">
+              <thead>
+                <tr><th>Time</th><th>Node</th><th>Service</th><th>Requests</th><th>UV (HLL)</th><th>Errors</th><th>429</th><th>PoW</th><th>Bytes In/Out</th><th>p50/p95/p99 (ms)</th></tr>
+              </thead>
+              <tbody id="stats-tbody"></tbody>
+            </table>
+          </div>
+        </details>
+      </section>
+
+      <!-- Nodes & Links -->
+      <section id="tab-nodes" class="tab-panel hidden">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Registered Nodes</h3>
+            <div class="btn-row">
+              <input id="nodes-search" class="input-sm" type="search" placeholder="Filter by node tag…" />
+              <select id="nodes-role-filter" class="select-sm">
+                <option value="all">All Roles</option>
+                <option value="ingress">Ingress</option>
+                <option value="relay">Relay</option>
+                <option value="egress">Egress</option>
+                <option value="maintainer">Maintainer</option>
+              </select>
+            </div>
+          </div>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Node Tag</th>
+                <th>Roles</th>
+                <th>Public Key FP</th>
+                <th>Uptime</th>
+                <th>Config Seq</th>
+                <th>Last Reload</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-tbody"></tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Observed Link States</h3>
+            <div class="btn-row">
+              <input id="links-search" class="input-sm" type="search" placeholder="Filter node / peer…" />
+              <select id="links-state-filter" class="select-sm">
+                <option value="all">All States</option>
+                <option value="UP">UP</option>
+                <option value="DEGRADED">DEGRADED</option>
+                <option value="DOWN">DOWN</option>
+              </select>
+            </div>
+          </div>
+          <table class="table">
+            <thead>
+              <tr><th>Node</th><th>Peer Tag</th><th>Endpoint</th><th>State</th><th>RTT</th><th>Packet Loss</th></tr>
+            </thead>
+            <tbody id="links-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Onboarding -->
+      <section id="tab-onboarding" class="tab-panel hidden">
+        <div class="dashboard-grid-2">
+          <div class="panel">
+            <h3>Register Node Passphrase</h3>
+            <form id="enroll-form" class="form-grid">
+              <label>
+                <span>Target Node Tag</span>
+                <input id="enroll-tag" type="text" placeholder="e.g. ingress-hk-1" required />
+              </label>
+              <label>
+                <span>5-Word Passphrase</span>
+                <input id="enroll-passphrase" type="text" placeholder="amber-beacon-cedar-delta-echo" required />
+              </label>
+              <label>
+                <span>Onboarding Mode</span>
+                <select id="enroll-mode">
+                  <option value="active">Active (node dials bootstrap tunnel)</option>
+                  <option value="listening">Listening (mesh dials node)</option>
+                </select>
+              </label>
+              <label>
+                <span>Address (Listening mode)</span>
+                <input id="enroll-addr" type="text" placeholder="198.51.100.10:10802" />
+              </label>
+              <label>
+                <span>Via Hop Path (CSV, optional)</span>
+                <input id="enroll-hops" type="text" placeholder="bootstrap-1, relay-1" />
+              </label>
+              <div class="form-actions">
+                <button type="submit" class="btn primary">Register &amp; Enroll</button>
+              </div>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-header">
+              <h3>Quick CLI Helper</h3>
+              <button id="btn-copy-cli" class="btn sm">Copy Command</button>
+            </div>
+            <p class="muted-sm">Run on the new host to generate its config and start onboarding with the one-time 5-word passphrase:</p>
+            <pre id="enroll-cli-preview" class="output-box"></pre>
+          </div>
+        </div>
+        <div class="panel">
+          <h3>Passphrase Registry</h3>
+          <table class="table">
+            <thead><tr><th>Node Tag</th><th>Mode</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody id="passphrases-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Audit -->
+      <section id="tab-audit" class="tab-panel hidden">
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Audit Logs</h3>
+            <div class="btn-row">
+              <input id="audit-search" class="input-sm" type="search" placeholder="Search actor, action, target…" />
+              <select id="audit-status-filter" class="select-sm">
+                <option value="all">All Results</option>
+                <option value="ok">Success</option>
+                <option value="fail">Failed</option>
+              </select>
+            </div>
+          </div>
+          <table class="table">
+            <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead>
+            <tbody id="audit-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Floating Toast Stack -->
+  <div id="toast-stack" class="toast-stack"></div>
+
+  <!-- Reusable Modal -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="modal-title">Details</h3>
+        <button id="btn-modal-close" class="btn sm ghost">✕</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-footer" class="modal-footer"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
