@@ -1,13 +1,12 @@
-# Exposure
+<p align="center">
+  <img src="assets/banner.svg" alt="Exposure" width="100%" />
+</p>
 
 **English** | [简体中文](README.zh-CN.md)
 
 **A zero-trust, multi-hop reverse proxy, encrypted service mesh, edge guard, and telemetry platform written in Rust.**
 
 Exposure lets you securely publish internal or NAT-bound services across untrusted networks through composable **Ingress**, **Relay**, **Egress**, and **Maintainer** nodes—coordinated by a centralized **Control** plane with a built-in Web Admin Panel.
-
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 
 ---
 
@@ -166,9 +165,4 @@ cargo test --workspace
 
 ## License
 
-Dual-licensed under either of:
-
-- **MIT License**
-- **Apache License, Version 2.0**
-
-at your option.
+**MIT**

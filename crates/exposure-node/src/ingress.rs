@@ -1,77 +1,133 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use dashmap::DashSet;
+use chrono::Utc;
+use dashmap::DashMap;
 use exposure_core::config::{IngressConfig, IngressListener};
+use exposure_core::crypto::{generate_random_secret_hex, is_weak_secret, NodeKeyPair};
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
-use exposure_core::routing::match_ingress_rule;
+use exposure_core::routing::{canonical_ip, match_ingress_rule, normalize_host};
 use exposure_core::Result;
 use http::{header, HeaderValue, Request, Response, StatusCode, Version};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::egress::{full_body, ProxyBody};
+use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
-use crate::guard::{GuardDecision, GuardEngine};
+use crate::guard::{sanitize_redirect, GuardDecision, GuardEngine};
 use crate::logger::NodeLogger;
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
 
+const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn ensure_strong_clearance_secret(mut cfg: IngressConfig, node_tag: &str) -> IngressConfig {
+    if is_weak_secret(&cfg.clearance_secret) {
+        warn!(
+            node = %node_tag,
+            "ingress clearance_secret missing or weak; generating ephemeral random secret"
+        );
+        cfg.clearance_secret = generate_random_secret_hex(32);
+    }
+    cfg
+}
+
 /// L7 Ingress Server (DESIGN.md §3.2, §8, §11):
 /// - Supports HTTP/1.1, HTTP/2 (TLS ALPN `h2` & plaintext `h2c`), and WebSocket upgrades
-/// - Dynamic SNI TLS termination with pre-TLS ClientHello peeking
-/// - Rule matching by Host, URL prefix, Source CIDR, SNI
-/// - Entry Guard (CIDR, named token bucket rate limiting, fingerprint scoring, `/cdn-cgi/` PoW)
-/// - Dispatches via Forwarder (either local self-tag egress or remote mesh link)
+/// - Dynamic SNI TLS termination using authoritative rustls SNI + pre-TLS ClientHello bot signal
+/// - Rule matching by normalized Host, normalized URL prefix, canonical Source CIDR, authoritative SNI
+/// - Entry Guard (CIDR, bounded token bucket rate limiting, fingerprint scoring, `/cdn-cgi/` single-use PoW)
+/// - Signs `ServiceStreamHeader` with node Ed25519 key for multi-hop Egress ACL authentication
 pub struct IngressServer {
     node_tag: String,
-    cfg: Arc<RwLock<IngressConfig>>,
+    keypair: NodeKeyPair,
+    cfg: Arc<RwLock<Arc<IngressConfig>>>,
     default_ttl: u8,
     forwarder: Arc<Forwarder>,
     guard: Arc<GuardEngine>,
     cert_resolver: Arc<DynamicCertResolver>,
     logger: Arc<NodeLogger>,
-    started_listeners: DashSet<String>,
+    started_listeners: DashMap<String, JoinHandle<()>>,
+    conn_sem: Arc<Semaphore>,
 }
 
 impl IngressServer {
     pub fn new(
         node_tag: impl Into<String>,
+        keypair: NodeKeyPair,
         cfg: IngressConfig,
         default_ttl: u8,
         forwarder: Arc<Forwarder>,
         cert_resolver: Arc<DynamicCertResolver>,
         logger: Arc<NodeLogger>,
     ) -> Arc<Self> {
+        let tag = node_tag.into();
+        let cfg = ensure_strong_clearance_secret(cfg, &tag);
         Arc::new(Self {
-            node_tag: node_tag.into(),
-            cfg: Arc::new(RwLock::new(cfg)),
+            node_tag: tag,
+            keypair,
+            cfg: Arc::new(RwLock::new(Arc::new(cfg))),
             default_ttl,
             forwarder,
             guard: Arc::new(GuardEngine::new()),
             cert_resolver,
             logger,
-            started_listeners: DashSet::new(),
+            started_listeners: DashMap::new(),
+            conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_CONNS)),
         })
     }
 
-    pub async fn update_config(self: &Arc<Self>, cfg: IngressConfig) -> Result<()> {
-        if !cfg.tls_certs.is_empty() {
-            self.cert_resolver.load_from_files(&cfg.tls_certs)?;
+    pub async fn update_config(
+        self: &Arc<Self>,
+        cfg: IngressConfig,
+        ingress_enabled: bool,
+    ) -> Result<()> {
+        self.cert_resolver.load_from_files(&cfg.tls_certs)?;
+        let cfg = ensure_strong_clearance_secret(cfg, &self.node_tag);
+        let desired_listeners = if ingress_enabled {
+            cfg.listeners.clone()
+        } else {
+            Vec::new()
+        };
+        *self.cfg.write().await = Arc::new(cfg);
+
+        // Stop listeners that were removed or when ingress role is disabled
+        let desired_keys: HashSet<String> = desired_listeners
+            .iter()
+            .map(|l| format!("{}|{}", l.listen_addr, l.tls))
+            .collect();
+        let existing_keys: Vec<String> = self
+            .started_listeners
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for k in existing_keys {
+            if !desired_keys.contains(&k) {
+                if let Some((_, handle)) = self.started_listeners.remove(&k) {
+                    handle.abort();
+                    info!(node = %self.node_tag, listener = %k, "stopped removed ingress listener");
+                }
+            }
         }
-        let listeners = cfg.listeners.clone();
-        *self.cfg.write().await = cfg;
-        for l in listeners {
+
+        // Start newly added listeners
+        for l in desired_listeners {
             let key = format!("{}|{}", l.listen_addr, l.tls);
-            if !self.started_listeners.contains(&key) {
+            if !self.started_listeners.contains_key(&key) {
                 if let Err(e) = self.start_listener(l.clone()).await {
                     warn!(addr = %l.listen_addr, error = %e, "failed to start newly added ingress listener on hot reload");
                 }
@@ -83,7 +139,6 @@ impl IngressServer {
     pub async fn start_listener(self: &Arc<Self>, listener_cfg: IngressListener) -> Result<SocketAddr> {
         let key = format!("{}|{}", listener_cfg.listen_addr, listener_cfg.tls);
         let tcp_listener = TcpListener::bind(&listener_cfg.listen_addr).await?;
-        self.started_listeners.insert(key);
         let bound = tcp_listener.local_addr()?;
         info!(
             node = %self.node_tag,
@@ -100,41 +155,67 @@ impl IngressServer {
         };
 
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 let (tcp, peer_addr) = match tcp_listener.accept().await {
                     Ok(pair) => pair,
                     Err(e) => {
                         warn!(error = %e, "ingress accept error");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                let permit = match Arc::clone(&this.conn_sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!(peer = %peer_addr, "ingress max connection limit reached, dropping");
                         continue;
                     }
                 };
                 let _ = tcp.set_nodelay(true);
+                let canon_addr = SocketAddr::new(canonical_ip(peer_addr.ip()), peer_addr.port());
                 let this2 = Arc::clone(&this);
                 let acceptor2 = tls_acceptor.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Some(acceptor) = acceptor2 {
-                        // Non-destructively peek ClientHello for SNI & JA3-style bot signal
-                        let hello_sig = peek_client_hello(&tcp).await;
-                        match acceptor.accept(tcp).await {
-                            Ok(tls_stream) => {
+                        let mut hello_sig = peek_client_hello(&tcp).await;
+                        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                // Always use authoritative rustls-negotiated SNI (never fragmented peek bytes!)
+                                let auth_sni = tls_stream
+                                    .get_ref()
+                                    .1
+                                    .server_name()
+                                    .map(normalize_host);
+                                hello_sig.sni = auth_sni.clone();
                                 this2
-                                    .serve_conn(tls_stream, peer_addr, true, Some(hello_sig))
+                                    .serve_conn(
+                                        tls_stream,
+                                        canon_addr,
+                                        true,
+                                        auth_sni,
+                                        Some(hello_sig),
+                                    )
                                     .await;
                             }
-                            Err(e) => {
-                                debug!(peer = %peer_addr, error = %e, "ingress TLS handshake failed");
+                            Ok(Err(e)) => {
+                                debug!(peer = %canon_addr, error = %e, "ingress TLS handshake failed");
+                            }
+                            Err(_) => {
+                                debug!(peer = %canon_addr, "ingress TLS handshake timed out");
                             }
                         }
                     } else {
-                        this2.serve_conn(tcp, peer_addr, false, None).await;
+                        this2.serve_conn(tcp, canon_addr, false, None, None).await;
                     }
                 });
             }
         });
 
+        self.started_listeners.insert(key, handle);
         Ok(bound)
     }
 
@@ -143,25 +224,33 @@ impl IngressServer {
         io_stream: S,
         peer_addr: SocketAddr,
         is_tls: bool,
+        auth_sni: Option<String>,
         tls_signal: Option<ClientHelloSignal>,
     ) where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let tls_sig_arc = Arc::new(tls_signal);
+        let auth_sni_arc = Arc::new(auth_sni);
         let service = service_fn(move |req: Request<Incoming>| {
             let this2 = Arc::clone(&self);
             let sig2 = Arc::clone(&tls_sig_arc);
+            let sni2 = Arc::clone(&auth_sni_arc);
             async move {
                 Ok::<_, hyper::Error>(
                     this2
-                        .handle_http_request(req, peer_addr, is_tls, sig2.as_ref().as_ref())
+                        .handle_http_request(
+                            req,
+                            peer_addr,
+                            is_tls,
+                            sni2.as_deref(),
+                            sig2.as_ref().as_ref(),
+                        )
                         .await,
                 )
             }
         });
 
         let io = TokioIo::new(io_stream);
-        // AutoServerBuilder serves BOTH HTTP/1.1 (with WebSocket upgrades) AND HTTP/2!
         let builder = AutoServerBuilder::new(TokioExecutor::new());
         if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
             debug!(peer = %peer_addr, error = %e, "ingress connection closed");
@@ -173,14 +262,15 @@ impl IngressServer {
         req: Request<Incoming>,
         peer_addr: SocketAddr,
         is_tls: bool,
+        auth_sni: Option<&str>,
         tls_signal: Option<&ClientHelloSignal>,
     ) -> Response<ProxyBody> {
-        let server_hdr = self.cfg.read().await.server_header.clone();
+        let cfg = Arc::clone(&*self.cfg.read().await);
         let mut resp = self
-            .handle_http_request_inner(req, peer_addr, is_tls, tls_signal)
+            .handle_http_request_inner(req, peer_addr, is_tls, auth_sni, tls_signal, &cfg)
             .await;
-        if !server_hdr.trim().is_empty() {
-            if let Ok(hv) = HeaderValue::from_str(server_hdr.trim()) {
+        if !cfg.server_header.trim().is_empty() {
+            if let Ok(hv) = HeaderValue::from_str(cfg.server_header.trim()) {
                 resp.headers_mut().insert(header::SERVER, hv);
             }
         }
@@ -192,41 +282,116 @@ impl IngressServer {
         mut req: Request<Incoming>,
         peer_addr: SocketAddr,
         is_tls: bool,
+        auth_sni: Option<&str>,
         tls_signal: Option<&ClientHelloSignal>,
+        cfg: &IngressConfig,
     ) -> Response<ProxyBody> {
         let start = Instant::now();
-        let cfg = self.cfg.read().await.clone();
         let ray_id: String = Uuid::new_v4().simple().to_string()[..16].to_string();
 
-        let host = extract_host(&req, tls_signal.and_then(|s| s.sni.as_deref()));
+        // Reject requests where HTTP Host header and URI :authority disagree (prevents vhost confusion)
+        let host = match extract_and_validate_host(&req, auth_sni) {
+            Ok(h) => h,
+            Err(msg) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(full_body(msg))
+                    .unwrap();
+            }
+        };
+
         let path = req.uri().path().to_string();
         let path_and_query = req
             .uri()
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".into());
-        let sni = tls_signal.and_then(|s| s.sni.as_deref());
+        let client_ip = canonical_ip(peer_addr.ip());
 
-        // Built-in `/cdn-cgi/` PoW challenge endpoints
-        if path.starts_with("/cdn-cgi") {
-            let matched_rule = match_ingress_rule(&cfg.rules, &host, "/", peer_addr.ip(), sni);
+        // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`)
+        if path == "/cdn-cgi" || path.starts_with("/cdn-cgi/") {
+            let method = req.method().clone();
+            let headers = req.headers().clone();
+            let query_redirect = req
+                .uri()
+                .query()
+                .and_then(|q| extract_query_param(q, "redirect"))
+                .map(|r| sanitize_redirect(&r));
+
+            // Strictly cap body reads BEFORE buffering to prevent pre-auth OOM DoS!
+            let body_bytes = match Limited::new(req.into_body(), MAX_CDN_CGI_BODY_BYTES)
+                .collect()
+                .await
+            {
+                Ok(c) => c.to_bytes(),
+                Err(_) => {
+                    return Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(full_body("Payload Too Large"))
+                        .unwrap();
+                }
+            };
+
+            // Resolve the target route's GuardProfile (respects `url_prefix`-scoped guards!)
+            let body_redirect = if method == http::Method::POST && path == "/cdn-cgi/verify" {
+                serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                    .ok()
+                    .and_then(|v| v.get("redirect").and_then(|r| r.as_str()).map(sanitize_redirect))
+            } else {
+                None
+            };
+            let target_path = body_redirect
+                .or(query_redirect)
+                .unwrap_or_else(|| "/".to_string());
+            let target_path_only = target_path.split('?').next().unwrap_or("/");
+
+            let matched_rule = match_ingress_rule(&cfg.rules, &host, target_path_only, client_ip, auth_sni)
+                .or_else(|| match_ingress_rule(&cfg.rules, &host, "/", client_ip, auth_sni))
+                .or_else(|| {
+                    cfg.rules.iter().find(|r| {
+                        r.r#match
+                            .host
+                            .as_deref()
+                            .map(|pat| exposure_core::routing::host_matches(pat, &host))
+                            .unwrap_or(true)
+                    })
+                });
             let guard_profile = matched_rule
                 .and_then(|r| r.guard.as_ref())
                 .and_then(|g| cfg.guards.get(g));
 
-            let method = req.method().clone();
-            let headers = req.headers().clone();
-            let body_bytes = match req.into_body().collect().await {
-                Ok(c) => c.to_bytes(),
-                Err(_) => bytes::Bytes::new(),
-            };
+            // Enforce CIDR & rate-limit policy on `/cdn-cgi/*` too!
+            if let Some(profile) = guard_profile {
+                match self
+                    .guard
+                    .evaluate_access_and_rate_limit(profile, &cfg.rate_limit_buckets, client_ip)
+                {
+                    GuardDecision::Allow => {}
+                    GuardDecision::RateLimited { retry_after_secs } => {
+                        return Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::RETRY_AFTER, retry_after_secs.to_string())
+                            .body(full_body("Too Many Requests"))
+                            .unwrap();
+                    }
+                    GuardDecision::Reject { status, .. } => {
+                        return Response::builder()
+                            .status(status)
+                            .body(full_body("Access Denied"))
+                            .unwrap();
+                    }
+                    GuardDecision::ChallengeRedirect { .. } => {}
+                }
+            }
+
             let g_resp = self.guard.handle_cdn_cgi(
                 &method,
                 &path,
                 &body_bytes,
                 &headers,
                 &host,
-                peer_addr.ip(),
+                client_ip,
+                is_tls,
                 guard_profile,
                 &cfg.clearance_secret,
             );
@@ -240,7 +405,7 @@ impl IngressServer {
                     .record_session(
                         "ingress",
                         svc_tag,
-                        &peer_addr.ip().to_string(),
+                        &client_ip.to_string(),
                         200,
                         start.elapsed().as_secs_f64() * 1000.0,
                         0,
@@ -263,7 +428,7 @@ impl IngressServer {
         }
 
         // Identify service and next hop via local rules
-        let rule = match match_ingress_rule(&cfg.rules, &host, &path, peer_addr.ip(), sni) {
+        let rule = match match_ingress_rule(&cfg.rules, &host, &path, client_ip, auth_sni) {
             Some(r) => r.clone(),
             None => {
                 return Response::builder()
@@ -273,15 +438,17 @@ impl IngressServer {
             }
         };
 
-        // Evaluate Entry Guard if attached to this route
+        let mut active_profile = None;
+        // Evaluate Entry Guard if attached to this route (fail closed on undefined guard name!)
         if let Some(ref guard_name) = rule.guard {
             if !guard_name.trim().is_empty() {
                 if let Some(profile) = cfg.guards.get(guard_name) {
+                    active_profile = Some(profile);
                     match self.guard.evaluate(
                         profile,
                         &cfg.rate_limit_buckets,
                         &cfg.clearance_secret,
-                        peer_addr.ip(),
+                        client_ip,
                         &host,
                         &path_and_query,
                         req.headers(),
@@ -293,7 +460,7 @@ impl IngressServer {
                                 .record_session(
                                     "ingress",
                                     &rule.service_tag,
-                                    &peer_addr.ip().to_string(),
+                                    &client_ip.to_string(),
                                     429,
                                     start.elapsed().as_secs_f64() * 1000.0,
                                     0,
@@ -331,7 +498,7 @@ impl IngressServer {
                                 .record_session(
                                     "ingress",
                                     &rule.service_tag,
-                                    &peer_addr.ip().to_string(),
+                                    &client_ip.to_string(),
                                     status.as_u16(),
                                     start.elapsed().as_secs_f64() * 1000.0,
                                     0,
@@ -352,8 +519,8 @@ impl IngressServer {
                                 .record_session(
                                     "ingress",
                                     &rule.service_tag,
-                                    &peer_addr.ip().to_string(),
-                                    200,
+                                    &client_ip.to_string(),
+                                    302,
                                     start.elapsed().as_secs_f64() * 1000.0,
                                     0,
                                     0,
@@ -363,17 +530,6 @@ impl IngressServer {
                                     None,
                                 )
                                 .await;
-                            if let Some((bytes, mime)) = exposure_core::assets::load_web_asset(
-                                exposure_core::assets::WebApp::Challenge,
-                                "index.html",
-                            ) {
-                                return Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header(header::CONTENT_TYPE, mime)
-                                    .header(header::CACHE_CONTROL, "no-store")
-                                    .body(full_body(bytes))
-                                    .unwrap();
-                            }
                             return Response::builder()
                                 .status(StatusCode::FOUND)
                                 .header(header::LOCATION, location)
@@ -387,19 +543,37 @@ impl IngressServer {
                         node = %self.node_tag,
                         service = %rule.service_tag,
                         guard = %guard_name,
-                        "ingress rule references undefined guard profile"
+                        "ingress rule references undefined guard profile; failing closed"
                     );
+                    return Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(full_body("503 Service Unavailable"))
+                        .unwrap();
                 }
             }
         }
 
         let client_fp = crate::guard::classify_client(req.headers());
-        let fp_verified = self
-            .guard
-            .has_valid_fp_clearance(&cfg.clearance_secret, &host, req.headers());
+        let fp_verified = self.guard.has_valid_fp_clearance(
+            active_profile,
+            &cfg.clearance_secret,
+            &host,
+            client_ip,
+            req.headers(),
+        );
 
-        // Inject forwarding headers
-        if let Ok(hv) = HeaderValue::from_str(&peer_addr.ip().to_string()) {
+        // Strip untrusted client-supplied forwarding headers before injecting authoritative values
+        for h in [
+            "x-real-ip",
+            "forwarded",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-forwarded-host",
+            "x-forwarded-port",
+        ] {
+            req.headers_mut().remove(h);
+        }
+        if let Ok(hv) = HeaderValue::from_str(&client_ip.to_string()) {
             req.headers_mut().insert("x-forwarded-for", hv);
         }
         req.headers_mut().insert(
@@ -421,30 +595,45 @@ impl IngressServer {
 
         let is_upgrade = req.headers().contains_key(header::UPGRADE);
         let use_h2_mesh = req.version() == Version::HTTP_2 && !is_upgrade;
+        strip_hop_by_hop_headers(req.headers_mut(), use_h2_mesh, is_upgrade);
+
+        let request_id = Uuid::new_v4().to_string();
+        let now_ts = Utc::now().timestamp();
+        let origin_signing = ServiceStreamHeader::origin_signing_bytes(
+            &rule.service_tag,
+            &self.node_tag,
+            &request_id,
+            now_ts,
+        );
+        let origin_signature = Some(self.keypair.sign_b64(&origin_signing));
 
         let stream_hdr = ServiceStreamHeader {
             service_tag: rule.service_tag.clone(),
             origin_node_tag: self.node_tag.clone(),
             ttl: self.default_ttl,
             hop_count: 0,
-            request_id: Uuid::new_v4().to_string(),
-            client_ip: Some(peer_addr.ip().to_string()),
+            request_id,
+            client_ip: Some(client_ip.to_string()),
             is_tls,
-            sni: sni.map(|s| s.to_string()),
+            sni: auth_sni.map(|s| s.to_string()),
             protocol: if use_h2_mesh {
                 ServiceStreamProtocol::H2
             } else {
                 ServiceStreamProtocol::Http1
             },
+            visited: vec![self.node_tag.clone()],
+            timestamp: now_ts,
+            origin_signature,
         };
 
-        let mesh_stream = match self
-            .forwarder
-            .open_service_stream(&rule.next_peer, stream_hdr)
-            .await
+        let mesh_stream = match tokio::time::timeout(
+            MESH_PROXY_TIMEOUT,
+            self.forwarder.open_service_stream(&rule.next_peer, stream_hdr),
+        )
+        .await
         {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 let msg = format!(
                     "ingress forward to peer={} service={} failed: {}",
                     rule.next_peer, rule.service_tag, e
@@ -454,10 +643,10 @@ impl IngressServer {
                     .record_session(
                         "ingress",
                         &rule.service_tag,
-                        &peer_addr.ip().to_string(),
+                        &client_ip.to_string(),
                         502,
                         start.elapsed().as_secs_f64() * 1000.0,
-                        0,
+                        req_bytes_in,
                         0,
                         false,
                         false,
@@ -470,71 +659,111 @@ impl IngressServer {
                     .body(full_body("Bad Gateway: mesh forward failed"))
                     .unwrap();
             }
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::GATEWAY_TIMEOUT)
+                    .body(full_body("504 Gateway Time-out"))
+                    .unwrap();
+            }
         };
 
-        let proxy_res: std::result::Result<Response<ProxyBody>, String> = if use_h2_mesh {
-            *req.version_mut() = Version::HTTP_2;
-            match hyper::client::conn::http2::handshake(
-                TokioExecutor::new(),
-                TokioIo::new(mesh_stream),
-            )
-            .await
-            {
-                Ok((mut sender, conn)) => {
-                    tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    match sender.send_request(req).await {
-                        Ok(resp) => Ok(resp.map(|b| b.boxed())),
-                        Err(e) => Err(format!("mesh h2 send: {e}")),
-                    }
-                }
-                Err(e) => Err(format!("mesh h2 handshake: {e}")),
-            }
-        } else {
-            *req.version_mut() = Version::HTTP_11;
-            let client_upg = if is_upgrade {
-                Some(hyper::upgrade::on(&mut req))
-            } else {
-                None
-            };
-            match hyper::client::conn::http1::Builder::new()
-                .preserve_header_case(true)
-                .handshake(TokioIo::new(mesh_stream))
+        let proxy_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> =
+            if use_h2_mesh {
+                *req.version_mut() = Version::HTTP_2;
+                match tokio::time::timeout(
+                    MESH_PROXY_TIMEOUT,
+                    hyper::client::conn::http2::handshake(
+                        TokioExecutor::new(),
+                        TokioIo::new(mesh_stream),
+                    ),
+                )
                 .await
-            {
-                Ok((mut sender, conn)) => {
-                    tokio::spawn(async move {
-                        let _ = conn.with_upgrades().await;
-                    });
-                    match sender.send_request(req).await {
-                        Ok(mut resp) => {
-                            if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-                                if let Some(in_upg) = client_upg {
-                                    let out_upg = hyper::upgrade::on(&mut resp);
-                                    tokio::spawn(async move {
-                                        if let Ok((u_in, u_out)) =
-                                            tokio::try_join!(in_upg, out_upg)
-                                        {
-                                            let mut io_in = TokioIo::new(u_in);
-                                            let mut io_out = TokioIo::new(u_out);
-                                            let _ = tokio::io::copy_bidirectional(
-                                                &mut io_in,
-                                                &mut io_out,
-                                            )
-                                            .await;
-                                        }
-                                    });
-                                }
+                {
+                    Ok(Ok((mut sender, conn))) => {
+                        tokio::spawn(async move {
+                            let _ = conn.await;
+                        });
+                        match tokio::time::timeout(MESH_PROXY_TIMEOUT, sender.send_request(req))
+                            .await
+                        {
+                            Ok(Ok(resp)) => Ok(resp.map(|b| b.boxed())),
+                            Ok(Err(e)) => {
+                                Err((StatusCode::BAD_GATEWAY, format!("mesh h2 send: {e}")))
                             }
-                            Ok(resp.map(|b| b.boxed()))
+                            Err(_) => {
+                                Err((StatusCode::GATEWAY_TIMEOUT, "mesh h2 request timed out".into()))
+                            }
                         }
-                        Err(e) => Err(format!("mesh http1 send: {e}")),
+                    }
+                    Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("mesh h2 handshake: {e}"))),
+                    Err(_) => {
+                        Err((StatusCode::GATEWAY_TIMEOUT, "mesh h2 handshake timed out".into()))
                     }
                 }
-                Err(e) => Err(format!("mesh http1 handshake: {e}")),
-            }
-        };
+            } else {
+                *req.version_mut() = Version::HTTP_11;
+                let client_upg = if is_upgrade {
+                    Some(hyper::upgrade::on(&mut req))
+                } else {
+                    None
+                };
+                match tokio::time::timeout(
+                    MESH_PROXY_TIMEOUT,
+                    hyper::client::conn::http1::Builder::new()
+                        .preserve_header_case(true)
+                        .handshake(TokioIo::new(mesh_stream)),
+                )
+                .await
+                {
+                    Ok(Ok((mut sender, conn))) => {
+                        tokio::spawn(async move {
+                            let _ = conn.with_upgrades().await;
+                        });
+                        match tokio::time::timeout(MESH_PROXY_TIMEOUT, sender.send_request(req))
+                            .await
+                        {
+                            Ok(Ok(mut resp)) => {
+                                if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                                    if let Some(in_upg) = client_upg {
+                                        let out_upg = hyper::upgrade::on(&mut resp);
+                                        tokio::spawn(async move {
+                                            if let Ok((u_in, u_out)) =
+                                                tokio::try_join!(in_upg, out_upg)
+                                            {
+                                                let mut io_in = TokioIo::new(u_in);
+                                                let mut io_out = TokioIo::new(u_out);
+                                                let _ = tokio::time::timeout(
+                                                    WS_IDLE_TIMEOUT,
+                                                    tokio::io::copy_bidirectional(
+                                                        &mut io_in,
+                                                        &mut io_out,
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                        });
+                                    }
+                                }
+                                Ok(resp.map(|b| b.boxed()))
+                            }
+                            Ok(Err(e)) => {
+                                Err((StatusCode::BAD_GATEWAY, format!("mesh http1 send: {e}")))
+                            }
+                            Err(_) => Err((
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "mesh http1 request timed out".into(),
+                            )),
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        Err((StatusCode::BAD_GATEWAY, format!("mesh http1 handshake: {e}")))
+                    }
+                    Err(_) => Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "mesh http1 handshake timed out".into(),
+                    )),
+                }
+            };
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         match proxy_res {
@@ -549,7 +778,7 @@ impl IngressServer {
                     .record_session_with_fp(
                         "ingress",
                         &rule.service_tag,
-                        &peer_addr.ip().to_string(),
+                        &client_ip.to_string(),
                         resp.status().as_u16(),
                         latency_ms,
                         req_bytes_in,
@@ -566,14 +795,14 @@ impl IngressServer {
                     .await;
                 resp
             }
-            Err(err) => {
+            Err((err_status, err)) => {
                 warn!(ray_id = %ray_id, service = %rule.service_tag, error = %err, "ingress proxy error");
                 self.logger
                     .record_session(
                         "ingress",
                         &rule.service_tag,
-                        &peer_addr.ip().to_string(),
-                        504,
+                        &client_ip.to_string(),
+                        err_status.as_u16(),
                         latency_ms,
                         req_bytes_in,
                         0,
@@ -583,36 +812,95 @@ impl IngressServer {
                         Some(err),
                     )
                     .await;
+                let (title, detail) = if err_status == StatusCode::GATEWAY_TIMEOUT {
+                    ("Gateway Timeout", "The upstream server did not respond in time.")
+                } else {
+                    ("Bad Gateway", "The upstream server is temporarily unavailable.")
+                };
                 if rule.intercept_errors {
                     let html = exposure_core::assets::render_exposure_error_html(
-                        504,
-                        "Gateway Timeout",
-                        "The upstream server did not respond in time.",
+                        err_status.as_u16(),
+                        title,
+                        detail,
                         &ray_id,
                         None,
                     );
                     return Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
+                        .status(err_status)
                         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                         .header(header::CACHE_CONTROL, "no-store")
                         .body(full_body(html))
                         .unwrap();
                 }
                 Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(full_body("504 Gateway Time-out"))
+                    .status(err_status)
+                    .body(full_body(format!("{} {title}", err_status.as_u16())))
                     .unwrap()
             }
         }
     }
 }
 
-fn extract_host(req: &Request<Incoming>, sni: Option<&str>) -> String {
-    if let Some(h) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
-        return h.to_string();
+fn extract_and_validate_host(
+    req: &Request<Incoming>,
+    sni: Option<&str>,
+) -> std::result::Result<String, &'static str> {
+    let hdr_host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let uri_auth = req.uri().authority().map(|a| a.as_str());
+
+    if let (Some(h), Some(a)) = (hdr_host, uri_auth) {
+        if normalize_host(h) != normalize_host(a) {
+            return Err("400 Bad Request: Host and authority mismatch");
+        }
     }
-    if let Some(auth) = req.uri().authority() {
-        return auth.as_str().to_string();
+    if let Some(h) = hdr_host {
+        return Ok(h.to_string());
     }
-    sni.unwrap_or("").to_string()
+    if let Some(a) = uri_auth {
+        return Ok(a.to_string());
+    }
+    Ok(sni.unwrap_or("").to_string())
+}
+
+fn extract_query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(percent_decode_simple(v));
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode_simple(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }

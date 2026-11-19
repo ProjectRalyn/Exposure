@@ -1,10 +1,13 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use exposure_core::{ExposureError, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub trait TransportStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> TransportStream for T {}
@@ -47,8 +50,9 @@ impl TransportListener for TcpTransportListener {
 #[async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, addr: &str) -> Result<BoxedStream> {
-        let stream = TcpStream::connect(addr)
+        let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
+            .map_err(|_| ExposureError::Link(format!("tcp connect {addr}: timed out")))?
             .map_err(|e| ExposureError::Link(format!("tcp connect {addr}: {e}")))?;
         let _ = stream.set_nodelay(true);
         Ok(Box::pin(stream))

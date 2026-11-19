@@ -25,6 +25,20 @@ function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
 
+function isReservedKey(k) {
+  return k === "__proto__" || k === "prototype" || k === "constructor";
+}
+
+function generateRandomSecretHex(bytes = 32) {
+  const buf = new Uint8Array(bytes);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(buf);
+  } else {
+    for (let i = 0; i < bytes; i++) buf[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function defaultNodeSpec() {
   return {
     roles: { ingress: false, egress: false, relay: false, maintainer: false },
@@ -42,7 +56,7 @@ function defaultNodeSpec() {
       guards: {},
       rate_limit_buckets: {},
       tls_certs: [],
-      clearance_secret: "exposure-default-clearance-secret-change-me",
+      clearance_secret: generateRandomSecretHex(32),
       cert_store_dir: null,
     },
     egress: { services: {} },
@@ -54,7 +68,7 @@ function rolesFromAny(rawRoles) {
   const base = { ingress: false, egress: false, relay: false, maintainer: false };
   if (Array.isArray(rawRoles)) {
     for (const r of rawRoles) {
-      if (r in base) base[r] = true;
+      if (Object.hasOwn(base, r)) base[r] = true;
     }
     return base;
   }
@@ -69,21 +83,31 @@ function rolesFromAny(rawRoles) {
   return base;
 }
 
+function sanitizeRecord(obj) {
+  const out = {};
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    for (const [k, v] of Object.entries(obj)) {
+      if (!isReservedKey(k)) out[k] = v;
+    }
+  }
+  return out;
+}
+
 function normalizeNode(n) {
   const base = defaultNodeSpec();
   const out = { ...base, ...(n || {}) };
   out.roles = rolesFromAny(n?.roles);
   out.ingress = { ...base.ingress, ...(n?.ingress || {}) };
+  if (!out.ingress.clearance_secret) {
+    out.ingress.clearance_secret = base.ingress.clearance_secret;
+  }
   out.ingress.listeners = Array.isArray(out.ingress.listeners) ? out.ingress.listeners : [];
   out.ingress.rules = Array.isArray(out.ingress.rules) ? out.ingress.rules : [];
-  out.ingress.guards = out.ingress.guards && typeof out.ingress.guards === "object" ? out.ingress.guards : {};
-  out.ingress.rate_limit_buckets =
-    out.ingress.rate_limit_buckets && typeof out.ingress.rate_limit_buckets === "object"
-      ? out.ingress.rate_limit_buckets
-      : {};
+  out.ingress.guards = sanitizeRecord(out.ingress.guards);
+  out.ingress.rate_limit_buckets = sanitizeRecord(out.ingress.rate_limit_buckets);
   out.ingress.tls_certs = Array.isArray(out.ingress.tls_certs) ? out.ingress.tls_certs : [];
   out.egress = { ...base.egress, ...(n?.egress || {}) };
-  out.egress.services = out.egress.services && typeof out.egress.services === "object" ? out.egress.services : {};
+  out.egress.services = sanitizeRecord(out.egress.services);
   out.relay = { ...base.relay, ...(n?.relay || {}) };
   out.relay.rules = Array.isArray(out.relay.rules) ? out.relay.rules : [];
   out.maintainer_hops = Array.isArray(n?.maintainer_hops) ? n.maintainer_hops : [];
@@ -94,7 +118,7 @@ function defaultMaintainerTemplate() {
   return {
     is_primary_cert_manager: true,
     acme: {
-      directory_url: "https://acme-v02.api.letsencrypt.org/directory",
+      directory_url: "self-signed",
       contact_email: "",
       storage_dir: "./data/certs",
       providers: {},
@@ -107,6 +131,7 @@ function normalizeSpec(raw) {
   const nodes = {};
   if (raw && raw.nodes && typeof raw.nodes === "object") {
     for (const [tag, n] of Object.entries(raw.nodes)) {
+      if (isReservedKey(tag)) continue;
       nodes[tag] = normalizeNode(n);
     }
   }
@@ -123,10 +148,11 @@ function normalizeSpec(raw) {
         reverse_endpoints: Array.isArray(l.reverse_endpoints) ? l.reverse_endpoints : [],
       }))
     : [];
-  const maintainer_templates =
+  const maintainer_templates = sanitizeRecord(
     raw?.maintainer_templates && typeof raw.maintainer_templates === "object"
       ? deepClone(raw.maintainer_templates)
-      : {};
+      : {}
+  );
   const global_logger = raw?.global_logger || null;
   return { nodes, links, maintainer_templates, global_logger };
 }
@@ -143,7 +169,8 @@ function escapeHtml(s) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function shortestPathBFS(links, start, goal) {
@@ -157,7 +184,11 @@ function shortestPathBFS(links, start, goal) {
   for (const l of links) {
     if (!l.from || !l.to) continue;
     add(l.from, l.to);
-    if (l.mode === "tunnel") add(l.to, l.from);
+    if (l.mode === "tunnel") {
+      add(l.to, l.from);
+    } else if (l.mode === "on-demand" && l.bidirectional !== false && (l.reverse_endpoints || []).length > 0) {
+      add(l.to, l.from);
+    }
   }
   const visited = new Set([start]);
   const q = [[start]];
@@ -680,7 +711,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
 
       const statusDot = editor.showLiveOverlay
         ? live?.online
-          ? `<span class="live-dot online" title="Online (seq #${live.config_seq})"></span>`
+          ? `<span class="live-dot online" title="Online (seq #${Number(live.config_seq) || 0})"></span>`
           : live
           ? `<span class="live-dot offline" title="Offline"></span>`
           : `<span class="live-dot draft" title="Draft (not registered)"></span>`
@@ -865,10 +896,11 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     const errs = editor.validationErrors || [];
     const warns = editor.validationWarnings || [];
     if (!errs.length && !warns.length) {
+      bar.classList.remove("ok", "err");
       bar.classList.add("hidden");
       return;
     }
-    bar.classList.remove("hidden");
+    bar.classList.remove("hidden", "ok", "err");
     const items = [
       ...errs.map((msg) => ({ kind: "err", msg })),
       ...warns.map((msg) => ({ kind: "warn", msg })),
@@ -1077,7 +1109,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
 
     const live = editor.liveNodes.get(tag);
     const liveBadge = live
-      ? `<span class="pill ${live.online ? "ok" : "err"}">${live.online ? `ONLINE · seq #${live.config_seq}` : "OFFLINE"}</span>`
+      ? `<span class="pill ${live.online ? "ok" : "err"}">${live.online ? `ONLINE · seq #${Number(live.config_seq) || 0}` : "OFFLINE"}</span>`
       : `<span class="pill">DRAFT</span>`;
 
     box.innerHTML = `
@@ -1272,7 +1304,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
               <option value="exposure" ${node.ingress.server_header === "exposure" ? "selected" : ""}>exposure</option>
             </select>
           </label>
-          <label><span>Clearance Secret</span><input id="inp-clear-sec" value="${escapeHtml(node.ingress.clearance_secret || "")}" /></label>
+          <label><span>Clearance Secret</span><input id="inp-clear-sec" type="password" autocomplete="off" spellcheck="false" value="${escapeHtml(node.ingress.clearance_secret || "")}" /></label>
         </div>
         ${tlsCertsHtml}
       </div>
@@ -1416,6 +1448,16 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           <label class="check-inline"><input type="checkbox" data-es-any="${escapeHtml(sTag)}" ${svc.allow_any_origin ? "checked" : ""} /> Allow Any Origin</label>
           <label class="check-inline"><input type="checkbox" data-es-intercept="${escapeHtml(sTag)}" ${svc.intercept_errors ? "checked" : ""} /> Intercept Errors (5xx Page)</label>
         </div>
+        ${
+          svc.tls
+            ? `<div class="inspector-row">
+                <label><span>CA Cert Path (optional PEM)</span><input data-es-ca="${escapeHtml(sTag)}" value="${escapeHtml(svc.ca_cert_path || "")}" placeholder="/etc/exposure/ca.pem" /></label>
+                <label class="check-inline" style="align-self:end;padding-bottom:8px;">
+                  <input type="checkbox" data-es-insecure="${escapeHtml(sTag)}" ${svc.insecure_skip_verify ? "checked" : ""} /> Allow Insecure Cert
+                </label>
+              </div>`
+            : ""
+        }
       </div>`;
       })
       .join("");
@@ -1484,7 +1526,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         ${
           p.type === "cloudflare"
             ? `<div class="inspector-row">
-                <label><span>API Token</span><input data-dns-token="${escapeHtml(pName)}" value="${escapeHtml(p.api_token || "")}" /></label>
+                <label><span>API Token</span><input type="password" autocomplete="off" spellcheck="false" data-dns-token="${escapeHtml(pName)}" value="${escapeHtml(p.api_token || "")}" /></label>
                 <label><span>Zone ID</span><input data-dns-zone="${escapeHtml(pName)}" value="${escapeHtml(p.zone_id || "")}" /></label>
               </div>`
             : p.type === "webhook"
@@ -1549,7 +1591,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     // General tab
     box.querySelector("#inp-node-tag")?.addEventListener("change", (ev) => {
       const newTag = ev.target.value.trim();
-      if (!newTag || newTag === tag || editor.spec.nodes[newTag]) {
+      if (!newTag || newTag === tag || isReservedKey(newTag) || Object.hasOwn(editor.spec.nodes, newTag)) {
         ev.target.value = tag;
         return;
       }
@@ -1561,7 +1603,39 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       editor.spec.links.forEach((l) => {
         if (l.from === tag) l.from = newTag;
         if (l.to === tag) l.to = newTag;
+        if (l.peer_tag === tag) l.peer_tag = newTag;
       });
+      for (const n of Object.values(editor.spec.nodes)) {
+        if (Array.isArray(n.maintainer_hops)) {
+          n.maintainer_hops = n.maintainer_hops.map((h) => (h === tag ? newTag : h));
+        }
+        for (const r of n.ingress?.rules || []) {
+          if (r.next_peer === tag) r.next_peer = newTag;
+        }
+        for (const r of n.relay?.rules || []) {
+          if (r.next_peer === tag) r.next_peer = newTag;
+        }
+        for (const svc of Object.values(n.egress?.services || {})) {
+          if (Array.isArray(svc.allow_from)) {
+            svc.allow_from = svc.allow_from.map((a) => (a === tag ? newTag : a));
+          }
+        }
+      }
+      for (const tpl of Object.values(editor.spec.maintainer_templates || {})) {
+        for (const ord of tpl?.acme?.orders || []) {
+          if (Array.isArray(ord.target_nodes)) {
+            ord.target_nodes = ord.target_nodes.map((t) => (t === tag ? newTag : t));
+          }
+          if (ord.target_hops && typeof ord.target_hops === "object") {
+            const nextHops = {};
+            for (const [k, hops] of Object.entries(ord.target_hops)) {
+              const nk = k === tag ? newTag : k;
+              nextHops[nk] = Array.isArray(hops) ? hops.map((h) => (h === tag ? newTag : h)) : hops;
+            }
+            ord.target_hops = nextHops;
+          }
+        }
+      }
       editor.selected = { type: "node", tag: newTag };
       savePositions(editor.positions);
       render();
@@ -1768,25 +1842,35 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelectorAll("[data-del-bucket]").forEach((btn) =>
       btn.addEventListener("click", () => {
         markDirty(true);
-        delete node.ingress.rate_limit_buckets[btn.dataset.delBucket];
+        const bName = btn.dataset.delBucket;
+        delete node.ingress.rate_limit_buckets[bName];
+        for (const g of Object.values(node.ingress.guards || {})) {
+          if (g.rate_limit_bucket === bName) g.rate_limit_bucket = null;
+        }
         render();
       })
     );
     box.querySelectorAll("[data-bk-name]").forEach((inp) =>
       inp.addEventListener("change", () => {
         const oldN = inp.dataset.bkName, newN = inp.value.trim();
-        if (!newN || newN === oldN || node.ingress.rate_limit_buckets[newN]) { inp.value = oldN; return; }
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(node.ingress.rate_limit_buckets, newN)) {
+          inp.value = oldN;
+          return;
+        }
         markDirty(true);
         node.ingress.rate_limit_buckets[newN] = node.ingress.rate_limit_buckets[oldN];
         delete node.ingress.rate_limit_buckets[oldN];
+        for (const g of Object.values(node.ingress.guards || {})) {
+          if (g.rate_limit_bucket === oldN) g.rate_limit_bucket = newN;
+        }
         render();
       })
     );
     box.querySelectorAll("[data-bk-cap]").forEach((inp) =>
-      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkCap].capacity = Number(inp.value) || 60; })
+      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkCap].capacity = parseNum(inp.value, 60, 1); })
     );
     box.querySelectorAll("[data-bk-refill]").forEach((inp) =>
-      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkRefill].refill_per_sec = Number(inp.value) || 10; })
+      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkRefill].refill_per_sec = parseNum(inp.value, 10, 0.01); })
     );
     box.querySelectorAll("[data-bk-perip]").forEach((chk) =>
       chk.addEventListener("change", () => { markDirty(false); node.ingress.rate_limit_buckets[chk.dataset.bkPerip].per_ip = chk.checked; })
@@ -1831,7 +1915,10 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelectorAll("[data-gd-name]").forEach((inp) =>
       inp.addEventListener("change", () => {
         const oldN = inp.dataset.gdName, newN = inp.value.trim();
-        if (!newN || newN === oldN || node.ingress.guards[newN]) { inp.value = oldN; return; }
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(node.ingress.guards, newN)) {
+          inp.value = oldN;
+          return;
+        }
         markDirty(true);
         node.ingress.guards[newN] = node.ingress.guards[oldN];
         delete node.ingress.guards[oldN];
@@ -1874,7 +1961,10 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelectorAll("[data-es-tag]").forEach((inp) =>
       inp.addEventListener("change", () => {
         const oldTag = inp.dataset.esTag, newTag = inp.value.trim();
-        if (!newTag || newTag === oldTag || node.egress.services[newTag]) { inp.value = oldTag; return; }
+        if (!newTag || newTag === oldTag || isReservedKey(newTag) || Object.hasOwn(node.egress.services, newTag)) {
+          inp.value = oldTag;
+          return;
+        }
         markDirty(true);
         node.egress.services[newTag] = node.egress.services[oldTag];
         delete node.egress.services[oldTag];
@@ -1883,9 +1973,27 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     );
     box.querySelectorAll("[data-es-backend]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esBackend].backend = inp.value.trim(); }));
     box.querySelectorAll("[data-es-proto]").forEach((sel) => sel.addEventListener("change", () => { markDirty(false); node.egress.services[sel.dataset.esProto].protocol = sel.value; }));
-    box.querySelectorAll("[data-es-timeout]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esTimeout].timeout_ms = Number(inp.value) || 15000; }));
+    box.querySelectorAll("[data-es-timeout]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esTimeout].timeout_ms = parseNum(inp.value, 15000, 100); }));
     box.querySelectorAll("[data-es-allow]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esAllow].allow_from = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-es-tls]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.egress.services[chk.dataset.esTls].tls = chk.checked; }));
+    box.querySelectorAll("[data-es-tls]").forEach((chk) =>
+      chk.addEventListener("change", () => {
+        markDirty(true);
+        node.egress.services[chk.dataset.esTls].tls = chk.checked;
+        renderInspector();
+      })
+    );
+    box.querySelectorAll("[data-es-ca]").forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        node.egress.services[inp.dataset.esCa].ca_cert_path = inp.value.trim() || null;
+      })
+    );
+    box.querySelectorAll("[data-es-insecure]").forEach((chk) =>
+      chk.addEventListener("change", () => {
+        markDirty(false);
+        node.egress.services[chk.dataset.esInsecure].insecure_skip_verify = chk.checked;
+      })
+    );
     box.querySelectorAll("[data-es-intercept]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.egress.services[chk.dataset.esIntercept].intercept_errors = chk.checked; }));
     box.querySelectorAll("[data-es-any]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.egress.services[chk.dataset.esAny].allow_any_origin = chk.checked; }));
     box.querySelectorAll("[data-acl-toggle]").forEach((btn) =>
@@ -1925,10 +2033,16 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     });
     box.querySelector("#inp-maint-tpl")?.addEventListener("change", (ev) => {
       const oldN = node.maintainer_template || "default-maint", newN = ev.target.value.trim();
-      if (!newN || newN === oldN) return;
+      if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(editor.spec.maintainer_templates, newN)) {
+        ev.target.value = oldN;
+        return;
+      }
       markDirty(true);
       editor.spec.maintainer_templates[newN] = editor.spec.maintainer_templates[oldN] || defaultMaintainerTemplate();
       delete editor.spec.maintainer_templates[oldN];
+      for (const n of Object.values(editor.spec.nodes)) {
+        if (n.maintainer_template === oldN) n.maintainer_template = newN;
+      }
       node.maintainer_template = newN;
       render();
     });
@@ -1969,7 +2083,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelectorAll("[data-ord-dom]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordDom)].domain = inp.value.trim(); }));
     box.querySelectorAll("[data-ord-prov]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordProv)].provider = inp.value.trim(); }));
     box.querySelectorAll("[data-ord-targets]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordTargets)].target_nodes = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-ord-renew]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordRenew)].renew_before_days = Number(inp.value) || 30; }));
+    box.querySelectorAll("[data-ord-renew]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordRenew)].renew_before_days = parseNum(inp.value, 30, 1, 365); }));
     box.querySelectorAll("[data-auto-order-hops]").forEach((btn) =>
       btn.addEventListener("click", () => {
         const order = tpl.acme.orders[Number(btn.dataset.autoOrderHops)];
@@ -1994,8 +2108,8 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     const liveHtml = liveH
       ? `<div class="live-link-strip">
           <span class="pill ${liveH.state === "UP" ? "ok" : liveH.state === "DEGRADED" ? "warn" : "err"}">${escapeHtml(liveH.state)}</span>
-          <span>RTT: <b>${liveH.rtt_ms ?? "-"} ms</b></span>
-          <span>Loss: <b>${((liveH.loss_rate || 0) * 100).toFixed(1)}%</b></span>
+          <span>RTT: <b>${escapeHtml(liveH.rtt_ms ?? "-")} ms</b></span>
+          <span>Loss: <b>${((Number(liveH.loss_rate) || 0) * 100).toFixed(1)}%</b></span>
         </div>`
       : "";
 
@@ -2094,9 +2208,18 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     });
     box.querySelector("#btn-swap-link").addEventListener("click", () => {
       markDirty(true);
+      const oldTo = link.to;
       const tmp = link.from;
       link.from = link.to;
       link.to = tmp;
+      if (link.peer_tag === oldTo) {
+        link.peer_tag = null;
+      }
+      if (link.mode === "on-demand" && link.bidirectional !== false) {
+        const tmpEps = link.endpoints || [];
+        link.endpoints = link.reverse_endpoints || [];
+        link.reverse_endpoints = tmpEps;
+      }
       render();
     });
     box.querySelector("#sel-link-mode").addEventListener("change", (ev) => {
@@ -2165,7 +2288,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelectorAll("[data-ep-prio]").forEach((inp) =>
       inp.addEventListener("input", () => {
         markDirty(false);
-        link.endpoints[Number(inp.dataset.epPrio)].priority = Number(inp.value) || 10;
+        link.endpoints[Number(inp.dataset.epPrio)].priority = parseNum(inp.value, 10, 0, 65535);
       })
     );
     box.querySelectorAll("[data-ep-weight]").forEach((inp) =>
@@ -2397,8 +2520,9 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       const data = await api("/api/nodes");
       let added = 0;
       for (const n of data.nodes || []) {
+        if (!n?.node_tag || isReservedKey(n.node_tag)) continue;
         editor.liveNodes.set(n.node_tag, n);
-        if (!editor.spec.nodes[n.node_tag]) {
+        if (!Object.hasOwn(editor.spec.nodes, n.node_tag)) {
           const spec = defaultNodeSpec();
           spec.roles = rolesFromAny(n.roles);
           editor.spec.nodes[n.node_tag] = spec;
@@ -2420,12 +2544,18 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         method: "POST",
         body: JSON.stringify({ yaml: el("topology-editor").value }),
       });
-      if (res.spec) editor.spec = normalizeSpec(res.spec);
+      if (!res?.spec) {
+        const msg = (res?.errors && res.errors[0]) || "Invalid YAML syntax; fix errors before switching to Visual Graph";
+        showToast(msg, true);
+        return;
+      }
+      editor.spec = normalizeSpec(res.spec);
       if (res.paths) editor.compiledPaths = res.paths;
       editor.validationErrors = res.errors || [];
       editor.validationWarnings = res.warnings || [];
-    } catch {
-      // keep current spec if YAML had syntax error
+    } catch (e) {
+      showToast(`YAML parse error: ${e.message}`, true);
+      return;
     }
     editor.mode = "visual";
     el("topo-visual-wrap").classList.remove("hidden");
@@ -2491,7 +2621,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       editor.spec = normalizeSpec(spec);
       // Automatically surface onboarded/discovered live nodes on the graph
       for (const n of meta.live_nodes || []) {
-        if (n?.node_tag && !editor.spec.nodes[n.node_tag]) {
+        if (n?.node_tag && !isReservedKey(n.node_tag) && !Object.hasOwn(editor.spec.nodes, n.node_tag)) {
           const ns = defaultNodeSpec();
           ns.roles = rolesFromAny(n.roles);
           editor.spec.nodes[n.node_tag] = ns;

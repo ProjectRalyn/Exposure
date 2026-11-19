@@ -1,13 +1,12 @@
-# Exposure
+<p align="center">
+  <img src="assets/banner.svg" alt="Exposure" width="100%" />
+</p>
 
 [English](README.md) | **简体中文**
 
 **基于 Rust 构建的零信任多跳反向代理、加密服务网格、边缘防护与遥测平台。**
 
 Exposure 支持通过可组合的 **Ingress**、**Relay**、**Egress** 和 **Maintainer** 节点，在不可信网络中安全地暴露内网或 NAT 后的服务，并由内置 Web 管理面板的集中式 **Control** 控制面统一编排与下发配置。
-
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 
 ---
 
@@ -166,7 +165,4 @@ cargo test --workspace
 
 ## 许可证
 
-本项目采用双许可证授权，可任选其一：
-
-- **MIT License**
-- **Apache License, Version 2.0**
+**MIT**

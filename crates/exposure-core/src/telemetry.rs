@@ -22,6 +22,10 @@ impl HyperLogLog {
         }
     }
 
+    pub fn is_valid(&self) -> bool {
+        (4..=16).contains(&self.precision) && self.registers.len() == (1usize << self.precision)
+    }
+
     fn hash64(&self, item: &str) -> u64 {
         let mut hasher = Sha256::new();
         hasher.update(self.seed.to_be_bytes());
@@ -31,6 +35,9 @@ impl HyperLogLog {
     }
 
     pub fn insert(&mut self, item: &str) {
+        if !self.is_valid() {
+            return;
+        }
         let h = self.hash64(item);
         let idx = (h >> (64 - self.precision)) as usize;
         let w = (h << self.precision) | (1u64 << (self.precision - 1));
@@ -43,6 +50,9 @@ impl HyperLogLog {
     }
 
     pub fn merge(&mut self, other: &HyperLogLog) {
+        if !self.is_valid() || !other.is_valid() {
+            return;
+        }
         if self.precision != other.precision || self.seed != other.seed {
             return;
         }
@@ -54,6 +64,9 @@ impl HyperLogLog {
     }
 
     pub fn estimate(&self) -> f64 {
+        if !self.is_valid() || self.registers.is_empty() {
+            return 0.0;
+        }
         let m = self.registers.len() as f64;
         let alpha = match self.registers.len() {
             16 => 0.673,
@@ -64,8 +77,11 @@ impl HyperLogLog {
         let sum: f64 = self
             .registers
             .iter()
-            .map(|&r| 2.0_f64.powi(-(r as i32)))
+            .map(|&r| 2.0_f64.powi(-(r.min(64) as i32)))
             .sum();
+        if sum <= 0.0 || !sum.is_finite() {
+            return 0.0;
+        }
         let raw = alpha * m * m / sum;
 
         if raw <= 2.5 * m {
@@ -96,6 +112,9 @@ impl LatencyHistogram {
     }
 
     pub fn observe(&mut self, latency_ms: f64) {
+        if !latency_ms.is_finite() || latency_ms < 0.0 {
+            return;
+        }
         let mut idx = self.boundaries_ms.len();
         for (i, &b) in self.boundaries_ms.iter().enumerate() {
             if latency_ms <= b {
@@ -104,7 +123,7 @@ impl LatencyHistogram {
             }
         }
         if let Some(c) = self.counts.get_mut(idx) {
-            *c += 1;
+            *c = c.saturating_add(1);
         }
     }
 
@@ -113,12 +132,12 @@ impl LatencyHistogram {
             return;
         }
         for (a, &b) in self.counts.iter_mut().zip(other.counts.iter()) {
-            *a += b;
+            *a = a.saturating_add(b);
         }
     }
 
     pub fn total(&self) -> u64 {
-        self.counts.iter().sum()
+        self.counts.iter().copied().fold(0u64, u64::saturating_add)
     }
 
     pub fn quantile(&self, q: f64) -> f64 {
@@ -129,14 +148,14 @@ impl LatencyHistogram {
         let target = (q.clamp(0.0, 1.0) * total as f64).ceil().max(1.0) as u64;
         let mut acc = 0u64;
         for (i, &c) in self.counts.iter().enumerate() {
-            acc += c;
+            let prev_acc = acc;
+            acc = acc.saturating_add(c);
             if acc >= target {
                 if i < self.boundaries_ms.len() {
                     let lower = if i == 0 { 0.0 } else { self.boundaries_ms[i - 1] };
                     let upper = self.boundaries_ms[i];
-                    let prev_acc = acc - c;
                     let frac = if c > 0 {
-                        (target - prev_acc) as f64 / c as f64
+                        (target.saturating_sub(prev_acc)) as f64 / c as f64
                     } else {
                         1.0
                     };
@@ -237,55 +256,67 @@ impl MinuteSummary {
     }
 
     pub fn record(&mut self, rec: &SessionSummary) {
-        self.requests += 1;
+        self.requests = self.requests.saturating_add(1);
         if rec.status >= 500 {
-            self.errors += 1;
+            self.errors = self.errors.saturating_add(1);
         }
         if rec.rate_limited {
-            self.rate_limited += 1;
+            self.rate_limited = self.rate_limited.saturating_add(1);
         }
         if rec.challenged {
-            self.challenges_issued += 1;
+            self.challenges_issued = self.challenges_issued.saturating_add(1);
         }
         if rec.challenge_passed {
-            self.challenges_passed += 1;
+            self.challenges_passed = self.challenges_passed.saturating_add(1);
         }
         if rec.client_fp_verified {
-            self.client_fp_verified += 1;
+            self.client_fp_verified = self.client_fp_verified.saturating_add(1);
         }
         if let Some(ref d) = rec.device_type {
-            *self.device_counts.entry(d.clone()).or_insert(0) += 1;
+            let e = self.device_counts.entry(d.clone()).or_insert(0);
+            *e = e.saturating_add(1);
         }
         if let Some(ref b) = rec.browser_family {
-            *self.browser_counts.entry(b.clone()).or_insert(0) += 1;
+            let e = self.browser_counts.entry(b.clone()).or_insert(0);
+            *e = e.saturating_add(1);
         }
         if let Some(ref o) = rec.os_family {
-            *self.os_counts.entry(o.clone()).or_insert(0) += 1;
+            let e = self.os_counts.entry(o.clone()).or_insert(0);
+            *e = e.saturating_add(1);
         }
-        self.bytes_in += rec.bytes_in;
-        self.bytes_out += rec.bytes_out;
+        self.bytes_in = self.bytes_in.saturating_add(rec.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(rec.bytes_out);
         self.uv_hll.insert(&rec.ip_hmac);
         self.latency_hist.observe(rec.latency_ms);
     }
 
     pub fn merge_from(&mut self, other: &MinuteSummary) {
-        self.requests += other.requests;
-        self.errors += other.errors;
-        self.rate_limited += other.rate_limited;
-        self.challenges_issued += other.challenges_issued;
-        self.challenges_passed += other.challenges_passed;
-        self.client_fp_verified += other.client_fp_verified;
+        self.requests = self.requests.saturating_add(other.requests);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
+        self.challenges_issued = self.challenges_issued.saturating_add(other.challenges_issued);
+        self.challenges_passed = self.challenges_passed.saturating_add(other.challenges_passed);
+        self.client_fp_verified = self.client_fp_verified.saturating_add(other.client_fp_verified);
         for (k, v) in &other.device_counts {
-            *self.device_counts.entry(k.clone()).or_insert(0) += *v;
+            if self.device_counts.len() < 64 || self.device_counts.contains_key(k) {
+                let e = self.device_counts.entry(k.clone()).or_insert(0);
+                *e = e.saturating_add(*v);
+            }
         }
         for (k, v) in &other.browser_counts {
-            *self.browser_counts.entry(k.clone()).or_insert(0) += *v;
+            if self.browser_counts.len() < 64 || self.browser_counts.contains_key(k) {
+                let e = self.browser_counts.entry(k.clone()).or_insert(0);
+                *e = e.saturating_add(*v);
+            }
         }
         for (k, v) in &other.os_counts {
-            *self.os_counts.entry(k.clone()).or_insert(0) += *v;
+            if self.os_counts.len() < 64 || self.os_counts.contains_key(k) {
+                let e = self.os_counts.entry(k.clone()).or_insert(0);
+                *e = e.saturating_add(*v);
+            }
         }
-        self.bytes_in += other.bytes_in;
-        self.bytes_out += other.bytes_out;
+        self.bytes_in = self.bytes_in.saturating_add(other.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(other.bytes_out);
         self.uv_hll.merge(&other.uv_hll);
         self.latency_hist.merge(&other.latency_hist);
     }
@@ -351,6 +382,15 @@ mod tests {
         a.merge(&b);
         let est = a.estimate();
         assert!(est > 600.0 && est < 900.0, "unexpected HLL estimate: {est}");
+
+        // Malformed deserialized HLL must not panic or return NaN
+        let mut bad = HyperLogLog {
+            precision: 0,
+            seed: 1,
+            registers: vec![],
+        };
+        bad.insert("test");
+        assert_eq!(bad.estimate(), 0.0);
 
         let buckets = vec![10.0, 50.0, 100.0, 500.0];
         let mut h1 = LatencyHistogram::new(buckets.clone());

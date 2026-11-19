@@ -14,9 +14,15 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     entries.sort_by_key(|e| e.path());
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             collect_files(base, &path, out);
-        } else if path.is_file() {
+        } else if meta.is_file() {
             let rel = path
                 .strip_prefix(base)
                 .unwrap()
@@ -31,10 +37,17 @@ fn watch_dir(dir: &Path) {
     if !dir.exists() {
         return;
     }
+    println!("cargo:rerun-if-changed={}", dir.display());
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
+            let Ok(meta) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
                 if p.file_name().and_then(|n| n.to_str()) == Some("node_modules") {
                     continue;
                 }
@@ -46,22 +59,51 @@ fn watch_dir(dir: &Path) {
     }
 }
 
-fn find_native_esbuild(dir: &Path) -> Option<PathBuf> {
-    if !dir.exists() {
-        return None;
+fn host_esbuild_pkg_dir() -> Option<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("windows", "x86_64") => Some("win32-x64"),
+        _ => None,
     }
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(cur) = stack.pop() {
-        if let Ok(entries) = fs::read_dir(&cur) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.file_name().and_then(|n| n.to_str()) == Some("esbuild") {
-                    if let Ok(meta) = fs::metadata(&p) {
-                        if meta.is_file() && meta.len() > 1_000_000 {
-                            return Some(p);
-                        }
+}
+
+fn find_native_esbuild(node_modules: &Path) -> Option<PathBuf> {
+    let target_pkg = host_esbuild_pkg_dir()?;
+    let bin_name = if env::consts::OS == "windows" {
+        "esbuild.exe"
+    } else {
+        "esbuild"
+    };
+    let direct = node_modules
+        .join("@esbuild")
+        .join(target_pkg)
+        .join("bin")
+        .join(bin_name);
+    if let Ok(meta) = fs::metadata(&direct) {
+        if meta.is_file() {
+            return Some(direct);
+        }
+    }
+    // pnpm store layout: node_modules/.pnpm/@esbuild+<target>@.../node_modules/@esbuild/<target>/bin/esbuild
+    let pnpm_dir = node_modules.join(".pnpm");
+    let prefix = format!("@esbuild+{target_pkg}@");
+    if let Ok(entries) = fs::read_dir(&pnpm_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) {
+                let candidate = entry
+                    .path()
+                    .join("node_modules")
+                    .join("@esbuild")
+                    .join(target_pkg)
+                    .join("bin")
+                    .join(bin_name);
+                if let Ok(meta) = fs::metadata(&candidate) {
+                    if meta.is_file() {
+                        return Some(candidate);
                     }
                 }
             }
@@ -70,8 +112,8 @@ fn find_native_esbuild(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Fallback minifier using the standalone native `esbuild` binary when `node`/Vite cannot run.
-fn build_with_native_esbuild(web_dir: &Path) -> bool {
+/// Fallback minifier using the host-matched native `esbuild` binary into OUT_DIR staging.
+fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
     let Some(esbuild) = find_native_esbuild(&web_dir.join("node_modules")) else {
         return false;
     };
@@ -83,7 +125,7 @@ fn build_with_native_esbuild(web_dir: &Path) -> bool {
 
     for (app, entry_js, base) in apps {
         let src = web_dir.join(app);
-        let dst = web_dir.join("dist").join(app);
+        let dst = stage_dir.join(app);
         let assets = dst.join("assets");
         let _ = fs::remove_dir_all(&dst);
         if fs::create_dir_all(&assets).is_err() {
@@ -117,7 +159,9 @@ fn build_with_native_esbuild(web_dir: &Path) -> bool {
         };
         let patched = html
             .replace("./styles.css", &format!("{base}assets/styles.min.css"))
-            .replace(&format!("./{entry_js}"), &format!("{base}assets/app.min.js"));
+            .replace(&format!("./{entry_js}"), &format!("{base}assets/app.min.js"))
+            .replace("/cdn-cgi/styles.css", &format!("{base}assets/styles.min.css"))
+            .replace(&format!("/cdn-cgi/{entry_js}"), &format!("{base}assets/app.min.js"));
         if fs::write(dst.join("index.html"), patched).is_err() {
             return false;
         }
@@ -139,6 +183,7 @@ fn main() {
     watch_dir(&web_dir.join("challenge"));
     println!("cargo:rerun-if-changed={}", web_dir.join("build.mjs").display());
     println!("cargo:rerun-if-changed={}", web_dir.join("package.json").display());
+    println!("cargo:rerun-if-env-changed=EXPOSURE_USE_PREBUILT_WEB");
 
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     if profile != "release" {
@@ -150,26 +195,34 @@ fn main() {
         return;
     }
 
-    let dist_control = web_dir.join("dist").join("control");
-    let dist_challenge = web_dir.join("dist").join("challenge");
-
+    let stage_dir = out_dir.join("web_dist");
     let vite_ok = Command::new("pnpm")
         .arg("--dir")
         .arg(&web_dir)
         .arg("build")
+        .env("EXPOSURE_WEB_OUT_DIR", &stage_dir)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if !vite_ok {
-        let esbuild_ok = build_with_native_esbuild(&web_dir);
-        if !esbuild_ok && (!dist_control.exists() || !dist_challenge.exists()) {
-            panic!(
-                "Release build requires minified assets in {} (run `pnpm --dir web install && pnpm --dir web build`)",
-                web_dir.join("dist").display()
-            );
-        }
-    }
+    let effective_dist = if vite_ok && stage_dir.join("control").exists() && stage_dir.join("challenge").exists() {
+        stage_dir
+    } else if build_with_native_esbuild(&web_dir, &stage_dir) {
+        stage_dir
+    } else if env::var("EXPOSURE_USE_PREBUILT_WEB").ok().as_deref() == Some("1")
+        && web_dir.join("dist").join("control").exists()
+        && web_dir.join("dist").join("challenge").exists()
+    {
+        println!("cargo:warning=Using prebuilt web/dist assets because EXPOSURE_USE_PREBUILT_WEB=1");
+        web_dir.join("dist")
+    } else {
+        panic!(
+            "Release build failed to compile web assets via pnpm/esbuild (set EXPOSURE_USE_PREBUILT_WEB=1 to explicitly opt into prebuilt web/dist)"
+        );
+    };
+
+    let dist_control = effective_dist.join("control");
+    let dist_challenge = effective_dist.join("challenge");
 
     let mut control_files = Vec::new();
     let mut challenge_files = Vec::new();

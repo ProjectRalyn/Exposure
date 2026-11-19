@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Exposure Logo">
+  <defs>
+    <!-- Dark slate background -->
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141920" />
+      <stop offset="100%" stop-color="#1d242e" />
+    </linearGradient>
+
+    <!-- Electric cyan gradient for the encrypted tunnel -->
+    <linearGradient id="cyan-grad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="55%" stop-color="#0ea5e9" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+
+    <!-- Exact 10px uniform knockout around the white E -->
+    <mask id="cut-by-e">
+      <rect width="512" height="512" fill="white" />
+      <!-- Spine (144..180 -> 134..190) -->
+      <rect x="134" y="130" width="56" height="252" fill="black" />
+      <!-- Top bar (x+y=432 -> 446) -->
+      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
+      <!-- Middle bar (x+y=494 -> 508) -->
+      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
+      <!-- Bottom bar (x+y=628 -> 642) -->
+      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+    </mask>
+
+    <!-- Exact knockout around E + twin cyan tunnel (11px gap) for the slate perimeter -->
+    <mask id="cut-for-frame">
+      <rect width="512" height="512" fill="white" />
+      <!-- Tunnel channel (x+y = 506..626) -->
+      <polygon points="93,413 413,93 473,153 153,473" fill="black" />
+      <!-- E silhouette -->
+      <rect x="134" y="130" width="56" height="252" fill="black" />
+      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
+      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
+      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+    </mask>
+  </defs>
+
+  <!-- Background Squircle -->
+  <rect width="512" height="512" rx="96" fill="url(#bg-grad)" />
+
+  <!-- LAYER 1: Slate Gray Zero-Trust Diamond Perimeter -->
+  <g mask="url(#cut-for-frame)">
+    <polygon
+      points="256,56 456,256 256,456 56,256"
+      fill="none"
+      stroke="#526378"
+      stroke-width="24"
+      stroke-linejoin="miter"
+    />
+  </g>
+
+  <!-- LAYER 2: Electric Cyan Twin-Stream Encrypted Tunnel -->
+  <g mask="url(#cut-by-e)" fill="url(#cyan-grad)">
+    <!-- Upper stream (x+y = 522..556, symmetric ends x-y = +-280) -->
+    <polygon points="121,401 401,121 418,138 138,418" />
+    <!-- Lower parallel stream (x+y = 576..610, symmetric ends x-y = +-280) -->
+    <polygon points="148,428 428,148 445,165 165,445" />
+  </g>
+
+  <!-- LAYER 3: Crisp White Geometric "E" -->
+  <g fill="#f8fafc">
+    <rect x="144" y="140" width="36" height="232" />
+    <polygon points="144,140 292,140 256,176 144,176" />
+    <polygon points="144,238 256,238 220,274 144,274" />
+    <polygon points="144,336 292,336 256,372 144,372" />
+  </g>
+</svg>

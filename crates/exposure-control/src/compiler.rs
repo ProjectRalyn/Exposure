@@ -1,10 +1,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 
 use exposure_core::config::{
-    LinkMode, NodeConfig, PeerConfig, ProbeConfig, TopologySpec, TrustedMaintainer,
-    TunnelDirection,
+    EgressConfig, IngressConfig, LinkMode, NodeConfig, PeerConfig, ProbeConfig, RelayConfig,
+    TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection,
 };
+use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
+use exposure_core::routing::canonical_ip;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+
+const MAX_HOP_PATH_LEN: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRouteTrace {
@@ -30,20 +36,148 @@ pub struct CompileReport {
     pub paths: Vec<ServiceRouteTrace>,
 }
 
-/// Compile a `TopologySpec` into complete per-node `NodeConfig` maps, performing:
-/// - Peer & Hop Table validation
-/// - Service Tag conflict, ACL reference, and cross-node reachability/loop checks
-/// - Maintainer credential & trusted_maintainers injection
+fn validate_endpoint_address(
+    raw: &str,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    let trimmed = raw.trim();
+    match trimmed.rsplit_once(':') {
+        Some((host, port_str))
+            if !host.is_empty()
+                && port_str.parse::<u16>().map(|p| p > 0).unwrap_or(false) =>
+        {
+            let clean = host
+                .trim_matches(|c| c == '[' || c == ']')
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let is_local_name = clean == "localhost" || clean.ends_with(".localhost");
+            let is_local_ip = clean
+                .parse::<IpAddr>()
+                .map(|ip| {
+                    let c = canonical_ip(ip);
+                    c.is_loopback() || c.is_unspecified()
+                })
+                .unwrap_or(false);
+            if is_local_name || is_local_ip {
+                errors.push(format!(
+                    "{label} uses local/wildcard endpoint '{raw}' — specify a reachable LAN/WAN IP"
+                ));
+            }
+        }
+        _ => {
+            errors.push(format!(
+                "{label} has invalid endpoint '{raw}' (expected host:port)"
+            ));
+        }
+    }
+}
+
+fn validate_cidr_list(cidrs: &[String], label: &str, errors: &mut Vec<String>) {
+    for raw in cidrs {
+        let s = raw.trim();
+        if s.parse::<IpNet>().is_err() && s.parse::<IpAddr>().is_err() {
+            errors.push(format!("{label} contains invalid CIDR/IP '{raw}'"));
+        }
+    }
+}
+
+/// Compile a `TopologySpec` into complete per-node `NodeConfig` maps.
+/// Enforces pinned node public keys (`require_pinned_pubkeys = true` for production push).
 pub fn compile_topology(
     topo: &TopologySpec,
     control_public_key: &str,
     node_pubkeys: &HashMap<String, String>,
     maintainer_keys: &HashMap<String, (String, String)>,
 ) -> (CompileReport, BTreeMap<String, NodeConfig>) {
+    compile_topology_with_options(
+        topo,
+        control_public_key,
+        control_public_key,
+        node_pubkeys,
+        maintainer_keys,
+        true,
+    )
+}
+
+/// Compile a `TopologySpec` with explicit control link key and pinned-key enforcement option.
+pub fn compile_topology_with_options(
+    topo: &TopologySpec,
+    control_signing_public_key: &str,
+    control_link_public_key: &str,
+    node_pubkeys: &HashMap<String, String>,
+    maintainer_keys: &HashMap<String, (String, String)>,
+    require_pinned_pubkeys: bool,
+) -> (CompileReport, BTreeMap<String, NodeConfig>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut peer_map: HashMap<String, Vec<PeerConfig>> = HashMap::new();
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+
+    // 0. Validate node tags, global logger, guards, buckets, CIDRs, and maintainer templates
+    if let Some(ref gl) = topo.global_logger {
+        if !gl.hmac_key.is_empty() && is_weak_secret(&gl.hmac_key) {
+            errors.push(
+                "global_logger.hmac_key uses a weak or default secret; provide >=16 random chars or leave empty to auto-generate".into(),
+            );
+        }
+    }
+
+    for (node_tag, spec) in &topo.nodes {
+        if let Err(e) = validate_identifier(node_tag, "node_tag") {
+            errors.push(e.to_string());
+        }
+        if spec.roles.ingress {
+            if !spec.ingress.guards.is_empty() && is_weak_secret(&spec.ingress.clearance_secret) {
+                errors.push(format!(
+                    "ingress node '{node_tag}' uses a weak or default clearance_secret; set a high-entropy random secret (>=16 chars)"
+                ));
+            }
+            for (g_name, g) in &spec.ingress.guards {
+                validate_cidr_list(
+                    &g.allow_cidrs,
+                    &format!("ingress '{node_tag}' guard '{g_name}'.allow_cidrs"),
+                    &mut errors,
+                );
+                validate_cidr_list(
+                    &g.deny_cidrs,
+                    &format!("ingress '{node_tag}' guard '{g_name}'.deny_cidrs"),
+                    &mut errors,
+                );
+                if let Some(ref bname) = g.rate_limit_bucket {
+                    if !bname.trim().is_empty() && !spec.ingress.rate_limit_buckets.contains_key(bname) {
+                        errors.push(format!(
+                            "ingress '{node_tag}' guard '{g_name}' references undefined rate_limit_bucket '{bname}'"
+                        ));
+                    }
+                }
+            }
+            for rule in &spec.ingress.rules {
+                validate_cidr_list(
+                    &rule.r#match.source_cidrs,
+                    &format!("ingress '{node_tag}' rule '{}' source_cidrs", rule.service_tag),
+                    &mut errors,
+                );
+                if let Some(ref gname) = rule.guard {
+                    if !gname.trim().is_empty() && !spec.ingress.guards.contains_key(gname) {
+                        errors.push(format!(
+                            "ingress '{node_tag}' rule '{}' references undefined guard '{gname}'",
+                            rule.service_tag
+                        ));
+                    }
+                }
+            }
+        }
+        if spec.roles.maintainer {
+            if let Some(ref tpl) = spec.maintainer_template {
+                if !tpl.trim().is_empty() && !topo.maintainer_templates.contains_key(tpl) {
+                    errors.push(format!(
+                        "maintainer '{node_tag}' references undefined maintainer_template '{tpl}'"
+                    ));
+                }
+            }
+        }
+    }
 
     // 1. Validate links and build per-node Peer lists
     for link in &topo.links {
@@ -60,28 +194,49 @@ pub fn compile_topology(
             continue;
         }
 
-        // Preflight endpoint syntax & loopback/wildcard checks
-        for ep in &link.endpoints {
-            let trimmed = ep.address.trim();
-            match trimmed.rsplit_once(':') {
-                Some((host, port_str)) if !host.is_empty() && port_str.parse::<u16>().map(|p| p > 0).unwrap_or(false) => {
-                    let h = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
-                    if h == "0.0.0.0" || h == "::" || h == "127.0.0.1" || h == "::1" || h == "localhost" {
-                        errors.push(format!(
-                            "link '{} -> {}' uses local/wildcard endpoint '{}' — specify a reachable LAN/WAN IP",
-                            link.from, link.to, ep.address
-                        ));
-                    }
-                }
-                _ => {
-                    errors.push(format!(
-                        "link '{} -> {}' has invalid endpoint '{}' (expected host:port)",
-                        link.from, link.to, ep.address
-                    ));
-                }
+        let target_pk = node_pubkeys
+            .get(&link.to)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let source_pk = node_pubkeys
+            .get(&link.from)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if target_pk.is_none() {
+            let msg = format!(
+                "link '{} -> {}' target node '{}' is not enrolled (missing pinned public_key)",
+                link.from, link.to, link.to
+            );
+            if require_pinned_pubkeys {
+                errors.push(msg);
+            } else {
+                warnings.push(msg);
+            }
+        }
+        if source_pk.is_none()
+            && (link.mode == LinkMode::Tunnel || (link.mode == LinkMode::OnDemand && link.bidirectional))
+        {
+            let msg = format!(
+                "link '{} -> {}' source node '{}' is not enrolled (missing pinned public_key)",
+                link.from, link.to, link.from
+            );
+            if require_pinned_pubkeys {
+                errors.push(msg);
+            } else {
+                warnings.push(msg);
             }
         }
 
+        for ep in &link.endpoints {
+            validate_endpoint_address(
+                &ep.address,
+                &format!("link '{} -> {}'", link.from, link.to),
+                &mut errors,
+            );
+        }
+
+        let mut link_direction_valid = true;
         match link.mode {
             LinkMode::OnDemand => {
                 if link.endpoints.is_empty() {
@@ -115,21 +270,22 @@ pub fn compile_topology(
                     }
                 }
                 Some(TunnelDirection::Inbound) => {
+                    link_direction_valid = false;
                     errors.push(format!(
                         "tunnel link '{} -> {}' cannot use 'inbound' in topology; tunnel links always dial 'from -> to' (outbound) — swap 'from' and 'to' instead",
                         link.from, link.to
                     ));
                 }
                 None => {
+                    link_direction_valid = false;
                     errors.push(format!(
-                        "tunnel link '{} -> {}' must specify tunnel_direction ('outbound' or 'inbound')",
+                        "tunnel link '{} -> {}' must specify tunnel_direction ('outbound')",
                         link.from, link.to
                     ));
                 }
             },
         }
         let peer_tag = link.peer_tag.clone().unwrap_or_else(|| link.to.clone());
-        let target_pk = node_pubkeys.get(&link.to).cloned();
 
         let list = peer_map.entry(link.from.clone()).or_default();
         if list.iter().any(|p| p.peer_tag == peer_tag) {
@@ -149,14 +305,13 @@ pub fn compile_topology(
             expected_client_addr: link.expected_client_addr.clone(),
             endpoints: link.endpoints.clone(),
         });
-        adj.entry(link.from.clone())
-            .or_default()
-            .insert(link.to.clone());
+        if link_direction_valid {
+            adj.entry(link.from.clone())
+                .or_default()
+                .insert(link.to.clone());
+        }
 
         if link.mode == LinkMode::OnDemand && link.bidirectional {
-            adj.entry(link.to.clone())
-                .or_default()
-                .insert(link.from.clone());
             let source_listener = topo.nodes.get(&link.from).and_then(|n| n.link_listener.as_ref());
             if !source_listener.map(|l| l.allow_on_demand).unwrap_or(false) {
                 errors.push(format!(
@@ -165,67 +320,62 @@ pub fn compile_topology(
                 ));
             }
             for ep in &link.reverse_endpoints {
-                let trimmed = ep.address.trim();
-                match trimmed.rsplit_once(':') {
-                    Some((host, port_str)) if !host.is_empty() && port_str.parse::<u16>().map(|p| p > 0).unwrap_or(false) => {
-                        let h = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
-                        if h == "0.0.0.0" || h == "::" || h == "127.0.0.1" || h == "::1" || h == "localhost" {
-                            errors.push(format!(
-                                "link '{} -> {}' uses local/wildcard reverse endpoint '{}' — specify a reachable LAN/WAN IP",
-                                link.from, link.to, ep.address
-                            ));
-                        }
-                    }
-                    _ => {
-                        errors.push(format!(
-                            "link '{} -> {}' has invalid reverse endpoint '{}' (expected host:port)",
-                            link.from, link.to, ep.address
-                        ));
-                    }
-                }
+                validate_endpoint_address(
+                    &ep.address,
+                    &format!("link '{} -> {}' reverse", link.from, link.to),
+                    &mut errors,
+                );
             }
             let rev_list = peer_map.entry(link.to.clone()).or_default();
-            if !rev_list.iter().any(|p| p.node_tag == link.from) {
+            if !rev_list.iter().any(|p| p.peer_tag == link.from) {
                 if link.reverse_endpoints.is_empty() {
                     errors.push(format!(
                         "bidirectional on-demand link '{} -> {}' requires reverse_endpoints (address for '{}' to dial '{}'), or uncheck Bidirectional",
                         link.from, link.to, link.to, link.from
                     ));
                 } else {
+                    adj.entry(link.to.clone())
+                        .or_default()
+                        .insert(link.from.clone());
                     rev_list.push(PeerConfig {
                         peer_tag: link.from.clone(),
                         node_tag: link.from.clone(),
-                        public_key: node_pubkeys.get(&link.from).cloned(),
+                        public_key: source_pk.clone(),
                         pubkey_fingerprint: None,
                         mode: LinkMode::OnDemand,
                         tunnel_direction: None,
-                        expected_client_addr: link.expected_client_addr.clone(),
+                        expected_client_addr: None,
                         endpoints: link.reverse_endpoints.clone(),
                     });
                 }
+            } else {
+                adj.entry(link.to.clone())
+                    .or_default()
+                    .insert(link.from.clone());
             }
         }
 
-        // For inbound/outbound tunnels, links are bidirectional once established
-        if link.mode == LinkMode::Tunnel {
+        if link.mode == LinkMode::Tunnel && link_direction_valid {
             adj.entry(link.to.clone())
                 .or_default()
                 .insert(link.from.clone());
-            // Auto-ensure reverse peer entry on inbound side if not explicitly declared
-            let rev_dir = match link.tunnel_direction {
-                Some(TunnelDirection::Outbound) => Some(TunnelDirection::Inbound),
-                Some(TunnelDirection::Inbound) => Some(TunnelDirection::Outbound),
-                None => None,
-            };
             let rev_list = peer_map.entry(link.to.clone()).or_default();
-            if !rev_list.iter().any(|p| p.node_tag == link.from) {
+            if !rev_list
+                .iter()
+                .any(|p| p.node_tag == link.from && p.mode == LinkMode::Tunnel)
+            {
+                let rev_peer_tag = if rev_list.iter().any(|p| p.peer_tag == link.from) {
+                    format!("{}-tunnel", link.from)
+                } else {
+                    link.from.clone()
+                };
                 rev_list.push(PeerConfig {
-                    peer_tag: link.from.clone(),
+                    peer_tag: rev_peer_tag,
                     node_tag: link.from.clone(),
-                    public_key: node_pubkeys.get(&link.from).cloned(),
+                    public_key: source_pk,
                     pubkey_fingerprint: None,
                     mode: LinkMode::Tunnel,
-                    tunnel_direction: rev_dir,
+                    tunnel_direction: Some(TunnelDirection::Inbound),
                     expected_client_addr: link.expected_client_addr.clone(),
                     endpoints: vec![],
                 });
@@ -279,6 +429,15 @@ pub fn compile_topology(
         }
     }
 
+    // Helper: resolve peer_tag prioritizing exact peer_tag match over node_tag fallback
+    let resolve_peer = |node: &str, next_peer_tag: &str| -> Option<String> {
+        let list = peer_map.get(node)?;
+        list.iter()
+            .find(|p| p.peer_tag == next_peer_tag)
+            .or_else(|| list.iter().find(|p| p.node_tag == next_peer_tag))
+            .map(|p| p.node_tag.clone())
+    };
+
     // 4. Cross-node path tracing for every ingress rule (loop & reachability verification)
     let mut paths: Vec<ServiceRouteTrace> = Vec::new();
     for (ingress_tag, spec) in &topo.nodes {
@@ -295,7 +454,6 @@ pub fn compile_topology(
             let mut trace_err: Option<String> = None;
 
             loop {
-                // Co-located egress via self node_tag or "local"
                 if next_peer_tag == cur_node || next_peer_tag.eq_ignore_ascii_case("local") {
                     let node_spec = &topo.nodes[&cur_node];
                     if !node_spec.roles.egress
@@ -322,14 +480,7 @@ pub fn compile_topology(
                     break;
                 }
 
-                // Resolve peer_tag on cur_node -> target node_tag
-                let peers = peer_map.get(&cur_node);
-                let target_node = peers.and_then(|list| {
-                    list.iter()
-                        .find(|p| p.peer_tag == next_peer_tag || p.node_tag == next_peer_tag)
-                        .map(|p| p.node_tag.clone())
-                });
-                let Some(next_node) = target_node else {
+                let Some(next_node) = resolve_peer(&cur_node, &next_peer_tag) else {
                     let msg = format!(
                         "unreachable route for service '{}' from '{}': node '{}' has no peer '{}'",
                         rule.service_tag, ingress_tag, cur_node, next_peer_tag
@@ -401,14 +552,76 @@ pub fn compile_topology(
         }
     }
 
-    // 5. Validate Hop Tables (maintainer_hops)
-    for (node_tag, spec) in &topo.nodes {
-        if !spec.maintainer_hops.is_empty() {
-            validate_hop_path(&spec.maintainer_hops, &adj, topo, &mut errors, &format!("node '{node_tag}' maintainer_hops"));
+    // 4b. Validate standalone/orphan relay rules (duplicates, missing peers, and relay-only loops)
+    for (relay_tag, spec) in &topo.nodes {
+        if !spec.roles.relay {
+            continue;
+        }
+        let mut seen_tags = HashSet::new();
+        for rr in &spec.relay.rules {
+            if !seen_tags.insert(rr.service_tag.as_str()) {
+                errors.push(format!(
+                    "relay '{}' has duplicate rule for service_tag '{}'",
+                    relay_tag, rr.service_tag
+                ));
+            }
+            let mut visited = HashSet::new();
+            visited.insert(relay_tag.clone());
+            let mut cur = relay_tag.clone();
+            let mut np = rr.next_peer.clone();
+            loop {
+                let Some(next) = resolve_peer(&cur, &np) else {
+                    errors.push(format!(
+                        "relay '{}' rule for '{}' references unknown peer '{}'",
+                        cur, rr.service_tag, np
+                    ));
+                    break;
+                };
+                if !visited.insert(next.clone()) {
+                    errors.push(format!(
+                        "relay routing loop detected for service '{}' starting at '{}' hitting '{}'",
+                        rr.service_tag, relay_tag, next
+                    ));
+                    break;
+                }
+                let next_spec = &topo.nodes[&next];
+                if next_spec.roles.egress && next_spec.egress.services.contains_key(&rr.service_tag) {
+                    break;
+                }
+                if next_spec.roles.relay {
+                    if let Some(next_rr) = next_spec
+                        .relay
+                        .rules
+                        .iter()
+                        .find(|r| r.service_tag == rr.service_tag)
+                    {
+                        cur = next;
+                        np = next_rr.next_peer.clone();
+                        continue;
+                    }
+                }
+                break;
+            }
         }
     }
 
-    // 6. Emit compiled NodeConfig for each node
+    // 5. Validate Hop Tables (maintainer_hops)
+    for (node_tag, spec) in &topo.nodes {
+        if !spec.maintainer_hops.is_empty() {
+            validate_hop_path(
+                &spec.maintainer_hops,
+                node_tag,
+                None,
+                true,
+                &adj,
+                topo,
+                &mut errors,
+                &format!("node '{node_tag}' maintainer_hops"),
+            );
+        }
+    }
+
+    // 6. Emit compiled NodeConfig for each node (with least-privilege role secret scoping!)
     let mut compiled = BTreeMap::new();
     for (node_tag, spec) in &topo.nodes {
         let mut maint_cfg = if spec.roles.maintainer {
@@ -418,8 +631,15 @@ pub fn compile_topology(
                 .and_then(|t| topo.maintainer_templates.get(t))
                 .cloned()
                 .unwrap_or_default();
-            if let Some((sec, _)) = maintainer_keys.get(node_tag) {
-                mc.cert_signing_secret_key = Some(sec.clone());
+            if mc.is_primary_cert_manager {
+                if let Some((sec, _)) = maintainer_keys.get(node_tag) {
+                    mc.cert_signing_secret_key = Some(sec.clone());
+                }
+            } else {
+                // Least privilege: non-primary maintainers do NOT receive ACME provider secrets or cert signing private keys
+                mc.cert_signing_secret_key = None;
+                mc.acme.providers.clear();
+                mc.acme.orders.clear();
             }
             Some(mc)
         } else {
@@ -428,9 +648,32 @@ pub fn compile_topology(
 
         if let Some(ref mut mc) = maint_cfg {
             for order in &mc.acme.orders {
+                if let Err(e) = validate_dns_domain(&order.domain) {
+                    errors.push(format!("maintainer '{node_tag}' ACME order: {e}"));
+                }
+                if !order.provider.trim().is_empty()
+                    && !order.provider.eq_ignore_ascii_case("none")
+                    && !mc.acme.providers.contains_key(&order.provider)
+                {
+                    errors.push(format!(
+                        "maintainer '{node_tag}' cert order '{}' references unknown provider '{}'",
+                        order.domain, order.provider
+                    ));
+                }
+                for target in &order.target_nodes {
+                    if !topo.nodes.contains_key(target) {
+                        errors.push(format!(
+                            "maintainer '{node_tag}' cert order '{}' references unknown target node '{target}'",
+                            order.domain
+                        ));
+                    }
+                }
                 for (target, hops) in &order.target_hops {
                     validate_hop_path(
                         hops,
+                        node_tag,
+                        Some(target.as_str()),
+                        false,
                         &adj,
                         topo,
                         &mut errors,
@@ -440,21 +683,66 @@ pub fn compile_topology(
             }
         }
 
+        // Collect trusted origin Ingress public keys for this Egress node's `allow_from` ACLs
+        let mut trusted_origins: Vec<TrustedOrigin> = Vec::new();
+        if spec.roles.egress {
+            let mut seen_origins = HashSet::new();
+            for svc in spec.egress.services.values() {
+                for origin in &svc.allow_from {
+                    if seen_origins.insert(origin.clone()) {
+                        if let Some(pk) = node_pubkeys
+                            .get(origin)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                        {
+                            trusted_origins.push(TrustedOrigin {
+                                node_tag: origin.clone(),
+                                public_key: pk.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only emit config sections for enabled roles (prevents distributing ingress secrets to non-ingress nodes!)
+        let ingress_cfg = if spec.roles.ingress {
+            spec.ingress.clone()
+        } else {
+            IngressConfig::default()
+        };
+        let egress_cfg = if spec.roles.egress {
+            spec.egress.clone()
+        } else {
+            EgressConfig::default()
+        };
+        let relay_cfg = if spec.roles.relay {
+            spec.relay.clone()
+        } else {
+            RelayConfig::default()
+        };
+
         let node_cfg = NodeConfig {
             node_tag: node_tag.clone(),
-            identity_secret_key: String::new(), // Preserved locally on target Node during hot reload
-            control_public_key: Some(control_public_key.to_string()),
+            identity_secret_key: String::new(),
+            control_public_key: Some(control_signing_public_key.to_string()),
+            control_link_public_key: Some(control_link_public_key.to_string()),
             roles: spec.roles.clone(),
             link_listener: spec.link_listener.clone(),
             peers: peer_map.get(node_tag).cloned().unwrap_or_default(),
             probe: spec.probe.clone().unwrap_or_else(ProbeConfig::default),
             default_ttl: 16,
             maintainer_hops: spec.maintainer_hops.clone(),
-            trusted_maintainers: trusted_maintainers.clone(),
+            trusted_maintainers: if spec.roles.ingress {
+                trusted_maintainers.clone()
+            } else {
+                Vec::new()
+            },
+            trusted_origins,
             logger: topo.global_logger.clone().unwrap_or_default(),
-            ingress: spec.ingress.clone(),
-            egress: spec.egress.clone(),
-            relay: spec.relay.clone(),
+            ingress: ingress_cfg,
+            egress: egress_cfg,
+            relay: relay_cfg,
             maintainer: maint_cfg,
             bootstrap_tunnel_addr: None,
             config_sequence: 0,
@@ -472,16 +760,57 @@ pub fn compile_topology(
     (report, compiled)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_hop_path(
     hops: &[String],
+    expected_start: &str,
+    expected_end: Option<&str>,
+    end_must_be_maintainer: bool,
     adj: &HashMap<String, HashSet<String>>,
     topo: &TopologySpec,
     errors: &mut Vec<String>,
     label: &str,
 ) {
+    if hops.len() < 2 {
+        errors.push(format!("{label}: hop path must contain at least 2 nodes"));
+        return;
+    }
+    if hops.len() > MAX_HOP_PATH_LEN {
+        errors.push(format!(
+            "{label}: hop path length {} exceeds max TTL {MAX_HOP_PATH_LEN}",
+            hops.len()
+        ));
+    }
+    if hops.first().map(|s| s.as_str()) != Some(expected_start) {
+        errors.push(format!(
+            "{label}: hop path must start at '{expected_start}' (got '{:?}')",
+            hops.first()
+        ));
+    }
+    if let Some(end) = expected_end {
+        if hops.last().map(|s| s.as_str()) != Some(end) {
+            errors.push(format!(
+                "{label}: hop path must end at '{end}' (got '{:?}')",
+                hops.last()
+            ));
+        }
+    }
+    if end_must_be_maintainer {
+        if let Some(last) = hops.last() {
+            if !topo.nodes.get(last).map(|n| n.roles.maintainer).unwrap_or(false) {
+                errors.push(format!(
+                    "{label}: hop path target '{last}' is not a maintainer node"
+                ));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
     for h in hops {
         if !topo.nodes.contains_key(h) {
             errors.push(format!("{label}: unknown node '{h}' in hop table"));
+        }
+        if !seen.insert(h.as_str()) {
+            errors.push(format!("{label}: cycle/duplicate node '{h}' in hop table"));
         }
     }
     for win in hops.windows(2) {
@@ -505,9 +834,15 @@ pub fn compute_control_hops(
     }
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for link in &topo.links {
+        if link.mode == LinkMode::Tunnel && link.tunnel_direction != Some(TunnelDirection::Outbound) {
+            continue;
+        }
         adj.entry(link.from.as_str()).or_default().push(link.to.as_str());
-        // Allow traversal in both directions for tunnel or bidirectional on-demand links
-        if link.mode == LinkMode::Tunnel || (link.mode == LinkMode::OnDemand && link.bidirectional) {
+        if link.mode == LinkMode::Tunnel
+            || (link.mode == LinkMode::OnDemand
+                && link.bidirectional
+                && !link.reverse_endpoints.is_empty())
+        {
             adj.entry(link.to.as_str()).or_default().push(link.from.as_str());
         }
     }
@@ -518,6 +853,9 @@ pub fn compute_control_hops(
     queue.push_back(vec![control_id.to_string(), bootstrap_node.to_string()]);
 
     while let Some(path) = queue.pop_front() {
+        if path.len() > MAX_HOP_PATH_LEN {
+            continue;
+        }
         let last = path.last().unwrap().as_str();
         if let Some(neighbors) = adj.get(last) {
             for &nb in neighbors {
@@ -540,17 +878,32 @@ pub fn compute_control_hops(
 mod tests {
     use super::*;
     use exposure_core::config::{
-        EgressConfig, EgressServiceConfig, IngressConfig, IngressRule, NodeRoles, PeerEndpoint,
-        RelayConfig, RelayRule, RuleMatch, TopologyLinkSpec, TopologyNodeSpec,
+        EgressConfig, EgressServiceConfig, IngressConfig, IngressRule, LinkListenConfig, NodeRoles,
+        PeerEndpoint, RelayConfig, RelayRule, RuleMatch, TopologyLinkSpec, TopologyNodeSpec,
     };
+    use exposure_core::crypto::NodeKeyPair;
 
     #[test]
-    fn compiler_detects_loop_and_validates_happy_path() {
+    fn compiler_detects_loop_unpinned_keys_and_validates_happy_path() {
+        let kp_in = NodeKeyPair::generate();
+        let kp_re = NodeKeyPair::generate();
+        let kp_eg = NodeKeyPair::generate();
+        let mut pubkeys = HashMap::new();
+        pubkeys.insert("ingress-a".into(), kp_in.public_key_b64());
+        pubkeys.insert("relay-1".into(), kp_re.public_key_b64());
+        pubkeys.insert("egress-1".into(), kp_eg.public_key_b64());
+
         let mut topo = TopologySpec::default();
         topo.nodes.insert(
             "ingress-a".into(),
             TopologyNodeSpec {
                 roles: NodeRoles { ingress: true, ..Default::default() },
+                link_listener: Some(LinkListenConfig {
+                    listen_addr: "0.0.0.0:9443".into(),
+                    allow_on_demand: true,
+                    allow_tunnel: true,
+                    allow_bootstrap: false,
+                }),
                 ingress: IngressConfig {
                     rules: vec![IngressRule {
                         name: None,
@@ -558,6 +911,7 @@ mod tests {
                         service_tag: "web".into(),
                         next_peer: "relay-1".into(),
                         guard: None,
+                        intercept_errors: false,
                     }],
                     ..Default::default()
                 },
@@ -568,6 +922,12 @@ mod tests {
             "relay-1".into(),
             TopologyNodeSpec {
                 roles: NodeRoles { relay: true, ..Default::default() },
+                link_listener: Some(LinkListenConfig {
+                    listen_addr: "0.0.0.0:9443".into(),
+                    allow_on_demand: true,
+                    allow_tunnel: true,
+                    allow_bootstrap: false,
+                }),
                 relay: RelayConfig {
                     rules: vec![RelayRule {
                         service_tag: "web".into(),
@@ -584,9 +944,12 @@ mod tests {
                 backend: "127.0.0.1:8080".into(),
                 protocol: Default::default(),
                 tls: false,
+                ca_cert_path: None,
+                insecure_skip_verify: false,
                 allow_from: vec!["ingress-a".into()],
                 allow_any_origin: false,
                 timeout_ms: 5000,
+                intercept_errors: false,
                 local_health_check: None,
             },
         );
@@ -594,6 +957,12 @@ mod tests {
             "egress-1".into(),
             TopologyNodeSpec {
                 roles: NodeRoles { egress: true, ..Default::default() },
+                link_listener: Some(LinkListenConfig {
+                    listen_addr: "0.0.0.0:9443".into(),
+                    allow_on_demand: true,
+                    allow_tunnel: true,
+                    allow_bootstrap: false,
+                }),
                 egress: EgressConfig { services },
                 ..Default::default()
             },
@@ -604,7 +973,9 @@ mod tests {
             peer_tag: None,
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
-            endpoints: vec![PeerEndpoint { address: "127.0.0.1:9001".into(), priority: 10, weight: 100 }],
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9001".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
             expected_client_addr: None,
         });
         topo.links.push(TopologyLinkSpec {
@@ -613,13 +984,22 @@ mod tests {
             peer_tag: None,
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
-            endpoints: vec![PeerEndpoint { address: "127.0.0.1:9002".into(), priority: 10, weight: 100 }],
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.2:9002".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
             expected_client_addr: None,
         });
 
-        let (report, compiled) = compile_topology(&topo, "ctrl-pk", &HashMap::new(), &HashMap::new());
+        // Missing pubkeys MUST fail compilation by default
+        let (unpinned_report, _) = compile_topology(&topo, "ctrl-pk", &HashMap::new(), &HashMap::new());
+        assert!(!unpinned_report.valid);
+
+        // With pinned pubkeys, compiles cleanly and injects trusted_origins into egress-1
+        let (report, compiled) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(report.valid, "errors: {:?}", report.errors);
         assert_eq!(compiled.len(), 3);
+        assert_eq!(compiled["egress-1"].trusted_origins.len(), 1);
+        assert_eq!(compiled["egress-1"].trusted_origins[0].node_tag, "ingress-a");
 
         // Introduce loop: relay-1 -> ingress-a
         topo.nodes.get_mut("relay-1").unwrap().relay.rules[0].next_peer = "ingress-a".into();
@@ -629,10 +1009,12 @@ mod tests {
             peer_tag: None,
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
-            endpoints: vec![],
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.3:9003".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
             expected_client_addr: None,
         });
-        let (loop_report, _) = compile_topology(&topo, "ctrl-pk", &HashMap::new(), &HashMap::new());
+        let (loop_report, _) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!loop_report.valid);
         assert!(loop_report.errors.iter().any(|e| e.contains("loop")));
     }

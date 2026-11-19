@@ -2,10 +2,15 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::config::{NodeRoles, SignedConfigBundle};
+use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
 use crate::telemetry::{AlertRecord, CertStatusInfo, LinkStatusSnapshot, MinuteSummary, SessionSummary};
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_HANDSHAKE_FRAME_BYTES: usize = 16 * 1024;
+pub const MAX_HEADER_FRAME_BYTES: usize = 32 * 1024;
+pub const MAX_SPECIAL_HOPS: usize = 32;
+pub const MAX_TTL: u8 = 32;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u8)]
@@ -28,7 +33,7 @@ impl StreamKind {
     }
 }
 
-/// First frame sent after Noise transport establishment to bind Ed25519 identity.
+/// First frame sent after Noise transport establishment to bind Ed25519 identity to the Noise channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloFrame {
     pub node_tag: String,
@@ -44,27 +49,28 @@ pub struct HelloFrame {
 }
 
 impl HelloFrame {
+    /// Protocol v2 channel-bound signing bytes (binds Noise handshake hash `h` + length-prefixed fields).
     pub fn signing_bytes(
+        noise_handshake_hash: &[u8],
         node_tag: &str,
         public_key: &str,
         nonce: &[u8],
         timestamp: i64,
         is_control: bool,
     ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(128);
-        out.extend_from_slice(b"exposure-hello-v1:");
-        out.extend_from_slice(node_tag.as_bytes());
-        out.push(b':');
-        out.extend_from_slice(public_key.as_bytes());
-        out.push(b':');
-        out.extend_from_slice(nonce);
-        out.push(b':');
+        let mut out = Vec::with_capacity(192);
+        out.extend_from_slice(b"exposure-hello-c2s-v2:");
+        push_len_prefixed(&mut out, noise_handshake_hash);
+        push_len_prefixed(&mut out, node_tag.as_bytes());
+        push_len_prefixed(&mut out, public_key.as_bytes());
+        push_len_prefixed(&mut out, nonce);
         out.extend_from_slice(&timestamp.to_be_bytes());
         out.push(if is_control { 1 } else { 0 });
         out
     }
 }
 
+/// Signed responder acknowledgement binding responder Ed25519 identity to the same Noise session & client nonce.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloAck {
     pub accepted: bool,
@@ -72,8 +78,39 @@ pub struct HelloAck {
     pub bootstrap_pending: bool,
     pub node_tag: String,
     pub public_key: String,
+    pub nonce: Vec<u8>,
+    pub timestamp: i64,
+    pub signature: String,
     #[serde(default)]
     pub warning: Option<String>,
+}
+
+impl HelloAck {
+    #[allow(clippy::too_many_arguments)]
+    pub fn signing_bytes(
+        noise_handshake_hash: &[u8],
+        client_nonce: &[u8],
+        server_nonce: &[u8],
+        timestamp: i64,
+        node_tag: &str,
+        public_key: &str,
+        accepted: bool,
+        authenticated: bool,
+        bootstrap_pending: bool,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(224);
+        out.extend_from_slice(b"exposure-hello-s2c-v2:");
+        push_len_prefixed(&mut out, noise_handshake_hash);
+        push_len_prefixed(&mut out, client_nonce);
+        push_len_prefixed(&mut out, server_nonce);
+        out.extend_from_slice(&timestamp.to_be_bytes());
+        push_len_prefixed(&mut out, node_tag.as_bytes());
+        push_len_prefixed(&mut out, public_key.as_bytes());
+        out.push(if accepted { 1 } else { 0 });
+        out.push(if authenticated { 1 } else { 0 });
+        out.push(if bootstrap_pending { 1 } else { 0 });
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -101,6 +138,32 @@ pub struct ServiceStreamHeader {
     pub sni: Option<String>,
     #[serde(default)]
     pub protocol: ServiceStreamProtocol,
+    /// Nodes already traversed to guarantee loop prevention across relays.
+    #[serde(default)]
+    pub visited: Vec<String>,
+    /// Unix timestamp (seconds) when origin created this stream header.
+    #[serde(default)]
+    pub timestamp: i64,
+    /// Ed25519 signature by `origin_node_tag` authenticating origin identity to Egress ACLs.
+    #[serde(default)]
+    pub origin_signature: Option<String>,
+}
+
+impl ServiceStreamHeader {
+    pub fn origin_signing_bytes(
+        service_tag: &str,
+        origin_node_tag: &str,
+        request_id: &str,
+        timestamp: i64,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(b"exposure-svc-origin-v2:");
+        push_len_prefixed(&mut out, service_tag.as_bytes());
+        push_len_prefixed(&mut out, origin_node_tag.as_bytes());
+        push_len_prefixed(&mut out, request_id.as_bytes());
+        out.extend_from_slice(&timestamp.to_be_bytes());
+        out
+    }
 }
 
 /// Special data frame routed explicitly along a Node Tag Hop Table.
@@ -120,7 +183,7 @@ impl SpecialFrame {
             id: id.into(),
             hops,
             hop_index: 0,
-            ttl,
+            ttl: ttl.min(MAX_TTL),
             payload,
         }
     }
@@ -129,12 +192,29 @@ impl SpecialFrame {
         self.hops.get(self.hop_index).map(|s| s.as_str())
     }
 
+    pub fn prev_hop(&self) -> Option<&str> {
+        self.hop_index
+            .checked_sub(1)
+            .and_then(|i| self.hops.get(i))
+            .map(|s| s.as_str())
+    }
+
     pub fn next_hop(&self) -> Option<&str> {
-        self.hops.get(self.hop_index + 1).map(|s| s.as_str())
+        self.hop_index
+            .checked_add(1)
+            .and_then(|i| self.hops.get(i))
+            .map(|s| s.as_str())
     }
 
     pub fn is_final_hop(&self, self_tag: &str) -> bool {
-        self.hop_index + 1 >= self.hops.len()
+        if self.hop_index >= self.hops.len() {
+            return false;
+        }
+        let next_idx = match self.hop_index.checked_add(1) {
+            Some(v) => v,
+            None => return false,
+        };
+        next_idx == self.hops.len()
             && self
                 .hops
                 .get(self.hop_index)
@@ -142,12 +222,43 @@ impl SpecialFrame {
                 .unwrap_or(false)
     }
 
+    pub fn validate_hops(&self) -> Result<()> {
+        if self.hops.is_empty() || self.hops.len() > MAX_SPECIAL_HOPS {
+            return Err(ExposureError::Routing(format!(
+                "invalid special frame hops len: {}",
+                self.hops.len()
+            )));
+        }
+        if self.hop_index >= self.hops.len() {
+            return Err(ExposureError::Routing("special frame hop_index out of bounds".into()));
+        }
+        if self.ttl > MAX_TTL {
+            return Err(ExposureError::Routing("special frame ttl exceeds maximum".into()));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.hops.len());
+        for h in &self.hops {
+            if !seen.insert(h.as_str()) {
+                return Err(ExposureError::Routing(format!(
+                    "special frame contains duplicate hop '{h}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn advance(&mut self) -> Result<()> {
         if self.ttl == 0 {
             return Err(ExposureError::Routing("special frame TTL exhausted".into()));
         }
+        let next = self
+            .hop_index
+            .checked_add(1)
+            .ok_or_else(|| ExposureError::Routing("special frame hop_index overflow".into()))?;
+        if next >= self.hops.len() {
+            return Err(ExposureError::Routing("special frame has no next hop".into()));
+        }
         self.ttl -= 1;
-        self.hop_index += 1;
+        self.hop_index = next;
         Ok(())
     }
 
@@ -246,6 +357,7 @@ pub enum SpecialPayload {
     },
     CertBundle {
         domain: String,
+        target_node_tag: String,
         cert_pem: String,
         key_pem: String,
         issued_at: i64,
@@ -279,13 +391,27 @@ pub enum SpecialPayload {
         #[serde(default)]
         control_public_key: Option<String>,
         #[serde(default)]
+        control_link_public_key: Option<String>,
+        /// Passphrase-keyed HMAC proving responder knows the onboarding passphrase.
+        #[serde(default)]
+        reply_proof: Option<String>,
+        /// Nonce used to compute `reply_proof`.
+        #[serde(default)]
+        nonce: Vec<u8>,
+        #[serde(default)]
         error: Option<String>,
     },
     DialEnrollReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
         target_node_tag: String,
         target_addr: String,
         passphrase: String,
         control_public_key: String,
+        control_link_public_key: String,
+        /// Ed25519 signature by Control's config-signing key authorizing this relay dial.
+        control_signature: String,
     },
     DialEnrollResp {
         success: bool,
@@ -301,6 +427,7 @@ pub enum SpecialPayload {
 
 pub fn cert_bundle_signing_bytes(
     domain: &str,
+    target_node_tag: &str,
     cert_pem: &str,
     key_pem: &str,
     issued_at: i64,
@@ -308,35 +435,61 @@ pub fn cert_bundle_signing_bytes(
     maintainer_tag: &str,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"exposure-cert-v1:");
-    out.extend_from_slice(maintainer_tag.as_bytes());
-    out.push(b':');
-    out.extend_from_slice(domain.as_bytes());
-    out.push(b':');
+    out.extend_from_slice(b"exposure-cert-v2:");
+    push_len_prefixed(&mut out, maintainer_tag.as_bytes());
+    push_len_prefixed(&mut out, target_node_tag.as_bytes());
+    push_len_prefixed(&mut out, domain.as_bytes());
     out.extend_from_slice(&issued_at.to_be_bytes());
     out.extend_from_slice(&expires_at.to_be_bytes());
-    out.extend_from_slice(cert_pem.as_bytes());
-    out.extend_from_slice(key_pem.as_bytes());
+    push_len_prefixed(&mut out, cert_pem.as_bytes());
+    push_len_prefixed(&mut out, key_pem.as_bytes());
     out
 }
 
 pub fn discovery_resp_signing_bytes(
     request_id: &str,
     node_tag: &str,
+    roles: &NodeRoles,
     public_key: &str,
     config_sequence: u64,
     neighbors: &[DiscoveryNeighbor],
 ) -> Vec<u8> {
+    let r_json = serde_json::to_vec(roles).unwrap_or_default();
     let n_json = serde_json::to_vec(neighbors).unwrap_or_default();
     let mut out = Vec::new();
-    out.extend_from_slice(b"exposure-discovery-v1:");
-    out.extend_from_slice(request_id.as_bytes());
-    out.push(b':');
-    out.extend_from_slice(node_tag.as_bytes());
-    out.push(b':');
-    out.extend_from_slice(public_key.as_bytes());
+    out.extend_from_slice(b"exposure-discovery-v2:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    push_len_prefixed(&mut out, node_tag.as_bytes());
+    push_len_prefixed(&mut out, &r_json);
+    push_len_prefixed(&mut out, public_key.as_bytes());
     out.extend_from_slice(&config_sequence.to_be_bytes());
-    out.extend_from_slice(&n_json);
+    push_len_prefixed(&mut out, &n_json);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dial_enroll_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    relay_node_tag: &str,
+    target_node_tag: &str,
+    target_addr: &str,
+    passphrase: &str,
+    control_public_key: &str,
+    control_link_public_key: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(b"exposure-dial-enroll-v2:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, relay_node_tag.as_bytes());
+    push_len_prefixed(&mut out, target_node_tag.as_bytes());
+    push_len_prefixed(&mut out, target_addr.as_bytes());
+    push_len_prefixed(&mut out, passphrase.as_bytes());
+    push_len_prefixed(&mut out, control_public_key.as_bytes());
+    push_len_prefixed(&mut out, control_link_public_key.as_bytes());
     out
 }
 
@@ -360,16 +513,17 @@ where
     Ok(())
 }
 
-/// Read a length-prefixed JSON frame.
-pub async fn read_json_frame<R, T>(reader: &mut R) -> Result<T>
+/// Read a length-prefixed JSON frame with an explicit maximum byte limit.
+pub async fn read_json_frame_bounded<R, T>(reader: &mut R, max_bytes: usize) -> Result<T>
 where
     R: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
 {
     let len = reader.read_u32().await? as usize;
-    if len > MAX_FRAME_BYTES {
+    let cap = max_bytes.min(MAX_FRAME_BYTES);
+    if len == 0 || len > cap {
         return Err(ExposureError::Protocol(format!(
-            "incoming frame exceeds limit: {len} bytes"
+            "incoming frame length {len} outside allowed 1..={cap}"
         )));
     }
     let mut buf = vec![0u8; len];
@@ -378,12 +532,21 @@ where
         .map_err(|e| ExposureError::Protocol(format!("deserialize frame: {e}")))
 }
 
+/// Read a length-prefixed JSON frame (up to `MAX_FRAME_BYTES`).
+pub async fn read_json_frame<R, T>(reader: &mut R) -> Result<T>
+where
+    R: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    read_json_frame_bounded(reader, MAX_FRAME_BYTES).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn hop_table_reverse_symmetry() {
+    fn hop_table_reverse_symmetry_and_overflow_safety() {
         let req = SpecialFrame::new(
             "req-1",
             vec!["control-1".into(), "boot".into(), "relay-a".into(), "egress-1".into()],
@@ -392,6 +555,7 @@ mod tests {
         );
         assert_eq!(req.current_target(), Some("control-1"));
         assert_eq!(req.next_hop(), Some("boot"));
+        assert!(req.validate_hops().is_ok());
 
         let rep = req.reverse_for_reply(SpecialPayload::ErrorReply {
             message: "ok".into(),
@@ -401,5 +565,16 @@ mod tests {
             vec!["egress-1", "relay-a", "boot", "control-1"]
         );
         assert_eq!(rep.hop_index, 0);
+
+        let bad = SpecialFrame {
+            id: "bad".into(),
+            hops: vec!["a".into(), "b".into()],
+            hop_index: usize::MAX,
+            ttl: 8,
+            payload: SpecialPayload::StatusReq,
+        };
+        assert!(!bad.is_final_hop("a"));
+        assert_eq!(bad.next_hop(), None);
+        assert!(bad.validate_hops().is_err());
     }
 }

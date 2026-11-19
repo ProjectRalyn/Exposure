@@ -85,7 +85,26 @@ async function sha256(bytes) {
   return sha256Sync(bytes);
 }
 
-async function solveChallenge(challenge, difficulty) {
+function sanitizeSameOriginRedirect(raw) {
+  if (typeof raw !== "string") return "/";
+  const trimmed = raw.trim();
+  if (!trimmed || !trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.startsWith("/\\")) {
+    return "/";
+  }
+  if (/[\r\n\0\\]/.test(trimmed)) return "/";
+  try {
+    const resolved = new URL(trimmed, window.location.origin);
+    if (resolved.origin !== window.location.origin) return "/";
+    return `${resolved.pathname}${resolved.search}${resolved.hash}` || "/";
+  } catch {
+    return "/";
+  }
+}
+
+async function solveChallenge(challenge, difficulty, expiresAt) {
+  if (!Number.isInteger(difficulty) || difficulty < 1 || difficulty > 28) {
+    throw new Error(`Invalid challenge difficulty: ${difficulty}`);
+  }
   const encoder = new TextEncoder();
   let nonce = 0;
   const expected = Math.pow(2, difficulty);
@@ -98,6 +117,9 @@ async function solveChallenge(challenge, difficulty) {
     }
     nonce++;
     if (nonce % 500 === 0) {
+      if (Number.isFinite(expiresAt) && Date.now() / 1000 >= expiresAt) {
+        throw new Error("Challenge expired before verification completed. Please reload.");
+      }
       metaHashes.textContent = `Hashes: ${nonce}`;
       const pct = Math.min(95, Math.max(12, Math.round((nonce / expected) * 85)));
       progressBar.style.width = `${pct}%`;
@@ -158,17 +180,23 @@ function collectClientFingerprint() {
 async function run() {
   try {
     const params = new URLSearchParams(window.location.search);
-    const redirect = params.get("redirect") || "/";
+    const redirect = sanitizeSameOriginRedirect(params.get("redirect") || "/");
 
-    const resp = await fetch("/cdn-cgi/challenge", { credentials: "same-origin" });
+    const challengeUrl = `/cdn-cgi/challenge?redirect=${encodeURIComponent(redirect)}`;
+    const resp = await fetch(challengeUrl, { credentials: "same-origin" });
     if (!resp.ok) {
       throw new Error(`Failed to fetch challenge (${resp.status})`);
     }
     const data = await resp.json();
-    metaDifficulty.textContent = `Difficulty: ${data.difficulty} bits`;
+    const difficulty = Number(data.difficulty);
+    if (!Number.isInteger(difficulty) || difficulty < 1 || difficulty > 28) {
+      throw new Error(`Invalid challenge difficulty (${data.difficulty})`);
+    }
+    const expiresAt = Number(data.expires_at);
+    metaDifficulty.textContent = `Difficulty: ${difficulty} bits`;
     statusText.textContent = "Computing verification proof…";
 
-    const solved = await solveChallenge(data.token, data.difficulty);
+    const solved = await solveChallenge(data.token, difficulty, expiresAt);
     metaHashes.textContent = `Hashes: ${solved.hashes}`;
     progressBar.style.width = "100%";
     statusText.textContent = "Proof accepted, issuing clearance…";
@@ -182,7 +210,7 @@ async function run() {
         nonce: solved.nonce,
         signature: data.signature,
         expires_at: data.expires_at,
-        difficulty: data.difficulty,
+        difficulty,
         redirect,
         client_fp: collectClientFingerprint(),
       }),
@@ -195,7 +223,8 @@ async function run() {
 
     const result = await verifyResp.json();
     if (window.location.pathname.startsWith("/cdn-cgi")) {
-      window.location.replace(result.redirect || redirect || "/");
+      const safeTarget = sanitizeSameOriginRedirect(result.redirect || "/");
+      window.location.replace(safeTarget);
     } else {
       window.location.reload();
     }

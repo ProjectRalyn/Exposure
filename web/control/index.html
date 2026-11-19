@@ -270,6 +270,7 @@
             <span>Time Window</span>
             <select id="obs-window-filter">
               <option value="0">All Available</option>
+              <option value="300">Last 5 min</option>
               <option value="900">Last 15 min</option>
               <option value="3600">Last 1 hour</option>
               <option value="21600">Last 6 hours</option>
@@ -290,7 +291,7 @@
             <button type="button" class="cf-metric-tab" data-cf-metric="uv">
               <span class="cf-mt-label">Unique Visitors</span>
               <span id="cf-val-uv" class="cf-mt-val">0</span>
-              <span id="cf-sub-uv" class="cf-mt-sub">HyperLogLog union</span>
+              <span id="cf-sub-uv" class="cf-mt-sub">Sum of bucket UVs</span>
             </button>
             <button type="button" class="cf-metric-tab" data-cf-metric="bandwidth">
               <span class="cf-mt-label">Total Data Served</span>

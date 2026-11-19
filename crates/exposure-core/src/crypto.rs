@@ -1,9 +1,14 @@
+use std::io::Write;
+use std::path::Path;
+
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
-use rand::Rng;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -12,7 +17,7 @@ use crate::error::{ExposureError, Result};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Compact 128-word NATO/tech-inspired list for 5-word one-time onboarding passphrases.
+/// Compact 128-word NATO/tech-inspired list for onboarding passphrases.
 const WORDLIST: &[&str] = &[
     "amber", "anchor", "apex", "atlas", "aurora", "badge", "basalt", "beacon",
     "birch", "blaze", "bolt", "breeze", "bridge", "brook", "canyon", "carbon",
@@ -31,6 +36,196 @@ const WORDLIST: &[&str] = &[
     "sierra", "silver", "slate", "solar", "spruce", "star", "steel", "stone",
     "storm", "summit", "timber", "titan", "topaz", "vector", "velvet", "zenith",
 ];
+
+/// Append a length-prefixed (`u32 BE`) byte slice to a transcript to eliminate delimiter ambiguity.
+pub fn push_len_prefixed(buf: &mut Vec<u8>, data: &[u8]) {
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Update an HMAC with a length-prefixed (`u32 BE`) byte slice.
+fn mac_update_lp(mac: &mut HmacSha256, data: &[u8]) {
+    mac.update(&(data.len() as u32).to_be_bytes());
+    mac.update(data);
+}
+
+/// Generate a cryptographically random hex string of `num_bytes` bytes (2 * num_bytes hex chars).
+pub fn generate_random_secret_hex(num_bytes: usize) -> String {
+    let mut buf = vec![0u8; num_bytes];
+    OsRng.fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+/// Hash a plaintext password using Argon2id with a random salt.
+pub fn hash_password(plaintext: &str) -> Result<String> {
+    if plaintext.is_empty() {
+        return Err(ExposureError::Crypto("password cannot be empty".into()));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let hash = argon2
+        .hash_password(plaintext.as_bytes(), &salt)
+        .map_err(|e| ExposureError::Crypto(format!("argon2 hash failed: {e}")))?;
+    Ok(hash.to_string())
+}
+
+/// Verify a plaintext password against a stored PHC Argon2id hash.
+pub fn verify_password(plaintext: &str, stored_hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored_hash.trim()) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(plaintext.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// Returns true if a secret is empty, too short, or matches a known hardcoded weak placeholder.
+pub fn is_weak_secret(secret: &str) -> bool {
+    let s = secret.trim();
+    if s.len() < 16 {
+        return true;
+    }
+    matches!(
+        s,
+        "exposure-default-clearance-secret-change-me"
+            | "exposure-default-hmac-key"
+            | "exposure-control-session-secret"
+            | "exposure-admin"
+            | "change-this-in-production"
+            | "change-me-now"
+            | "replace-me"
+    )
+}
+
+/// Validate a node/peer/service tag identifier (no path traversal, control chars, or colons).
+pub fn validate_identifier(tag: &str, kind: &str) -> Result<()> {
+    let t = tag.trim();
+    if t.is_empty() || t.len() > 128 {
+        return Err(ExposureError::Config(format!(
+            "invalid {kind}: must be 1..=128 chars"
+        )));
+    }
+    if t.contains("..")
+        || !t
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@'))
+    {
+        return Err(ExposureError::Config(format!(
+            "invalid {kind} '{tag}': only [A-Za-z0-9._@-] without '..' allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a DNS domain (optionally leading `*.` wildcard) against path traversal & injection.
+pub fn validate_dns_domain(domain: &str) -> Result<()> {
+    let d = domain.trim();
+    if d.is_empty() || d.len() > 253 {
+        return Err(ExposureError::Config(format!(
+            "invalid domain '{domain}': length must be 1..=253"
+        )));
+    }
+    if d == "*" {
+        return Ok(());
+    }
+    let check = d.strip_prefix("*.").unwrap_or(d);
+    if check.is_empty() || check.starts_with('.') || check.ends_with('.') || check.contains("..") {
+        return Err(ExposureError::Config(format!(
+            "invalid domain '{domain}'"
+        )));
+    }
+    for label in check.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ExposureError::Config(format!(
+                "invalid domain label in '{domain}'"
+            )));
+        }
+        if label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(ExposureError::Config(format!(
+                "invalid character in domain '{domain}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Atomically write sensitive file contents with `0o600` permissions on Unix (`create_new` -> `sync_all` -> `rename`).
+pub fn write_secret_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secret");
+    let rand_suffix = generate_random_secret_hex(8);
+    let tmp_path = parent.join(format!(".{file_name}.{rand_suffix}.tmp"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(content)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Enforce restrictive `0o600` permissions on an existing file (Unix).
+pub fn restrict_file_permissions_0600(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// Enforce restrictive `0o700` permissions on a directory (Unix).
+pub fn restrict_dir_permissions_0700(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let _ = path;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct NodeKeyPair {
@@ -128,16 +323,17 @@ pub fn pubkey_fingerprint_b64(pubkey_b64: &str) -> Result<String> {
     Ok(pubkey_fingerprint(&vk.to_bytes()))
 }
 
-/// Generate a 5-word one-time onboarding passphrase (valid for 10 minutes).
+/// Generate a high-entropy one-time onboarding passphrase (5 words + 64-bit random hex = 99 bits entropy).
 pub fn generate_five_word_passphrase() -> String {
     let mut rng = OsRng;
-    let words: Vec<&str> = (0..5)
-        .map(|_| WORDLIST[rng.gen_range(0..WORDLIST.len())])
+    let mut parts: Vec<String> = (0..5)
+        .map(|_| WORDLIST[rng.gen_range(0..WORDLIST.len())].to_string())
         .collect();
-    words.join("-")
+    parts.push(generate_random_secret_hex(8));
+    parts.join("-")
 }
 
-/// Compute HMAC-SHA256 proof binding passphrase, node_tag, pubkey, and handshake nonce.
+/// Compute length-prefixed HMAC-SHA256 proof binding passphrase, node_tag, pubkey, and handshake nonce.
 pub fn compute_passphrase_proof(
     passphrase: &str,
     node_tag: &str,
@@ -146,12 +342,10 @@ pub fn compute_passphrase_proof(
 ) -> String {
     let mut mac = HmacSha256::new_from_slice(passphrase.trim().as_bytes())
         .expect("HMAC can take key of any size");
-    mac.update(b"exposure-bootstrap-v1:");
-    mac.update(node_tag.as_bytes());
-    mac.update(b":");
-    mac.update(pubkey_b64.as_bytes());
-    mac.update(b":");
-    mac.update(nonce);
+    mac.update(b"exposure-bootstrap-v2:");
+    mac_update_lp(&mut mac, node_tag.as_bytes());
+    mac_update_lp(&mut mac, pubkey_b64.as_bytes());
+    mac_update_lp(&mut mac, nonce);
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -162,8 +356,55 @@ pub fn verify_passphrase_proof(
     nonce: &[u8],
     proof_hex: &str,
 ) -> bool {
-    let expected = compute_passphrase_proof(passphrase, node_tag, pubkey_b64, nonce);
-    expected.as_bytes().ct_eq(proof_hex.trim().as_bytes()).into()
+    let trimmed = passphrase.trim();
+    if trimmed.is_empty() || nonce.len() < 16 {
+        return false;
+    }
+    let expected = compute_passphrase_proof(trimmed, node_tag, pubkey_b64, nonce);
+    let candidate = proof_hex.trim();
+    expected.len() == candidate.len() && bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
+}
+
+/// Compute mutual-auth HMAC proof for `BootstrapReply`, proving the responder knows the onboarding passphrase
+/// and binding `control_signing_pubkey`, `control_link_pubkey`, `target_node_tag`, and `nonce`.
+pub fn compute_bootstrap_reply_proof(
+    passphrase: &str,
+    control_signing_pubkey: &str,
+    control_link_pubkey: &str,
+    target_node_tag: &str,
+    nonce: &[u8],
+) -> String {
+    let mut mac = HmacSha256::new_from_slice(passphrase.trim().as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(b"exposure-bootstrap-reply-v2:");
+    mac_update_lp(&mut mac, control_signing_pubkey.as_bytes());
+    mac_update_lp(&mut mac, control_link_pubkey.as_bytes());
+    mac_update_lp(&mut mac, target_node_tag.as_bytes());
+    mac_update_lp(&mut mac, nonce);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn verify_bootstrap_reply_proof(
+    passphrase: &str,
+    control_signing_pubkey: &str,
+    control_link_pubkey: &str,
+    target_node_tag: &str,
+    nonce: &[u8],
+    proof_hex: &str,
+) -> bool {
+    let trimmed = passphrase.trim();
+    if trimmed.is_empty() || nonce.len() < 16 {
+        return false;
+    }
+    let expected = compute_bootstrap_reply_proof(
+        trimmed,
+        control_signing_pubkey,
+        control_link_pubkey,
+        target_node_tag,
+        nonce,
+    );
+    let candidate = proof_hex.trim();
+    expected.len() == candidate.len() && bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
 }
 
 /// Anonymize client IP using HMAC-SHA256 truncated to 16 hex chars (64-bit pseudonymous tag).
@@ -236,7 +477,8 @@ pub fn verify_clearance_cookie(secret: &str, cookie_val: &str) -> Result<Clearan
     mac.update(b"exposure-clearance-v1:");
     mac.update(payload_b64.as_bytes());
     let expected_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
-    let eq: bool = expected_b64.as_bytes().ct_eq(sig_b64.as_bytes()).into();
+    let eq: bool = expected_b64.len() == sig_b64.len()
+        && bool::from(expected_b64.as_bytes().ct_eq(sig_b64.as_bytes()));
     if !eq {
         return Err(ExposureError::Auth("invalid clearance cookie signature".into()));
     }
@@ -248,28 +490,51 @@ pub fn verify_clearance_cookie(secret: &str, cookie_val: &str) -> Result<Clearan
     Ok(claims)
 }
 
-pub fn sign_challenge_token(secret: &str, token: &str, expires_at: i64, difficulty: u8) -> String {
+/// Sign a PoW challenge token bound to `(host, client_ip_key, token, expires_at, difficulty)`.
+pub fn sign_challenge_token(
+    secret: &str,
+    host: &str,
+    client_ip_key: &str,
+    token: &str,
+    expires_at: i64,
+    difficulty: u8,
+) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-    mac.update(format!("exposure-pow-v1:{token}:{expires_at}:{difficulty}").as_bytes());
+    mac.update(b"exposure-pow-v2:");
+    mac_update_lp(&mut mac, host.as_bytes());
+    mac_update_lp(&mut mac, client_ip_key.as_bytes());
+    mac_update_lp(&mut mac, token.as_bytes());
+    mac.update(&expires_at.to_be_bytes());
+    mac.update(&[difficulty]);
     URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 pub fn verify_challenge_token(
     secret: &str,
+    host: &str,
+    client_ip_key: &str,
     token: &str,
     expires_at: i64,
     difficulty: u8,
     sig: &str,
 ) -> bool {
-    let expected = sign_challenge_token(secret, token, expires_at, difficulty);
-    expected.as_bytes().ct_eq(sig.as_bytes()).into()
+    let expected = sign_challenge_token(secret, host, client_ip_key, token, expires_at, difficulty);
+    expected.len() == sig.len() && bool::from(expected.as_bytes().ct_eq(sig.as_bytes()))
 }
 
 pub fn short_sha256_hex(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());
     hex::encode(&h.finalize()[..8])
+}
+
+/// Constant-time comparison of two arbitrary-length byte slices using fixed-length SHA-256 digests
+/// so slice length is not leaked via timing.
+pub fn ct_eq_hashed(a: &[u8], b: &[u8]) -> bool {
+    let da = Sha256::digest(a);
+    let db = Sha256::digest(b);
+    bool::from(da.ct_eq(&db))
 }
 
 #[cfg(test)]
@@ -288,11 +553,23 @@ mod tests {
     #[test]
     fn passphrase_and_proof() {
         let pass = generate_five_word_passphrase();
-        assert_eq!(pass.split('-').count(), 5);
-        let nonce = b"random-nonce-123";
+        assert_eq!(pass.split('-').count(), 6);
+        let nonce = b"random-nonce-1234567890";
         let proof = compute_passphrase_proof(&pass, "node-a", "pk-abc", nonce);
         assert!(verify_passphrase_proof(&pass, "node-a", "pk-abc", nonce, &proof));
-        assert!(!verify_passphrase_proof("wrong-pass-here-now-no", "node-a", "pk-abc", nonce, &proof));
+        assert!(!verify_passphrase_proof("wrong-pass-here-now-no-0000", "node-a", "pk-abc", nonce, &proof));
+
+        let reply_proof = compute_bootstrap_reply_proof(&pass, "ctrl-sig", "ctrl-link", "node-a", nonce);
+        assert!(verify_bootstrap_reply_proof(&pass, "ctrl-sig", "ctrl-link", "node-a", nonce, &reply_proof));
+        assert!(!verify_bootstrap_reply_proof(&pass, "other-sig", "ctrl-link", "node-a", nonce, &reply_proof));
+    }
+
+    #[test]
+    fn argon2_password_roundtrip() {
+        let h = hash_password("s3cr3t-passphrase!").unwrap();
+        assert!(h.starts_with("$argon2id$"));
+        assert!(verify_password("s3cr3t-passphrase!", &h));
+        assert!(!verify_password("wrong", &h));
     }
 
     #[test]
@@ -304,15 +581,30 @@ mod tests {
         }
         assert!(verify_pow_solution(token, nonce, 10));
 
+        let sig = sign_challenge_token("secret-key", "example.com", "203.0.113", token, 4_000_000_000, 10);
+        assert!(verify_challenge_token("secret-key", "example.com", "203.0.113", token, 4_000_000_000, 10, &sig));
+        assert!(!verify_challenge_token("secret-key", "other.com", "203.0.113", token, 4_000_000_000, 10, &sig));
+
         let claims = ClearanceClaims {
             host: "example.com".into(),
             expires_at: 4_000_000_000,
             ua_hash: Some(short_sha256_hex("Mozilla/5.0")),
             ip_prefix: Some("203.0.113".into()),
+            fp_hash: None,
         };
         let cookie = sign_clearance_cookie("secret-key", &claims).unwrap();
         let decoded = verify_clearance_cookie("secret-key", &cookie).unwrap();
         assert_eq!(decoded.host, "example.com");
         assert!(verify_clearance_cookie("other-key", &cookie).is_err());
+    }
+
+    #[test]
+    fn domain_validation_blocks_traversal() {
+        assert!(validate_dns_domain("example.com").is_ok());
+        assert!(validate_dns_domain("*.sub.example.com").is_ok());
+        assert!(validate_dns_domain("../etc/passwd").is_err());
+        assert!(validate_dns_domain("/etc/passwd").is_err());
+        assert!(validate_dns_domain("a\\b.com").is_err());
+        assert!(validate_dns_domain("a;rm -rf /").is_err());
     }
 }

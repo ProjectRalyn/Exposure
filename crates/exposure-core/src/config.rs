@@ -203,7 +203,7 @@ pub struct RateLimitBucket {
     pub per_ip: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardProfile {
     #[serde(default)]
     pub antibot: AntibotMode,
@@ -227,7 +227,7 @@ pub struct GuardProfile {
     pub bind_ua: bool,
     #[serde(default)]
     pub bind_ip_prefix: bool,
-    /// Optional header or path exceptions for API clients.
+    /// Authenticated API bypass rules formatted as `"Header-Name: expected-secret-value"`.
     #[serde(default)]
     pub api_bypass_headers: Vec<String>,
     /// Block known bot/scraper User-Agents.
@@ -239,6 +239,27 @@ pub struct GuardProfile {
     /// Require a verified browser JS fingerprint bound to the clearance cookie.
     #[serde(default)]
     pub require_client_fp: bool,
+}
+
+impl Default for GuardProfile {
+    fn default() -> Self {
+        Self {
+            antibot: AntibotMode::Off,
+            rate_limit_bucket: None,
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            challenge_threshold: default_challenge_threshold(),
+            reject_threshold: default_reject_threshold(),
+            pow_difficulty: default_pow_difficulty(),
+            clearance_ttl_secs: default_clearance_ttl_secs(),
+            bind_ua: true,
+            bind_ip_prefix: false,
+            api_bypass_headers: Vec::new(),
+            block_bots: false,
+            block_headless: false,
+            require_client_fp: false,
+        }
+    }
 }
 
 fn default_challenge_threshold() -> u8 {
@@ -288,7 +309,7 @@ pub struct IngressListener {
     pub tls: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngressConfig {
     #[serde(default)]
     pub listeners: Vec<IngressListener>,
@@ -300,7 +321,8 @@ pub struct IngressConfig {
     pub rate_limit_buckets: BTreeMap<String, RateLimitBucket>,
     #[serde(default)]
     pub tls_certs: Vec<TlsCertEntry>,
-    #[serde(default = "default_clearance_secret")]
+    /// HMAC signing secret for Entry Guard challenges & clearance cookies (must be high-entropy random).
+    #[serde(default)]
     pub clearance_secret: String,
     #[serde(default)]
     pub cert_store_dir: Option<String>,
@@ -308,12 +330,23 @@ pub struct IngressConfig {
     pub server_header: String,
 }
 
-fn default_server_header() -> String {
-    "nginx".into()
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            listeners: Vec::new(),
+            rules: Vec::new(),
+            guards: BTreeMap::new(),
+            rate_limit_buckets: BTreeMap::new(),
+            tls_certs: Vec::new(),
+            clearance_secret: String::new(),
+            cert_store_dir: None,
+            server_header: default_server_header(),
+        }
+    }
 }
 
-fn default_clearance_secret() -> String {
-    "exposure-default-clearance-secret-change-me".into()
+fn default_server_header() -> String {
+    "nginx".into()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -351,6 +384,12 @@ pub struct EgressServiceConfig {
     pub protocol: BackendProtocol,
     #[serde(default)]
     pub tls: bool,
+    /// Optional path to custom PEM root CA certificate bundle for verifying `tls: true` backends.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    /// Explicitly skip backend server certificate chain verification (still verifies TLS handshake signatures).
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
     /// Allowed origin ingress Node Tags. Empty => deny unless `allow_any_origin: true`.
     #[serde(default)]
     pub allow_from: Vec<String>,
@@ -421,7 +460,8 @@ impl Default for SegmentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggerConfig {
-    #[serde(default = "default_hmac_key")]
+    /// HMAC key for pseudonymizing client IPs (auto-generated randomly if left empty on standalone nodes).
+    #[serde(default)]
     pub hmac_key: String,
     #[serde(default)]
     pub store_raw_ip: bool,
@@ -437,14 +477,10 @@ pub struct LoggerConfig {
     pub segment: SegmentConfig,
 }
 
-fn default_hmac_key() -> String {
-    "exposure-default-hmac-key".into()
-}
-
 impl Default for LoggerConfig {
     fn default() -> Self {
         Self {
-            hmac_key: default_hmac_key(),
+            hmac_key: String::new(),
             store_raw_ip: false,
             sample_rate: default_sample_rate(),
             hll_precision: default_hll_precision(),
@@ -525,6 +561,9 @@ pub struct TrustedMaintainer {
     pub public_key: String,
 }
 
+/// Alias for trusted origin Ingress public keys provisioned onto Egress nodes for multi-hop ACL verification.
+pub type TrustedOrigin = TrustedMaintainer;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_tag: String,
@@ -533,6 +572,9 @@ pub struct NodeConfig {
     /// Control's Ed25519 config-signing public key (installed during onboarding or pre-configured).
     #[serde(default)]
     pub control_public_key: Option<String>,
+    /// Control's Ed25519 link-authentication public key (falls back to `control_public_key` when omitted).
+    #[serde(default)]
+    pub control_link_public_key: Option<String>,
     #[serde(default)]
     pub roles: NodeRoles,
     #[serde(default)]
@@ -548,6 +590,9 @@ pub struct NodeConfig {
     pub maintainer_hops: Vec<String>,
     #[serde(default)]
     pub trusted_maintainers: Vec<TrustedMaintainer>,
+    /// Trusted origin Ingress public keys for verifying multi-hop `ServiceStreamHeader` signatures on Egress.
+    #[serde(default)]
+    pub trusted_origins: Vec<TrustedOrigin>,
     #[serde(default)]
     pub logger: LoggerConfig,
     #[serde(default)]
@@ -566,8 +611,18 @@ pub struct NodeConfig {
     pub config_sequence: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigBundlePurpose {
+    #[default]
+    Apply,
+    Preflight,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedConfigBundle {
+    #[serde(default)]
+    pub purpose: ConfigBundlePurpose,
     pub node_tag: String,
     pub sequence: u64,
     pub min_sequence: u64,
@@ -581,6 +636,7 @@ impl SignedConfigBundle {
     pub fn canonical_bytes(&self) -> crate::Result<Vec<u8>> {
         #[derive(Serialize)]
         struct SigningPayload<'a> {
+            purpose: ConfigBundlePurpose,
             node_tag: &'a str,
             sequence: u64,
             min_sequence: u64,
@@ -588,7 +644,12 @@ impl SignedConfigBundle {
             expires_at: i64,
             config: &'a NodeConfig,
         }
-        serde_json::to_vec(&SigningPayload {
+        let prefix: &[u8] = match self.purpose {
+            ConfigBundlePurpose::Apply => b"exposure-config-apply-v2:",
+            ConfigBundlePurpose::Preflight => b"exposure-config-preflight-v2:",
+        };
+        let body = serde_json::to_vec(&SigningPayload {
+            purpose: self.purpose,
             node_tag: &self.node_tag,
             sequence: self.sequence,
             min_sequence: self.min_sequence,
@@ -596,10 +657,33 @@ impl SignedConfigBundle {
             expires_at: self.expires_at,
             config: &self.config,
         })
-        .map_err(|e| crate::ExposureError::Config(format!("canonical config encode: {e}")))
+        .map_err(|e| crate::ExposureError::Config(format!("canonical config encode: {e}")))?;
+        let mut out = Vec::with_capacity(prefix.len() + body.len());
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(&body);
+        Ok(out)
     }
 
-    pub fn verify(&self, control_pubkey_b64: &str, current_seq: u64, now_ts: i64) -> crate::Result<()> {
+    pub fn verify(
+        &self,
+        control_pubkey_b64: &str,
+        expected_node_tag: &str,
+        expected_purpose: ConfigBundlePurpose,
+        current_seq: u64,
+        now_ts: i64,
+    ) -> crate::Result<()> {
+        if self.purpose != expected_purpose {
+            return Err(crate::ExposureError::Auth(format!(
+                "config bundle purpose mismatch: got {:?}, expected {:?}",
+                self.purpose, expected_purpose
+            )));
+        }
+        if self.node_tag != expected_node_tag || self.config.node_tag != expected_node_tag {
+            return Err(crate::ExposureError::Auth(format!(
+                "config bundle target mismatch: bundle={} config={} expected={}",
+                self.node_tag, self.config.node_tag, expected_node_tag
+            )));
+        }
         if self.sequence <= current_seq {
             return Err(crate::ExposureError::Auth(format!(
                 "config rollback rejected: incoming seq {} <= current {}",
@@ -618,6 +702,12 @@ impl SignedConfigBundle {
                 self.expires_at, now_ts
             )));
         }
+        if self.issued_at > now_ts + 300 {
+            return Err(crate::ExposureError::Auth(format!(
+                "config bundle issued_at {} is too far in the future",
+                self.issued_at
+            )));
+        }
         let payload = self.canonical_bytes()?;
         crate::crypto::verify_signature_b64(control_pubkey_b64, &payload, &self.signature)
     }
@@ -634,13 +724,16 @@ pub enum ControlRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminAuthConfig {
     pub username: String,
-    pub password: String,
-    #[serde(default = "default_jwt_secret")]
+    /// PHC Argon2id password hash (`$argon2id$...`).
+    pub password_hash: String,
+    /// High-entropy session signing/derivation secret (>= 32 chars, no weak default).
     pub token_secret: String,
 }
 
-fn default_jwt_secret() -> String {
-    "exposure-control-session-secret".into()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +752,9 @@ pub struct ControlConfig {
     #[serde(default)]
     pub role: ControlRole,
     pub panel_listen_addr: String,
+    /// Optional TLS configuration for the Control Admin Panel & API.
+    #[serde(default)]
+    pub tls: Option<ControlTlsConfig>,
     pub sqlite_path: String,
     /// Ed25519 config-signing secret key (base64).
     pub signing_secret_key: String,

@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -9,9 +9,28 @@ use serde::{Deserialize, Serialize};
 use crate::config::SegmentConfig;
 use crate::error::{ExposureError, Result};
 
+fn sanitize_prefix(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('.');
+    if trimmed.is_empty() || trimmed.contains("..") {
+        "node".to_string()
+    } else {
+        trimmed.chars().take(64).collect()
+    }
+}
+
 /// Production-layer atomic segment file store:
 /// - Batches JSONL records in memory
-/// - Flushes atomically (`tmp` -> `sync_all` -> `rename`) when full, on timer, or on SIGINT/SIGTERM
+/// - Flushes atomically (`tmp` with `0o600` -> `sync_all` -> `rename`) when full, on timer, or on SIGINT/SIGTERM
 /// - Enforces rotation, max disk usage, and retention policies
 pub struct SegmentWriter<T> {
     cfg: SegmentConfig,
@@ -23,9 +42,10 @@ pub struct SegmentWriter<T> {
 impl<T: Serialize> SegmentWriter<T> {
     pub fn new(cfg: SegmentConfig, prefix: impl Into<String>) -> Result<Self> {
         fs::create_dir_all(&cfg.dir)?;
+        let safe_prefix = sanitize_prefix(&prefix.into());
         Ok(Self {
             cfg,
-            prefix: prefix.into(),
+            prefix: safe_prefix,
             buffer: Vec::new(),
             seq: 0,
         })
@@ -33,7 +53,7 @@ impl<T: Serialize> SegmentWriter<T> {
 
     pub fn push(&mut self, record: T) -> Result<bool> {
         self.buffer.push(record);
-        if self.buffer.len() >= self.cfg.max_batch_records {
+        if self.buffer.len() >= self.cfg.max_batch_records.max(1) {
             self.flush()?;
             return Ok(true);
         }
@@ -49,14 +69,21 @@ impl<T: Serialize> SegmentWriter<T> {
             return Ok(None);
         }
         fs::create_dir_all(&self.cfg.dir)?;
-        self.seq += 1;
+        self.seq = self.seq.saturating_add(1);
         let ts = Utc::now().timestamp_millis();
         let filename = format!("{}-{}-{:06}.seg.jsonl", self.prefix, ts, self.seq);
         let final_path = Path::new(&self.cfg.dir).join(&filename);
         let tmp_path = Path::new(&self.cfg.dir).join(format!(".{filename}.tmp"));
 
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut opts = OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path)?;
             for item in &self.buffer {
                 let line = serde_json::to_string(item)
                     .map_err(|e| ExposureError::Storage(format!("serialize segment record: {e}")))?;
@@ -78,8 +105,9 @@ impl<T: Serialize> SegmentWriter<T> {
             return Ok(());
         }
         let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+        let retention_secs = self.cfg.retention_hours.saturating_mul(3600);
         let retention_cutoff = SystemTime::now()
-            .checked_sub(Duration::from_secs(self.cfg.retention_hours * 3600))
+            .checked_sub(Duration::from_secs(retention_secs))
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         for entry in fs::read_dir(dir)?.flatten() {
@@ -103,7 +131,7 @@ impl<T: Serialize> SegmentWriter<T> {
 
         // Sort oldest first and trim until total disk bytes <= max_disk_bytes (preserving newest file).
         files.sort_by_key(|(_, _, m)| *m);
-        let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+        let mut total: u64 = files.iter().map(|(_, len, _)| *len).fold(0u64, u64::saturating_add);
         let mut remaining = files.len();
         for (path, len, _) in files {
             if total <= self.cfg.max_disk_bytes || remaining <= 1 {
@@ -148,7 +176,7 @@ mod tests {
             max_disk_bytes: 500,
             ..Default::default()
         };
-        let mut w = SegmentWriter::<SessionSummary>::new(cfg, "node-a").unwrap();
+        let mut w = SegmentWriter::<SessionSummary>::new(cfg, "../node-a").unwrap();
         let sample = SessionSummary {
             timestamp_ms: 1700000000000,
             node_tag: "node-a".into(),
@@ -164,6 +192,10 @@ mod tests {
             challenged: false,
             challenge_passed: false,
             error: None,
+            device_type: None,
+            browser_family: None,
+            os_family: None,
+            client_fp_verified: false,
         };
         assert!(!w.push(sample.clone()).unwrap());
         assert!(w.push(sample.clone()).unwrap());

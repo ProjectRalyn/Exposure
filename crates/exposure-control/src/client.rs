@@ -1,30 +1,36 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::{
-    BootstrapNodeTarget, ControlConfig, NodeConfig, NodeRoles, ProbeConfig, SignedConfigBundle,
-    TopologySpec,
+    BootstrapNodeTarget, ConfigBundlePurpose, ControlConfig, ControlRole, NodeConfig, NodeRoles,
+    ProbeConfig, SignedConfigBundle, TopologySpec,
 };
 use exposure_core::crypto::{
-    compute_passphrase_proof, verify_passphrase_proof, verify_signature_b64, NodeKeyPair,
+    compute_bootstrap_reply_proof, compute_passphrase_proof, verify_signature_b64, NodeKeyPair,
 };
 use exposure_core::protocol::{
-    discovery_resp_signing_bytes, read_json_frame, write_json_frame, MaintainerTelemetrySnapshot,
-    NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
+    dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, read_json_frame, write_json_frame,
+    MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::telemetry::{AlertRecord, CertStatusInfo, LinkStatusSnapshot, MinuteSummary};
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
+use futures::stream::{FuturesUnordered, StreamExt};
 use rand::RngCore;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::compiler::{compile_topology, compute_control_hops, CompileReport};
+use crate::compiler::{compile_topology_with_options, compute_control_hops, CompileReport};
 use crate::db::ControlDb;
+
+const MAX_INCOMING_DISPATCH_TASKS: usize = 128;
+const INCOMING_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DISCOVERY_DEPTH: usize = 16;
+const MAX_DISCOVERY_NODES: usize = 512;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct MaintainerHealthInfo {
@@ -55,6 +61,9 @@ pub struct ControlClient {
     active_bootstrap_node: Arc<RwLock<Option<String>>>,
     pending_replies: Arc<DashMap<String, oneshot::Sender<SpecialFrame>>>,
     telemetry_cache: Arc<RwLock<CachedTelemetry>>,
+    incoming_sem: Arc<Semaphore>,
+    /// Per-node push lock serializing concurrent `push_node_config` calls for the same node.
+    node_push_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl ControlClient {
@@ -82,6 +91,8 @@ impl ControlClient {
             active_bootstrap_node: Arc::new(RwLock::new(None)),
             pending_replies: Arc::new(DashMap::new()),
             telemetry_cache: Arc::new(RwLock::new(CachedTelemetry::default())),
+            incoming_sem: Arc::new(Semaphore::new(MAX_INCOMING_DISPATCH_TASKS)),
+            node_push_locks: Arc::new(DashMap::new()),
         });
 
         client.spawn_incoming_dispatcher();
@@ -94,6 +105,10 @@ impl ControlClient {
 
     pub fn signing_public_key_b64(&self) -> String {
         self.signing_kp.public_key_b64()
+    }
+
+    pub fn link_public_key_b64(&self) -> String {
+        self.link_manager.keypair().public_key_b64()
     }
 
     pub fn db(&self) -> &Arc<ControlDb> {
@@ -112,7 +127,8 @@ impl ControlClient {
         let Some(tag) = self.active_bootstrap_tag().await else {
             return false;
         };
-        self.link_manager.has_connected_peer(&tag).await
+        // Directly checks authenticated active sessions even though Control's LinkManager `peers` is empty!
+        self.link_manager.has_active_session_for_node(&tag)
     }
 
     /// Connect to the first reachable bootstrap tunnel-listening Node (supports primary + backups).
@@ -135,6 +151,7 @@ impl ControlClient {
     }
 
     pub async fn connect_single_bootstrap(&self, target: &BootstrapNodeTarget) -> Result<String> {
+        let mut bootstrap_nonce = Vec::new();
         let proof_pair = if let Some(ref pass) = target.passphrase {
             let mut nonce = vec![0u8; 24];
             rand::thread_rng().fill_bytes(&mut nonce);
@@ -144,12 +161,12 @@ impl ControlClient {
                 &self.link_manager.keypair().public_key_b64(),
                 &nonce,
             );
+            bootstrap_nonce = nonce.clone();
             Some((nonce, proof))
         } else {
             None
         };
 
-        // Check if we already pinned this bootstrap node's pubkey in SQLite
         let expected_pk = if let Some(ref pk) = target.public_key {
             Some(pk.clone())
         } else {
@@ -160,50 +177,88 @@ impl ControlClient {
                 .filter(|s| !s.is_empty())
         };
 
+        // Enforce expected bootstrap node_tag & authenticated handshake!
         let (session, outcome) = self
             .link_manager
-            .dial_endpoint(&target.address, expected_pk.as_deref(), None, proof_pair)
+            .dial_endpoint(
+                &target.address,
+                Some(&target.node_tag),
+                expected_pk.as_deref(),
+                None,
+                proof_pair,
+                false,
+            )
             .await?;
 
-        self.link_manager.register_outbound_session(
-            target.address.clone(),
-            outcome.remote_node_tag.clone(),
-            session,
-            outcome.authenticated,
-        );
+        if !outcome.authenticated {
+            session.close().await;
+            return Err(ExposureError::Auth(format!(
+                "bootstrap node '{}' did not authenticate Control",
+                target.node_tag
+            )));
+        }
 
-        // Pin bootstrap node's public key in SQLite
-        self.db
-            .upsert_node(
-                &outcome.remote_node_tag,
+        // Pin bootstrap node's public key WITHOUT overwriting an already-pinned differing key or wiping roles
+        if let Err(e) = self
+            .db
+            .upsert_node_if_unpinned(
+                &target.node_tag,
                 &outcome.remote_public_key,
                 &NodeRoles::default(),
                 true,
             )
-            .await?;
+            .await
+        {
+            session.close().await;
+            return Err(e);
+        }
 
-        // If we authenticated with passphrase, ensure bootstrap node receives our config-signing public key
-        if target.passphrase.is_some() {
+        self.link_manager
+            .register_outbound_session(
+                target.address.clone(),
+                target.node_tag.clone(),
+                outcome.remote_public_key.clone(),
+                session,
+                true,
+            )
+            .await;
+
+        // If authenticated with passphrase, send mutual-auth BootstrapReply carrying both Control signing & link pubkeys
+        if let Some(ref pass) = target.passphrase {
+            let sig_pk = self.signing_kp.public_key_b64();
+            let link_pk = self.link_public_key_b64();
+            let reply_proof = compute_bootstrap_reply_proof(
+                pass,
+                &sig_pk,
+                &link_pk,
+                &target.node_tag,
+                &bootstrap_nonce,
+            );
             let install = SpecialFrame::new(
                 Uuid::new_v4().to_string(),
-                vec![self.cfg.control_id.clone(), outcome.remote_node_tag.clone()],
+                vec![self.cfg.control_id.clone(), target.node_tag.clone()],
                 4,
                 SpecialPayload::BootstrapReply {
                     accepted: true,
-                    control_public_key: Some(self.signing_kp.public_key_b64()),
+                    control_public_key: Some(sig_pk),
+                    control_link_public_key: Some(link_pk),
+                    reply_proof: Some(reply_proof),
+                    nonce: bootstrap_nonce,
                     error: None,
                 },
             );
-            let _ = self.send_special(install).await;
+            if let Err(e) = self.send_special(install).await {
+                warn!(node = %target.node_tag, error = %e, "failed to send BootstrapReply to bootstrap node");
+            }
         }
 
         info!(
             control = %self.cfg.control_id,
-            bootstrap = %outcome.remote_node_tag,
+            bootstrap = %target.node_tag,
             addr = %target.address,
             "Control connected to bootstrap tunnel node"
         );
-        Ok(outcome.remote_node_tag)
+        Ok(target.node_tag.clone())
     }
 
     fn spawn_incoming_dispatcher(self: &Arc<Self>) {
@@ -213,14 +268,30 @@ impl ControlClient {
                 return;
             };
             while let Some(mut incoming) = rx.recv().await {
+                if !incoming.authenticated {
+                    continue;
+                }
                 if incoming.kind != StreamKind::Special && incoming.kind != StreamKind::Bootstrap {
                     continue;
                 }
+                let permit = match Arc::clone(&this.incoming_sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("control incoming stream handler limit reached; dropping stream");
+                        continue;
+                    }
+                };
                 let this2 = Arc::clone(&this);
                 tokio::spawn(async move {
-                    let frame: SpecialFrame = match read_json_frame(&mut incoming.stream).await {
-                        Ok(f) => f,
-                        Err(_) => return,
+                    let _permit = permit;
+                    let frame: SpecialFrame = match tokio::time::timeout(
+                        INCOMING_FRAME_TIMEOUT,
+                        read_json_frame(&mut incoming.stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(f)) => f,
+                        _ => return,
                     };
                     if let Some((_, waiter)) = this2.pending_replies.remove(&frame.id) {
                         let _ = waiter.send(frame);
@@ -241,18 +312,48 @@ impl ControlClient {
             ref via_node,
         } = frame.payload
         {
+            if self.cfg.role != ControlRole::Active {
+                let reply = frame.reverse_for_reply(SpecialPayload::BootstrapReply {
+                    accepted: false,
+                    control_public_key: None,
+                    control_link_public_key: None,
+                    reply_proof: None,
+                    nonce: vec![],
+                    error: Some("control instance is in standby mode".into()),
+                });
+                let _ = self.send_special(reply).await;
+                return;
+            }
+
             let res = self
                 .verify_and_accept_onboarding(node_tag, public_key, nonce, proof, via_node)
                 .await;
             let reply_payload = match res {
-                Ok(()) => SpecialPayload::BootstrapReply {
-                    accepted: true,
-                    control_public_key: Some(self.signing_kp.public_key_b64()),
-                    error: None,
-                },
+                Ok(passphrase) => {
+                    let sig_pk = self.signing_kp.public_key_b64();
+                    let link_pk = self.link_public_key_b64();
+                    let reply_proof = compute_bootstrap_reply_proof(
+                        &passphrase,
+                        &sig_pk,
+                        &link_pk,
+                        node_tag,
+                        nonce,
+                    );
+                    SpecialPayload::BootstrapReply {
+                        accepted: true,
+                        control_public_key: Some(sig_pk),
+                        control_link_public_key: Some(link_pk),
+                        reply_proof: Some(reply_proof),
+                        nonce: nonce.clone(),
+                        error: None,
+                    }
+                }
                 Err(e) => SpecialPayload::BootstrapReply {
                     accepted: false,
                     control_public_key: None,
+                    control_link_public_key: None,
+                    reply_proof: None,
+                    nonce: vec![],
                     error: Some(e.to_string()),
                 },
             };
@@ -268,49 +369,41 @@ impl ControlClient {
         nonce: &[u8],
         proof: &str,
         via_node: &str,
-    ) -> Result<()> {
-        let items = self.db.list_passphrases().await?;
-        let rec = items
-            .into_iter()
-            .find(|p| p.node_tag == node_tag)
-            .ok_or_else(|| ExposureError::Auth(format!("no passphrase registered for {node_tag}")))?;
-
-        if rec.revoked {
-            return Err(ExposureError::Auth("passphrase already revoked".into()));
+    ) -> Result<String> {
+        match self
+            .db
+            .consume_passphrase_and_enroll(node_tag, public_key, nonce, proof)
+            .await
+        {
+            Ok(passphrase) => {
+                self.db
+                    .append_audit(
+                        "bootstrap",
+                        "enroll",
+                        node_tag,
+                        true,
+                        &format!("enrolled via {via_node}, passphrase revoked"),
+                    )
+                    .await;
+                Ok(passphrase)
+            }
+            Err(e) => {
+                self.db
+                    .append_audit(
+                        "bootstrap",
+                        "enroll",
+                        node_tag,
+                        false,
+                        &format!("onboarding failed via {via_node}: {e}"),
+                    )
+                    .await;
+                Err(e)
+            }
         }
-        if Utc::now().timestamp() > rec.expires_ts {
-            return Err(ExposureError::Auth("passphrase expired".into()));
-        }
-        if !verify_passphrase_proof(&rec.passphrase, node_tag, public_key, nonce, proof) {
-            self.db
-                .append_audit(
-                    "bootstrap",
-                    "enroll",
-                    node_tag,
-                    false,
-                    &format!("invalid passphrase proof via {via_node}"),
-                )
-                .await;
-            return Err(ExposureError::Auth("invalid passphrase proof".into()));
-        }
-
-        self.db
-            .upsert_node(node_tag, public_key, &NodeRoles::default(), true)
-            .await?;
-        self.db.revoke_passphrase(node_tag).await?;
-        self.db
-            .append_audit(
-                "bootstrap",
-                "enroll",
-                node_tag,
-                true,
-                &format!("enrolled via {via_node}, passphrase revoked"),
-            )
-            .await;
-        Ok(())
     }
 
     pub async fn send_special(&self, mut frame: SpecialFrame) -> Result<()> {
+        frame.validate_hops()?;
         if frame.current_target() == Some(self.cfg.control_id.as_str()) {
             frame.advance()?;
         }
@@ -352,20 +445,39 @@ impl ControlClient {
         }
     }
 
-    /// Sign a compiled `NodeConfig` into a `SignedConfigBundle`.
+    /// Sign a compiled `NodeConfig` into a `SignedConfigBundle` for `Apply`.
     pub fn sign_config_bundle(
         &self,
         node_tag: &str,
         sequence: u64,
         config: NodeConfig,
     ) -> Result<SignedConfigBundle> {
+        self.sign_config_bundle_with_purpose(
+            node_tag,
+            sequence,
+            config,
+            ConfigBundlePurpose::Apply,
+            3600,
+        )
+    }
+
+    /// Sign a `NodeConfig` with explicit domain-separated `ConfigBundlePurpose` (`Apply` vs `Preflight`).
+    pub fn sign_config_bundle_with_purpose(
+        &self,
+        node_tag: &str,
+        sequence: u64,
+        config: NodeConfig,
+        purpose: ConfigBundlePurpose,
+        ttl_secs: i64,
+    ) -> Result<SignedConfigBundle> {
         let now = Utc::now().timestamp();
         let mut bundle = SignedConfigBundle {
+            purpose,
             node_tag: node_tag.to_string(),
             sequence,
             min_sequence: sequence,
             issued_at: now,
-            expires_at: now + 3600,
+            expires_at: now + ttl_secs,
             config,
             signature: String::new(),
         };
@@ -374,11 +486,48 @@ impl ControlClient {
         Ok(bundle)
     }
 
-    /// Compile current topology (or provided YAML) with stored node & maintainer keys.
-    pub async fn compile_yaml(
+    /// Read-only compilation for `GET /api/topology`, `POST /api/topology/validate`, and `preflight`:
+    /// NEVER mutates SQLite (uses existing maintainer keys or ephemeral preview keys).
+    pub async fn compile_yaml_readonly(
         &self,
         yaml: &str,
-    ) -> Result<(TopologySpec, CompileReport, std::collections::BTreeMap<String, NodeConfig>)> {
+    ) -> Result<(TopologySpec, CompileReport, BTreeMap<String, NodeConfig>)> {
+        let topo: TopologySpec = serde_yaml::from_str(yaml)
+            .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?;
+
+        let db_nodes = self.db.list_nodes().await?;
+        let mut node_pubkeys = HashMap::new();
+        for n in &db_nodes {
+            if !n.public_key.is_empty() {
+                node_pubkeys.insert(n.node_tag.clone(), n.public_key.clone());
+            }
+        }
+
+        let mut maint_keys = HashMap::new();
+        for (tag, spec) in &topo.nodes {
+            if spec.roles.maintainer {
+                if let Some(pair) = self.db.get_maintainer_keypair(tag).await? {
+                    maint_keys.insert(tag.clone(), pair);
+                }
+            }
+        }
+
+        let (report, compiled) = compile_topology_with_options(
+            &topo,
+            &self.signing_kp.public_key_b64(),
+            &self.link_public_key_b64(),
+            &node_pubkeys,
+            &maint_keys,
+            true,
+        );
+        Ok((topo, report, compiled))
+    }
+
+    /// Compile topology AND provision persistent maintainer keypairs (Active role mutating operations ONLY).
+    pub async fn compile_yaml_and_provision(
+        &self,
+        yaml: &str,
+    ) -> Result<(TopologySpec, CompileReport, BTreeMap<String, NodeConfig>)> {
         let topo: TopologySpec = serde_yaml::from_str(yaml)
             .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?;
 
@@ -398,17 +547,18 @@ impl ControlClient {
             }
         }
 
-        let (report, compiled) = compile_topology(
+        let (report, compiled) = compile_topology_with_options(
             &topo,
             &self.signing_kp.public_key_b64(),
+            &self.link_public_key_b64(),
             &node_pubkeys,
             &maint_keys,
+            true,
         );
         Ok((topo, report, compiled))
     }
 
-    /// Push a signed config bundle to a single target Node along the computed Hop Table.
-    /// Send a candidate signed config to a Node for non-mutating preflight connectivity & port checks.
+    /// Send a candidate Preflight-domain-separated signed config to a Node for non-mutating checks.
     pub async fn preflight_node_config(
         &self,
         topo: &TopologySpec,
@@ -440,7 +590,14 @@ impl ControlClient {
         };
 
         let seq = self.db.latest_config_sequence().await.unwrap_or(0) + 1;
-        let bundle = match self.sign_config_bundle(node_tag, seq, cfg) {
+        // Domain-separated Preflight bundle (30s TTL) CANNOT be replayed as ConfigPush!
+        let bundle = match self.sign_config_bundle_with_purpose(
+            node_tag,
+            seq,
+            cfg,
+            ConfigBundlePurpose::Preflight,
+            30,
+        ) {
             Ok(b) => b,
             Err(e) => {
                 return PreflightReport {
@@ -495,6 +652,13 @@ impl ControlClient {
         node_tag: &str,
         cfg: NodeConfig,
     ) -> Result<u64> {
+        let push_lock = self
+            .node_push_locks
+            .entry(node_tag.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = push_lock.lock().await;
+
         let boot = self
             .active_bootstrap_tag()
             .await
@@ -507,13 +671,13 @@ impl ControlClient {
             },
         )?;
 
-        let seq = self.db.next_config_sequence().await?;
-        let bundle = self.sign_config_bundle(node_tag, seq, cfg.clone())?;
-        let cfg_json = serde_json::to_string(&cfg).unwrap_or_default();
-        let ver_id = self
+        let cfg_json = serde_json::to_string(&cfg)
+            .map_err(|e| ExposureError::Config(format!("serialize node config: {e}")))?;
+        let (seq, ver_id) = self
             .db
-            .record_config_version(seq, node_tag, &cfg_json, "pending")
+            .allocate_and_record_config_version(node_tag, &cfg_json)
             .await?;
+        let bundle = self.sign_config_bundle(node_tag, seq, cfg)?;
 
         let frame = SpecialFrame::new(
             Uuid::new_v4().to_string(),
@@ -571,11 +735,21 @@ impl ControlClient {
                     .await;
                 Err(e)
             }
-            _ => Err(ExposureError::Protocol("unexpected reply to ConfigPush".into())),
+            _ => {
+                let err_s = "unexpected reply to ConfigPush";
+                self.db
+                    .update_config_version_status(ver_id, "failed")
+                    .await?;
+                self.db
+                    .append_audit(actor, "config_push", node_tag, false, err_s)
+                    .await;
+                Err(ExposureError::Protocol(err_s.into()))
+            }
         }
     }
 
-    /// Run multi-hop BFS Discovery starting from the connected bootstrap tunnel Node (DESIGN.md §9.4).
+    /// Run bounded multi-hop BFS Discovery starting from the connected bootstrap tunnel Node (DESIGN.md §9.4).
+    /// NEVER overwrites an already-pinned public key in SQLite!
     pub async fn run_discovery(&self, actor: &str) -> Result<usize> {
         let boot = self
             .active_bootstrap_tag()
@@ -590,6 +764,9 @@ impl ControlClient {
 
         let mut discovered = 0usize;
         while let Some(hops) = queue.pop_front() {
+            if discovered >= MAX_DISCOVERY_NODES || hops.len() > MAX_DISCOVERY_DEPTH {
+                continue;
+            }
             let target = hops.last().unwrap().clone();
             let req_id = Uuid::new_v4().to_string();
             let frame = SpecialFrame::new(
@@ -616,9 +793,18 @@ impl ControlClient {
                         },
                     ..
                 }) => {
+                    if request_id != req_id {
+                        warn!(expected = %req_id, got = %request_id, "discovery response request_id mismatch");
+                        continue;
+                    }
+                    if node_tag != target {
+                        warn!(expected = %target, got = %node_tag, "discovery response node_tag mismatch");
+                        continue;
+                    }
                     let signing = discovery_resp_signing_bytes(
                         &request_id,
                         &node_tag,
+                        &roles,
                         &public_key,
                         config_sequence,
                         &neighbors,
@@ -627,7 +813,6 @@ impl ControlClient {
                         warn!(node = %node_tag, error = %e, "discovery signature invalid, ignoring");
                         continue;
                     }
-                    // Detect duplicate Node Tag with different public keys
                     if let Some(prev_pk) = seen_pubkeys.get(&node_tag) {
                         if prev_pk != &public_key {
                             warn!(node = %node_tag, "duplicate node_tag detected with conflicting public key");
@@ -637,16 +822,28 @@ impl ControlClient {
                         seen_pubkeys.insert(node_tag.clone(), public_key.clone());
                     }
 
-                    self.db
-                        .upsert_node(&node_tag, &public_key, &roles, true)
-                        .await?;
+                    if let Err(e) = self
+                        .db
+                        .upsert_node_if_unpinned(&node_tag, &public_key, &roles, true)
+                        .await
+                    {
+                        warn!(node = %node_tag, error = %e, "discovery rejected conflicting public key against pinned DB");
+                        self.db
+                            .append_audit(actor, "discovery_conflict", &node_tag, false, &e.to_string())
+                            .await;
+                        continue;
+                    }
                     discovered += 1;
 
-                    for nb in neighbors {
-                        if visited.insert(nb.node_tag.clone()) {
-                            let mut next_hops = hops.clone();
-                            next_hops.push(nb.node_tag);
-                            queue.push_back(next_hops);
+                    if hops.len() < MAX_DISCOVERY_DEPTH {
+                        for nb in neighbors {
+                            if visited.len() < MAX_DISCOVERY_NODES
+                                && visited.insert(nb.node_tag.clone())
+                            {
+                                let mut next_hops = hops.clone();
+                                next_hops.push(nb.node_tag);
+                                queue.push_back(next_hops);
+                            }
                         }
                     }
                 }
@@ -669,8 +866,8 @@ impl ControlClient {
         Ok(discovered)
     }
 
-    /// Actively pull node status from all Nodes and aggregated stats/certs from all Maintainers.
-    pub async fn pull_all_telemetry(&self) -> Result<usize> {
+    /// Concurrently pull node status from all Nodes and aggregated stats/certs from all Maintainers.
+    pub async fn pull_all_telemetry(self: &Arc<Self>) -> Result<usize> {
         let Some(boot) = self.active_bootstrap_tag().await else {
             return Ok(0);
         };
@@ -681,9 +878,6 @@ impl ControlClient {
             serde_yaml::from_str(&yaml).unwrap_or_default()
         };
 
-        let mut cache = CachedTelemetry::default();
-        let mut pulled = 0usize;
-
         let mut tag_set: HashSet<String> = topo.nodes.keys().cloned().collect();
         tag_set.insert(boot.clone());
         if let Ok(db_nodes) = self.db.list_nodes().await {
@@ -691,94 +885,149 @@ impl ControlClient {
                 tag_set.insert(n.node_tag);
             }
         }
-        let node_tags: Vec<String> = tag_set.into_iter().collect();
 
-        for tag in &node_tags {
-            let hops = compute_control_hops(&self.cfg.control_id, &boot, tag, &topo)
-                .unwrap_or_else(|| vec![self.cfg.control_id.clone(), tag.clone()]);
+        let mut futs = FuturesUnordered::new();
+        for tag in tag_set {
+            let Some(hops) = compute_control_hops(&self.cfg.control_id, &boot, &tag, &topo)
+                .or_else(|| {
+                    if tag == boot {
+                        Some(vec![self.cfg.control_id.clone(), boot.clone()])
+                    } else {
+                        None
+                    }
+                })
+            else {
+                let _ = self.db.set_node_online(&tag, false).await;
+                continue;
+            };
+            let this = Arc::clone(self);
+            futs.push(tokio::spawn(async move {
+                let status_frame = SpecialFrame::new(
+                    Uuid::new_v4().to_string(),
+                    hops.clone(),
+                    16,
+                    SpecialPayload::StatusReq,
+                );
+                match this
+                    .send_special_rpc(status_frame, Duration::from_secs(5))
+                    .await
+                {
+                    Ok(SpecialFrame {
+                        payload: SpecialPayload::StatusResp(snap),
+                        ..
+                    }) => {
+                        if snap.node_tag != tag {
+                            warn!(expected = %tag, got = %snap.node_tag, "spoofed StatusResp node_tag rejected");
+                            return None;
+                        }
+                        let _ = this
+                            .db
+                            .upsert_node_if_unpinned(&tag, "", &snap.roles, true)
+                            .await;
+                        let _ = this
+                            .db
+                            .set_node_reload_result(
+                                &tag,
+                                snap.config_sequence,
+                                snap.last_reload_ok,
+                                snap.last_reload_error.as_deref(),
+                            )
+                            .await;
 
-            // Pull StatusResp
-            let status_frame = SpecialFrame::new(
-                Uuid::new_v4().to_string(),
-                hops.clone(),
-                16,
-                SpecialPayload::StatusReq,
-            );
-            if let Ok(SpecialFrame {
-                payload: SpecialPayload::StatusResp(NodeStatusSnapshot {
+                        let maint_snap = if snap.roles.maintainer {
+                            let pull_frame = SpecialFrame::new(
+                                Uuid::new_v4().to_string(),
+                                hops,
+                                16,
+                                SpecialPayload::PullTelemetryReq { since_minute: None },
+                            );
+                            match this
+                                .send_special_rpc(pull_frame, Duration::from_secs(6))
+                                .await
+                            {
+                                Ok(SpecialFrame {
+                                    payload: SpecialPayload::PullTelemetryResp(ms),
+                                    ..
+                                }) if ms.maintainer_tag == tag => Some(ms),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        Some((snap, maint_snap))
+                    }
+                    _ => {
+                        let _ = this.db.set_node_online(&tag, false).await;
+                        None
+                    }
+                }
+            }));
+        }
+
+        let mut cache = CachedTelemetry::default();
+        let mut pulled = 0usize;
+        let mut dedup_summaries: HashMap<(i64, String, String), MinuteSummary> = HashMap::new();
+        let mut dedup_certs: HashMap<String, CertStatusInfo> = HashMap::new();
+
+        while let Some(res) = futs.next().await {
+            if let Ok(Some((snap, maint_opt))) = res {
+                let NodeStatusSnapshot {
                     node_tag,
-                    roles,
-                    config_sequence,
-                    last_reload_ok,
-                    last_reload_error,
                     uptime_secs,
                     links,
                     alerts,
-                }),
-                ..
-            }) = self
-                .send_special_rpc(status_frame, Duration::from_secs(5))
-                .await
-            {
-                let _ = self.db.upsert_node(&node_tag, "", &roles, true).await;
-                let _ = self
-                    .db
-                    .set_node_reload_result(
-                        &node_tag,
-                        config_sequence,
-                        last_reload_ok,
-                        last_reload_error.as_deref(),
-                    )
-                    .await;
-                cache.node_uptimes.insert(node_tag.clone(), uptime_secs);
+                    ..
+                } = snap;
+                cache.node_uptimes.insert(node_tag, uptime_secs);
                 cache.links.extend(links);
                 cache.alerts.extend(alerts);
                 pulled += 1;
 
-                // If Maintainer, actively pull aggregated summaries & certificate status
-                if roles.maintainer {
-                    let pull_frame = SpecialFrame::new(
-                        Uuid::new_v4().to_string(),
-                        hops,
-                        16,
-                        SpecialPayload::PullTelemetryReq { since_minute: None },
-                    );
-                    if let Ok(SpecialFrame {
-                        payload:
-                            SpecialPayload::PullTelemetryResp(MaintainerTelemetrySnapshot {
-                                maintainer_tag,
-                                summaries,
-                                certificates,
-                                segment_backlog,
-                                merge_latency_ms,
-                                alerts: m_alerts,
-                            }),
-                        ..
-                    }) = self
-                        .send_special_rpc(pull_frame, Duration::from_secs(6))
-                        .await
-                    {
-                        cache.maintainers.push(MaintainerHealthInfo {
-                            maintainer_tag,
-                            segment_backlog,
-                            merge_latency_ms,
-                        });
-                        cache.summaries.extend(summaries);
-                        cache.certificates.extend(certificates);
-                        cache.alerts.extend(m_alerts);
+                if let Some(MaintainerTelemetrySnapshot {
+                    maintainer_tag,
+                    summaries,
+                    certificates,
+                    segment_backlog,
+                    merge_latency_ms,
+                    alerts: m_alerts,
+                }) = maint_opt
+                {
+                    cache.maintainers.push(MaintainerHealthInfo {
+                        maintainer_tag,
+                        segment_backlog,
+                        merge_latency_ms,
+                    });
+                    for s in summaries {
+                        // Deduplicate summaries reported by multiple maintainers by keeping the highest-count entry
+                        let key = (s.minute_epoch, s.node_tag.clone(), s.service_tag.clone());
+                        dedup_summaries
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if s.requests > existing.requests {
+                                    *existing = s.clone();
+                                }
+                            })
+                            .or_insert(s);
                     }
+                    for c in certificates {
+                        dedup_certs.insert(c.domain.clone(), c);
+                    }
+                    cache.alerts.extend(m_alerts);
                 }
             }
         }
 
+        cache.summaries = dedup_summaries.into_values().collect();
+        cache.certificates = dedup_certs.into_values().collect();
         cache.last_pulled_at = Some(Utc::now().to_rfc3339());
         *self.telemetry_cache.write().await = cache;
         Ok(pulled)
     }
 
-    /// Trigger enrollment of a listening node via a relay/bootstrap node (Hop Table `DialEnrollReq`).
+    /// Trigger enrollment of a listening node via a relay/bootstrap node using Control-signed `DialEnrollReq`.
     pub async fn trigger_listening_enroll(
         &self,
+        actor: &str,
         target_node_tag: &str,
         target_addr: &str,
         passphrase: &str,
@@ -792,17 +1041,48 @@ impl ControlClient {
         if via_hops.is_empty() {
             hops.push(boot);
         } else {
+            if via_hops.first().map(|s| s.as_str()) != Some(boot.as_str()) {
+                hops.push(boot);
+            }
             hops.extend(via_hops.iter().cloned());
         }
+        let relay_node_tag = hops
+            .last()
+            .cloned()
+            .ok_or_else(|| ExposureError::Routing("missing relay hop for DialEnrollReq".into()))?;
+
+        let request_id = Uuid::new_v4().to_string();
+        let now = Utc::now().timestamp();
+        let expires_at = now + 60;
+        let sig_pk = self.signing_kp.public_key_b64();
+        let link_pk = self.link_public_key_b64();
+        let signing = dial_enroll_req_signing_bytes(
+            &request_id,
+            now,
+            expires_at,
+            &relay_node_tag,
+            target_node_tag,
+            target_addr,
+            passphrase,
+            &sig_pk,
+            &link_pk,
+        );
+        let control_signature = self.signing_kp.sign_b64(&signing);
+
         let frame = SpecialFrame::new(
             Uuid::new_v4().to_string(),
             hops,
             16,
             SpecialPayload::DialEnrollReq {
+                request_id,
+                issued_at: now,
+                expires_at,
                 target_node_tag: target_node_tag.to_string(),
                 target_addr: target_addr.to_string(),
                 passphrase: passphrase.to_string(),
-                control_public_key: self.signing_kp.public_key_b64(),
+                control_public_key: sig_pk,
+                control_link_public_key: link_pk,
+                control_signature,
             },
         );
         match self.send_special_rpc(frame, Duration::from_secs(10)).await? {
@@ -816,12 +1096,12 @@ impl ControlClient {
                 ..
             } => {
                 self.db
-                    .upsert_node(target_node_tag, &pk, &NodeRoles::default(), true)
+                    .upsert_node_if_unpinned(target_node_tag, &pk, &NodeRoles::default(), true)
                     .await?;
                 self.db.revoke_passphrase(target_node_tag).await?;
                 self.db
                     .append_audit(
-                        "admin",
+                        actor,
                         "dial_enroll",
                         target_node_tag,
                         true,
@@ -833,10 +1113,16 @@ impl ControlClient {
             SpecialFrame {
                 payload: SpecialPayload::DialEnrollResp { error, .. },
                 ..
-            } => Err(ExposureError::Auth(
-                error.unwrap_or_else(|| "dial enrollment failed".into()),
-            )),
-            _ => Err(ExposureError::Protocol("unexpected DialEnroll reply".into())),
+            } => {
+                let _ = self.db.revoke_passphrase(target_node_tag).await;
+                Err(ExposureError::Auth(
+                    error.unwrap_or_else(|| "dial enrollment failed".into()),
+                ))
+            }
+            _ => {
+                let _ = self.db.revoke_passphrase(target_node_tag).await;
+                Err(ExposureError::Protocol("unexpected DialEnroll reply".into()))
+            }
         }
     }
 }

@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="Exposure Banner">
+  <defs>
+    <!-- Dark slate background -->
+    <linearGradient id="banner-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#12171e" />
+      <stop offset="60%" stop-color="#181f28" />
+      <stop offset="100%" stop-color="#1e2733" />
+    </linearGradient>
+
+    <!-- Electric cyan gradient -->
+    <linearGradient id="banner-cyan" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0284c7" />
+      <stop offset="55%" stop-color="#0ea5e9" />
+      <stop offset="100%" stop-color="#38bdf8" />
+    </linearGradient>
+
+    <!-- Subtle radial glow behind the logo -->
+    <radialGradient id="logo-glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#0ea5e9" stop-opacity="0.14" />
+      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Masks for the logo mark -->
+    <mask id="cut-by-e-banner">
+      <rect width="512" height="512" fill="white" />
+      <rect x="134" y="130" width="56" height="252" fill="black" />
+      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
+      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
+      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+    </mask>
+
+    <mask id="cut-for-frame-banner">
+      <rect width="512" height="512" fill="white" />
+      <polygon points="93,413 413,93 473,153 153,473" fill="black" />
+      <rect x="134" y="130" width="56" height="252" fill="black" />
+      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
+      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
+      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+    </mask>
+  </defs>
+
+  <!-- Banner Container -->
+  <rect width="1200" height="300" rx="24" fill="url(#banner-bg)" />
+
+  <!-- Subtle ambient glow behind the icon -->
+  <circle cx="195" cy="150" r="165" fill="url(#logo-glow)" />
+
+  <!-- Subtle decorative diagonal lines on the far right -->
+  <g opacity="0.06" fill="#38bdf8">
+    <polygon points="1030,300 1200,130 1200,162 1062,300" />
+    <polygon points="1084,300 1200,184 1200,216 1116,300" />
+  </g>
+
+  <!-- Logo Mark (scaled to 246x246, vertically centered) -->
+  <g transform="translate(72, 27) scale(0.48)">
+    <!-- LAYER 1: Slate Gray Zero-Trust Diamond Perimeter -->
+    <g mask="url(#cut-for-frame-banner)">
+      <polygon
+        points="256,56 456,256 256,456 56,256"
+        fill="none"
+        stroke="#526378"
+        stroke-width="24"
+        stroke-linejoin="miter"
+      />
+    </g>
+
+    <!-- LAYER 2: Electric Cyan Twin-Stream Encrypted Tunnel -->
+    <g mask="url(#cut-by-e-banner)" fill="url(#banner-cyan)">
+      <polygon points="121,401 401,121 418,138 138,418" />
+      <polygon points="148,428 428,148 445,165 165,445" />
+    </g>
+
+    <!-- LAYER 3: Crisp White Geometric "E" -->
+    <g fill="#f8fafc">
+      <rect x="144" y="140" width="36" height="232" />
+      <polygon points="144,140 292,140 256,176 144,176" />
+      <polygon points="144,238 256,238 220,274 144,274" />
+      <polygon points="144,336 292,336 256,372 144,372" />
+    </g>
+  </g>
+
+  <!-- Wordmark & Tagline -->
+  <g transform="translate(364, 0)">
+    <!-- Project Name -->
+    <text
+      x="0"
+      y="148"
+      fill="#f8fafc"
+      font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+      font-size="84"
+      font-weight="700"
+      letter-spacing="-1.5"
+    >Exposure</text>
+
+    <!-- Twin-beam inspired accent bar -->
+    <polygon points="2,174 86,174 80,180 2,180" fill="url(#banner-cyan)" />
+    <polygon points="96,174 128,174 122,180 90,180" fill="#526378" />
+
+    <!-- Tagline -->
+    <text
+      x="2"
+      y="214"
+      fill="#94a3b8"
+      font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+      font-size="18"
+      font-weight="600"
+      letter-spacing="2.2"
+    >ZERO-TRUST MULTI-HOP REVERSE PROXY &amp; ENCRYPTED SERVICE MESH</text>
+  </g>
+</svg>

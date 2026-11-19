@@ -7,7 +7,8 @@ nodes:
       listen_addr: "0.0.0.0:9443"
       allow_on_demand: true
       allow_tunnel: true
-      allow_bootstrap: true
+      # Keep bootstrap disabled after initial node onboarding
+      allow_bootstrap: false
     maintainer_hops:
       - ingress-hk
       - relay-sg
@@ -19,7 +20,8 @@ nodes:
         - listen_addr: "0.0.0.0:8443"
           tls: true
       cert_store_dir: "./data/ingress-certs"
-      clearance_secret: "change-this-in-production"
+      # Replace with your own 32-byte random hex secret (e.g. `openssl rand -hex 32`)
+      clearance_secret: "9f8e7d6c5b4a392817162534435261708f9ea0b1c2d3e4f5a6b7c8d9e0f1a2b3"
       rate_limit_buckets:
         web-default:
           capacity: 60
@@ -79,6 +81,10 @@ nodes:
         web@region-a:
           backend: "192.168.1.3:10808"
           protocol: auto
+          # Optional Backend TLS (verifies WebPKI roots by default):
+          # tls: true
+          # ca_cert_path: "/etc/exposure/backend-ca.pem"
+          # insecure_skip_verify: false
           allow_from: ["ingress-hk"]
           timeout_ms: 15000
           local_health_check:
@@ -105,8 +111,13 @@ links:
   - from: ingress-hk
     to: relay-sg
     mode: on-demand
+    bidirectional: true
     endpoints:
       - address: "relay-sg.internal:9443"
+        priority: 10
+        weight: 100
+    reverse_endpoints:
+      - address: "ingress-hk.internal:9443"
         priority: 10
         weight: 100
   - from: egress-home
@@ -120,22 +131,13 @@ links:
   - from: relay-sg
     to: maintainer-1
     mode: on-demand
+    bidirectional: true
     endpoints:
       - address: "maintainer-1.internal:9443"
         priority: 10
         weight: 100
-  - from: maintainer-1
-    to: relay-sg
-    mode: on-demand
-    endpoints:
+    reverse_endpoints:
       - address: "relay-sg.internal:9443"
-        priority: 10
-        weight: 100
-  - from: relay-sg
-    to: ingress-hk
-    mode: on-demand
-    endpoints:
-      - address: "ingress-hk.internal:9443"
         priority: 10
         weight: 100
 
@@ -143,14 +145,15 @@ maintainer_templates:
   default-maint:
     is_primary_cert_manager: true
     acme:
-      directory_url: "https://acme-v02.api.letsencrypt.org/directory"
+      # Use "self-signed" for local/internal cert issuance
+      directory_url: "self-signed"
       contact_email: "ops@example.com"
       storage_dir: "./data/maintainer-certs"
       providers:
         cf-prod:
           type: cloudflare
-          api_token: "replace-me"
-          zone_id: "replace-me"
+          api_token: "replace-with-real-api-token"
+          zone_id: "0123456789abcdef0123456789abcdef"
       orders:
         - domain: "example.com"
           provider: "cf-prod"

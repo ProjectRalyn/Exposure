@@ -13,7 +13,7 @@ import {
 } from "./charts.js";
 
 const state = {
-  token: localStorage.getItem("exposure_token") || "",
+  authenticated: false,
   activeTab: "overview",
   obsHeroMetric: "requests", // requests | uv | bandwidth | guard | latency
   autoRefreshMs: 30000,
@@ -26,6 +26,9 @@ const state = {
     versions: [],
   },
 };
+
+// Clear any legacy plaintext token left in localStorage by older builds.
+try { localStorage.removeItem("exposure_token"); } catch {}
 
 const el = (id) => document.getElementById(id);
 
@@ -76,12 +79,20 @@ el("modal-backdrop")?.addEventListener("click", (ev) => {
   if (ev.target === el("modal-backdrop")) closeModal();
 });
 
+function shellQuote(v) {
+  return `'${String(v ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
 async function api(path, opts = {}) {
-  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
-  if (state.token) headers["Authorization"] = `Bearer ${state.token}`;
-  const resp = await fetch(path, { ...opts, headers });
+  const { skipLogoutOn401 = false, ...fetchOpts } = opts;
+  const headers = Object.assign({ "Content-Type": "application/json" }, fetchOpts.headers || {});
+  const resp = await fetch(path, {
+    credentials: "same-origin",
+    ...fetchOpts,
+    headers,
+  });
   if (resp.status === 401) {
-    logout();
+    if (!skipLogoutOn401) resetToLogin();
     throw new Error("Session expired");
   }
   const text = await resp.text();
@@ -93,12 +104,21 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function logout() {
-  state.token = "";
-  localStorage.removeItem("exposure_token");
+function resetToLogin() {
+  state.authenticated = false;
   stopAutoRefresh();
+  if (el("login-pass")) el("login-pass").value = "";
   el("app-view").classList.add("hidden");
   el("login-view").classList.remove("hidden");
+}
+
+async function logout() {
+  try {
+    await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+  } catch {
+    // ignore network errors during logout
+  }
+  resetToLogin();
 }
 
 function updateBootstrapBadge(bootTag) {
@@ -238,7 +258,7 @@ function renderMaintainerStrip(container, maintainers) {
   container.innerHTML = maintainers
     .map(
       (m) =>
-        `<span class="maint-chip">Maintainer <b>${esc(m.maintainer_tag)}</b> · backlog <b>${m.segment_backlog}</b> · merge <b>${(m.merge_latency_ms || 0).toFixed(2)}ms</b></span>`
+        `<span class="maint-chip">Maintainer <b>${esc(m.maintainer_tag)}</b> · backlog <b>${Number(m.segment_backlog) || 0}</b> · merge <b>${(Number(m.merge_latency_ms) || 0).toFixed(2)}ms</b></span>`
     )
     .join("");
 }
@@ -444,7 +464,7 @@ async function refreshTopology(opts = {}) {
       if (!rec) return;
       openModal({
         title: `Confirm Rollback — ${rec.node_tag}`,
-        bodyHtml: `<p>Push historical snapshot <b>#${rec.sequence}</b> (created ${esc(formatDateTime(rec.created_at))}) as a new signed revision to <code>${esc(rec.node_tag)}</code>?</p>`,
+        bodyHtml: `<p>Push historical snapshot <b>#${esc(rec.sequence)}</b> (created ${esc(formatDateTime(rec.created_at))}) as a new signed revision to <code>${esc(rec.node_tag)}</code>?</p>`,
         actions: [
           { label: "Cancel", cls: "ghost" },
           {
@@ -633,58 +653,65 @@ function renderObservabilityCharts() {
     total_challenges_passed: 0,
     total_bytes_in: 0,
     total_bytes_out: 0,
-    p50_sum: 0,
-    p95_sum: 0,
-    p99_sum: 0,
-    n: 0,
+    p50_wsum: 0,
+    p95_wsum: 0,
+    p99_wsum: 0,
+    lat_weight: 0,
   };
 
   for (const s of filtered) {
-    agg.total_requests += s.requests || 0;
-    agg.total_uv += s.uv_estimate || 0;
-    agg.total_errors += s.errors || 0;
-    agg.total_rate_limited += s.rate_limited || 0;
-    agg.total_challenges_issued += s.challenges_issued || 0;
-    agg.total_challenges_passed += s.challenges_passed || 0;
-    agg.total_bytes_in += s.bytes_in || 0;
-    agg.total_bytes_out += s.bytes_out || 0;
-    agg.p50_sum += s.p50_ms || 0;
-    agg.p95_sum += s.p95_ms || 0;
-    agg.p99_sum += s.p99_ms || 0;
-    agg.n += 1;
+    const reqs = Number(s.requests) || 0;
+    agg.total_requests += reqs;
+    agg.total_uv += Number(s.uv_estimate) || 0;
+    agg.total_errors += Number(s.errors) || 0;
+    agg.total_rate_limited += Number(s.rate_limited) || 0;
+    agg.total_challenges_issued += Number(s.challenges_issued) || 0;
+    agg.total_challenges_passed += Number(s.challenges_passed) || 0;
+    agg.total_bytes_in += Number(s.bytes_in) || 0;
+    agg.total_bytes_out += Number(s.bytes_out) || 0;
+    if (reqs > 0) {
+      agg.p50_wsum += (Number(s.p50_ms) || 0) * reqs;
+      agg.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
+      agg.p99_wsum += (Number(s.p99_ms) || 0) * reqs;
+      agg.lat_weight += reqs;
+    }
 
     let b = byMin.get(s.minute_epoch);
     if (!b) {
       b = {
         minute_epoch: s.minute_epoch,
         requests: 0, uv: 0, errors: 0, rl: 0, ch_i: 0, ch_p: 0, bytes_in: 0, bytes_out: 0,
-        p50: 0, p95: 0, p99: 0, n: 0,
+        p50_wsum: 0, p95_wsum: 0, p99_wsum: 0, lat_weight: 0,
       };
       byMin.set(s.minute_epoch, b);
     }
-    b.requests += s.requests || 0;
-    b.uv += s.uv_estimate || 0;
-    b.errors += s.errors || 0;
-    b.rl += s.rate_limited || 0;
-    b.ch_i += s.challenges_issued || 0;
-    b.ch_p += s.challenges_passed || 0;
-    b.bytes_in += s.bytes_in || 0;
-    b.bytes_out += s.bytes_out || 0;
-    b.p50 += s.p50_ms || 0;
-    b.p95 += s.p95_ms || 0;
-    b.p99 += s.p99_ms || 0;
-    b.n += 1;
+    b.requests += reqs;
+    b.uv += Number(s.uv_estimate) || 0;
+    b.errors += Number(s.errors) || 0;
+    b.rl += Number(s.rate_limited) || 0;
+    b.ch_i += Number(s.challenges_issued) || 0;
+    b.ch_p += Number(s.challenges_passed) || 0;
+    b.bytes_in += Number(s.bytes_in) || 0;
+    b.bytes_out += Number(s.bytes_out) || 0;
+    if (reqs > 0) {
+      b.p50_wsum += (Number(s.p50_ms) || 0) * reqs;
+      b.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
+      b.p99_wsum += (Number(s.p99_ms) || 0) * reqs;
+      b.lat_weight += reqs;
+    }
 
     const accumGroup = (map, key, field) => {
       let g = map.get(key);
       if (!g) {
-        g = { [field]: key, requests: 0, errors: 0, p95_sum: 0, n: 0 };
+        g = { [field]: key, requests: 0, errors: 0, p95_wsum: 0, lat_weight: 0 };
         map.set(key, g);
       }
-      g.requests += s.requests || 0;
-      g.errors += s.errors || 0;
-      g.p95_sum += s.p95_ms || 0;
-      g.n += 1;
+      g.requests += reqs;
+      g.errors += Number(s.errors) || 0;
+      if (reqs > 0) {
+        g.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
+        g.lat_weight += reqs;
+      }
     };
     accumGroup(bySvc, s.service_tag, "service_tag");
     accumGroup(byNode, s.node_tag, "node_tag");
@@ -692,9 +719,9 @@ function renderObservabilityCharts() {
 
   // Update Cloudflare Hero Metric Tabs
   const errPct = agg.total_requests > 0 ? ((agg.total_errors / agg.total_requests) * 100).toFixed(2) : "0.00";
-  const avgP50 = agg.n ? agg.p50_sum / agg.n : 0;
-  const avgP95 = agg.n ? agg.p95_sum / agg.n : 0;
-  const avgP99 = agg.n ? agg.p99_sum / agg.n : 0;
+  const avgP50 = agg.lat_weight > 0 ? agg.p50_wsum / agg.lat_weight : 0;
+  const avgP95 = agg.lat_weight > 0 ? agg.p95_wsum / agg.lat_weight : 0;
+  const avgP99 = agg.lat_weight > 0 ? agg.p99_wsum / agg.lat_weight : 0;
   const totalBytes = agg.total_bytes_in + agg.total_bytes_out;
   const totalGuard = agg.total_challenges_issued + agg.total_rate_limited;
 
@@ -703,7 +730,7 @@ function renderObservabilityCharts() {
     el("cf-sub-requests").textContent = `${errPct}% errors · ${formatCompact(agg.total_errors)} 5xx`;
     el("cf-val-uv").textContent = formatCompact(agg.total_uv);
     el("cf-sub-uv").textContent =
-      agg.total_uv > 0 ? `${(agg.total_requests / agg.total_uv).toFixed(1)} req / visitor` : "HyperLogLog union";
+      agg.total_uv > 0 ? `${(agg.total_requests / agg.total_uv).toFixed(1)} req / bucket-UV` : "Sum of bucket UVs";
     el("cf-val-bandwidth").textContent = formatBytes(totalBytes);
     el("cf-sub-bandwidth").textContent = `${formatBytes(agg.total_bytes_in)} in · ${formatBytes(agg.total_bytes_out)} out`;
     el("cf-val-guard").textContent = formatCompact(totalGuard);
@@ -728,7 +755,7 @@ function renderObservabilityCharts() {
     uv: {
       unit: "",
       series: [
-        { name: "Unique Visitors (HLL)", color: "#009F6B", values: pts.map((p) => Math.round(p.uv)), area: true },
+        { name: "Bucket UV Sum (HLL)", color: "#009F6B", values: pts.map((p) => Math.round(p.uv)), area: true },
         { name: "Requests", color: "#4DA9D6", values: pts.map((p) => p.requests), dashed: true },
       ],
     },
@@ -750,9 +777,9 @@ function renderObservabilityCharts() {
     latency: {
       unit: "ms",
       series: [
-        { name: "p99", color: "#C40233", values: pts.map((p) => p.p99 / p.n), dashed: true },
-        { name: "p95", color: "#FAC800", values: pts.map((p) => p.p95 / p.n) },
-        { name: "p50", color: "#009F6B", values: pts.map((p) => p.p50 / p.n), area: true },
+        { name: "p99", color: "#C40233", values: pts.map((p) => (p.lat_weight > 0 ? p.p99_wsum / p.lat_weight : 0)), dashed: true },
+        { name: "p95", color: "#FAC800", values: pts.map((p) => (p.lat_weight > 0 ? p.p95_wsum / p.lat_weight : 0)) },
+        { name: "p50", color: "#009F6B", values: pts.map((p) => (p.lat_weight > 0 ? p.p50_wsum / p.lat_weight : 0)), area: true },
       ],
     },
   };
@@ -768,10 +795,10 @@ function renderObservabilityCharts() {
 
   // Service & Node breakdown bar charts
   const svcList = [...bySvc.values()]
-    .map((g) => ({ ...g, p95_ms: g.n ? g.p95_sum / g.n : 0 }))
+    .map((g) => ({ ...g, p95_ms: g.lat_weight > 0 ? g.p95_wsum / g.lat_weight : 0 }))
     .sort((a, b) => b.requests - a.requests);
   const nodeList = [...byNode.values()]
-    .map((g) => ({ ...g, p95_ms: g.n ? g.p95_sum / g.n : 0 }))
+    .map((g) => ({ ...g, p95_ms: g.lat_weight > 0 ? g.p95_wsum / g.lat_weight : 0 }))
     .sort((a, b) => b.requests - a.requests);
 
   renderBarList(el("obs-service-bars"), svcList, "No service traffic in selected window");
@@ -779,11 +806,12 @@ function renderObservabilityCharts() {
   renderGuardFunnel(el("obs-guard-funnel"), agg);
 
   const cleanReqs = Math.max(0, agg.total_requests - agg.total_errors - agg.total_rate_limited - agg.total_challenges_issued);
+  const cleanOrPassed = Math.min(agg.total_requests, cleanReqs + agg.total_challenges_passed);
   renderDonutChart(el("obs-outcome-donut"), {
     centerValue: formatCompact(agg.total_requests),
     centerLabel: "Requests",
     slices: [
-      { label: "Clean / Passed", value: cleanReqs + agg.total_challenges_passed, color: "#009F6B" },
+      { label: "Clean / Passed", value: cleanOrPassed, color: "#009F6B" },
       { label: "PoW Challenged", value: Math.max(0, agg.total_challenges_issued - agg.total_challenges_passed), color: "#6A5ACD" },
       { label: "Rate-Limited (429)", value: agg.total_rate_limited, color: "#FAC800" },
       { label: "Errors (5xx)", value: agg.total_errors, color: "#C40233" },
@@ -905,21 +933,22 @@ function updateOnboardingCliPreview() {
   const pre = el("enroll-cli-preview");
   if (!pre) return;
   const tag = el("enroll-tag")?.value.trim() || "node-new-1";
-  const pass = el("enroll-passphrase")?.value.trim() || "<5-word-passphrase>";
+  const pass = el("enroll-passphrase")?.value.trim() || "<one-time-passphrase>";
   const mode = el("enroll-mode")?.value || "active";
   const addr = el("enroll-addr")?.value.trim() || "0.0.0.0:10802";
+  const cfgPath = `./${tag.replace(/[^A-Za-z0-9._-]/g, "_")}.yaml`;
   if (mode === "listening") {
     pre.textContent =
       `# 1. Initialize listening node\n` +
-      `exposure init-node --tag ${tag} --output ./${tag}.yaml --listen ${addr} --ingress\n\n` +
-      `# 2. Start node with the generated one-time passphrase\n` +
-      `exposure node --config ./${tag}.yaml --passphrase "${pass}"`;
+      `exposure init-node --tag ${shellQuote(tag)} --output ${shellQuote(cfgPath)} --listen ${shellQuote(addr)} --ingress\n\n` +
+      `# 2. Start node with the generated one-time passphrase via environment variable\n` +
+      `EXPOSURE_PASSPHRASE=${shellQuote(pass)} exposure node --config ${shellQuote(cfgPath)}`;
   } else {
     pre.textContent =
       `# 1. Initialize active node pointing to bootstrap tunnel\n` +
-      `exposure init-node --tag ${tag} --output ./${tag}.yaml --bootstrap <bootstrap-ip:10802> --egress\n\n` +
+      `exposure init-node --tag ${shellQuote(tag)} --output ${shellQuote(cfgPath)} --bootstrap '<bootstrap-ip:10802>' --egress\n\n` +
       `# 2. Start node (dials bootstrap and authenticates with Control)\n` +
-      `exposure node --config ./${tag}.yaml --passphrase "${pass}"`;
+      `EXPOSURE_PASSPHRASE=${shellQuote(pass)} exposure node --config ${shellQuote(cfgPath)}`;
   }
 }
 
@@ -1049,7 +1078,7 @@ async function refreshCurrentTab(opts = {}) {
 
 function startAutoRefresh() {
   stopAutoRefresh();
-  if (state.autoRefreshMs > 0 && state.token) {
+  if (state.autoRefreshMs > 0 && state.authenticated) {
     state.refreshTimer = setInterval(() => {
       // Never disrupt active editing in topology studio
       if (state.activeTab === "topology" && topoEditor.isDirty()) return;
@@ -1087,15 +1116,16 @@ el("login-form")?.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   el("login-error").classList.add("hidden");
   try {
-    const res = await api("/api/auth/login", {
+    await api("/api/auth/login", {
       method: "POST",
+      skipLogoutOn401: true,
       body: JSON.stringify({
         username: el("login-user").value.trim(),
         password: el("login-pass").value,
       }),
     });
-    state.token = res.token;
-    localStorage.setItem("exposure_token", res.token);
+    el("login-pass").value = "";
+    state.authenticated = true;
     el("login-view").classList.add("hidden");
     el("app-view").classList.remove("hidden");
     switchTab("overview");
@@ -1110,7 +1140,7 @@ document.querySelectorAll(".nav-item").forEach((btn) => {
   btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 });
 
-el("btn-logout")?.addEventListener("click", logout);
+el("btn-logout")?.addEventListener("click", () => { logout(); });
 el("btn-refresh")?.addEventListener("click", () => refreshCurrentTab());
 
 el("btn-discover")?.addEventListener("click", async () => {
@@ -1131,15 +1161,23 @@ el("btn-pull-all")?.addEventListener("click", async () => {
 
 // Ctrl+S shortcut inside Topology Studio
 window.addEventListener("keydown", (ev) => {
-  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s" && state.activeTab === "topology" && state.token) {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s" && state.activeTab === "topology" && state.authenticated) {
     ev.preventDefault();
     saveTopologyNow(false);
   }
 });
 
-if (state.token) {
-  el("login-view").classList.add("hidden");
-  el("app-view").classList.remove("hidden");
-  switchTab("overview");
-  startAutoRefresh();
+async function bootstrapSession() {
+  try {
+    await api("/api/auth/me", { method: "GET", skipLogoutOn401: true });
+    state.authenticated = true;
+    el("login-view").classList.add("hidden");
+    el("app-view").classList.remove("hidden");
+    switchTab("overview");
+    startAutoRefresh();
+  } catch {
+    resetToLogin();
+  }
 }
+
+bootstrapSession();

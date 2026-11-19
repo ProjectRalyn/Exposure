@@ -1,20 +1,26 @@
+use std::collections::HashMap;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chrono::Utc;
 use dashmap::DashMap;
-use exposure_core::config::{BackendProtocol, EgressConfig, EgressServiceConfig};
+use exposure_core::config::{BackendProtocol, EgressConfig, EgressServiceConfig, TrustedOrigin};
+use exposure_core::crypto::verify_signature_b64;
 use exposure_core::protocol::ServiceStreamHeader;
 use exposure_core::{ExposureError, Result};
-use http::{header, Request, Response, StatusCode};
+use http::header::HeaderName;
+use http::{header, HeaderMap, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -22,6 +28,9 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::logger::NodeLogger;
+
+const ORIGIN_SIG_MAX_SKEW_SECS: u64 = 120;
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -31,35 +40,89 @@ pub fn full_body(data: impl Into<Bytes>) -> ProxyBody {
         .boxed()
 }
 
+/// Strip RFC 9110 static + dynamic `Connection`-listed hop-by-hop headers (and invalid `TE` for H2).
+pub fn strip_hop_by_hop_headers(headers: &mut HeaderMap, for_h2: bool, preserve_upgrade: bool) {
+    let mut dynamic_names: Vec<HeaderName> = Vec::new();
+    for val in headers.get_all(header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            for token in s.split(',') {
+                let t = token.trim();
+                if preserve_upgrade && t.eq_ignore_ascii_case("upgrade") {
+                    continue;
+                }
+                if let Ok(name) = HeaderName::from_bytes(t.as_bytes()) {
+                    dynamic_names.push(name);
+                }
+            }
+        }
+    }
+    for name in dynamic_names {
+        headers.remove(&name);
+    }
+    if !preserve_upgrade {
+        headers.remove(header::CONNECTION);
+        headers.remove(header::UPGRADE);
+    }
+    headers.remove("keep-alive");
+    headers.remove("proxy-connection");
+    headers.remove(header::PROXY_AUTHENTICATE);
+    headers.remove(header::PROXY_AUTHORIZATION);
+    if for_h2 {
+        headers.remove(header::TRANSFER_ENCODING);
+        let valid_te = headers
+            .get(header::TE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().eq_ignore_ascii_case("trailers"))
+            .unwrap_or(false);
+        if !valid_te {
+            headers.remove(header::TE);
+        }
+    }
+}
+
 /// Egress role runtime (DESIGN.md §3.3 & §8):
 /// - Resolves `ServiceTag -> backend`
-/// - Enforces `allow_from` ACL against `origin_node_tag` (default deny unless `allow_any_origin`)
-/// - Proxies HTTP/1.1, HTTP/2 (h2c/h2), and WebSocket upgrades
-/// - Runs optional active health checks strictly for local backends
+/// - Enforces cryptographically authenticated `allow_from` ACL against `origin_node_tag` (default deny)
+/// - Verifies backend TLS certificates by default (with optional custom CA or explicit `insecure_skip_verify`)
+/// - Proxies HTTP/1.1, HTTP/2 (`h2c`/`h2`), and WebSocket upgrades
+/// - Runs optional active TCP/HTTP health checks strictly for local backends
 pub struct EgressHandler {
     node_tag: String,
     cfg: Arc<RwLock<EgressConfig>>,
+    trusted_origins: Arc<RwLock<HashMap<String, String>>>,
     logger: Arc<NodeLogger>,
     /// Local backend health status (true = healthy, false = unhealthy).
     local_health: Arc<DashMap<String, bool>>,
+    last_hc_run: Arc<DashMap<String, Instant>>,
 }
 
 impl EgressHandler {
     pub fn new(
         node_tag: impl Into<String>,
         cfg: EgressConfig,
+        trusted_origins: Vec<TrustedOrigin>,
         logger: Arc<NodeLogger>,
     ) -> Arc<Self> {
+        let origin_map = trusted_origins
+            .into_iter()
+            .map(|o| (o.node_tag, o.public_key))
+            .collect();
         Arc::new(Self {
             node_tag: node_tag.into(),
             cfg: Arc::new(RwLock::new(cfg)),
+            trusted_origins: Arc::new(RwLock::new(origin_map)),
             logger,
             local_health: Arc::new(DashMap::new()),
+            last_hc_run: Arc::new(DashMap::new()),
         })
     }
 
-    pub async fn update_config(&self, cfg: EgressConfig) {
+    pub async fn update_config(&self, cfg: EgressConfig, trusted_origins: Vec<TrustedOrigin>) {
         *self.cfg.write().await = cfg;
+        *self.trusted_origins.write().await = trusted_origins
+            .into_iter()
+            .map(|o| (o.node_tag, o.public_key))
+            .collect();
     }
 
     pub async fn has_service(&self, service_tag: &str) -> bool {
@@ -77,18 +140,48 @@ impl EgressHandler {
     pub fn spawn_local_health_checks(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let hc_client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_default();
             loop {
                 let services = this.cfg.read().await.services.clone();
+                let now = Instant::now();
                 for (tag, svc) in services {
                     if let Some(ref hc) = svc.local_health_check {
                         if !hc.enabled {
                             continue;
                         }
-                        let timeout = Duration::from_millis(hc.timeout_ms);
-                        let healthy = matches!(
-                            tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await,
-                            Ok(Ok(_))
-                        );
+                        let interval = Duration::from_secs(hc.interval_secs.max(1));
+                        let due = this
+                            .last_hc_run
+                            .get(&tag)
+                            .map(|last| now.duration_since(*last) >= interval)
+                            .unwrap_or(true);
+                        if !due {
+                            continue;
+                        }
+                        this.last_hc_run.insert(tag.clone(), now);
+
+                        let timeout = Duration::from_millis(hc.timeout_ms.max(200));
+                        let healthy = if let Some(ref http_path) = hc.http_path {
+                            let scheme = if svc.tls { "https" } else { "http" };
+                            let path = if http_path.starts_with('/') {
+                                http_path.as_str()
+                            } else {
+                                "/"
+                            };
+                            let url = format!("{scheme}://{}{path}", svc.backend);
+                            matches!(
+                                hc_client.get(&url).timeout(timeout).send().await,
+                                Ok(r) if r.status().as_u16() < 500
+                            )
+                        } else {
+                            matches!(
+                                tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await,
+                                Ok(Ok(_))
+                            )
+                        };
                         let prev = this.local_health.insert(tag.clone(), healthy);
                         if !healthy && prev != Some(false) {
                             let msg = format!(
@@ -100,15 +193,75 @@ impl EgressHandler {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Verify cryptographic origin authenticity for `ServiceStreamHeader`.
+    async fn verify_origin_authenticity(
+        &self,
+        header: &ServiceStreamHeader,
+        authenticated_peer_tag: Option<&str>,
+    ) -> Result<()> {
+        // Co-located local duplex pipe from this same node
+        if authenticated_peer_tag == Some(self.node_tag.as_str())
+            && header.origin_node_tag == self.node_tag
+        {
+            return Ok(());
+        }
+        // Direct 1-hop stream: the authenticated Noise+Ed25519 link peer MUST equal origin_node_tag
+        if header.hop_count == 0 {
+            match authenticated_peer_tag {
+                Some(peer) if peer == header.origin_node_tag => return Ok(()),
+                other => {
+                    return Err(ExposureError::AccessDenied(format!(
+                        "egress {} rejected spoofed direct origin_node_tag={} from authenticated peer {:?}",
+                        self.node_tag, header.origin_node_tag, other
+                    )));
+                }
+            }
+        }
+        // Multi-hop stream via relays: verify origin's Ed25519 signature against trusted_origins
+        let origins = self.trusted_origins.read().await;
+        let origin_pk = origins.get(&header.origin_node_tag).ok_or_else(|| {
+            ExposureError::AccessDenied(format!(
+                "egress {} has no trusted public key for multi-hop origin {}",
+                self.node_tag, header.origin_node_tag
+            ))
+        })?;
+        let sig = header.origin_signature.as_deref().ok_or_else(|| {
+            ExposureError::AccessDenied(format!(
+                "egress {} rejected unsigned multi-hop stream from origin {}",
+                self.node_tag, header.origin_node_tag
+            ))
+        })?;
+        let now = Utc::now().timestamp();
+        if now.abs_diff(header.timestamp) > ORIGIN_SIG_MAX_SKEW_SECS {
+            return Err(ExposureError::AccessDenied(format!(
+                "egress {} rejected stale origin signature from {}",
+                self.node_tag, header.origin_node_tag
+            )));
+        }
+        let signing = ServiceStreamHeader::origin_signing_bytes(
+            &header.service_tag,
+            &header.origin_node_tag,
+            &header.request_id,
+            header.timestamp,
+        );
+        verify_signature_b64(origin_pk, &signing, sig).map_err(|_| {
+            ExposureError::AccessDenied(format!(
+                "egress {} invalid origin signature for origin {}",
+                self.node_tag, header.origin_node_tag
+            ))
+        })
     }
 
     /// Handle an incoming L7 service stream (from remote Yamux OR local duplex pipe).
     pub async fn handle_stream<S>(
         self: &Arc<Self>,
         header: ServiceStreamHeader,
+        authenticated_peer_tag: Option<String>,
         stream: S,
     ) -> Result<()>
     where
@@ -133,16 +286,28 @@ impl EgressHandler {
         };
 
         // Enforce origin Node Tag ACL (default deny unless explicitly allowed or allow_any_origin)
-        if !svc.allow_any_origin
-            && !svc.allow_from.iter().any(|allowed| allowed == &header.origin_node_tag)
-        {
-            let msg = format!(
-                "egress {} ACL denied service={} from origin={}",
-                self.node_tag, header.service_tag, header.origin_node_tag
-            );
-            warn!("{msg}");
-            self.logger.emit_alert("warn", msg.clone()).await;
-            return Err(ExposureError::AccessDenied(msg));
+        if !svc.allow_any_origin {
+            if !svc
+                .allow_from
+                .iter()
+                .any(|allowed| allowed == &header.origin_node_tag)
+            {
+                let msg = format!(
+                    "egress {} ACL denied service={} from origin={}",
+                    self.node_tag, header.service_tag, header.origin_node_tag
+                );
+                warn!("{msg}");
+                self.logger.emit_alert("warn", msg.clone()).await;
+                return Err(ExposureError::AccessDenied(msg));
+            }
+            if let Err(e) = self
+                .verify_origin_authenticity(&header, authenticated_peer_tag.as_deref())
+                .await
+            {
+                warn!("{e}");
+                self.logger.emit_alert("warn", e.to_string()).await;
+                return Err(e);
+            }
         }
 
         let this = Arc::clone(self);
@@ -173,10 +338,24 @@ impl EgressHandler {
         let start = Instant::now();
         let client_ip = hdr.client_ip.as_deref().unwrap_or("0.0.0.0");
 
-        let is_upgrade = req
+        if !self.is_local_backend_healthy(&hdr.service_tag) {
+            return self
+                .build_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service Unavailable",
+                    "The upstream backend failed local health checks.",
+                    svc.intercept_errors,
+                );
+        }
+
+        let req_bytes_in = req
             .headers()
-            .get(header::UPGRADE)
-            .is_some();
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| req.body().size_hint().lower());
+
+        let is_upgrade = req.headers().get(header::UPGRADE).is_some();
 
         let timeout = Duration::from_millis(svc.timeout_ms.max(1000));
         let tcp = match tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await {
@@ -198,7 +377,7 @@ impl EgressHandler {
                         client_ip,
                         502,
                         start.elapsed().as_secs_f64() * 1000.0,
-                        0,
+                        req_bytes_in,
                         0,
                         false,
                         false,
@@ -206,10 +385,12 @@ impl EgressHandler {
                         Some(msg),
                     )
                     .await;
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full_body("Bad Gateway: backend connect failed"))
-                    .unwrap();
+                return self.build_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "Bad Gateway",
+                    "Could not connect to the upstream server.",
+                    svc.intercept_errors,
+                );
             }
             Err(_) => {
                 let msg = format!(
@@ -225,7 +406,7 @@ impl EgressHandler {
                         client_ip,
                         504,
                         start.elapsed().as_secs_f64() * 1000.0,
-                        0,
+                        req_bytes_in,
                         0,
                         false,
                         false,
@@ -233,26 +414,12 @@ impl EgressHandler {
                         Some(msg),
                     )
                     .await;
-                if svc.intercept_errors {
-                    let ray_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-                    let html = exposure_core::assets::render_exposure_error_html(
-                        504,
-                        "Gateway Timeout",
-                        "The upstream server did not respond in time.",
-                        &ray_id,
-                        None,
-                    );
-                    return Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
-                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                        .header(header::CACHE_CONTROL, "no-store")
-                        .body(full_body(html))
-                        .unwrap();
-                }
-                return Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(full_body("Gateway Timeout"))
-                    .unwrap();
+                return self.build_error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Gateway Timeout",
+                    "The upstream server did not respond in time.",
+                    svc.intercept_errors,
+                );
             }
         };
 
@@ -264,21 +431,36 @@ impl EgressHandler {
         }
 
         let use_h2 = svc.protocol == BackendProtocol::H2
-            || (svc.protocol == BackendProtocol::Auto && req.version() == http::Version::HTTP_2 && !is_upgrade);
+            || (svc.protocol == BackendProtocol::Auto
+                && req.version() == http::Version::HTTP_2
+                && !is_upgrade);
 
-        let resp_res: std::result::Result<Response<ProxyBody>, String> = if svc.tls {
-            match connect_backend_tls(tcp, &svc.backend, use_h2).await {
-                Ok(tls_stream) => forward_http_stream(tls_stream, req, use_h2, is_upgrade, timeout).await,
-                Err(e) => Err(e),
+        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.tls {
+            match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, use_h2)).await {
+                Ok(Ok(tls_stream)) => {
+                    forward_http_stream(tls_stream, req, use_h2, is_upgrade, svc.tls, &svc.backend, timeout)
+                        .await
+                }
+                Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
+                Err(_) => Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("tls handshake timeout with backend {}", svc.backend),
+                )),
             }
         } else {
-            forward_http_stream(tcp, req, use_h2, is_upgrade, timeout).await
+            forward_http_stream(tcp, req, use_h2, is_upgrade, false, &svc.backend, timeout).await
         };
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match resp_res {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                let resp_bytes_out = resp
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or_else(|| resp.body().size_hint().lower());
                 self.logger
                     .record_session(
                         "egress",
@@ -286,8 +468,8 @@ impl EgressHandler {
                         client_ip,
                         status,
                         elapsed_ms,
-                        0,
-                        0,
+                        req_bytes_in,
+                        resp_bytes_out,
                         false,
                         false,
                         false,
@@ -300,7 +482,7 @@ impl EgressHandler {
                     .await;
                 resp
             }
-            Err(err_msg) => {
+            Err((err_status, err_msg)) => {
                 warn!(service = %hdr.service_tag, backend = %svc.backend, error = %err_msg, "egress request failed");
                 self.logger.emit_alert("error", err_msg.clone()).await;
                 self.logger
@@ -308,38 +490,53 @@ impl EgressHandler {
                         "egress",
                         &hdr.service_tag,
                         client_ip,
-                        502,
+                        err_status.as_u16(),
                         elapsed_ms,
+                        req_bytes_in,
                         0,
-                        0,
                         false,
                         false,
                         false,
-                        Some(err_msg.clone()),
+                        Some(err_msg),
                     )
                     .await;
-                if svc.intercept_errors {
-                    let ray_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-                    let html = exposure_core::assets::render_exposure_error_html(
-                        504,
-                        "Gateway Timeout",
-                        "The upstream server is temporarily unavailable.",
-                        &ray_id,
-                        None,
-                    );
-                    return Response::builder()
-                        .status(StatusCode::GATEWAY_TIMEOUT)
-                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                        .header(header::CACHE_CONTROL, "no-store")
-                        .body(full_body(html))
-                        .unwrap();
-                }
-                Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(full_body("504 Gateway Time-out"))
-                    .unwrap()
+                let (title, detail) = if err_status == StatusCode::GATEWAY_TIMEOUT {
+                    ("Gateway Timeout", "The upstream server did not respond in time.")
+                } else {
+                    ("Bad Gateway", "The upstream server is temporarily unavailable.")
+                };
+                self.build_error_response(err_status, title, detail, svc.intercept_errors)
             }
         }
+    }
+
+    fn build_error_response(
+        &self,
+        status: StatusCode,
+        title: &str,
+        detail: &str,
+        intercept: bool,
+    ) -> Response<ProxyBody> {
+        if intercept {
+            let ray_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+            let html = exposure_core::assets::render_exposure_error_html(
+                status.as_u16(),
+                title,
+                detail,
+                &ray_id,
+                None,
+            );
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(full_body(html))
+                .unwrap();
+        }
+        Response::builder()
+            .status(status)
+            .body(full_body(format!("{} {title}", status.as_u16())))
+            .unwrap()
     }
 }
 
@@ -348,46 +545,72 @@ async fn forward_http_stream<S>(
     mut req: Request<Incoming>,
     use_h2: bool,
     is_upgrade: bool,
+    use_tls: bool,
+    backend_addr: &str,
     timeout: Duration,
-) -> std::result::Result<Response<ProxyBody>, String>
+) -> std::result::Result<Response<ProxyBody>, (StatusCode, String)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if use_h2 {
         *req.version_mut() = http::Version::HTTP_2;
-        req.headers_mut().remove(header::CONNECTION);
-        req.headers_mut().remove("keep-alive");
-        req.headers_mut().remove("proxy-connection");
-        req.headers_mut().remove(header::TRANSFER_ENCODING);
-        req.headers_mut().remove(header::UPGRADE);
+        strip_hop_by_hop_headers(req.headers_mut(), true, false);
+        // Ensure :scheme and :authority are populated when upgrading HTTP/1.1 -> H2
+        if req.uri().scheme().is_none() || req.uri().authority().is_none() {
+            let authority = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(backend_addr)
+                .to_string();
+            let path_q = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
+            let scheme = if use_tls { "https" } else { "http" };
+            if let Ok(new_uri) = format!("{scheme}://{authority}{path_q}").parse() {
+                *req.uri_mut() = new_uri;
+            }
+        }
 
-        match hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)).await {
-            Ok((mut sender, conn)) => {
+        let hs = tokio::time::timeout(
+            timeout,
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
+        )
+        .await;
+        match hs {
+            Ok(Ok((mut sender, conn))) => {
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
                 match tokio::time::timeout(timeout, sender.send_request(req)).await {
                     Ok(Ok(resp)) => Ok(resp.map(|b| b.boxed())),
-                    Ok(Err(e)) => Err(format!("h2 upstream error: {e}")),
-                    Err(_) => Err("h2 upstream timeout".into()),
+                    Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("h2 upstream error: {e}"))),
+                    Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "h2 upstream timeout".into())),
                 }
             }
-            Err(e) => Err(format!("h2 handshake failed: {e}")),
+            Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("h2 handshake failed: {e}"))),
+            Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "h2 handshake timeout".into())),
         }
     } else {
         *req.version_mut() = http::Version::HTTP_11;
+        strip_hop_by_hop_headers(req.headers_mut(), false, is_upgrade);
         let client_upgrade = if is_upgrade {
             Some(hyper::upgrade::on(&mut req))
         } else {
             None
         };
 
-        match hyper::client::conn::http1::Builder::new()
-            .preserve_header_case(true)
-            .handshake(TokioIo::new(stream))
-            .await
-        {
-            Ok((mut sender, conn)) => {
+        let hs = tokio::time::timeout(
+            timeout,
+            hyper::client::conn::http1::Builder::new()
+                .preserve_header_case(true)
+                .handshake(TokioIo::new(stream)),
+        )
+        .await;
+        match hs {
+            Ok(Ok((mut sender, conn))) => {
                 tokio::spawn(async move {
                     let _ = conn.with_upgrades().await;
                 });
@@ -400,9 +623,9 @@ where
                                     if let Ok((u_in, u_out)) = tokio::try_join!(in_upg, out_upg) {
                                         let mut io_in = TokioIo::new(u_in);
                                         let mut io_out = TokioIo::new(u_out);
-                                        let _ = tokio::io::copy_bidirectional(
-                                            &mut io_in,
-                                            &mut io_out,
+                                        let _ = tokio::time::timeout(
+                                            WS_IDLE_TIMEOUT,
+                                            tokio::io::copy_bidirectional(&mut io_in, &mut io_out),
                                         )
                                         .await;
                                     }
@@ -411,49 +634,86 @@ where
                         }
                         Ok(resp.map(|b| b.boxed()))
                     }
-                    Ok(Err(e)) => Err(format!("http1 upstream error: {e}")),
-                    Err(_) => Err("http1 upstream timeout".into()),
+                    Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("http1 upstream error: {e}"))),
+                    Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "http1 upstream timeout".into())),
                 }
             }
-            Err(e) => Err(format!("http1 handshake failed: {e}")),
+            Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("http1 handshake failed: {e}"))),
+            Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "http1 handshake timeout".into())),
         }
     }
 }
 
 async fn connect_backend_tls(
     tcp: TcpStream,
-    backend_addr: &str,
+    svc: &EgressServiceConfig,
     use_h2: bool,
 ) -> std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoBackendCertVerifier))
-        .with_no_client_auth();
+
+    let mut cfg = if svc.insecure_skip_verify {
+        let algos = rustls::crypto::ring::default_provider().signature_verification_algorithms;
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureBackendCertVerifier { algos }))
+            .with_no_client_auth()
+    } else {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if let Some(ref ca_path) = svc.ca_cert_path {
+            if !ca_path.trim().is_empty() {
+                let ca_bytes = std::fs::read(ca_path)
+                    .map_err(|e| format!("read backend ca_cert_path '{ca_path}': {e}"))?;
+                let mut reader = BufReader::new(&ca_bytes[..]);
+                let mut added = 0usize;
+                for cert in rustls_pemfile::certs(&mut reader) {
+                    let cert =
+                        cert.map_err(|e| format!("parse backend CA cert '{ca_path}': {e}"))?;
+                    root_store
+                        .add(cert)
+                        .map_err(|e| format!("add backend CA cert '{ca_path}': {e}"))?;
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err(format!("no valid CA certificates found in '{ca_path}'"));
+                }
+            }
+        }
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+
     cfg.alpn_protocols = if use_h2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
         vec![b"http/1.1".to_vec()]
     };
 
-    let host = backend_addr
+    let host = svc
+        .backend
         .rsplit_once(':')
         .map(|(h, _)| h)
-        .unwrap_or(backend_addr)
+        .unwrap_or(&svc.backend)
         .trim_matches(|c| c == '[' || c == ']');
     let server_name = ServerName::try_from(host.to_string())
-        .unwrap_or_else(|_| ServerName::try_from("localhost".to_string()).unwrap());
+        .map_err(|e| format!("invalid backend TLS server name '{host}': {e}"))?;
 
     TlsConnector::from(Arc::new(cfg))
         .connect(server_name, tcp)
         .await
-        .map_err(|e| format!("tls handshake with backend {backend_addr} failed: {e}"))
+        .map_err(|e| format!("tls handshake with backend {} failed: {e}", svc.backend))
 }
 
+/// Explicit opt-in verifier for `insecure_skip_verify: true`:
+/// Skips server certificate chain/hostname validation ONLY, while STILL cryptographically verifying
+/// TLS 1.2 & TLS 1.3 handshake signatures against the presented certificate's public key!
 #[derive(Debug)]
-struct NoBackendCertVerifier;
+struct InsecureBackendCertVerifier {
+    algos: WebPkiSupportedAlgorithms,
+}
 
-impl ServerCertVerifier for NoBackendCertVerifier {
+impl ServerCertVerifier for InsecureBackendCertVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &CertificateDer<'_>,
@@ -467,33 +727,23 @@ impl ServerCertVerifier for NoBackendCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls12_signature(message, cert, dss, &self.algos)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls13_signature(message, cert, dss, &self.algos)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-        ]
+        self.algos.supported_schemes()
     }
 }

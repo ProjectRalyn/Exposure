@@ -53,6 +53,15 @@ function esc(v) {
   }[c]));
 }
 
+function safeColor(c, fallback = "#4DA9D6") {
+  return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : fallback;
+}
+
+function finiteVal(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 function smoothPath(pts) {
   if (pts.length === 0) return "";
   if (pts.length === 1) return `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
@@ -96,8 +105,13 @@ export function renderAreaLineChart(
   const plotW = W - padL - padR;
   const plotH = H - padT - padB;
 
-  const allVals = series.flatMap((s) => s.values);
-  const rawMax = Math.max(1, ...allVals);
+  let rawMax = 1;
+  for (const s of series) {
+    for (const v of s.values) {
+      const fv = finiteVal(v);
+      if (fv > rawMax) rawMax = fv;
+    }
+  }
   const yMax = niceMax(rawMax);
   const ticks = 4;
 
@@ -106,7 +120,7 @@ export function renderAreaLineChart(
     isSparse
       ? padL + ((i + 0.5) / labels.length) * plotW
       : padL + (i / (labels.length - 1)) * plotW;
-  const yAt = (v) => padT + plotH - (Math.max(0, v) / yMax) * plotH;
+  const yAt = (v) => padT + plotH - (finiteVal(v) / yMax) * plotH;
 
   const uid = `cg_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -143,7 +157,8 @@ export function renderAreaLineChart(
       const centerX = xAt(li);
       const startX = centerX - totalGroup / 2;
       series.forEach((s, si) => {
-        const v = Number(s.values[li]) || 0;
+        const color = safeColor(s.color);
+        const v = finiteVal(s.values[li]);
         const bx = startX + si * (barW + 6);
         const by = yAt(v);
         const bh = Math.max(v > 0 ? 4 : 0, padT + plotH - by);
@@ -151,8 +166,8 @@ export function renderAreaLineChart(
         if (li === 0) {
           defs += `
             <linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="${s.color}" stop-opacity="0.92" />
-              <stop offset="100%" stop-color="${s.color}" stop-opacity="0.35" />
+              <stop offset="0%" stop-color="${color}" stop-opacity="0.92" />
+              <stop offset="100%" stop-color="${color}" stop-opacity="0.35" />
             </linearGradient>`;
         }
         pathsSvg += `<rect x="${bx.toFixed(1)}" y="${(padT + plotH - bh).toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="5" fill="url(#${gid})" />`;
@@ -163,28 +178,29 @@ export function renderAreaLineChart(
               : unit === "bytes"
               ? formatBytes(v)
               : formatCompact(v);
-          pathsSvg += `<text x="${(bx + barW / 2).toFixed(1)}" y="${(padT + plotH - bh - 5).toFixed(1)}" text-anchor="middle" class="chart-axis-text" fill="${s.color}">${esc(fv)}</text>`;
+          pathsSvg += `<text x="${(bx + barW / 2).toFixed(1)}" y="${(padT + plotH - bh - 5).toFixed(1)}" text-anchor="middle" class="chart-axis-text" fill="${color}">${esc(fv)}</text>`;
         }
       });
     });
   } else {
     series.forEach((s, si) => {
+      const color = safeColor(s.color);
       const pts = s.values.map((v, i) => ({ x: xAt(i), y: yAt(v) }));
       const lineD = smoothPath(pts);
       const gid = `${uid}_${si}`;
       if (s.area) {
         defs += `
           <linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="${s.color}" stop-opacity="0.34" />
-            <stop offset="100%" stop-color="${s.color}" stop-opacity="0.02" />
+            <stop offset="0%" stop-color="${color}" stop-opacity="0.34" />
+            <stop offset="100%" stop-color="${color}" stop-opacity="0.02" />
           </linearGradient>`;
         const areaD = `${lineD} L ${pts[pts.length - 1].x.toFixed(1)} ${(padT + plotH).toFixed(1)} L ${pts[0].x.toFixed(1)} ${(padT + plotH).toFixed(1)} Z`;
         pathsSvg += `<path d="${areaD}" fill="url(#${gid})" />`;
       }
-      pathsSvg += `<path d="${lineD}" fill="none" stroke="${s.color}" stroke-width="2.2" ${s.dashed ? 'stroke-dasharray="5 4"' : ""} stroke-linecap="round" />`;
+      pathsSvg += `<path d="${lineD}" fill="none" stroke="${color}" stroke-width="2.2" ${s.dashed ? 'stroke-dasharray="5 4"' : ""} stroke-linecap="round" />`;
       if (pts.length <= 28) {
         pts.forEach((p) => {
-          pathsSvg += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.8" fill="${s.color}" opacity="0.9" />`;
+          pathsSvg += `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.8" fill="${color}" opacity="0.9" />`;
         });
       }
     });
@@ -193,7 +209,7 @@ export function renderAreaLineChart(
   const legendHtml = series
     .map(
       (s) =>
-        `<span class="chart-legend-item"><i style="background:${s.color}"></i>${esc(s.name)}</span>`
+        `<span class="chart-legend-item"><i style="background:${safeColor(s.color)}"></i>${esc(s.name)}</span>`
     )
     .join("");
 
@@ -220,6 +236,7 @@ export function renderAreaLineChart(
 
   hit.addEventListener("mousemove", (ev) => {
     const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
     const relX = ((ev.clientX - rect.left) / rect.width) * W;
     const ratio = Math.max(0, Math.min(1, (relX - padL) / plotW));
     const idx = isSparse
@@ -232,14 +249,14 @@ export function renderAreaLineChart(
 
     const rows = series
       .map((s) => {
-        const v = s.values[idx] ?? 0;
+        const v = finiteVal(s.values[idx]);
         const fv =
           unit === "ms"
-            ? `${Number(v).toFixed(1)} ms`
+            ? `${v.toFixed(1)} ms`
             : unit === "bytes"
             ? formatBytes(v)
             : formatCompact(v);
-        return `<div class="tt-row"><span><i style="background:${s.color}"></i>${esc(s.name)}</span><strong>${esc(fv)}</strong></div>`;
+        return `<div class="tt-row"><span><i style="background:${safeColor(s.color)}"></i>${esc(s.name)}</span><strong>${esc(fv)}</strong></div>`;
       })
       .join("");
     tooltip.innerHTML = `<div class="tt-title">${esc(labels[idx])}</div>${rows}`;
@@ -287,7 +304,7 @@ export function renderDonutChart(container, { slices = [], centerValue = "0", ce
       if (val <= 0) continue;
       const frac = val / total;
       const dash = frac * c;
-      rings += `<circle cx="64" cy="64" r="${r}" fill="none" stroke="${s.color}" stroke-width="12"
+      rings += `<circle cx="64" cy="64" r="${r}" fill="none" stroke="${safeColor(s.color)}" stroke-width="12"
         stroke-dasharray="${dash.toFixed(2)} ${(c - dash).toFixed(2)}"
         stroke-dashoffset="${(-offset).toFixed(2)}"
         transform="rotate(-90 64 64)" />`;
@@ -300,7 +317,7 @@ export function renderDonutChart(container, { slices = [], centerValue = "0", ce
       const pct = total > 0 ? Math.round(((Number(s.value) || 0) / total) * 100) : 0;
       return `
         <div class="donut-legend-row">
-          <span class="donut-legend-name"><i style="background:${s.color}"></i>${esc(s.label)}</span>
+          <span class="donut-legend-name"><i style="background:${safeColor(s.color)}"></i>${esc(s.label)}</span>
           <span class="donut-legend-val">${esc(s.value)} <small>(${pct}%)</small></span>
         </div>`;
     })
@@ -327,14 +344,19 @@ export function renderBarList(container, items = [], emptyText = "No traffic rec
     container.innerHTML = `<div class="chart-empty">${esc(emptyText)}</div>`;
     return;
   }
-  const totalReqs = Math.max(1, items.reduce((a, i) => a + (Number(i.requests) || 0), 0));
-  const maxVal = Math.max(1, ...items.map((i) => Number(i.requests) || 0));
+  const totalReqs = Math.max(1, items.reduce((a, i) => a + finiteVal(i.requests), 0));
+  let maxVal = 1;
+  for (const it of items) {
+    const r = finiteVal(it.requests);
+    if (r > maxVal) maxVal = r;
+  }
   container.innerHTML = `<div class="bar-list">${items
     .slice(0, 8)
     .map((it) => {
       const label = it.service_tag || it.node_tag || it.label || "-";
-      const req = Number(it.requests) || 0;
-      const err = Number(it.errors) || 0;
+      const req = finiteVal(it.requests);
+      const err = finiteVal(it.errors);
+      const p95 = finiteVal(it.p95_ms);
       const pct = Math.max(4, Math.round((req / maxVal) * 100));
       const share = ((req / totalReqs) * 100).toFixed(1);
       const errRate = req > 0 ? ((err / req) * 100).toFixed(1) : "0.0";
@@ -346,7 +368,7 @@ export function renderBarList(container, items = [], emptyText = "No traffic rec
             <span class="bar-item-metrics">
               <strong>${formatCompact(req)}</strong> req
               · <span class="pill ${errCls}">${errRate}% err</span>
-              · <span class="muted">p95 ${(it.p95_ms || 0).toFixed(1)}ms</span>
+              · <span class="muted">p95 ${p95.toFixed(1)}ms</span>
             </span>
           </div>
           <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
@@ -360,16 +382,17 @@ export function renderBarList(container, items = [], emptyText = "No traffic rec
  */
 export function renderGuardFunnel(container, traffic) {
   if (!container) return;
-  const total = Number(traffic?.total_requests) || 0;
-  const rl = Number(traffic?.total_rate_limited) || 0;
-  const chIssued = Number(traffic?.total_challenges_issued) || 0;
-  const chPassed = Number(traffic?.total_challenges_passed) || 0;
-  const errors = Number(traffic?.total_errors) || 0;
+  const total = finiteVal(traffic?.total_requests);
+  const rl = finiteVal(traffic?.total_rate_limited);
+  const chIssued = finiteVal(traffic?.total_challenges_issued);
+  const chPassed = finiteVal(traffic?.total_challenges_passed);
+  const errors = finiteVal(traffic?.total_errors);
   const clean = Math.max(0, total - rl - chIssued - errors);
+  const cleanOrPassed = Math.min(total, clean + chPassed);
 
   const stages = [
     { label: "Total Requests", val: total, color: "#4DA9D6" },
-    { label: "Clean / Passed", val: clean + chPassed, color: "#009F6B" },
+    { label: "Clean / Passed", val: cleanOrPassed, color: "#009F6B" },
     { label: "PoW Challenged", val: chIssued, color: "#6A5ACD" },
     { label: "PoW Cleared", val: chPassed, color: "#00A3B8" },
     { label: "Rate-Limited (429)", val: rl, color: "#FAC800" },
@@ -384,7 +407,7 @@ export function renderGuardFunnel(container, traffic) {
         <div class="funnel-row">
           <div class="funnel-lbl">${esc(s.label)}</div>
           <div class="funnel-track">
-            <div class="funnel-bar" style="width:${Math.max(s.val > 0 ? 3 : 0, pct).toFixed(1)}%;background:${s.color}"></div>
+            <div class="funnel-bar" style="width:${Math.max(s.val > 0 ? 3 : 0, pct).toFixed(1)}%;background:${safeColor(s.color)}"></div>
           </div>
           <div class="funnel-val">${formatCompact(s.val)} <small>${pct.toFixed(1)}%</small></div>
         </div>`;
@@ -454,8 +477,8 @@ export function renderMiniTopo(container, { spec, liveNodes = [], liveLinks = []
     const mx = (a.x + b.x) / 2;
     const my = (a.y + b.y) / 2 - 12;
     edgesSvg += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none" stroke="${stroke}" stroke-width="2" ${dash} opacity="0.85" />`;
-    if (h?.rtt_ms != null) {
-      edgesSvg += `<text x="${mx}" y="${my - 2}" text-anchor="middle" class="mini-edge-lbl">${h.rtt_ms}ms</text>`;
+    if (h?.rtt_ms != null && Number.isFinite(Number(h.rtt_ms))) {
+      edgesSvg += `<text x="${mx}" y="${my - 2}" text-anchor="middle" class="mini-edge-lbl">${esc(Math.round(Number(h.rtt_ms)))}ms</text>`;
     }
   });
 
