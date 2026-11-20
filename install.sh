@@ -16,11 +16,15 @@ ROLE=""                 # node | control | binary-only
 BIN_SRC=""              # local binary path
 DOWNLOAD_URL=""         # remote HTTPS binary URL
 DOWNLOAD_SHA256=""      # optional expected SHA-256 hex digest for --url
+GITHUB_REPO="${EXPOSURE_GITHUB_REPO:-ProjectRalyn/Exposure}"
+RELEASE_VERSION="${EXPOSURE_VERSION:-latest}"
+NON_INTERACTIVE=false
 FORCE_INIT=false
 START_SERVICE=true
 UNINSTALL=false
 PURGE=false
 TMP_BIN=""
+TMP_SHA=""
 
 # Node options
 NODE_TAG=""
@@ -32,6 +36,8 @@ NODE_RELAY=false
 NODE_MAINTAINER=false
 CUSTOM_CONFIG=""
 NODE_CONFIG=""
+NODE_ROLES_EXPLICIT=false
+NODE_PROMPT_DONE=false
 
 # Control options
 CONTROL_ID="control-1"
@@ -59,6 +65,9 @@ cleanup_tmp() {
     if [[ -n "${TMP_BIN:-}" && -f "$TMP_BIN" ]]; then
         rm -f -- "$TMP_BIN"
     fi
+    if [[ -n "${TMP_SHA:-}" && -f "$TMP_SHA" ]]; then
+        rm -f -- "$TMP_SHA"
+    fi
 }
 trap cleanup_tmp EXIT
 
@@ -71,15 +80,18 @@ Usage:
 
 General Options:
   --role <node|control|binary-only>
-                          Component role to install/configure (default: binary-only)
-  --bin <path>            Path to local exposure binary (auto-detected if omitted)
-  --url <https-url>       Download HTTPS URL for exposure binary (if not using --bin)
-  --sha256 <hex>          Expected 64-char SHA-256 hex digest for --url binary
+                          Component role to install/configure (prompts if omitted on TTY)
+  --bin <path>            Path to local exposure binary (skips GitHub Release download)
+  --url <https-url>       Download HTTPS URL for exposure binary (if not using GitHub Release)
+  --repo <owner/repo>     GitHub repository for release downloads (default: ProjectRalyn/Exposure)
+  --version <tag|latest>  Release tag to download (default: latest)
+  --sha256 <hex>          Expected 64-char SHA-256 hex digest for binary
   --bin-dir <dir>         Binary install directory (default: /usr/local/bin)
   --config-dir <dir>      Config directory (default: /etc/exposure)
   --data-dir <dir>        Data/state directory (default: /var/lib/exposure)
   --user <name>           System user for systemd service (default: exposure)
   --run-as-root           Run systemd service as root instead of dedicated user
+  -y, --non-interactive   Disable interactive prompts (use CLI flags/defaults)
   --force-init            Overwrite existing config file if present
   --no-start              Install service without starting it immediately
   --uninstall             Uninstall exposure binary and systemd services
@@ -134,12 +146,15 @@ parse_args() {
             --role)                 require_arg "$1" "$#"; ROLE="$2"; shift 2 ;;
             --bin)                  require_arg "$1" "$#"; BIN_SRC="$2"; shift 2 ;;
             --url)                  require_arg "$1" "$#"; DOWNLOAD_URL="$2"; shift 2 ;;
+            --repo)                 require_arg "$1" "$#"; GITHUB_REPO="$2"; shift 2 ;;
+            --version)              require_arg "$1" "$#"; RELEASE_VERSION="$2"; shift 2 ;;
             --sha256)               require_arg "$1" "$#"; DOWNLOAD_SHA256="$2"; shift 2 ;;
             --bin-dir)              require_arg "$1" "$#"; BIN_DIR="$2"; shift 2 ;;
             --config-dir)           require_arg "$1" "$#"; CONFIG_DIR="$2"; shift 2 ;;
             --data-dir)             require_arg "$1" "$#"; DATA_DIR="$2"; shift 2 ;;
             --user)                 require_arg "$1" "$#"; SERVICE_USER="$2"; shift 2 ;;
             --run-as-root)          USE_ROOT_USER=true; shift ;;
+            -y|--non-interactive)   NON_INTERACTIVE=true; shift ;;
             --force-init)           FORCE_INIT=true; shift ;;
             --no-start)             START_SERVICE=false; shift ;;
             --uninstall)            UNINSTALL=true; shift ;;
@@ -148,10 +163,10 @@ parse_args() {
             --tag)                  require_arg "$1" "$#"; NODE_TAG="$2"; shift 2 ;;
             --listen)               require_arg "$1" "$#"; NODE_LISTEN="$2"; shift 2 ;;
             --bootstrap)            require_arg "$1" "$#"; NODE_BOOTSTRAP="$2"; shift 2 ;;
-            --ingress)              NODE_INGRESS=true; shift ;;
-            --egress)               NODE_EGRESS=true; shift ;;
-            --relay)                NODE_RELAY=true; shift ;;
-            --maintainer)           NODE_MAINTAINER=true; shift ;;
+            --ingress)              NODE_INGRESS=true; NODE_ROLES_EXPLICIT=true; shift ;;
+            --egress)               NODE_EGRESS=true; NODE_ROLES_EXPLICIT=true; shift ;;
+            --relay)                NODE_RELAY=true; NODE_ROLES_EXPLICIT=true; shift ;;
+            --maintainer)           NODE_MAINTAINER=true; NODE_ROLES_EXPLICIT=true; shift ;;
             --config)               require_arg "$1" "$#"; CUSTOM_CONFIG="$2"; shift 2 ;;
 
             --id)                   require_arg "$1" "$#"; CONTROL_ID="$2"; shift 2 ;;
@@ -270,10 +285,21 @@ verify_sha256() {
     log_info "Verified binary SHA-256: ${actual}"
 }
 
+download_https() {
+    local url="$1"
+    local out="$2"
+    [[ "$url" == https://* ]] || die "Download URL must use https:// (refusing insecure transport): $url"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$out"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only --secure-protocol=TLSv1_2 -qO "$out" "$url"
+    else
+        die "Neither curl nor wget is installed."
+    fi
+}
+
 resolve_binary() {
     local arch="$1"
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
     if [[ -n "$BIN_SRC" ]]; then
         [[ -f "$BIN_SRC" ]] || die "Specified binary not found: $BIN_SRC"
@@ -283,42 +309,43 @@ resolve_binary() {
         return 0
     fi
 
-    if [[ -n "$DOWNLOAD_URL" ]]; then
-        [[ "$DOWNLOAD_URL" == https://* ]] || die "--url must use https:// (refusing insecure transport)."
-        TMP_BIN="$(mktemp /tmp/exposure.XXXXXX)"
-        chmod 0700 "$TMP_BIN"
-        log_info "Downloading exposure binary from $DOWNLOAD_URL ..."
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --proto '=https' --tlsv1.2 "$DOWNLOAD_URL" -o "$TMP_BIN"
-        elif command -v wget >/dev/null 2>&1; then
-            wget --https-only --secure-protocol=TLSv1_2 -qO "$TMP_BIN" "$DOWNLOAD_URL"
+    local asset_name="exposure-linux-${arch}"
+    local release_base=""
+    if [[ -z "$DOWNLOAD_URL" ]]; then
+        if [[ "$RELEASE_VERSION" == "latest" ]]; then
+            release_base="https://github.com/${GITHUB_REPO}/releases/latest/download"
         else
-            die "Neither curl nor wget is installed."
+            release_base="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_VERSION}"
         fi
-        if [[ -n "$DOWNLOAD_SHA256" ]]; then
-            verify_sha256 "$TMP_BIN" "$DOWNLOAD_SHA256"
-        else
-            log_warn "No --sha256 provided; downloaded binary integrity was not checksum-verified."
-        fi
-        BIN_SRC="$TMP_BIN"
-        return 0
+        DOWNLOAD_URL="${release_base}/${asset_name}"
+        log_info "Using GitHub Release (${RELEASE_VERSION}) for ${GITHUB_REPO}: ${asset_name}"
     fi
 
-    # Auto-detect local binary relative to the script directory (never untrusted CWD)
-    local candidates=(
-        "${script_dir}/${APP_NAME}"
-        "${script_dir}/target/${arch}-unknown-linux-musl/release/${APP_NAME}"
-        "${script_dir}/target/release/${APP_NAME}"
-    )
-    for c in "${candidates[@]}"; do
-        if [[ -f "$c" && -x "$c" ]]; then
-            BIN_SRC="$c"
-            log_info "Auto-detected binary: $BIN_SRC"
-            return 0
-        fi
-    done
+    TMP_BIN="$(mktemp /tmp/exposure.XXXXXX)"
+    chmod 0700 "$TMP_BIN"
+    log_info "Downloading exposure binary from $DOWNLOAD_URL ..."
+    download_https "$DOWNLOAD_URL" "$TMP_BIN" \
+        || die "Failed to download binary from $DOWNLOAD_URL (pass --bin <path> to install a local binary)."
 
-    die "Could not find exposure binary. Pass --bin <path> or --url <https-url>."
+    if [[ -z "$DOWNLOAD_SHA256" && -n "$release_base" ]]; then
+        TMP_SHA="$(mktemp /tmp/exposure-sha.XXXXXX)"
+        if download_https "${release_base}/SHA256SUMS.txt" "$TMP_SHA" 2>/dev/null; then
+            local sum_line
+            sum_line="$(grep -E "[[:space:]]${asset_name}\$" "$TMP_SHA" | head -n1 || true)"
+            if [[ -n "$sum_line" ]]; then
+                DOWNLOAD_SHA256="${sum_line%% *}"
+            fi
+        fi
+    fi
+
+    if [[ -n "$DOWNLOAD_SHA256" ]]; then
+        verify_sha256 "$TMP_BIN" "$DOWNLOAD_SHA256"
+    else
+        log_warn "No checksum available; downloaded binary integrity was not checksum-verified."
+    fi
+
+    BIN_SRC="$TMP_BIN"
+    return 0
 }
 
 install_binary() {
@@ -434,14 +461,140 @@ EOF
     fi
 }
 
+can_prompt() {
+    [[ "$NON_INTERACTIVE" == "false" && -r /dev/tty && -w /dev/tty ]]
+}
+
+prompt_val() {
+    local __var="$1"
+    local prompt_text="$2"
+    local default_val="${3:-}"
+    local reply=""
+    if [[ -n "$default_val" ]]; then
+        printf '%b?%b %s [%s]: ' "$CYAN" "$NC" "$prompt_text" "$default_val" >/dev/tty
+    else
+        printf '%b?%b %s: ' "$CYAN" "$NC" "$prompt_text" >/dev/tty
+    fi
+    IFS= read -r reply </dev/tty || reply=""
+    if [[ -z "$reply" ]]; then
+        reply="$default_val"
+    fi
+    printf -v "$__var" '%s' "$reply"
+}
+
+prompt_yn() {
+    local __var="$1"
+    local prompt_text="$2"
+    local default_yn="${3:-n}"
+    local hint="y/N"
+    [[ "$default_yn" == "y" ]] && hint="Y/n"
+    local reply=""
+    printf '%b?%b %s [%s]: ' "$CYAN" "$NC" "$prompt_text" "$hint" >/dev/tty
+    IFS= read -r reply </dev/tty || reply=""
+    reply="${reply:-$default_yn}"
+    case "${reply,,}" in
+        y|yes|true|1) printf -v "$__var" '%s' "true" ;;
+        *)            printf -v "$__var" '%s' "false" ;;
+    esac
+}
+
+prompt_secret() {
+    local __var="$1"
+    local prompt_text="$2"
+    local reply=""
+    printf '%b?%b %s: ' "$CYAN" "$NC" "$prompt_text" >/dev/tty
+    IFS= read -rs reply </dev/tty || reply=""
+    printf '\n' >/dev/tty
+    printf -v "$__var" '%s' "$reply"
+}
+
+detect_primary_ip() {
+    local ip=""
+    if command -v hostname >/dev/null 2>&1; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    if [[ -z "$ip" ]] && command -v ip >/dev/null 2>&1; then
+        ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)"
+    fi
+    printf '%s' "${ip:-<this-host-ip>}"
+}
+
+prompt_role_if_needed() {
+    if [[ -n "$ROLE" ]]; then
+        return 0
+    fi
+    if ! can_prompt; then
+        ROLE="binary-only"
+        return 0
+    fi
+    printf '\n%bSelect Exposure component to install:%b\n' "$CYAN" "$NC" >/dev/tty
+    printf '  1) node         (Mesh Node: Ingress / Egress / Relay / Maintainer)\n' >/dev/tty
+    printf '  2) control      (Control Plane & Admin Web Panel)\n' >/dev/tty
+    printf '  3) binary-only  (Install exposure binary only)\n' >/dev/tty
+    local choice=""
+    prompt_val choice "Enter choice (1-3)" "1"
+    case "$choice" in
+        1|node)        ROLE="node" ;;
+        2|control)     ROLE="control" ;;
+        3|binary-only) ROLE="binary-only" ;;
+        *)             die "Invalid selection: $choice" ;;
+    esac
+}
+
+prompt_node_init() {
+    [[ "$NODE_PROMPT_DONE" == "true" ]] && return 0
+    NODE_PROMPT_DONE=true
+    can_prompt || return 0
+
+    local default_tag="${NODE_TAG:-$(hostname -s 2>/dev/null || hostname)}"
+    local default_listen="${NODE_LISTEN:-0.0.0.0:10802}"
+    printf '\n%bConfigure Node Initialization:%b\n' "$CYAN" "$NC" >/dev/tty
+    prompt_val NODE_TAG "Node Tag (--tag)" "$default_tag"
+    prompt_val NODE_LISTEN "Link Listen Address (--listen, or 'none' to disable)" "$default_listen"
+    if [[ "${NODE_LISTEN,,}" == "none" || "${NODE_LISTEN,,}" == "off" ]]; then
+        NODE_LISTEN=""
+    fi
+
+    if [[ "$NODE_ROLES_EXPLICIT" == "false" ]]; then
+        prompt_yn NODE_INGRESS "Enable Ingress role?" "n"
+        prompt_yn NODE_EGRESS "Enable Egress role?" "y"
+        prompt_yn NODE_RELAY "Enable Relay role?" "n"
+        prompt_yn NODE_MAINTAINER "Enable Maintainer role?" "n"
+    fi
+
+    prompt_val NODE_BOOTSTRAP "Bootstrap Tunnel Address (optional, e.g. 1.2.3.4:10802)" "$NODE_BOOTSTRAP"
+}
+
+prompt_control_init() {
+    can_prompt || return 0
+    printf '\n%bConfigure Control Plane Initialization:%b\n' "$CYAN" "$NC" >/dev/tty
+    prompt_val CONTROL_ID "Control ID (--id)" "$CONTROL_ID"
+    prompt_val CONTROL_PANEL "Admin Panel Listen Address (--panel)" "$CONTROL_PANEL"
+    prompt_val ADMIN_USER "Admin Username (--admin-user)" "$ADMIN_USER"
+    if [[ -z "$ADMIN_PASSWORD" ]]; then
+        prompt_secret ADMIN_PASSWORD "Admin Password (leave blank to auto-generate)"
+    fi
+    prompt_val BOOTSTRAP_TAG "Initial Bootstrap Node Tag (optional)" "$BOOTSTRAP_TAG"
+    if [[ -n "$BOOTSTRAP_TAG" ]]; then
+        prompt_val BOOTSTRAP_ADDR "Initial Bootstrap Node Address (e.g. 1.2.3.4:10802)" "$BOOTSTRAP_ADDR"
+        if [[ -z "$BOOTSTRAP_PASSPHRASE" ]]; then
+            prompt_secret BOOTSTRAP_PASSPHRASE "Initial Bootstrap Node 5-Word Passphrase (optional)"
+        fi
+    fi
+}
+
 setup_node() {
     local cfg="${NODE_CONFIG:-${CONFIG_DIR}/node.yaml}"
     local cfg_dir
     cfg_dir="$(dirname "$cfg")"
     mkdir -p "$cfg_dir"
     local tag="${NODE_TAG:-$(hostname -s 2>/dev/null || hostname)}"
+    local node_pubkey=""
 
     if [[ ! -f "$cfg" || "$FORCE_INIT" == "true" ]]; then
+        prompt_node_init
+        tag="${NODE_TAG:-$tag}"
+
         local args=(init-node --tag "$tag" --output "$cfg")
         [[ "$FORCE_INIT" == "true" ]]      && args+=(--force)
         [[ -n "$NODE_LISTEN" ]]            && args+=(--listen "$NODE_LISTEN")
@@ -452,7 +605,10 @@ setup_node() {
         [[ "$NODE_MAINTAINER" == "true" ]] && args+=(--maintainer)
 
         log_info "Initializing Node config at $cfg ..."
-        (umask 0077; "${BIN_DIR}/${APP_NAME}" "${args[@]}")
+        local init_out=""
+        init_out="$(umask 0077; "${BIN_DIR}/${APP_NAME}" "${args[@]}")"
+        printf '%s\n' "$init_out"
+        node_pubkey="$(printf '%s\n' "$init_out" | awk -F': *' '/^Public Key:/ {print $2; exit}')"
         chmod 0600 "$cfg"
         if [[ "$USE_ROOT_USER" == "false" ]]; then
             chown "${SERVICE_USER}:$(id -gn "$SERVICE_USER")" "$cfg"
@@ -466,12 +622,59 @@ setup_node() {
         extra_rw="$cfg_dir"
     fi
 
+    local start_since
+    start_since="$(date '+%Y-%m-%d %H:%M:%S')"
+
     write_systemd_unit \
         "exposure-node" \
         "Exposure Reverse Proxy & Mesh Node" \
         "${BIN_DIR}/${APP_NAME} node --config ${cfg}" \
         "true" \
         "$extra_rw"
+
+    # Wait briefly for exposure-node to print its one-time 5-word onboarding passphrase
+    local passphrase=""
+    if [[ "$START_SERVICE" == "true" ]] && has_systemd && command -v journalctl >/dev/null 2>&1; then
+        local i
+        for i in 1 2 3 4 5; do
+            sleep 1
+            passphrase="$(journalctl -u exposure-node.service --since "$start_since" --no-pager -o cat 2>/dev/null \
+                | awk '/ONE-TIME ONBOARDING PASSPHRASE/{getline; gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit}' || true)"
+            if [[ -n "$passphrase" ]]; then
+                break
+            fi
+        done
+    fi
+
+    local mode_label="Listening (mesh dials node)"
+    local host_ip
+    host_ip="$(detect_primary_ip)"
+    local listen_port="${NODE_LISTEN##*:}"
+    [[ -z "$NODE_LISTEN" || "$listen_port" == "$NODE_LISTEN" ]] && listen_port="10802"
+    local listen_addr_hint="${host_ip}:${listen_port}"
+    if [[ -n "$NODE_BOOTSTRAP" ]]; then
+        mode_label="Active (node dials bootstrap tunnel)"
+    fi
+
+    printf '\n%b==================== Onboarding Info ====================%b\n' "$CYAN" "$NC"
+    printf 'Use these values in Control Panel -> Onboarding:\n'
+    printf '  Target Node Tag   : %s\n' "$tag"
+    if [[ -n "$passphrase" ]]; then
+        printf '  5-Word Passphrase : %s\n' "$passphrase"
+    else
+        printf '  5-Word Passphrase : (check logs: journalctl -u exposure-node -n 30 --no-pager)\n'
+    fi
+    printf '  Onboarding Mode   : %s\n' "$mode_label"
+    if [[ -n "$NODE_BOOTSTRAP" ]]; then
+        printf '  Bootstrap Tunnel  : %s\n' "$NODE_BOOTSTRAP"
+    else
+        printf '  Address (Listen)  : %s\n' "$listen_addr_hint"
+    fi
+    if [[ -n "$node_pubkey" ]]; then
+        printf '  Node Public Key   : %s\n' "$node_pubkey"
+    fi
+    printf '  Config File       : %s\n' "$cfg"
+    printf '%b=========================================================%b\n\n' "$CYAN" "$NC"
 }
 
 generate_random_password() {
@@ -491,8 +694,13 @@ setup_control() {
     sqlite_dir="$(dirname "$sqlite")"
     mkdir -p "$cfg_dir" "$sqlite_dir"
 
+    local generated_pw=false
+    local sign_pk=""
+    local link_pk=""
+
     if [[ ! -f "$cfg" || "$FORCE_INIT" == "true" ]]; then
-        local generated_pw=false
+        prompt_control_init
+
         if [[ -z "$ADMIN_PASSWORD" ]]; then
             ADMIN_PASSWORD="$(generate_random_password)"
             generated_pw=true
@@ -511,21 +719,19 @@ setup_control() {
         [[ -n "$BOOTSTRAP_ADDR" ]]    && args+=(--bootstrap-addr "$BOOTSTRAP_ADDR")
 
         log_info "Initializing Control config at $cfg ..."
-        (
+        local init_out=""
+        init_out="$(
             umask 0077
             EXPOSURE_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
             EXPOSURE_BOOTSTRAP_PASSPHRASE="$BOOTSTRAP_PASSPHRASE" \
             "${BIN_DIR}/${APP_NAME}" "${args[@]}"
-        )
+        )"
+        printf '%s\n' "$init_out"
+        sign_pk="$(printf '%s\n' "$init_out" | awk -F': *' '/^Signing Public Key:/ {print $2; exit}')"
+        link_pk="$(printf '%s\n' "$init_out" | awk -F': *' '/^Link Public Key:/ {print $2; exit}')"
         chmod 0600 "$cfg"
         if [[ "$USE_ROOT_USER" == "false" ]]; then
             chown "${SERVICE_USER}:$(id -gn "$SERVICE_USER")" "$cfg"
-        fi
-
-        if [[ "$generated_pw" == "true" ]]; then
-            printf '\n%bGenerated Control Admin Credentials:%b\n' "$CYAN" "$NC"
-            printf '  Username: %s\n' "$ADMIN_USER"
-            printf '  Password: %s\n\n' "$ADMIN_PASSWORD"
         fi
     else
         log_info "Using existing Control config: $cfg"
@@ -550,6 +756,22 @@ setup_control() {
         "${BIN_DIR}/${APP_NAME} control --config ${cfg}" \
         "$grant_net_bind" \
         "${extra_rw# }"
+
+    printf '\n%b================= Control Plane Info ====================%b\n' "$CYAN" "$NC"
+    printf '  Control ID        : %s\n' "$CONTROL_ID"
+    printf '  Admin Panel       : http://%s\n' "$CONTROL_PANEL"
+    printf '  Admin Username    : %s\n' "$ADMIN_USER"
+    if [[ "$generated_pw" == "true" ]]; then
+        printf '  Admin Password    : %s\n' "$ADMIN_PASSWORD"
+    fi
+    if [[ -n "$sign_pk" ]]; then
+        printf '  Signing PubKey    : %s\n' "$sign_pk"
+    fi
+    if [[ -n "$link_pk" ]]; then
+        printf '  Link PubKey       : %s\n' "$link_pk"
+    fi
+    printf '  Config File       : %s\n' "$cfg"
+    printf '%b=========================================================%b\n\n' "$CYAN" "$NC"
 }
 
 do_uninstall() {
@@ -599,9 +821,7 @@ main() {
     arch="$(detect_arch)"
     log_info "Detected architecture: $arch"
 
-    if [[ -z "$ROLE" ]]; then
-        ROLE="binary-only"
-    fi
+    prompt_role_if_needed
 
     case "$ROLE" in
         node|control|binary-only) ;;
