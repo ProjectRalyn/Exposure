@@ -448,6 +448,8 @@ pub fn has_leading_zero_bits(bytes: &[u8], bits: u8) -> bool {
 pub struct ClearanceClaims {
     pub host: String,
     pub expires_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
     #[serde(default)]
     pub ua_hash: Option<String>,
     #[serde(default)]
@@ -621,6 +623,17 @@ pub fn short_sha256_hex(input: &str) -> String {
     hex::encode(&h.finalize()[..8])
 }
 
+/// Keyed 64-bit HMAC-SHA256 hex digest (16 hex chars) for binding UA/attributes in cookies
+/// without exposing offline-computable unkeyed hashes.
+pub fn keyed_short_hmac_hex(secret: &str, domain: &str, input: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(domain.as_bytes());
+    mac.update(b":");
+    mac.update(input.as_bytes());
+    hex::encode(&mac.finalize().into_bytes()[..8])
+}
+
 /// Constant-time comparison of two arbitrary-length byte slices using fixed-length SHA-256 digests
 /// so slice length is not leaked via timing.
 pub fn ct_eq_hashed(a: &[u8], b: &[u8]) -> bool {
@@ -680,8 +693,9 @@ mod tests {
         let claims = ClearanceClaims {
             host: "example.com".into(),
             expires_at: 4_000_000_000,
-            ua_hash: Some(short_sha256_hex("Mozilla/5.0")),
-            ip_prefix: Some("203.0.113".into()),
+            jti: Some("sess0123456789ab".into()),
+            ua_hash: Some(keyed_short_hmac_hex("secret-key", "exposure-ua", "Mozilla/5.0")),
+            ip_prefix: Some("203.0.113.10".into()),
             fp_hash: None,
         };
         let cookie = sign_clearance_cookie("secret-key", &claims).unwrap();

@@ -632,6 +632,34 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         "should not re-inject beacon when valid exposure_fp cookie is present"
     );
 
+    // --- TEST C3: Oversized single HTTP header (64 KiB) MUST be rejected with 431 (F5) ---
+    let big_hdr = "A".repeat(64 * 1024);
+    let big_hdr_resp = http_client
+        .get(format!("http://{ingress_http}/mesh-v1"))
+        .header("Host", "remote.test")
+        .header("X-Oversized", big_hdr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        big_hdr_resp.status(),
+        431,
+        "oversized 64 KiB single header should be rejected with 431"
+    );
+
+    // --- TEST C4: Unknown Host MUST be rejected with 421 Misdirected Request (F7) ---
+    let unknown_host_resp = http_client
+        .get(format!("http://{ingress_http}/index.html"))
+        .header("Host", "unconfigured-vhost.invalid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown_host_resp.status(),
+        421,
+        "unknown Host header must be rejected with 421 Misdirected Request"
+    );
+
     // --- TEST D: Guard Token Bucket Rate Limiting (429 + Retry-After) ---
     for _ in 0..2 {
         let r = http_client

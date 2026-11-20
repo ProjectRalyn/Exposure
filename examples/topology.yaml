@@ -15,11 +15,11 @@ defaults:
     challenge_threshold: 50
     reject_threshold: 85
     pow_difficulty: 16
-    clearance_ttl_secs: 1800
+    clearance_ttl_secs: 600
     bind_ua: true
-    bind_ip_prefix: false
+    bind_ip_prefix: true
     block_bots: false
-    block_headless: false
+    block_headless: true
     require_client_fp: false
     js_fp_beacon: true
     js_fp_ttl_secs: 3600

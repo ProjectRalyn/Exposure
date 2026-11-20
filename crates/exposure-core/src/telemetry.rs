@@ -459,12 +459,77 @@ impl ClientJsFingerprint {
         let webgl_l = self.webgl.to_ascii_lowercase();
         let plat_l = self.platform.to_ascii_lowercase();
         let ua_l = ua.to_ascii_lowercase();
-        self.webdriver
+
+        // 1. Direct automation / software-renderer signals
+        if self.webdriver
             || webgl_l.contains("swiftshader")
             || webgl_l.contains("llvmpipe")
             || webgl_l.contains("headless")
-            || (ua_l.contains("iphone") && plat_l.contains("win"))
-            || (ua_l.contains("android") && plat_l.contains("win"))
+            || webgl_l.contains("mesa offscreen")
+        {
+            return true;
+        }
+
+        // 2. Cross-field OS vs navigator.platform consistency checks
+        if !plat_l.is_empty() {
+            if ua_l.contains("windows nt") && (plat_l.contains("linux") || plat_l.contains("mac")) {
+                return true;
+            }
+            if (ua_l.contains("macintosh") || ua_l.contains("mac os x"))
+                && !ua_l.contains("iphone")
+                && !ua_l.contains("ipad")
+                && (plat_l.contains("win") || plat_l.contains("linux"))
+            {
+                return true;
+            }
+            if ua_l.contains("linux")
+                && !ua_l.contains("android")
+                && (plat_l.contains("win") || plat_l.contains("mac"))
+            {
+                return true;
+            }
+            if ua_l.contains("iphone")
+                && (plat_l.contains("win") || plat_l.contains("linux") || plat_l.contains("macintel"))
+            {
+                return true;
+            }
+            if ua_l.contains("ipad") && (plat_l.contains("win") || plat_l.contains("linux")) {
+                return true;
+            }
+            if ua_l.contains("android") && (plat_l.contains("win") || plat_l.contains("mac")) {
+                return true;
+            }
+        }
+
+        // 3. Malformed / fabricated canvas_hash or screen dimensions
+        if !self.canvas_hash.is_empty()
+            && (self.canvas_hash.len() < 6
+                || !self.canvas_hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return true;
+        }
+        if !self.screen.is_empty() {
+            let parts: Vec<&str> = self.screen.split('x').collect();
+            let valid_dims = parts.len() >= 2
+                && parts[0].parse::<u32>().map(|w| w > 0).unwrap_or(false)
+                && parts[1].parse::<u32>().map(|h| h > 0).unwrap_or(false);
+            if !valid_dims {
+                return true;
+            }
+        }
+
+        // 4. Completely empty fingerprint claiming to be a standard browser
+        if ua_l.contains("mozilla/")
+            && self.cores == 0
+            && self.platform.is_empty()
+            && self.tz.is_empty()
+            && self.canvas_hash.is_empty()
+            && self.screen.is_empty()
+        {
+            return true;
+        }
+
+        false
     }
 }
 

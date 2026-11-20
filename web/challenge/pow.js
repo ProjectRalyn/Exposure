@@ -158,7 +158,7 @@ function collectClientFingerprint() {
         h ^= d.charCodeAt(i);
         h = Math.imul(h, 16777619);
       }
-      canvasHash = (h >>> 0).toString(16);
+      canvasHash = (h >>> 0).toString(16).padStart(8, "0");
     }
   } catch {}
   let tz = "";

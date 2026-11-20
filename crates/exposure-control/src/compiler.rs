@@ -367,6 +367,17 @@ pub fn compile_topology_full(
                 }
             }
             for rule in &ing.rules {
+                let rule_label = rule.name.as_deref().unwrap_or(&rule.service_tag);
+                let host_pat = rule.r#match.host.as_deref().map(str::trim).unwrap_or("");
+                if host_pat.is_empty() {
+                    errors.push(format!(
+                        "ingress '{node_tag}' rule '{rule_label}' must specify match.host (enter '*' explicitly to accept all hosts)"
+                    ));
+                } else if host_pat == "*" {
+                    warnings.push(format!(
+                        "ingress '{node_tag}' rule '{rule_label}' uses wildcard host '*' (accepts all Host headers)"
+                    ));
+                }
                 validate_cidr_list(
                     &rule.r#match.source_cidrs,
                     &format!("ingress '{node_tag}' rule '{}' source_cidrs", rule.service_tag),
@@ -1264,6 +1275,13 @@ mod tests {
             compiled["egress-1"].logger.hmac_key,
             "cluster-hmac-secret-key-0123456789abcdef"
         );
+
+        // Missing match.host MUST fail compilation unless explicitly '*'
+        let mut topo_no_host = topo.clone();
+        topo_no_host.nodes.get_mut("ingress-a").unwrap().ingress.rules[0].r#match.host = None;
+        let (no_host_report, _) = compile_topology(&topo_no_host, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!no_host_report.valid);
+        assert!(no_host_report.errors.iter().any(|e| e.contains("match.host")));
 
         // Introduce loop: relay-1 -> ingress-a
         topo.nodes.get_mut("relay-1").unwrap().relay.rules[0].next_peer = "ingress-a".into();

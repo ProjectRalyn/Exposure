@@ -149,7 +149,26 @@ fn path_matches_prefix(normalized_path: &str, raw_prefix: &str) -> bool {
         || normalized_path.as_bytes()[prefix.len()] == b'/'
 }
 
+/// Check whether any configured ingress rule explicitly matches the given `host`.
+/// Rules with empty/missing `match.host` never match (must explicitly set `"*"` to accept all hosts).
+pub fn any_rule_matches_host(rules: &[IngressRule], host: &str) -> bool {
+    let norm_h = normalize_host(host);
+    if norm_h.is_empty() {
+        return false;
+    }
+    rules.iter().any(|rule| {
+        rule.r#match
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|pat| !pat.is_empty())
+            .map(|pat| host_matches(pat, &norm_h))
+            .unwrap_or(false)
+    })
+}
+
 /// Match an incoming L7 request against configured ingress rules in declaration order.
+/// Every rule MUST explicitly specify `match.host` (set `"*"` explicitly to match all hosts).
 pub fn match_ingress_rule<'a>(
     rules: &'a [IngressRule],
     host: &str,
@@ -157,13 +176,18 @@ pub fn match_ingress_rule<'a>(
     client_ip: IpAddr,
     sni: Option<&str>,
 ) -> Option<&'a IngressRule> {
+    let norm_h = normalize_host(host);
+    if norm_h.is_empty() {
+        return None;
+    }
     let norm_path = normalize_path_for_match(path);
     for rule in rules {
         let m = &rule.r#match;
-        if let Some(ref pat) = m.host {
-            if !host_matches(pat, host) {
-                continue;
-            }
+        let Some(pat) = m.host.as_deref().map(str::trim).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        if !host_matches(pat, &norm_h) {
+            continue;
         }
         if let Some(ref prefix) = m.url_prefix {
             if !path_matches_prefix(&norm_path, prefix) {
@@ -305,6 +329,33 @@ mod tests {
         // IPv6 bracket host normalization
         assert_eq!(normalize_host("[2001:db8::1]:443"), "2001:db8::1");
         assert!(host_matches("2001:db8::1", "[2001:db8::1]:443"));
+
+        // Unknown host must not match; rule with host=None must fail closed unless host="*"
+        assert!(!any_rule_matches_host(&rules, "evil.example"));
+        assert!(match_ingress_rule(&rules, "evil.example", "/", mapped_v6, None).is_none());
+        let hostless = vec![IngressRule {
+            name: Some("empty-host".into()),
+            r#match: RuleMatch {
+                host: None,
+                url_prefix: None,
+                source_cidrs: vec![],
+                sni: None,
+            },
+            service_tag: "svc".into(),
+            next_peer: "p".into(),
+            guard: None,
+            intercept_errors: None,
+            js_fp_beacon: None,
+        }];
+        assert!(match_ingress_rule(&hostless, "anything.test", "/", mapped_v6, None).is_none());
+        let explicit_wildcard = vec![IngressRule {
+            r#match: RuleMatch {
+                host: Some("*".into()),
+                ..Default::default()
+            },
+            ..hostless[0].clone()
+        }];
+        assert!(match_ingress_rule(&explicit_wildcard, "anything.test", "/", mapped_v6, None).is_some());
     }
 
     #[test]

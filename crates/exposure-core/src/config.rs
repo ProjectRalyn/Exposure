@@ -36,7 +36,7 @@ fn default_pow_difficulty() -> u8 {
     16
 }
 fn default_clearance_ttl_secs() -> u64 {
-    1800
+    600
 }
 fn default_hll_precision() -> u8 {
     12
@@ -274,13 +274,13 @@ impl GuardProfile {
         self.bind_ua.unwrap_or(true)
     }
     pub fn effective_bind_ip_prefix(&self) -> bool {
-        self.bind_ip_prefix.unwrap_or(false)
+        self.bind_ip_prefix.unwrap_or(true)
     }
     pub fn effective_block_bots(&self) -> bool {
         self.block_bots.unwrap_or(false)
     }
     pub fn effective_block_headless(&self) -> bool {
-        self.block_headless.unwrap_or(false)
+        self.block_headless.unwrap_or(true)
     }
     pub fn effective_require_client_fp(&self) -> bool {
         self.require_client_fp.unwrap_or(false)
@@ -916,11 +916,11 @@ pub struct GuardDefaults {
     pub clearance_ttl_secs: u64,
     #[serde(default = "default_true")]
     pub bind_ua: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub bind_ip_prefix: bool,
     #[serde(default)]
     pub block_bots: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub block_headless: bool,
     #[serde(default)]
     pub require_client_fp: bool,
@@ -940,9 +940,9 @@ impl Default for GuardDefaults {
             pow_difficulty: default_pow_difficulty(),
             clearance_ttl_secs: default_clearance_ttl_secs(),
             bind_ua: true,
-            bind_ip_prefix: false,
+            bind_ip_prefix: true,
             block_bots: false,
-            block_headless: false,
+            block_headless: true,
             require_client_fp: false,
             js_fp_beacon: true,
             js_fp_ttl_secs: default_js_fp_ttl_secs(),

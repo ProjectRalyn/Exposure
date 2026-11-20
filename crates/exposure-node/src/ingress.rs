@@ -1,6 +1,7 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -13,13 +14,13 @@ use exposure_core::crypto::{
     generate_random_secret_hex, is_weak_secret, short_sha256_hex, NodeKeyPair,
 };
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
-use exposure_core::routing::{canonical_ip, match_ingress_rule, normalize_host};
+use exposure_core::routing::{any_rule_matches_host, canonical_ip, match_ingress_rule, normalize_host};
 use exposure_core::Result;
 use http::{header, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
@@ -35,11 +36,58 @@ use crate::logger::NodeLogger;
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
 
 const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
+const MAX_CONNS_PER_IP: usize = 128;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP1_MAX_HEADERS: usize = 100;
+const HTTP1_MAX_BUF_SIZE: usize = 32 * 1024;
+const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
 const MAX_HTML_INJECT_BYTES: usize = 2 * 1024 * 1024;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+struct PerIpConnGuard {
+    map: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
+    ip: IpAddr,
+    counter: Arc<AtomicUsize>,
+}
+
+impl PerIpConnGuard {
+    fn try_acquire(map: &Arc<DashMap<IpAddr, Arc<AtomicUsize>>>, ip: IpAddr) -> Option<Self> {
+        let counter = map
+            .entry(ip)
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        loop {
+            let cur = counter.load(Ordering::Acquire);
+            if cur >= MAX_CONNS_PER_IP {
+                return None;
+            }
+            if counter
+                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self {
+                    map: Arc::clone(map),
+                    ip,
+                    counter,
+                });
+            }
+        }
+    }
+}
+
+impl Drop for PerIpConnGuard {
+    fn drop(&mut self) {
+        if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Remove entry only if still zero so concurrent acquires don't race
+            self.map.remove_if(&self.ip, |_, c| c.load(Ordering::Acquire) == 0);
+        }
+    }
+}
 
 fn ensure_strong_clearance_secret(mut cfg: IngressConfig, node_tag: &str) -> IngressConfig {
     if is_weak_secret(&cfg.clearance_secret) {
@@ -69,6 +117,7 @@ pub struct IngressServer {
     logger: Arc<NodeLogger>,
     started_listeners: DashMap<String, JoinHandle<()>>,
     conn_sem: Arc<Semaphore>,
+    per_ip_conns: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
 }
 
 impl IngressServer {
@@ -94,6 +143,7 @@ impl IngressServer {
             logger,
             started_listeners: DashMap::new(),
             conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_CONNS)),
+            per_ip_conns: Arc::new(DashMap::new()),
         })
     }
 
@@ -171,6 +221,14 @@ impl IngressServer {
                         continue;
                     }
                 };
+                let canon_ip = canonical_ip(peer_addr.ip());
+                let ip_guard = match PerIpConnGuard::try_acquire(&this.per_ip_conns, canon_ip) {
+                    Some(g) => g,
+                    None => {
+                        debug!(peer = %peer_addr, "ingress per-IP max connection limit reached, dropping");
+                        continue;
+                    }
+                };
                 let permit = match Arc::clone(&this.conn_sem).try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -179,12 +237,13 @@ impl IngressServer {
                     }
                 };
                 let _ = tcp.set_nodelay(true);
-                let canon_addr = SocketAddr::new(canonical_ip(peer_addr.ip()), peer_addr.port());
+                let canon_addr = SocketAddr::new(canon_ip, peer_addr.port());
                 let this2 = Arc::clone(&this);
                 let acceptor2 = tls_acceptor.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _ip_guard = ip_guard;
                     if let Some(acceptor) = acceptor2 {
                         let mut hello_sig = peek_client_hello(&tcp).await;
                         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
@@ -257,7 +316,20 @@ impl IngressServer {
         });
 
         let io = TokioIo::new(io_stream);
-        let builder = AutoServerBuilder::new(TokioExecutor::new());
+        let mut builder = AutoServerBuilder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT)
+            .max_headers(HTTP1_MAX_HEADERS)
+            .max_buf_size(HTTP1_MAX_BUF_SIZE)
+            .keep_alive(true);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .max_header_list_size(HTTP2_MAX_HEADER_LIST_SIZE)
+            .keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT);
         if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
             debug!(peer = %peer_addr, error = %e, "ingress connection closed");
         }
@@ -358,20 +430,25 @@ impl IngressServer {
                         r.r#match
                             .host
                             .as_deref()
+                            .map(str::trim)
+                            .filter(|pat| !pat.is_empty())
                             .map(|pat| exposure_core::routing::host_matches(pat, &host))
-                            .unwrap_or(true)
+                            .unwrap_or(false)
                     })
                 });
+            if matched_rule.is_none() && !cfg.rules.is_empty() && !any_rule_matches_host(&cfg.rules, &host) {
+                return Response::builder()
+                    .status(StatusCode::MISDIRECTED_REQUEST)
+                    .body(full_body("421 Misdirected Request"))
+                    .unwrap();
+            }
             let guard_profile = matched_rule
                 .and_then(|r| r.guard.as_ref())
                 .and_then(|g| cfg.guards.get(g));
 
-            // Enforce CIDR & rate-limit policy on `/cdn-cgi/*` too!
+            // Enforce CIDR policy on `/cdn-cgi/*` (rate limiting on `/cdn-cgi/*` is isolated per-IP inside `handle_cdn_cgi`)
             if let Some(profile) = guard_profile {
-                match self
-                    .guard
-                    .evaluate_access_and_rate_limit(profile, &cfg.rate_limit_buckets, client_ip)
-                {
+                match self.guard.evaluate_access_cidrs(profile, client_ip) {
                     GuardDecision::Allow => {}
                     GuardDecision::RateLimited { retry_after_secs } => {
                         return Response::builder()
@@ -398,6 +475,7 @@ impl IngressServer {
                 &host,
                 client_ip,
                 is_tls,
+                tls_signal,
                 guard_profile,
                 &cfg.clearance_secret,
                 cfg.effective_js_fp_ttl_secs(),
@@ -485,6 +563,12 @@ impl IngressServer {
         let rule = match match_ingress_rule(&cfg.rules, &host, &path, client_ip, auth_sni) {
             Some(r) => r.clone(),
             None => {
+                if !cfg.rules.is_empty() && !any_rule_matches_host(&cfg.rules, &host) {
+                    return Response::builder()
+                        .status(StatusCode::MISDIRECTED_REQUEST)
+                        .body(full_body("421 Misdirected Request"))
+                        .unwrap();
+                }
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(full_body("404 Not Found"))
@@ -1104,16 +1188,24 @@ impl Body for PrefixBody {
 /// Inject `<script defer src="/cdn-cgi/fp.js" data-t="..."></script>` into eligible uncompressed 2xx HTML responses.
 /// Safely passes through oversized or non-HTML responses untouched.
 async fn maybe_inject_fp_beacon(resp: Response<ProxyBody>, fp_token: &str) -> Response<ProxyBody> {
-    if !resp.status().is_success() {
+    if !resp.status().is_success()
+        || resp.status() == StatusCode::NO_CONTENT
+        || resp.status() == StatusCode::RESET_CONTENT
+    {
         return resp;
     }
-    let is_html = resp
+    let is_safe_html = resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.to_ascii_lowercase().starts_with("text/html"))
+        .map(|ct| {
+            let ct_l = ct.to_ascii_lowercase();
+            ct_l.starts_with("text/html")
+                && !ct_l.contains("utf-16")
+                && !ct_l.contains("utf-32")
+        })
         .unwrap_or(false);
-    if !is_html {
+    if !is_safe_html {
         return resp;
     }
     let is_uncompressed = resp
@@ -1180,18 +1272,20 @@ async fn maybe_inject_fp_beacon(resp: Response<ProxyBody>, fp_token: &str) -> Re
     Response::from_parts(parts, full_body(injected))
 }
 
-fn find_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
+fn rfind_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
     if needle_lower.is_empty() || haystack.len() < needle_lower.len() {
         return None;
     }
     haystack
         .windows(needle_lower.len())
-        .position(|w| w.iter().zip(needle_lower).all(|(a, b)| a.to_ascii_lowercase() == *b))
+        .rposition(|w| w.iter().zip(needle_lower).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
 fn inject_script_into_html(html: &[u8], snippet: &[u8]) -> Vec<u8> {
-    let pos = find_ascii_case_insensitive(html, b"</body>")
-        .or_else(|| find_ascii_case_insensitive(html, b"</head>"))
+    // Search backwards for the FINAL `</body>` (or `</head>`) so literal `"</body>"` inside
+    // inline `<script>` blocks or HTML comments earlier in the document is never corrupted.
+    let pos = rfind_ascii_case_insensitive(html, b"</body>")
+        .or_else(|| rfind_ascii_case_insensitive(html, b"</head>"))
         .unwrap_or(html.len());
     let mut out = Vec::with_capacity(html.len() + snippet.len());
     out.extend_from_slice(&html[..pos]);
@@ -1218,9 +1312,15 @@ fn extract_and_validate_host(
         }
     }
     if let Some(h) = hdr_host {
+        if normalize_host(h).is_empty() {
+            return Err("400 Bad Request: Invalid Host header");
+        }
         return Ok(h.to_string());
     }
     if let Some(a) = uri_auth {
+        if normalize_host(a).is_empty() {
+            return Err("400 Bad Request: Invalid authority");
+        }
         return Ok(a.to_string());
     }
     Ok(sni.unwrap_or("").to_string())
@@ -1284,4 +1384,18 @@ fn is_browser_navigation(method: &http::Method, headers: &http::HeaderMap) -> bo
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     accept.contains("text/html") || accept.is_empty() || accept == "*/*"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_injection_targets_last_closing_body_tag() {
+        let html = b"<html><body><script>var s = '</body>';</script><p>ok</p></body></html>";
+        let out = inject_script_into_html(html, b"<script src=\"/cdn-cgi/fp.js\"></script>");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("<script>var s = '</body>';</script>"));
+        assert!(s.ends_with("<p>ok</p><script src=\"/cdn-cgi/fp.js\"></script></body></html>"));
+    }
 }

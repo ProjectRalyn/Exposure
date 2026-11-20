@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -9,9 +10,9 @@ use dashmap::DashMap;
 use exposure_core::assets::{load_web_asset, WebApp};
 use exposure_core::config::{AntibotMode, GuardProfile, RateLimitBucket};
 use exposure_core::crypto::{
-    ct_eq_hashed, short_sha256_hex, sign_challenge_token, sign_clearance_cookie, sign_fp_cookie,
-    sign_fp_token, verify_challenge_token, verify_clearance_cookie, verify_fp_cookie,
-    verify_fp_token, verify_pow_solution, ClearanceClaims, FpCookieClaims,
+    ct_eq_hashed, keyed_short_hmac_hex, sign_challenge_token, sign_clearance_cookie,
+    sign_fp_cookie, sign_fp_token, verify_challenge_token, verify_clearance_cookie,
+    verify_fp_cookie, verify_fp_token, verify_pow_solution, ClearanceClaims, FpCookieClaims,
 };
 use exposure_core::routing::{canonical_ip, ip_matches_cidrs, normalize_host};
 use exposure_core::telemetry::ClientJsFingerprint;
@@ -31,6 +32,8 @@ const MAX_FP_COOLDOWNS: usize = 50_000;
 const CHALLENGE_TTL_SECS: i64 = 300;
 const FP_TOKEN_TTL_SECS: i64 = 60;
 const FP_INJECT_COOLDOWN: Duration = Duration::from_secs(15);
+const ADAPTIVE_WINDOW: Duration = Duration::from_secs(60);
+const VERIFY_FAILURE_WINDOW: Duration = Duration::from_secs(300);
 const CHALLENGE_CSP: &str =
     "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
 
@@ -49,10 +52,11 @@ struct TokenBucketState {
 }
 
 #[derive(Debug, Clone)]
-struct AggregatedClientSession {
-    expires_at: i64,
-    has_fp: bool,
-    is_headless: bool,
+struct ChallengeActivity {
+    window_start: Instant,
+    challenges_issued: u32,
+    failure_window_start: Instant,
+    verify_failures: u32,
 }
 
 pub enum GuardDecision {
@@ -73,20 +77,26 @@ pub struct GuardHttpResponse {
 /// - CIDR allow/deny (canonicalized IPv4/IPv6)
 /// - Bounded named token-bucket rate limiting (429 + Retry-After)
 /// - TLS + HTTP browser fingerprint scoring
-/// - Built-in `/cdn-cgi/` single-use host/IP-bound PoW challenge & signed clearance cookies
+/// - Built-in `/cdn-cgi/` single-use host+exact-IP-bound adaptive PoW challenge & signed clearance cookies
 /// - Adaptive passive JS fingerprint beacon (`/cdn-cgi/fp.js` + `/cdn-cgi/fp-report`)
 pub struct GuardEngine {
     buckets: DashMap<(String, String), TokenBucketState>,
+    /// Dedicated per-IP rate limiter for `/cdn-cgi/challenge` and `/cdn-cgi/verify` (isolated from app buckets).
+    cdn_cgi_challenge_limiter: DashMap<String, TokenBucketState>,
+    /// Dedicated per-IP rate limiter for static `/cdn-cgi/*` challenge UI assets.
+    cdn_cgi_asset_limiter: DashMap<String, TokenBucketState>,
     /// Single-use spent PoW challenge tokens mapped to their expiration timestamp.
     spent_challenges: DashMap<String, i64>,
     /// Single-use spent passive FP report tokens mapped to their expiration timestamp.
     spent_fp_tokens: DashMap<String, i64>,
     /// Dedicated per-IP rate limiter for `/cdn-cgi/fp-report` (prevents telemetry/CPU flooding).
     fp_report_limiter: DashMap<String, TokenBucketState>,
-    /// Per-(ip_prefix, host) injection cooldown so parallel HTML fetches don't re-inject beacons.
+    /// Per-(exact_ip, host) injection cooldown so parallel HTML fetches don't re-inject beacons.
     fp_inject_cooldown: DashMap<(String, String), Instant>,
-    /// Aggregated verified client/device sessions keyed by `(host, client_ip, ua_hash)` so page navigations and API/fetch calls share trust.
-    aggregated_sessions: DashMap<(String, IpAddr, String), AggregatedClientSession>,
+    /// Per-IP challenge issuance & verify-failure tracking for adaptive PoW difficulty scaling.
+    challenge_activity: DashMap<String, ChallengeActivity>,
+    /// Rolling 60s global challenge issuance counter for burst-attack adaptive PoW escalation.
+    global_challenge_window: Mutex<(Instant, u32)>,
 }
 
 impl Default for GuardEngine {
@@ -99,58 +109,19 @@ impl GuardEngine {
     pub fn new() -> Self {
         Self {
             buckets: DashMap::new(),
+            cdn_cgi_challenge_limiter: DashMap::new(),
+            cdn_cgi_asset_limiter: DashMap::new(),
             spent_challenges: DashMap::new(),
             spent_fp_tokens: DashMap::new(),
             fp_report_limiter: DashMap::new(),
             fp_inject_cooldown: DashMap::new(),
-            aggregated_sessions: DashMap::new(),
+            challenge_activity: DashMap::new(),
+            global_challenge_window: Mutex::new((Instant::now(), 0)),
         }
     }
 
-    fn client_session_key(&self, host: &str, client_ip: IpAddr, headers: &HeaderMap) -> (String, IpAddr, String) {
-        let host_clean = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-        let ua = headers
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        (host_clean, canonical_ip(client_ip), short_sha256_hex(ua))
-    }
-
-    fn record_aggregated_session(
-        &self,
-        host: &str,
-        client_ip: IpAddr,
-        headers: &HeaderMap,
-        expires_at: i64,
-        has_fp: bool,
-        is_headless: bool,
-    ) {
-        let now = Utc::now().timestamp();
-        if self.aggregated_sessions.len() >= MAX_RATE_LIMIT_BUCKETS {
-            self.aggregated_sessions.retain(|_, v| v.expires_at > now);
-        }
-        let key = self.client_session_key(host, client_ip, headers);
-        self.aggregated_sessions
-            .entry(key)
-            .and_modify(|e| {
-                e.expires_at = e.expires_at.max(expires_at);
-                e.has_fp = e.has_fp || has_fp;
-                e.is_headless = e.is_headless || is_headless;
-            })
-            .or_insert(AggregatedClientSession {
-                expires_at,
-                has_fp,
-                is_headless,
-            });
-    }
-
-    /// Evaluate ONLY CIDR + Rate Limit checks (used on `/cdn-cgi/*` before PoW handling).
-    pub fn evaluate_access_and_rate_limit(
-        &self,
-        profile: &GuardProfile,
-        bucket_defs: &BTreeMap<String, RateLimitBucket>,
-        client_ip: IpAddr,
-    ) -> GuardDecision {
+    /// Evaluate ONLY CIDR allow/deny rules (used on `/cdn-cgi/*` before isolated `/cdn-cgi/` rate limits).
+    pub fn evaluate_access_cidrs(&self, profile: &GuardProfile, client_ip: IpAddr) -> GuardDecision {
         let client_ip = canonical_ip(client_ip);
         if !profile.deny_cidrs.is_empty() && ip_matches_cidrs(client_ip, &profile.deny_cidrs) {
             return GuardDecision::Reject {
@@ -164,6 +135,21 @@ impl GuardEngine {
                 reason: "source CIDR not in allowlist".into(),
             };
         }
+        GuardDecision::Allow
+    }
+
+    /// Evaluate CIDR + Named token-bucket rate limiting.
+    pub fn evaluate_access_and_rate_limit(
+        &self,
+        profile: &GuardProfile,
+        bucket_defs: &BTreeMap<String, RateLimitBucket>,
+        client_ip: IpAddr,
+    ) -> GuardDecision {
+        let client_ip = canonical_ip(client_ip);
+        match self.evaluate_access_cidrs(profile, client_ip) {
+            GuardDecision::Allow => {}
+            other => return other,
+        }
         if let Some(ref bucket_name) = profile.rate_limit_bucket {
             if let Some(def) = bucket_defs.get(bucket_name) {
                 if let Err(retry_after) = self.consume_token(bucket_name, def, client_ip) {
@@ -174,6 +160,153 @@ impl GuardEngine {
             }
         }
         GuardDecision::Allow
+    }
+
+    fn consume_per_ip_limiter(
+        map: &DashMap<String, TokenBucketState>,
+        client_ip: IpAddr,
+        capacity: f64,
+        refill_per_sec: f64,
+        max_entries: usize,
+    ) -> Result<(), u64> {
+        let now = Instant::now();
+        if map.len() >= max_entries {
+            map.retain(|_, v| now.duration_since(v.last_refill) < BUCKET_IDLE_TTL);
+            if map.len() >= max_entries {
+                map.clear();
+            }
+        }
+        let key = canonical_ip(client_ip).to_string();
+        let mut entry = map.entry(key).or_insert_with(|| TokenBucketState {
+            tokens: capacity,
+            last_refill: now,
+        });
+        let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
+        entry.tokens = (entry.tokens + elapsed * refill_per_sec).min(capacity);
+        entry.last_refill = now;
+        if entry.tokens >= 1.0 {
+            entry.tokens -= 1.0;
+            Ok(())
+        } else {
+            let needed = 1.0 - entry.tokens;
+            let wait = if refill_per_sec > 0.0 {
+                (needed / refill_per_sec).ceil().max(1.0) as u64
+            } else {
+                60
+            };
+            Err(wait)
+        }
+    }
+
+    fn record_challenge_and_compute_difficulty(
+        &self,
+        base_difficulty: u8,
+        client_ip: IpAddr,
+        headers: &HeaderMap,
+        tls_signal: Option<&ClientHelloSignal>,
+    ) -> u8 {
+        let base = base_difficulty.clamp(1, 28);
+        let now = Instant::now();
+
+        // 1. Update global rolling 60s challenge counter
+        let global_rate = {
+            let mut g = self
+                .global_challenge_window
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if now.duration_since(g.0) >= ADAPTIVE_WINDOW {
+                *g = (now, 1);
+            } else {
+                g.1 = g.1.saturating_add(1);
+            }
+            g.1
+        };
+
+        // 2. Update per-IP rolling challenge & failure counters
+        if self.challenge_activity.len() >= MAX_SPENT_CHALLENGES {
+            self.challenge_activity.retain(|_, v| {
+                now.duration_since(v.window_start) < ADAPTIVE_WINDOW
+                    || now.duration_since(v.failure_window_start) < VERIFY_FAILURE_WINDOW
+            });
+            if self.challenge_activity.len() >= MAX_SPENT_CHALLENGES {
+                self.challenge_activity.clear();
+            }
+        }
+        let ip_key = client_ip_binding_key(client_ip);
+        let (ip_challenges, ip_failures) = {
+            let mut entry = self
+                .challenge_activity
+                .entry(ip_key)
+                .or_insert_with(|| ChallengeActivity {
+                    window_start: now,
+                    challenges_issued: 0,
+                    failure_window_start: now,
+                    verify_failures: 0,
+                });
+            if now.duration_since(entry.window_start) >= ADAPTIVE_WINDOW {
+                entry.window_start = now;
+                entry.challenges_issued = 1;
+            } else {
+                entry.challenges_issued = entry.challenges_issued.saturating_add(1);
+            }
+            if now.duration_since(entry.failure_window_start) >= VERIFY_FAILURE_WINDOW {
+                entry.failure_window_start = now;
+                entry.verify_failures = 0;
+            }
+            (entry.challenges_issued, entry.verify_failures)
+        };
+
+        // 3. Adaptive difficulty bump based on IP burst, failures, global load, and HTTP/TLS suspicion
+        let mut bump: u8 = 0;
+        if ip_failures >= 5 {
+            bump = bump.saturating_add(4);
+        } else if ip_failures >= 2 {
+            bump = bump.saturating_add(2);
+        }
+        if ip_challenges >= 25 {
+            bump = bump.saturating_add(4);
+        } else if ip_challenges >= 10 {
+            bump = bump.saturating_add(2);
+        } else if ip_challenges >= 4 {
+            bump = bump.saturating_add(1);
+        }
+        if global_rate >= 500 {
+            bump = bump.saturating_add(3);
+        } else if global_rate >= 200 {
+            bump = bump.saturating_add(2);
+        } else if global_rate >= 60 {
+            bump = bump.saturating_add(1);
+        }
+        let score = compute_suspicion_score(headers, tls_signal);
+        if score >= 80 {
+            bump = bump.saturating_add(2);
+        } else if score >= 60 {
+            bump = bump.saturating_add(1);
+        }
+
+        let max_adaptive = base.max(24).min(28);
+        base.saturating_add(bump).min(max_adaptive)
+    }
+
+    fn record_verify_failure(&self, client_ip: IpAddr) {
+        let now = Instant::now();
+        let ip_key = client_ip_binding_key(client_ip);
+        self.challenge_activity
+            .entry(ip_key)
+            .and_modify(|e| {
+                if now.duration_since(e.failure_window_start) >= VERIFY_FAILURE_WINDOW {
+                    e.failure_window_start = now;
+                    e.verify_failures = 1;
+                } else {
+                    e.verify_failures = e.verify_failures.saturating_add(1);
+                }
+            })
+            .or_insert_with(|| ChallengeActivity {
+                window_start: now,
+                challenges_issued: 0,
+                failure_window_start: now,
+                verify_failures: 1,
+            });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -242,36 +375,12 @@ impl GuardEngine {
             }
         }
 
-        // 5. Check existing clearance cookie OR aggregated same-device/same-user session
+        // 5. Require a cryptographically signed clearance cookie (never bypass via cookie-less IP+UA cache!)
         if let Some(claims) =
             self.valid_clearance_claims(profile, clearance_secret, host, client_ip, headers)
         {
-            self.record_aggregated_session(
-                host,
-                client_ip,
-                headers,
-                claims.expires_at,
-                claims.fp_hash.is_some(),
-                false,
-            );
             if !profile.effective_require_client_fp() || claims.fp_hash.is_some() {
                 return GuardDecision::Allow;
-            }
-        } else {
-            let key = self.client_session_key(host, client_ip, headers);
-            if let Some(sess) = self.aggregated_sessions.get(&key) {
-                let now = Utc::now().timestamp();
-                if sess.expires_at >= now {
-                    if profile.effective_block_headless() && sess.is_headless {
-                        return GuardDecision::Reject {
-                            status: StatusCode::FORBIDDEN,
-                            reason: "headless browser fingerprint blocked".into(),
-                        };
-                    }
-                    if !profile.effective_require_client_fp() || sess.has_fp {
-                        return GuardDecision::Allow;
-                    }
-                }
             }
         }
 
@@ -398,10 +507,10 @@ impl GuardEngine {
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if claims.ua_hash != short_sha256_hex(ua) {
+        if claims.ua_hash != keyed_short_hmac_hex(secret, "exposure-ua", ua) {
             return None;
         }
-        if claims.ip_prefix != ip_prefix(client_ip) {
+        if claims.ip_prefix != client_ip_binding_key(client_ip) {
             return None;
         }
         Some(claims)
@@ -491,7 +600,7 @@ impl GuardEngine {
                 self.fp_inject_cooldown.clear();
             }
         }
-        let cd_key = (ip_prefix(client_ip), normalize_host(host));
+        let cd_key = (client_ip_binding_key(client_ip), normalize_host(host));
         if let Some(last) = self.fp_inject_cooldown.get(&cd_key) {
             if now.duration_since(*last) < FP_INJECT_COOLDOWN {
                 return false;
@@ -501,7 +610,7 @@ impl GuardEngine {
         true
     }
 
-    /// Mint a short-lived (60s), single-use, host+ip_prefix+UA+service-bound token for `/cdn-cgi/fp.js`.
+    /// Mint a short-lived (60s), single-use, host+exact-IP+keyed-UA+service-bound token for `/cdn-cgi/fp.js`.
     pub fn mint_fp_token(
         &self,
         secret: &str,
@@ -511,12 +620,12 @@ impl GuardEngine {
         service_tag: &str,
     ) -> String {
         let host_clean = normalize_host(host);
-        let ip_key = ip_prefix(client_ip);
+        let ip_key = client_ip_binding_key(client_ip);
         let ua = headers
             .get(header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let ua_hash = short_sha256_hex(ua);
+        let ua_hash = keyed_short_hmac_hex(secret, "exposure-ua", ua);
         let token_id = Uuid::new_v4().simple().to_string();
         let expires_at = Utc::now().timestamp() + FP_TOKEN_TTL_SECS;
         let svc_b64 = URL_SAFE_NO_PAD.encode(service_tag.as_bytes());
@@ -532,32 +641,14 @@ impl GuardEngine {
         format!("{token_id}.{expires_at}.{svc_b64}.{sig}")
     }
 
-    fn consume_fp_report_rate_limit(&self, client_ip: IpAddr) -> bool {
-        let now = Instant::now();
-        if self.fp_report_limiter.len() >= MAX_SPENT_FP_TOKENS {
-            self.fp_report_limiter
-                .retain(|_, v| now.duration_since(v.last_refill) < BUCKET_IDLE_TTL);
-            if self.fp_report_limiter.len() >= MAX_SPENT_FP_TOKENS {
-                self.fp_report_limiter.clear();
-            }
-        }
-        let key = canonical_ip(client_ip).to_string();
-        let mut entry = self
-            .fp_report_limiter
-            .entry(key)
-            .or_insert_with(|| TokenBucketState {
-                tokens: 12.0,
-                last_refill: now,
-            });
-        let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
-        entry.tokens = (entry.tokens + elapsed * 0.2).min(12.0); // 12 burst, 12/min sustained
-        entry.last_refill = now;
-        if entry.tokens >= 1.0 {
-            entry.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+    fn consume_fp_report_rate_limit(&self, client_ip: IpAddr) -> Result<(), u64> {
+        Self::consume_per_ip_limiter(
+            &self.fp_report_limiter,
+            client_ip,
+            12.0,
+            0.2, // 12 burst, 12/min sustained per IP
+            MAX_SPENT_FP_TOKENS,
+        )
     }
 
     fn consume_fp_token(&self, token_id: &str, expires_at: i64, now: i64) -> bool {
@@ -600,12 +691,12 @@ impl GuardEngine {
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            if claims.ua_hash.as_deref() != Some(&short_sha256_hex(ua)) {
+            if claims.ua_hash.as_deref() != Some(&keyed_short_hmac_hex(secret, "exposure-ua", ua)) {
                 return None;
             }
         }
         if profile.effective_bind_ip_prefix() {
-            if claims.ip_prefix.as_deref() != Some(&ip_prefix(client_ip)) {
+            if claims.ip_prefix.as_deref() != Some(&client_ip_binding_key(client_ip)) {
                 return None;
             }
         }
@@ -640,13 +731,14 @@ impl GuardEngine {
         host: &str,
         client_ip: IpAddr,
         is_tls: bool,
+        tls_signal: Option<&ClientHelloSignal>,
         profile: Option<&GuardProfile>,
         clearance_secret: &str,
         fp_ttl_secs: u64,
     ) -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
         let client_ip = canonical_ip(client_ip);
         let host_clean = normalize_host(host);
-        let ip_key = ip_prefix(client_ip);
+        let ip_key = client_ip_binding_key(client_ip);
         let sub = path.strip_prefix("/cdn-cgi").unwrap_or("");
 
         let sec_headers = || -> Vec<(String, String)> {
@@ -657,8 +749,38 @@ impl GuardEngine {
             ]
         };
 
+        let rate_limit_resp = |retry_after: u64, msg: &[u8]| -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
+            let mut extra = sec_headers();
+            extra.push(("Retry-After".into(), retry_after.to_string()));
+            extra.push(("Cache-Control".into(), "no-store".into()));
+            (
+                GuardHttpResponse {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    content_type: "text/plain; charset=utf-8",
+                    body: msg.to_vec(),
+                    extra_headers: extra,
+                },
+                None,
+            )
+        };
+
         if method == Method::GET && sub == "/challenge" {
-            let difficulty = profile.map(|p| p.pow_difficulty).unwrap_or(16).clamp(1, 28);
+            if let Err(retry_after) = Self::consume_per_ip_limiter(
+                &self.cdn_cgi_challenge_limiter,
+                client_ip,
+                30.0,
+                1.0,
+                MAX_RATE_LIMIT_BUCKETS,
+            ) {
+                return rate_limit_resp(retry_after, b"challenge rate limited");
+            }
+            let base_difficulty = profile.map(|p| p.pow_difficulty).unwrap_or(16).clamp(1, 28);
+            let difficulty = self.record_challenge_and_compute_difficulty(
+                base_difficulty,
+                client_ip,
+                headers,
+                tls_signal,
+            );
             let token = Uuid::new_v4().to_string();
             let expires_at = Utc::now().timestamp() + CHALLENGE_TTL_SECS;
             let signature = sign_challenge_token(
@@ -690,23 +812,26 @@ impl GuardEngine {
 
         // Passive JS fingerprint beacon ingestion endpoint (authenticated via short-lived single-use HMAC nonce)
         if method == Method::POST && sub == "/fp-report" {
-            if !self.consume_fp_report_rate_limit(client_ip) {
-                return (
+            let fp_forbidden = || -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
+                (
                     GuardHttpResponse {
-                        status: StatusCode::TOO_MANY_REQUESTS,
+                        status: StatusCode::FORBIDDEN,
                         content_type: "text/plain; charset=utf-8",
-                        body: b"fp report rate limited".to_vec(),
+                        body: b"forbidden".to_vec(),
                         extra_headers: sec_headers(),
                     },
                     None,
-                );
+                )
+            };
+            if let Err(retry_after) = self.consume_fp_report_rate_limit(client_ip) {
+                return rate_limit_resp(retry_after, b"rate limited");
             }
             if body.len() > 4096 {
                 return (
                     GuardHttpResponse {
                         status: StatusCode::PAYLOAD_TOO_LARGE,
                         content_type: "text/plain; charset=utf-8",
-                        body: b"fp report payload too large".to_vec(),
+                        body: b"payload too large".to_vec(),
                         extra_headers: sec_headers(),
                     },
                     None,
@@ -714,15 +839,7 @@ impl GuardEngine {
             }
             if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
                 if !site.eq_ignore_ascii_case("same-origin") {
-                    return (
-                        GuardHttpResponse {
-                            status: StatusCode::FORBIDDEN,
-                            content_type: "text/plain; charset=utf-8",
-                            body: b"cross-site fp report rejected".to_vec(),
-                            extra_headers: sec_headers(),
-                        },
-                        None,
-                    );
+                    return fp_forbidden();
                 }
             }
             if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
@@ -731,15 +848,7 @@ impl GuardEngine {
                     .ok()
                     .and_then(|u| u.authority().map(|a| normalize_host(a.as_str())));
                 if origin_host.as_deref() != Some(host_clean.as_str()) {
-                    return (
-                        GuardHttpResponse {
-                            status: StatusCode::FORBIDDEN,
-                            content_type: "text/plain; charset=utf-8",
-                            body: b"origin mismatch".to_vec(),
-                            extra_headers: sec_headers(),
-                        },
-                        None,
-                    );
+                    return fp_forbidden();
                 }
             }
             let ct = headers
@@ -751,7 +860,7 @@ impl GuardEngine {
                     GuardHttpResponse {
                         status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                         content_type: "text/plain; charset=utf-8",
-                        body: b"expected application/json".to_vec(),
+                        body: b"unsupported media type".to_vec(),
                         extra_headers: sec_headers(),
                     },
                     None,
@@ -771,7 +880,7 @@ impl GuardEngine {
                         GuardHttpResponse {
                             status: StatusCode::BAD_REQUEST,
                             content_type: "text/plain; charset=utf-8",
-                            body: b"invalid fp report payload".to_vec(),
+                            body: b"bad request".to_vec(),
                             extra_headers: sec_headers(),
                         },
                         None,
@@ -781,27 +890,11 @@ impl GuardEngine {
 
             let parts: Vec<&str> = req.token.split('.').collect();
             if parts.len() != 4 {
-                return (
-                    GuardHttpResponse {
-                        status: StatusCode::FORBIDDEN,
-                        content_type: "text/plain; charset=utf-8",
-                        body: b"malformed fp token".to_vec(),
-                        extra_headers: sec_headers(),
-                    },
-                    None,
-                );
+                return fp_forbidden();
             }
             let (token_id, exp_s, svc_b64, sig) = (parts[0], parts[1], parts[2], parts[3]);
             let Ok(expires_at) = exp_s.parse::<i64>() else {
-                return (
-                    GuardHttpResponse {
-                        status: StatusCode::FORBIDDEN,
-                        content_type: "text/plain; charset=utf-8",
-                        body: b"invalid fp token expiry".to_vec(),
-                        extra_headers: sec_headers(),
-                    },
-                    None,
-                );
+                return fp_forbidden();
             };
             let service_tag = match URL_SAFE_NO_PAD
                 .decode(svc_b64)
@@ -809,17 +902,7 @@ impl GuardEngine {
                 .and_then(|b| String::from_utf8(b).ok())
             {
                 Some(s) if !s.is_empty() && s.len() <= 128 => s,
-                _ => {
-                    return (
-                        GuardHttpResponse {
-                            status: StatusCode::FORBIDDEN,
-                            content_type: "text/plain; charset=utf-8",
-                            body: b"invalid fp token service".to_vec(),
-                            extra_headers: sec_headers(),
-                        },
-                        None,
-                    );
-                }
+                _ => return fp_forbidden(),
             };
 
             let now = Utc::now().timestamp();
@@ -827,7 +910,7 @@ impl GuardEngine {
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let ua_hash = short_sha256_hex(ua);
+            let ua_hash = keyed_short_hmac_hex(clearance_secret, "exposure-ua", ua);
 
             if expires_at < now
                 || expires_at > now + FP_TOKEN_TTL_SECS + 15
@@ -842,27 +925,11 @@ impl GuardEngine {
                     sig,
                 )
             {
-                return (
-                    GuardHttpResponse {
-                        status: StatusCode::FORBIDDEN,
-                        content_type: "text/plain; charset=utf-8",
-                        body: b"fp token expired or invalid".to_vec(),
-                        extra_headers: sec_headers(),
-                    },
-                    None,
-                );
+                return fp_forbidden();
             }
 
             if !self.consume_fp_token(token_id, expires_at, now) {
-                return (
-                    GuardHttpResponse {
-                        status: StatusCode::FORBIDDEN,
-                        content_type: "text/plain; charset=utf-8",
-                        body: b"fp token already consumed".to_vec(),
-                        extra_headers: sec_headers(),
-                    },
-                    None,
-                );
+                return fp_forbidden();
             }
 
             req.fp.sanitize();
@@ -873,6 +940,7 @@ impl GuardEngine {
                 .unwrap_or(fp_ttl_secs)
                 .max(60);
 
+            // Passive FP cookie records fingerprint telemetry only (NEVER grants PoW clearance!).
             let claims = FpCookieClaims {
                 host: host_clean,
                 expires_at: now.saturating_add(ttl as i64),
@@ -881,7 +949,6 @@ impl GuardEngine {
                 fp_hash: fp_hash.clone(),
                 is_headless,
             };
-            self.record_aggregated_session(host, client_ip, headers, claims.expires_at, true, is_headless);
             let cookie_val = match sign_fp_cookie(clearance_secret, &claims) {
                 Ok(v) => v,
                 Err(_) => {
@@ -922,6 +989,15 @@ impl GuardEngine {
         }
 
         if method == Method::POST && sub == "/verify" {
+            if let Err(retry_after) = Self::consume_per_ip_limiter(
+                &self.cdn_cgi_challenge_limiter,
+                client_ip,
+                30.0,
+                1.0,
+                MAX_RATE_LIMIT_BUCKETS,
+            ) {
+                return rate_limit_resp(retry_after, b"verify rate limited");
+            }
             if body.len() > 4096 {
                 return (
                     GuardHttpResponse {
@@ -954,6 +1030,7 @@ impl GuardEngine {
             let mut req: VerifyReq = match serde_json::from_slice(body) {
                 Ok(r) => r,
                 Err(_) => {
+                    self.record_verify_failure(client_ip);
                     return (
                         GuardHttpResponse {
                             status: StatusCode::BAD_REQUEST,
@@ -981,6 +1058,7 @@ impl GuardEngine {
                     &req.signature,
                 )
             {
+                self.record_verify_failure(client_ip);
                 return (
                     GuardHttpResponse {
                         status: StatusCode::FORBIDDEN,
@@ -993,6 +1071,7 @@ impl GuardEngine {
             }
 
             if !verify_pow_solution(&req.token, req.nonce, req.difficulty) {
+                self.record_verify_failure(client_ip);
                 return (
                     GuardHttpResponse {
                         status: StatusCode::FORBIDDEN,
@@ -1005,6 +1084,7 @@ impl GuardEngine {
             }
 
             if !self.consume_challenge_token(&req.token, req.expires_at, now) {
+                self.record_verify_failure(client_ip);
                 return (
                     GuardHttpResponse {
                         status: StatusCode::FORBIDDEN,
@@ -1016,24 +1096,25 @@ impl GuardEngine {
                 );
             }
 
-            let ttl = profile.map(|p| p.clearance_ttl_secs).unwrap_or(1800);
+            let ttl = profile.map(|p| p.clearance_ttl_secs).unwrap_or(600);
             let bind_ua = profile.map(|p| p.effective_bind_ua()).unwrap_or(true);
             let bind_ip = profile
                 .map(|p| p.effective_bind_ip_prefix())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let ua = headers
                 .get(header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let block_headless = profile
                 .map(|p| p.effective_block_headless())
-                .unwrap_or(false);
+                .unwrap_or(true);
 
             let mut verified_fp_sub: Option<VerifiedFpSubmission> = None;
             let fp_hash = if let Some(ref mut cfp) = req.client_fp {
                 cfp.sanitize();
                 let is_headless = cfp.detect_headless(ua);
                 if block_headless && is_headless {
+                    self.record_verify_failure(client_ip);
                     return (
                         GuardHttpResponse {
                             status: StatusCode::FORBIDDEN,
@@ -1057,19 +1138,18 @@ impl GuardEngine {
                 None
             };
 
-            let has_fp = fp_hash.is_some();
             let claims = ClearanceClaims {
                 host: host_clean,
                 expires_at: now.saturating_add(ttl as i64),
+                jti: Some(Uuid::new_v4().simple().to_string()[..16].to_string()),
                 ua_hash: if bind_ua {
-                    Some(short_sha256_hex(ua))
+                    Some(keyed_short_hmac_hex(clearance_secret, "exposure-ua", ua))
                 } else {
                     None
                 },
                 ip_prefix: if bind_ip { Some(ip_key) } else { None },
                 fp_hash,
             };
-            self.record_aggregated_session(host, client_ip, headers, claims.expires_at, has_fp, false);
 
             let cookie_val = match sign_clearance_cookie(clearance_secret, &claims) {
                 Ok(v) => v,
@@ -1104,6 +1184,16 @@ impl GuardEngine {
                 },
                 verified_fp_sub,
             );
+        }
+
+        if let Err(retry_after) = Self::consume_per_ip_limiter(
+            &self.cdn_cgi_asset_limiter,
+            client_ip,
+            60.0,
+            5.0,
+            MAX_RATE_LIMIT_BUCKETS,
+        ) {
+            return rate_limit_resp(retry_after, b"too many requests");
         }
 
         let asset_path = sub.trim_start_matches('/');
@@ -1145,30 +1235,68 @@ pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSign
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim();
     let ua_l = ua.to_ascii_lowercase();
 
-    if ua.is_empty() {
-        score += 45;
-    } else if ua_l.contains("curl")
+    let is_known_bot = ua_l.contains("curl")
         || ua_l.contains("wget")
         || ua_l.contains("python")
         || ua_l.contains("scrapy")
         || ua_l.contains("go-http-client")
         || ua_l.contains("headless")
         || ua_l.contains("bot")
-    {
+        || ua_l.contains("spider")
+        || ua_l.contains("crawler")
+        || ua_l.contains("libwww")
+        || ua_l.contains("httpclient")
+        || ua_l.contains("okhttp")
+        || ua_l.contains("aiohttp")
+        || ua_l.contains("httpx")
+        || ua_l.contains("urllib")
+        || ua_l.contains("axios")
+        || ua_l.contains("node-fetch")
+        || ua_l.contains("undici")
+        || ua_l.contains("postman")
+        || ua_l.contains("insomnia");
+
+    if ua.is_empty() {
         score += 55;
+    } else if is_known_bot {
+        score += 50;
+    } else if !ua_l.contains("mozilla/") {
+        // Real desktop/mobile browsers always advertise `Mozilla/5.0 ...`; arbitrary custom UAs
+        // (e.g. `notnginx`, `ZabbixX`, `abc`) should score MORE suspicious, never less.
+        score += 35;
     }
 
-    if !headers.contains_key(header::ACCEPT) {
+    let has_accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_accept {
         score += 15;
     }
-    if !headers.contains_key(header::ACCEPT_LANGUAGE) {
-        score += 20;
+
+    let has_accept_lang = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_accept_lang {
+        score += 25;
     }
-    if ua_l.contains("mozilla/") && !headers.contains_key("sec-fetch-mode") {
-        score += 15;
+
+    let has_sec_fetch = headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !is_known_bot && !has_sec_fetch {
+        // Real browsers on plain HTTP still stay at 25 (< 50), while scripts lacking Accept-Language
+        // or using non-Mozilla UAs cross the 50-point challenge threshold.
+        score += 25;
     }
 
     if let Some(sig) = tls {
@@ -1183,17 +1311,10 @@ pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSign
     score.min(100) as u8
 }
 
-fn ip_prefix(ip: IpAddr) -> String {
-    match canonical_ip(ip) {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            format!("{}.{}.{}", o[0], o[1], o[2])
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            format!("{:x}:{:x}:{:x}", s[0], s[1], s[2])
-        }
-    }
+/// Exact canonical IP binding key (IPv4 `/32`, IPv6 `/128`) so LAN/NAT peers in the same `/24`
+/// cannot share or replay challenge tokens or IP-bound clearance cookies.
+fn client_ip_binding_key(ip: IpAddr) -> String {
+    canonical_ip(ip).to_string()
 }
 
 /// Strict same-origin relative redirect sanitizer (blocks `//`, `/\`, backslashes, control chars, scheme URIs).
@@ -1393,6 +1514,7 @@ mod tests {
             "example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
@@ -1424,11 +1546,29 @@ mod tests {
             "other.example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
         );
         assert_eq!(cross_host.status, StatusCode::FORBIDDEN);
+
+        // Same /24 neighbor IP must NOT be allowed to submit this IP's challenge token!
+        let neighbor_ip: IpAddr = "198.51.100.8".parse().unwrap();
+        let (cross_ip, _) = engine.handle_cdn_cgi(
+            &Method::POST,
+            "/cdn-cgi/verify",
+            &verify_body,
+            &headers,
+            "example.com",
+            neighbor_ip,
+            true,
+            None,
+            Some(&profile),
+            "my-secret-key-for-testing-123456",
+            3600,
+        );
+        assert_eq!(cross_ip.status, StatusCode::FORBIDDEN);
 
         // Legitimate submission succeeds and sets Secure flag on TLS
         let (ver, _) = engine.handle_cdn_cgi(
@@ -1439,6 +1579,7 @@ mod tests {
             "example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
@@ -1453,6 +1594,19 @@ mod tests {
             .clone();
         assert!(set_cookie.contains("; Secure"));
 
+        // Cookie-less request after PoW MUST still be challenged (no IP+UA server-side bypass!)
+        let dec_no_cookie = engine.evaluate(
+            &profile,
+            &BTreeMap::new(),
+            "my-secret-key-for-testing-123456",
+            ip,
+            "example.com",
+            "/hello",
+            &headers,
+            None,
+        );
+        assert!(matches!(dec_no_cookie, GuardDecision::ChallengeRedirect { .. }));
+
         // Replaying the same solved challenge token must fail!
         let (replay, _) = engine.handle_cdn_cgi(
             &Method::POST,
@@ -1462,6 +1616,7 @@ mod tests {
             "example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
@@ -1517,12 +1672,29 @@ mod tests {
             "example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
         );
         assert_eq!(fp_resp.status, StatusCode::NO_CONTENT);
         assert!(fp_sub.is_some());
+        // Passive FP report MUST NOT bypass an `antibot: always` route!
+        let strict_profile = GuardProfile {
+            antibot: AntibotMode::Always,
+            ..Default::default()
+        };
+        let dec_after_beacon = engine.evaluate(
+            &strict_profile,
+            &BTreeMap::new(),
+            "my-secret-key-for-testing-123456",
+            ip,
+            "example.com",
+            "/admin",
+            &browser_hdrs,
+            None,
+        );
+        assert!(matches!(dec_after_beacon, GuardDecision::ChallengeRedirect { .. }));
         // Replay must be rejected
         let (fp_replay, _) = engine.handle_cdn_cgi(
             &Method::POST,
@@ -1532,6 +1704,7 @@ mod tests {
             "example.com",
             ip,
             true,
+            None,
             Some(&profile),
             "my-secret-key-for-testing-123456",
             3600,
@@ -1554,6 +1727,191 @@ mod tests {
             None,
         );
         assert!(matches!(dec2, GuardDecision::Allow));
+    }
+
+    #[test]
+    fn guard_pentest_hardening_exact_ip_headless_adaptive_pow_and_retry_after() {
+        let engine = GuardEngine::new();
+        let secret = "my-secret-key-for-testing-123456";
+        let profile = GuardProfile {
+            antibot: AntibotMode::Always,
+            pow_difficulty: 8,
+            ..Default::default() // defaults: bind_ip_prefix=true (/32), block_headless=true
+        };
+        let ip1: IpAddr = "172.16.36.36".parse().unwrap();
+        let ip2_same_24: IpAddr = "172.16.36.37".parse().unwrap();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        hdrs.insert(header::ACCEPT, "text/html".parse().unwrap());
+        hdrs.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
+        hdrs.insert("sec-fetch-mode", "navigate".parse().unwrap());
+
+        let solve = |ip: IpAddr, fp: serde_json::Value| {
+            let (ch, _) = engine.handle_cdn_cgi(
+                &Method::GET,
+                "/cdn-cgi/challenge",
+                &[],
+                &hdrs,
+                "app.local",
+                ip,
+                true,
+                None,
+                Some(&profile),
+                secret,
+                3600,
+            );
+            assert_eq!(ch.status, StatusCode::OK);
+            let val: serde_json::Value = serde_json::from_slice(&ch.body).unwrap();
+            let token = val["token"].as_str().unwrap().to_string();
+            let diff = val["difficulty"].as_u64().unwrap() as u8;
+            let mut nonce = 0u64;
+            while !verify_pow_solution(&token, nonce, diff) {
+                nonce += 1;
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "token": token,
+                "nonce": nonce,
+                "signature": val["signature"],
+                "expires_at": val["expires_at"],
+                "difficulty": diff,
+                "client_fp": fp,
+            }))
+            .unwrap();
+            (
+                diff,
+                engine.handle_cdn_cgi(
+                    &Method::POST,
+                    "/cdn-cgi/verify",
+                    &body,
+                    &hdrs,
+                    "app.local",
+                    ip,
+                    true,
+                    None,
+                    Some(&profile),
+                    secret,
+                    3600,
+                ),
+            )
+        };
+
+        // 1. Headless / tampered fingerprints MUST be rejected by default (F2)
+        let (_, (r_wd, _)) = solve(
+            ip1,
+            serde_json::json!({
+                "webdriver": true, "platform": "Win32", "screen": "1920x1080x24",
+                "tz": "UTC", "cores": 8, "canvas_hash": "deadbeef"
+            }),
+        );
+        assert_eq!(r_wd.status, StatusCode::FORBIDDEN);
+
+        let (_, (r_os, _)) = solve(
+            ip1,
+            serde_json::json!({
+                "webdriver": false, "platform": "Linux x86_64", "screen": "1920x1080x24",
+                "tz": "UTC", "cores": 8, "canvas_hash": "deadbeef"
+            }),
+        );
+        assert_eq!(r_os.status, StatusCode::FORBIDDEN);
+
+        let (_, (r_canvas, _)) = solve(
+            ip1,
+            serde_json::json!({
+                "webdriver": false, "platform": "Win32", "screen": "1920x1080x24",
+                "tz": "UTC", "cores": 8, "canvas_hash": "abc"
+            }),
+        );
+        assert_eq!(r_canvas.status, StatusCode::FORBIDDEN);
+
+        // 2. Adaptive PoW difficulty MUST have escalated after failures & repeated requests (F2)
+        let (escalated_diff, (r_ok, _)) = solve(
+            ip1,
+            serde_json::json!({
+                "webdriver": false, "platform": "Win32", "screen": "1920x1080x24",
+                "tz": "UTC", "cores": 8, "canvas_hash": "a1b2c3d4"
+            }),
+        );
+        assert!(
+            escalated_diff > profile.pow_difficulty,
+            "expected adaptive difficulty > {}, got {}",
+            profile.pow_difficulty,
+            escalated_diff
+        );
+        assert_eq!(r_ok.status, StatusCode::OK);
+        let cookie_pair = r_ok
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k == "Set-Cookie")
+            .unwrap()
+            .1
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 3. Exact /32 IP binding: works for ip1 WITH cookie, rejected for ip1 WITHOUT cookie, rejected for ip2 in same /24 even WITH cookie! (F1)
+        let mut with_cookie = hdrs.clone();
+        with_cookie.insert(header::COOKIE, cookie_pair.parse().unwrap());
+        assert!(matches!(
+            engine.evaluate(&profile, &BTreeMap::new(), secret, ip1, "app.local", "/", &with_cookie, None),
+            GuardDecision::Allow
+        ));
+        assert!(matches!(
+            engine.evaluate(&profile, &BTreeMap::new(), secret, ip1, "app.local", "/", &hdrs, None),
+            GuardDecision::ChallengeRedirect { .. }
+        ));
+        assert!(matches!(
+            engine.evaluate(&profile, &BTreeMap::new(), secret, ip2_same_24, "app.local", "/", &with_cookie, None),
+            GuardDecision::ChallengeRedirect { .. }
+        ));
+
+        // 4. Isolated /cdn-cgi/challenge rate limiter returns 429 + Retry-After for abusive IP while not blocking other IPs (F4)
+        let flood_ip: IpAddr = "172.16.36.99".parse().unwrap();
+        let mut got_429 = false;
+        for _ in 0..40 {
+            let (resp, _) = engine.handle_cdn_cgi(
+                &Method::GET,
+                "/cdn-cgi/challenge",
+                &[],
+                &hdrs,
+                "app.local",
+                flood_ip,
+                true,
+                None,
+                Some(&profile),
+                secret,
+                3600,
+            );
+            if resp.status == StatusCode::TOO_MANY_REQUESTS {
+                assert!(
+                    resp.extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("retry-after")),
+                    "429 must include Retry-After header"
+                );
+                got_429 = true;
+                break;
+            }
+        }
+        assert!(got_429, "expected /cdn-cgi/challenge burst to trigger 429");
+        // Different IP is completely unaffected
+        let (other_ok, _) = engine.handle_cdn_cgi(
+            &Method::GET,
+            "/cdn-cgi/challenge",
+            &[],
+            &hdrs,
+            "app.local",
+            ip2_same_24,
+            true,
+            None,
+            Some(&profile),
+            secret,
+            3600,
+        );
+        assert_eq!(other_ok.status, StatusCode::OK);
     }
 
     #[test]
@@ -1590,5 +1948,72 @@ mod tests {
             None,
         );
         assert!(matches!(dec, GuardDecision::ChallengeRedirect { .. }));
+    }
+
+    #[test]
+    fn guard_blocks_poc_accept_and_custom_ua_bypasses() {
+        let engine = GuardEngine::new();
+        let profile = GuardProfile {
+            antibot: AntibotMode::Challenge,
+            challenge_threshold: 50,
+            reject_threshold: 85,
+            ..Default::default()
+        };
+        let ip: IpAddr = "172.16.36.36".parse().unwrap();
+
+        // 1. PoC experiment: Mozilla UA + Accept: */* (no Accept-Language, no Sec-Fetch-Mode) -> MUST be challenged!
+        let mut poc_accept = HeaderMap::new();
+        poc_accept.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 Safari/537.36 poc"
+                .parse()
+                .unwrap(),
+        );
+        poc_accept.insert(header::ACCEPT, "*/*".parse().unwrap());
+        assert!(compute_suspicion_score(&poc_accept, None) >= 50);
+        assert!(matches!(
+            engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &poc_accept, None),
+            GuardDecision::ChallengeRedirect { .. }
+        ));
+
+        // 2. Empty Accept header must NOT count as valid Accept
+        let mut poc_empty_accept = poc_accept.clone();
+        poc_empty_accept.insert(header::ACCEPT, "".parse().unwrap());
+        assert!(compute_suspicion_score(&poc_empty_accept, None) >= 65);
+
+        // 3. Arbitrary non-Mozilla UAs (`notnginx`, `Xkube-probeXX`, `ZabbixX`) -> MUST NOT bypass!
+        for custom_ua in ["notnginx-123", "Xkube-probeXX", "ZabbixX", "abc"] {
+            let mut h = HeaderMap::new();
+            h.insert(header::USER_AGENT, custom_ua.parse().unwrap());
+            assert!(compute_suspicion_score(&h, None) >= 85);
+            assert!(!matches!(
+                engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                GuardDecision::Allow
+            ));
+            // Even with Accept + Accept-Language, missing Sec-Fetch-Mode + non-Mozilla UA still >= 50
+            h.insert(header::ACCEPT, "*/*".parse().unwrap());
+            h.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
+            assert!(compute_suspicion_score(&h, None) >= 50);
+            assert!(!matches!(
+                engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                GuardDecision::Allow
+            ));
+        }
+
+        // 4. Genuine browser on plain HTTP (Mozilla + Accept + Accept-Language, no Sec-Fetch-Mode) still passes challenge mode
+        let mut real_http_browser = HeaderMap::new();
+        real_http_browser.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        real_http_browser.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+        real_http_browser.insert(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9".parse().unwrap());
+        assert!(compute_suspicion_score(&real_http_browser, None) < 50);
+        assert!(matches!(
+            engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &real_http_browser, None),
+            GuardDecision::Allow
+        ));
     }
 }

@@ -62,11 +62,11 @@ function defaultTopologyDefaults() {
       challenge_threshold: 50,
       reject_threshold: 85,
       pow_difficulty: 16,
-      clearance_ttl_secs: 1800,
+      clearance_ttl_secs: 600,
       bind_ua: true,
-      bind_ip_prefix: false,
+      bind_ip_prefix: true,
       block_bots: false,
-      block_headless: false,
+      block_headless: true,
       require_client_fp: false,
       js_fp_beacon: true,
       js_fp_ttl_secs: 3600,
@@ -1588,7 +1588,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         <label><span>API Bypass Headers (CSV, Name: secret)</span><input data-${prefix}-bypass="${escapeHtml(gName)}" value="${escapeHtml((g.api_bypass_headers || []).join(", "))}" placeholder="X-Api-Key: secret" /></label>
         <div class="tri-stack">
           ${renderTriSlider({ attrName: `data-${prefix}-ua`, attrVal: gName, label: "Bind User-Agent", val: g.bind_ua, inherited: gDefs.bind_ua })}
-          ${renderTriSlider({ attrName: `data-${prefix}-ip`, attrVal: gName, label: "Bind IP Prefix (/24 /48)", val: g.bind_ip_prefix, inherited: gDefs.bind_ip_prefix })}
+          ${renderTriSlider({ attrName: `data-${prefix}-ip`, attrVal: gName, label: "Bind Client IP (/32)", val: g.bind_ip_prefix, inherited: gDefs.bind_ip_prefix })}
           ${renderTriSlider({ attrName: `data-${prefix}-bots`, attrVal: gName, label: "Block Known Bots", val: g.block_bots, inherited: gDefs.block_bots })}
           ${renderTriSlider({ attrName: `data-${prefix}-headless`, attrVal: gName, label: "Block Headless Browsers", val: g.block_headless, inherited: gDefs.block_headless })}
           ${renderTriSlider({ attrName: `data-${prefix}-fp`, attrVal: gName, label: "Require Verified JS FP", val: g.require_client_fp, inherited: gDefs.require_client_fp })}
@@ -1675,7 +1675,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           <label><span>Service Tag</span><input list="service-tags-list" data-ir-svc="${i}" value="${escapeHtml(r.service_tag || "")}" placeholder="web@default" /></label>
         </div>
         <div class="inspector-row">
-          <label><span>Match Host</span><input data-ir-host="${i}" value="${escapeHtml(r.match?.host || "")}" placeholder="*.example.com" /></label>
+          <label><span>Match Host * (domain or * for all)</span><input data-ir-host="${i}" value="${escapeHtml(r.match?.host || "")}" placeholder="example.com (or *)" /></label>
           <label><span>Next Peer</span><input list="peer-tags-list" data-ir-peer="${i}" value="${escapeHtml(r.next_peer || "")}" placeholder="relay-1 or self" /></label>
         </div>
         <div class="inspector-row">
@@ -2366,7 +2366,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         const r = node.ingress.rules[Number(inp.dataset.irHost)];
         r.match = r.match || {};
         const v = inp.value.trim();
-        r.match.host = v && v !== "*" ? v : null;
+        r.match.host = v || null;
       })
     );
     box.querySelectorAll("[data-ir-peer]").forEach((inp) =>
@@ -3002,7 +3002,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           </div>
           <div class="tri-stack">
             ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "bind_ua", label: "Bind User-Agent", val: gDefs.bind_ua })}
-            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "bind_ip_prefix", label: "Bind IP Prefix (/24 /48)", val: gDefs.bind_ip_prefix })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "bind_ip_prefix", label: "Bind Client IP (/32)", val: gDefs.bind_ip_prefix })}
             ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "block_bots", label: "Block Known Bots", val: gDefs.block_bots })}
             ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "block_headless", label: "Block Headless Browsers", val: gDefs.block_headless })}
             ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "require_client_fp", label: "Require Verified JS FP", val: gDefs.require_client_fp })}
