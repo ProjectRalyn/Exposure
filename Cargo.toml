@@ -10,9 +10,9 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-authors = ["Exposure Contributors"]
-license = "MIT OR Apache-2.0"
+edition = "2024"
+authors = ["ProjectRalyn <ralyn@d2lib.com>"]
+license = "MIT"
 
 [workspace.dependencies]
 exposure-core = { path = "crates/exposure-core" }
