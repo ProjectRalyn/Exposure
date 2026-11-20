@@ -1056,6 +1056,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           c.classList.toggle("selected", c.dataset.nodeTag === tag);
         });
         renderEdges();
+        renderMinimap();
         if (prevSelectedTag !== tag) {
           renderInspector();
         }
@@ -1145,22 +1146,47 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     const ox = (mw - w * s) / 2 - minX * s;
     const oy = (mh - h * s) / 2 - minY * s;
 
+    let edgesSvg = "";
+    editor.spec.links.forEach((l, idx) => {
+      if (!editor.spec.nodes[l.from] || !editor.spec.nodes[l.to]) return;
+      const pa = editor.positions[l.from] || { x: 40, y: 40 };
+      const pb = editor.positions[l.to] || { x: 40, y: 40 };
+      const ha = editor.nodeHeights[l.from] || NODE_DEFAULT_H;
+      const hb = editor.nodeHeights[l.to] || NODE_DEFAULT_H;
+      const x1 = (pa.x + NODE_W / 2) * s + ox;
+      const y1 = (pa.y + ha / 2) * s + oy;
+      const x2 = (pb.x + NODE_W / 2) * s + ox;
+      const y2 = (pb.y + hb / 2) * s + oy;
+      const isSelLink = editor.selected?.type === "link" && editor.selected.index === idx;
+      edgesSvg += `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${isSelLink ? "#FAC800" : "#475569"}" stroke-width="${isSelLink ? "1.6" : "1"}" stroke-opacity="0.75" />`;
+    });
+
     let rects = "";
     for (const tag of tags) {
       const p = editor.positions[tag] || { x: 40, y: 40 };
+      const nh = editor.nodeHeights[tag] || NODE_DEFAULT_H;
       const isSel = editor.selected?.type === "node" && editor.selected.tag === tag;
-      rects += `<rect x="${(p.x * s + ox).toFixed(1)}" y="${(p.y * s + oy).toFixed(1)}" width="${Math.max(5, NODE_W * s).toFixed(1)}" height="${Math.max(4, NODE_DEFAULT_H * s).toFixed(1)}" rx="0" fill="${isSel ? "#4DA9D6" : "#334155"}" />`;
+      rects += `<rect x="${(p.x * s + ox).toFixed(1)}" y="${(p.y * s + oy).toFixed(1)}" width="${Math.max(6, NODE_W * s).toFixed(1)}" height="${Math.max(5, nh * s).toFixed(1)}" rx="2" fill="${isSel ? "#4DA9D6" : "#334155"}" ${isSel ? 'stroke="#e0f2fe" stroke-width="1"' : ""} />`;
     }
 
     const cr = canvas.getBoundingClientRect();
-    const vx = (-editor.view.tx / editor.view.scale) * s + ox;
-    const vy = (-editor.view.ty / editor.view.scale) * s + oy;
-    const vw = (cr.width / editor.view.scale) * s;
-    const vh = (cr.height / editor.view.scale) * s;
+    let vpRect = "";
+    if (cr.width > 10 && cr.height > 10) {
+      const vx = (-editor.view.tx / editor.view.scale) * s + ox;
+      const vy = (-editor.view.ty / editor.view.scale) * s + oy;
+      const vw = (cr.width / editor.view.scale) * s;
+      const vh = (cr.height / editor.view.scale) * s;
+      const cx1 = Math.max(0.5, Math.min(mw - 1, vx));
+      const cy1 = Math.max(0.5, Math.min(mh - 1, vy));
+      const cx2 = Math.max(cx1 + 4, Math.min(mw - 0.5, vx + vw));
+      const cy2 = Math.max(cy1 + 4, Math.min(mh - 0.5, vy + vh));
+      vpRect = `<rect x="${cx1.toFixed(1)}" y="${cy1.toFixed(1)}" width="${(cx2 - cx1).toFixed(1)}" height="${(cy2 - cy1).toFixed(1)}" rx="2" fill="rgba(56,189,248,0.08)" stroke="#4DA9D6" stroke-width="1" stroke-opacity="0.85" />`;
+    }
 
     mm.innerHTML = `<svg viewBox="0 0 ${mw} ${mh}" width="${mw}" height="${mh}">
+      ${vpRect}
+      ${edgesSvg}
       ${rects}
-      <rect x="${vx.toFixed(1)}" y="${vy.toFixed(1)}" width="${Math.max(8, vw).toFixed(1)}" height="${Math.max(8, vh).toFixed(1)}" fill="rgba(56,189,248,0.12)" stroke="#4DA9D6" stroke-width="1" />
     </svg>`;
   }
 
@@ -3267,6 +3293,12 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       if (editor.dragNode.moved) editor.suppressCanvasClick = true;
       savePositions(editor.positions);
       editor.dragNode = null;
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (editor.mode === "visual" && !el("tab-topology")?.classList.contains("hidden")) {
+      renderMinimap();
     }
   });
 
