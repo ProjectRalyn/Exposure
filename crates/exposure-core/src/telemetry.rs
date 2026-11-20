@@ -390,6 +390,28 @@ impl MinuteSummary {
     }
 }
 
+fn deser_u16_lenient<'de, D>(deserializer: D) -> std::result::Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() || v < 0.0 {
+        return Ok(0);
+    }
+    Ok(v.round().min(u16::MAX as f64) as u16)
+}
+
+fn deser_u8_lenient<'de, D>(deserializer: D) -> std::result::Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() || v < 0.0 {
+        return Ok(0);
+    }
+    Ok(v.round().min(u8::MAX as f64) as u8)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientJsFingerprint {
     #[serde(default)]
@@ -404,17 +426,17 @@ pub struct ClientJsFingerprint {
     pub tz: String,
     #[serde(default)]
     pub lang: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u16_lenient")]
     pub cores: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u16_lenient")]
     pub mem: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u8_lenient")]
     pub touch: u8,
     #[serde(default)]
     pub canvas_hash: String,
     #[serde(default)]
     pub dpr: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deser_u16_lenient")]
     pub plugins_count: u16,
 }
 
@@ -460,12 +482,14 @@ impl ClientJsFingerprint {
         let plat_l = self.platform.to_ascii_lowercase();
         let ua_l = ua.to_ascii_lowercase();
 
-        // 1. Direct automation / software-renderer signals
-        if self.webdriver
-            || webgl_l.contains("swiftshader")
+        // 1. Direct automation / headless signals (only flag SwiftShader/llvmpipe when plugins_count == 0
+        //    so genuine desktop browsers with GPU acceleration disabled or in VMs aren't false-positived)
+        let is_sw_renderer = webgl_l.contains("swiftshader")
             || webgl_l.contains("llvmpipe")
+            || webgl_l.contains("mesa offscreen");
+        if self.webdriver
             || webgl_l.contains("headless")
-            || webgl_l.contains("mesa offscreen")
+            || (is_sw_renderer && self.plugins_count == 0)
         {
             return true;
         }

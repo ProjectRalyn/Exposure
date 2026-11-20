@@ -540,6 +540,16 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert_eq!(html_resp.status(), 200);
+    assert_eq!(
+        html_resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "injected HTML must set Cache-Control: no-store to prevent 304 token replay"
+    );
+    assert!(
+        html_resp.headers().get("last-modified").is_none()
+            && html_resp.headers().get("etag").is_none(),
+        "injected HTML must strip Last-Modified and ETag validators"
+    );
     let html_body = html_resp.text().await.unwrap();
     assert!(
         html_body.contains(r#"<script defer src="/cdn-cgi/fp.js" data-t=""#),

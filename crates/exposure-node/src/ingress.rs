@@ -844,8 +844,10 @@ impl IngressServer {
             cfg.effective_js_fp_beacon(),
             rule.js_fp_beacon,
         ) {
-            // Request uncompressed HTML from upstream for this single probe request only (once per TTL per browser)
+            // Request fresh uncompressed HTML from upstream for this single probe request only (once per TTL per browser)
             req.headers_mut().remove(header::ACCEPT_ENCODING);
+            req.headers_mut().remove(header::IF_NONE_MATCH);
+            req.headers_mut().remove(header::IF_MODIFIED_SINCE);
             Some(self.guard.mint_fp_token(
                 &cfg.clearance_secret,
                 &host,
@@ -1261,13 +1263,17 @@ async fn maybe_inject_fp_beacon(resp: Response<ProxyBody>, fp_token: &str) -> Re
     );
     let injected = inject_script_into_html(&collected, snippet.as_bytes());
     parts.headers.remove(header::ETAG);
+    parts.headers.remove(header::LAST_MODIFIED);
+    parts.headers.remove(header::EXPIRES);
     parts.headers.remove(header::TRANSFER_ENCODING);
     if let Ok(hv) = HeaderValue::from_str(&injected.len().to_string()) {
         parts.headers.insert(header::CONTENT_LENGTH, hv);
     }
+    // Use `no-store` so browsers NEVER cache HTML containing a single-use `data-t` token
+    // (otherwise reload -> 304 Not Modified replays the spent token and triggers 403).
     parts.headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-cache"),
+        HeaderValue::from_static("no-store"),
     );
     Response::from_parts(parts, full_body(injected))
 }

@@ -172,12 +172,12 @@ function collectClientFingerprint() {
     screen: `${screen.width || 0}x${screen.height || 0}x${screen.colorDepth || 0}`,
     tz: tz.slice(0, 48),
     lang: String(navigator.language || "").slice(0, 24),
-    cores: Number(navigator.hardwareConcurrency || 0),
-    mem: Number(navigator.deviceMemory || 0),
-    touch: Number(navigator.maxTouchPoints || 0),
+    cores: Math.max(0, Math.round(Number(navigator.hardwareConcurrency || 0))),
+    mem: Math.max(0, Math.round(Number(navigator.deviceMemory || 0))),
+    touch: Math.max(0, Math.round(Number(navigator.maxTouchPoints || 0))),
     canvas_hash: canvasHash,
     dpr: String(window.devicePixelRatio || 1).slice(0, 16),
-    plugins_count: pluginsCount,
+    plugins_count: Math.max(0, Math.round(Number(pluginsCount || 0))),
   };
 }
 

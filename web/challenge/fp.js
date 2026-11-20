@@ -5,6 +5,11 @@
     const scriptEl = document.currentScript;
     const token = scriptEl && scriptEl.dataset ? scriptEl.dataset.t : "";
     if (!token) return;
+    const dedupKey = `exposure_fp_sent_${token.slice(0, 16)}`;
+    try {
+      if (window.sessionStorage && window.sessionStorage.getItem(dedupKey)) return;
+      if (window.sessionStorage) window.sessionStorage.setItem(dedupKey, "1");
+    } catch {}
 
     const collect = () => {
       let webgl = "";
@@ -60,12 +65,12 @@
         screen: `${screen.width || 0}x${screen.height || 0}x${screen.colorDepth || 0}`,
         tz: tz.slice(0, 48),
         lang: String(navigator.language || "").slice(0, 24),
-        cores: Number(navigator.hardwareConcurrency || 0),
-        mem: Number(navigator.deviceMemory || 0),
-        touch: Number(navigator.maxTouchPoints || 0),
+        cores: Math.max(0, Math.round(Number(navigator.hardwareConcurrency || 0))),
+        mem: Math.max(0, Math.round(Number(navigator.deviceMemory || 0))),
+        touch: Math.max(0, Math.round(Number(navigator.maxTouchPoints || 0))),
         canvas_hash: canvasHash,
         dpr,
-        plugins_count: pluginsCount,
+        plugins_count: Math.max(0, Math.round(Number(pluginsCount || 0))),
       };
     };
 
