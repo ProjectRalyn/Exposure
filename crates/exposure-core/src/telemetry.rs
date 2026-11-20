@@ -1,14 +1,24 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::routing::LinkHealthState;
 
-/// Deterministic HyperLogLog sketch with fixed precision and hash seed (DESIGN.md §4 & §12).
+/// Up to this many unique visitors per sketch are tracked with 100% exact cardinality;
+/// beyond this threshold the sketch seamlessly switches to HyperLogLog registers.
+pub const EXACT_UV_THRESHOLD: usize = 512;
+
+/// Deterministic HyperLogLog++ hybrid sketch (exact set up to 512 items, HLL above).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyperLogLog {
     pub precision: u8,
     pub seed: u64,
     pub registers: Vec<u8>,
+    #[serde(default)]
+    pub exact_set: BTreeSet<String>,
+    #[serde(default)]
+    pub exact_overflow: bool,
 }
 
 impl HyperLogLog {
@@ -19,6 +29,8 @@ impl HyperLogLog {
             precision: p,
             seed,
             registers: vec![0u8; m],
+            exact_set: BTreeSet::new(),
+            exact_overflow: false,
         }
     }
 
@@ -35,7 +47,7 @@ impl HyperLogLog {
     }
 
     pub fn insert(&mut self, item: &str) {
-        if !self.is_valid() {
+        if !self.is_valid() || item.is_empty() {
             return;
         }
         let h = self.hash64(item);
@@ -47,6 +59,15 @@ impl HyperLogLog {
                 *slot = rho;
             }
         }
+        if !self.exact_overflow {
+            // Compact 16-hex-char hashed key inside exact_set to bound memory
+            let compact = format!("{h:016x}");
+            self.exact_set.insert(compact);
+            if self.exact_set.len() > EXACT_UV_THRESHOLD {
+                self.exact_set.clear();
+                self.exact_overflow = true;
+            }
+        }
     }
 
     pub fn merge(&mut self, other: &HyperLogLog) {
@@ -56,9 +77,29 @@ impl HyperLogLog {
         if self.precision != other.precision || self.seed != other.seed {
             return;
         }
+        let self_has_nonzero_regs = self.registers.iter().any(|&r| r > 0);
+        let other_has_nonzero_regs = other.registers.iter().any(|&r| r > 0);
+        // Handle legacy sketches serialized without exact_set populated
+        let self_legacy = !self.exact_overflow && self.exact_set.is_empty() && self_has_nonzero_regs;
+        let other_legacy = !other.exact_overflow && other.exact_set.is_empty() && other_has_nonzero_regs;
+
         for (a, &b) in self.registers.iter_mut().zip(other.registers.iter()) {
             if b > *a {
                 *a = b;
+            }
+        }
+
+        if self.exact_overflow || other.exact_overflow || self_legacy || other_legacy {
+            self.exact_set.clear();
+            self.exact_overflow = true;
+        } else {
+            for k in &other.exact_set {
+                self.exact_set.insert(k.clone());
+                if self.exact_set.len() > EXACT_UV_THRESHOLD {
+                    self.exact_set.clear();
+                    self.exact_overflow = true;
+                    break;
+                }
             }
         }
     }
@@ -66,6 +107,12 @@ impl HyperLogLog {
     pub fn estimate(&self) -> f64 {
         if !self.is_valid() || self.registers.is_empty() {
             return 0.0;
+        }
+        if !self.exact_overflow {
+            let has_regs = self.registers.iter().any(|&r| r > 0);
+            if !self.exact_set.is_empty() || !has_regs {
+                return self.exact_set.len() as f64;
+            }
         }
         let m = self.registers.len() as f64;
         let alpha = match self.registers.len() {
@@ -201,11 +248,14 @@ pub struct SessionSummary {
     pub client_fp_verified: bool,
 }
 
-/// Aggregated summary per `(node_tag, minute_epoch, service_tag)` pushed to Maintainer.
+/// Aggregated summary per `(node_tag, role, minute_epoch, service_tag)` pushed to Maintainer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinuteSummary {
     pub minute_epoch: i64,
     pub node_tag: String,
+    /// Node role that recorded this summary (`"ingress"` or `"egress"`).
+    #[serde(default)]
+    pub role: String,
     pub service_tag: String,
     pub requests: u64,
     pub errors: u64,
@@ -230,6 +280,7 @@ impl MinuteSummary {
     pub fn new(
         minute_epoch: i64,
         node_tag: impl Into<String>,
+        role: impl Into<String>,
         service_tag: impl Into<String>,
         hll_precision: u8,
         hll_seed: u64,
@@ -238,6 +289,7 @@ impl MinuteSummary {
         Self {
             minute_epoch,
             node_tag: node_tag.into(),
+            role: role.into(),
             service_tag: service_tag.into(),
             requests: 0,
             errors: 0,
@@ -338,6 +390,211 @@ impl MinuteSummary {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClientJsFingerprint {
+    #[serde(default)]
+    pub webdriver: bool,
+    #[serde(default)]
+    pub webgl: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub screen: String,
+    #[serde(default)]
+    pub tz: String,
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
+    pub cores: u16,
+    #[serde(default)]
+    pub mem: u16,
+    #[serde(default)]
+    pub touch: u8,
+    #[serde(default)]
+    pub canvas_hash: String,
+    #[serde(default)]
+    pub dpr: String,
+    #[serde(default)]
+    pub plugins_count: u16,
+}
+
+fn clean_fp_str(raw: &str, max_len: usize) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(max_len)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+impl ClientJsFingerprint {
+    pub fn sanitize(&mut self) {
+        self.webgl = clean_fp_str(&self.webgl, 96);
+        self.platform = clean_fp_str(&self.platform, 32);
+        self.screen = clean_fp_str(&self.screen, 32);
+        self.tz = clean_fp_str(&self.tz, 48);
+        self.lang = clean_fp_str(&self.lang, 24);
+        self.canvas_hash = clean_fp_str(&self.canvas_hash, 32);
+        self.dpr = clean_fp_str(&self.dpr, 16);
+    }
+
+    pub fn canonical_hash(&self) -> String {
+        let canonical = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.screen,
+            self.tz,
+            self.lang,
+            self.platform,
+            self.cores,
+            self.mem,
+            self.touch,
+            self.webgl,
+            self.canvas_hash,
+            self.dpr,
+        );
+        crate::crypto::short_sha256_hex(&canonical)
+    }
+
+    pub fn detect_headless(&self, ua: &str) -> bool {
+        let webgl_l = self.webgl.to_ascii_lowercase();
+        let plat_l = self.platform.to_ascii_lowercase();
+        let ua_l = ua.to_ascii_lowercase();
+        self.webdriver
+            || webgl_l.contains("swiftshader")
+            || webgl_l.contains("llvmpipe")
+            || webgl_l.contains("headless")
+            || (ua_l.contains("iphone") && plat_l.contains("win"))
+            || (ua_l.contains("android") && plat_l.contains("win"))
+    }
+}
+
+/// Rich visitor & browser fingerprint observation aggregated across Node -> Maintainer -> Control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FingerprintObservation {
+    /// Composite key: `<ip_hmac>:<fp_hash>` (deduplicates same visitor + browser FP).
+    pub id: String,
+    pub ip_hmac: String,
+    /// Raw client IP (populated only when `store_raw_ip: true`).
+    #[serde(default)]
+    pub client_ip: Option<String>,
+    /// Masked IP subnet prefix (e.g. `203.0.113.0/24` or `2001:db8:1::/48`).
+    #[serde(default)]
+    pub ip_prefix: String,
+    /// Browser JS fingerprint hash (when JS-verified) or server-side UA/header hash.
+    pub fp_hash: String,
+    #[serde(default)]
+    pub js_verified: bool,
+    /// `"none" | "beacon" | "pow"`
+    #[serde(default)]
+    pub fp_source: String,
+    pub node_tag: String,
+    pub service_tag: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub accept_language: String,
+    #[serde(default)]
+    pub device_type: String,
+    #[serde(default)]
+    pub browser_family: String,
+    #[serde(default)]
+    pub os_family: String,
+    #[serde(default)]
+    pub is_bot: bool,
+    #[serde(default)]
+    pub is_headless: bool,
+    #[serde(default)]
+    pub suspicion_score: u8,
+    #[serde(default)]
+    pub tls_cipher_count: u16,
+    #[serde(default)]
+    pub tls_alpn: bool,
+    #[serde(default)]
+    pub js_fp: Option<ClientJsFingerprint>,
+    pub first_seen_ts: i64,
+    pub last_seen_ts: i64,
+    pub request_count: u64,
+    #[serde(default)]
+    pub challenge_count: u64,
+    #[serde(default)]
+    pub rate_limited_count: u64,
+}
+
+impl FingerprintObservation {
+    pub fn sanitize(&mut self) {
+        self.id = clean_fp_str(&self.id, 64);
+        self.ip_hmac = clean_fp_str(&self.ip_hmac, 32);
+        if let Some(ref mut ip) = self.client_ip {
+            *ip = clean_fp_str(ip, 64);
+        }
+        self.ip_prefix = clean_fp_str(&self.ip_prefix, 64);
+        self.fp_hash = clean_fp_str(&self.fp_hash, 32);
+        self.fp_source = clean_fp_str(&self.fp_source, 16);
+        self.host = clean_fp_str(&self.host, 128);
+        self.user_agent = clean_fp_str(&self.user_agent, 320);
+        self.accept_language = clean_fp_str(&self.accept_language, 64);
+        self.device_type = clean_fp_str(&self.device_type, 32);
+        self.browser_family = clean_fp_str(&self.browser_family, 32);
+        self.os_family = clean_fp_str(&self.os_family, 32);
+        if let Some(ref mut js) = self.js_fp {
+            js.sanitize();
+        }
+    }
+
+    pub fn merge_from(&mut self, other: &FingerprintObservation) {
+        if other.first_seen_ts > 0 && (self.first_seen_ts == 0 || other.first_seen_ts < self.first_seen_ts) {
+            self.first_seen_ts = other.first_seen_ts;
+        }
+        if other.last_seen_ts >= self.last_seen_ts {
+            self.last_seen_ts = other.last_seen_ts;
+            if !other.node_tag.is_empty() {
+                self.node_tag = other.node_tag.clone();
+            }
+            if !other.service_tag.is_empty() {
+                self.service_tag = other.service_tag.clone();
+            }
+            if !other.host.is_empty() {
+                self.host = other.host.clone();
+            }
+            if !other.user_agent.is_empty() {
+                self.user_agent = other.user_agent.clone();
+            }
+            if !other.accept_language.is_empty() {
+                self.accept_language = other.accept_language.clone();
+            }
+        }
+        if self.client_ip.is_none() && other.client_ip.is_some() {
+            self.client_ip = other.client_ip.clone();
+        }
+        if self.ip_prefix.is_empty() && !other.ip_prefix.is_empty() {
+            self.ip_prefix = other.ip_prefix.clone();
+        }
+        self.request_count = self.request_count.saturating_add(other.request_count);
+        self.challenge_count = self.challenge_count.saturating_add(other.challenge_count);
+        self.rate_limited_count = self
+            .rate_limited_count
+            .saturating_add(other.rate_limited_count);
+        self.suspicion_score = self.suspicion_score.max(other.suspicion_score);
+        self.is_bot |= other.is_bot;
+        self.is_headless |= other.is_headless;
+        if other.tls_cipher_count > 0 {
+            self.tls_cipher_count = other.tls_cipher_count;
+            self.tls_alpn = other.tls_alpn;
+        }
+        if other.js_verified {
+            self.js_verified = true;
+            if other.fp_source == "pow" || self.fp_source.is_empty() || self.fp_source == "none" {
+                self.fp_source = other.fp_source.clone();
+            }
+            if other.js_fp.is_some() {
+                self.js_fp = other.js_fp.clone();
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkStatusSnapshot {
     pub node_tag: String,
@@ -383,11 +640,26 @@ mod tests {
         let est = a.estimate();
         assert!(est > 600.0 && est < 900.0, "unexpected HLL estimate: {est}");
 
+        // Exact cardinality for small sets (<= 512)
+        let mut small_a = HyperLogLog::new(12, 42);
+        let mut small_b = HyperLogLog::new(12, 42);
+        for i in 0..10 {
+            small_a.insert(&format!("user-{i}"));
+        }
+        for i in 5..15 {
+            small_b.insert(&format!("user-{i}"));
+        }
+        assert_eq!(small_a.estimate(), 10.0);
+        small_a.merge(&small_b);
+        assert_eq!(small_a.estimate(), 15.0);
+
         // Malformed deserialized HLL must not panic or return NaN
         let mut bad = HyperLogLog {
             precision: 0,
             seed: 1,
             registers: vec![],
+            exact_set: BTreeSet::new(),
+            exact_overflow: false,
         };
         bad.insert("test");
         assert_eq!(bad.estimate(), 0.0);

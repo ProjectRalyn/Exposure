@@ -4,7 +4,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::config::{NodeRoles, SignedConfigBundle};
 use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
-use crate::telemetry::{AlertRecord, CertStatusInfo, LinkStatusSnapshot, MinuteSummary, SessionSummary};
+use crate::telemetry::{
+    AlertRecord, CertStatusInfo, FingerprintObservation, LinkStatusSnapshot, MinuteSummary,
+    SessionSummary,
+};
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME_BYTES: usize = 16 * 1024;
@@ -301,6 +304,8 @@ pub struct NodeStatusSnapshot {
 pub struct MaintainerTelemetrySnapshot {
     pub maintainer_tag: String,
     pub summaries: Vec<MinuteSummary>,
+    #[serde(default)]
+    pub fingerprints: Vec<FingerprintObservation>,
     pub certificates: Vec<CertStatusInfo>,
     pub segment_backlog: usize,
     pub merge_latency_ms: f64,
@@ -351,6 +356,8 @@ pub enum SpecialPayload {
         from_node: String,
         records: Vec<SessionSummary>,
         minute_summaries: Vec<MinuteSummary>,
+        #[serde(default)]
+        fingerprints: Vec<FingerprintObservation>,
     },
     LogAck {
         accepted: usize,

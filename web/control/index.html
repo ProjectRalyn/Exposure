@@ -42,6 +42,7 @@
         <button class="nav-item active" data-tab="overview">Overview</button>
         <button class="nav-item" data-tab="topology">Topology Studio</button>
         <button class="nav-item" data-tab="observability">Analytics &amp; Certs</button>
+        <button class="nav-item" data-tab="fingerprints">Fingerprints</button>
         <button class="nav-item" data-tab="nodes">Nodes &amp; Links</button>
         <button class="nav-item" data-tab="onboarding">Onboarding</button>
         <button class="nav-item" data-tab="audit">Audit Log</button>
@@ -178,6 +179,7 @@
             <div class="btn-row">
               <div class="seg-group">
                 <button id="btn-mode-visual" class="btn sm primary">Visual Graph</button>
+                <button id="btn-mode-defaults" class="btn sm">Defaults &amp; Templates</button>
                 <button id="btn-mode-yaml" class="btn sm">YAML Source</button>
               </div>
               <span id="topo-dirty-badge" class="pill warn hidden">UNSAVED</span>
@@ -238,6 +240,8 @@
             <aside id="topo-inspector" class="topo-inspector"></aside>
           </div>
 
+          <div id="topo-defaults-wrap" class="defaults-workspace hidden"></div>
+
           <div id="topo-yaml-wrap" class="hidden">
             <textarea id="topology-editor" class="code-editor" spellcheck="false"></textarea>
           </div>
@@ -291,7 +295,7 @@
             <button type="button" class="cf-metric-tab" data-cf-metric="uv">
               <span class="cf-mt-label">Unique Visitors</span>
               <span id="cf-val-uv" class="cf-mt-val">0</span>
-              <span id="cf-sub-uv" class="cf-mt-sub">Sum of bucket UVs</span>
+              <span id="cf-sub-uv" class="cf-mt-sub">Exact / HLL union</span>
             </button>
             <button type="button" class="cf-metric-tab" data-cf-metric="bandwidth">
               <span class="cf-mt-label">Total Data Served</span>
@@ -350,7 +354,10 @@
         <div class="panel">
           <div class="panel-header">
             <h3>Client Fingerprints (Devices · Browsers · OS)</h3>
-            <span id="obs-fp-verified-badge" class="muted-sm">0 JS-verified</span>
+            <div class="btn-row">
+              <span id="obs-fp-verified-badge" class="muted-sm">0 JS-verified</span>
+              <button id="btn-open-fp-explorer" class="btn sm">Search Fingerprints &amp; IPs →</button>
+            </div>
           </div>
           <div id="obs-fp-breakdown" class="dashboard-grid-3" style="margin-bottom:0;"></div>
         </div>
@@ -368,12 +375,107 @@
           <div class="table-scroll" style="margin-top:12px;">
             <table class="table">
               <thead>
-                <tr><th>Time</th><th>Node</th><th>Service</th><th>Requests</th><th>UV (HLL)</th><th>Errors</th><th>429</th><th>PoW</th><th>Bytes In/Out</th><th>p50/p95/p99 (ms)</th></tr>
+                <tr><th>Time</th><th>Node</th><th>Role</th><th>Service</th><th>Requests</th><th>UV</th><th>Errors</th><th>429</th><th>PoW</th><th>Bytes In/Out</th><th>p50/p95/p99 (ms)</th></tr>
               </thead>
               <tbody id="stats-tbody"></tbody>
             </table>
           </div>
         </details>
+      </section>
+
+      <!-- Fingerprints & Visitor Explorer -->
+      <section id="tab-fingerprints" class="tab-panel hidden">
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="kpi-label">Matched Visitors</div>
+            <div id="fp-kpi-total" class="kpi-val">0</div>
+            <div id="fp-kpi-ips" class="kpi-sub">0 unique IPs</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">JS-Verified FPs</div>
+            <div id="fp-kpi-verified" class="kpi-val">0</div>
+            <div id="fp-kpi-sources" class="kpi-sub">0 beacon · 0 PoW</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Unique Browser FPs</div>
+            <div id="fp-kpi-unique-fp" class="kpi-val">0</div>
+            <div class="kpi-sub">Distinct browser signatures</div>
+          </div>
+          <div class="kpi">
+            <div class="kpi-label">Bots &amp; Headless</div>
+            <div id="fp-kpi-risk" class="kpi-val">0 / 0</div>
+            <div class="kpi-sub">Bot UA / Headless JS</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="fp-search-bar">
+            <label>
+              <span>Universal Search (UA / WebGL / Host / Service / IP / FP)</span>
+              <input id="fp-search-q" type="search" placeholder="Search Chrome, NVIDIA, example.com, 203.0.113.5, or hash…" />
+            </label>
+            <label>
+              <span>IP / Prefix / HMAC</span>
+              <input id="fp-search-ip" type="search" placeholder="e.g. 203.0.113.5 or /24" />
+            </label>
+            <label>
+              <span>Browser FP / Canvas / WebGL</span>
+              <input id="fp-search-fp" type="search" placeholder="e.g. fp_hash or canvas" />
+            </label>
+            <div class="btn-row">
+              <button id="btn-fp-search" class="btn primary">Search</button>
+              <button id="btn-fp-clear" class="btn ghost">Reset</button>
+            </div>
+          </div>
+
+          <div class="fp-filter-row">
+            <div class="fp-chip-group" id="fp-verified-chips">
+              <span class="muted-sm">Verification:</span>
+              <button type="button" class="fp-chip active" data-fp-ver="all">All</button>
+              <button type="button" class="fp-chip" data-fp-ver="js">JS Verified</button>
+              <button type="button" class="fp-chip" data-fp-ver="beacon">Passive Beacon</button>
+              <button type="button" class="fp-chip" data-fp-ver="pow">PoW Verified</button>
+              <button type="button" class="fp-chip" data-fp-ver="ua">UA Only</button>
+            </div>
+            <div class="fp-chip-group" id="fp-risk-chips">
+              <span class="muted-sm">Risk:</span>
+              <button type="button" class="fp-chip active" data-fp-risk="all">All</button>
+              <button type="button" class="fp-chip" data-fp-risk="clean">Clean</button>
+              <button type="button" class="fp-chip" data-fp-risk="suspicious">Suspicious</button>
+              <button type="button" class="fp-chip" data-fp-risk="headless">Headless</button>
+              <button type="button" class="fp-chip" data-fp-risk="bot">Bots</button>
+            </div>
+            <div class="btn-row">
+              <select id="fp-node-filter" class="select-sm"><option value="all">All Nodes</option></select>
+              <select id="fp-svc-filter" class="select-sm"><option value="all">All Services</option></select>
+            </div>
+          </div>
+          <div id="fp-privacy-hint" class="muted-sm" style="margin-top:8px;"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h3>Visitor &amp; Browser Fingerprint Directory</h3>
+            <span id="fp-result-meta" class="muted-sm">Click any row to inspect full TLS, UA &amp; JS signals</span>
+          </div>
+          <div class="table-scroll" style="max-height:540px;">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>IP / Subnet / HMAC</th>
+                  <th>Browser FP</th>
+                  <th>Device · Browser · OS</th>
+                  <th>JS Signals (Screen · WebGL · TZ)</th>
+                  <th>Node / Service</th>
+                  <th>Risk</th>
+                  <th>Traffic</th>
+                  <th>Last Seen</th>
+                </tr>
+              </thead>
+              <tbody id="fp-tbody"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <!-- Nodes & Links -->

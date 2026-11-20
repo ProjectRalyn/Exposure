@@ -163,6 +163,8 @@ function collectClientFingerprint() {
   } catch {}
   let tz = "";
   try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch {}
+  let pluginsCount = 0;
+  try { pluginsCount = navigator.plugins ? navigator.plugins.length : 0; } catch {}
   return {
     webdriver: Boolean(navigator.webdriver),
     webgl: webgl.slice(0, 96),
@@ -174,6 +176,8 @@ function collectClientFingerprint() {
     mem: Number(navigator.deviceMemory || 0),
     touch: Number(navigator.maxTouchPoints || 0),
     canvas_hash: canvasHash,
+    dpr: String(window.devicePixelRatio || 1).slice(0, 16),
+    plugins_count: pluginsCount,
   };
 }
 

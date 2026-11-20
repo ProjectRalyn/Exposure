@@ -173,15 +173,31 @@ impl Default for ProbeConfig {
     }
 }
 
+fn default_js_fp_ttl_secs() -> u64 {
+    3600
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkListenConfig {
     pub listen_addr: String,
-    #[serde(default = "default_true")]
-    pub allow_on_demand: bool,
-    #[serde(default = "default_true")]
-    pub allow_tunnel: bool,
-    #[serde(default)]
-    pub allow_bootstrap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_on_demand: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_tunnel: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_bootstrap: Option<bool>,
+}
+
+impl LinkListenConfig {
+    pub fn effective_allow_on_demand(&self) -> bool {
+        self.allow_on_demand.unwrap_or(true)
+    }
+    pub fn effective_allow_tunnel(&self) -> bool {
+        self.allow_tunnel.unwrap_or(true)
+    }
+    pub fn effective_allow_bootstrap(&self) -> bool {
+        self.allow_bootstrap.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -199,15 +215,21 @@ pub enum AntibotMode {
 pub struct RateLimitBucket {
     pub capacity: f64,
     pub refill_per_sec: f64,
-    #[serde(default = "default_true")]
-    pub per_ip: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_ip: Option<bool>,
+}
+
+impl RateLimitBucket {
+    pub fn effective_per_ip(&self) -> bool {
+        self.per_ip.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuardProfile {
     #[serde(default)]
     pub antibot: AntibotMode,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_bucket: Option<String>,
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
@@ -223,22 +245,52 @@ pub struct GuardProfile {
     pub pow_difficulty: u8,
     #[serde(default = "default_clearance_ttl_secs")]
     pub clearance_ttl_secs: u64,
-    #[serde(default = "default_true")]
-    pub bind_ua: bool,
-    #[serde(default)]
-    pub bind_ip_prefix: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_ua: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_ip_prefix: Option<bool>,
     /// Authenticated API bypass rules formatted as `"Header-Name: expected-secret-value"`.
     #[serde(default)]
     pub api_bypass_headers: Vec<String>,
     /// Block known bot/scraper User-Agents.
-    #[serde(default)]
-    pub block_bots: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_bots: Option<bool>,
     /// Reject headless/automated browsers detected via JS WebGL/webdriver/platform cross-check.
-    #[serde(default)]
-    pub block_headless: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_headless: Option<bool>,
     /// Require a verified browser JS fingerprint bound to the clearance cookie.
-    #[serde(default)]
-    pub require_client_fp: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_client_fp: Option<bool>,
+    /// Inject passive JS fingerprint beacon into unverified HTML document responses (tri-state: Default/On/Off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+    /// Cooldown TTL in seconds before re-collecting passive JS fingerprint from the same browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_ttl_secs: Option<u64>,
+}
+
+impl GuardProfile {
+    pub fn effective_bind_ua(&self) -> bool {
+        self.bind_ua.unwrap_or(true)
+    }
+    pub fn effective_bind_ip_prefix(&self) -> bool {
+        self.bind_ip_prefix.unwrap_or(false)
+    }
+    pub fn effective_block_bots(&self) -> bool {
+        self.block_bots.unwrap_or(false)
+    }
+    pub fn effective_block_headless(&self) -> bool {
+        self.block_headless.unwrap_or(false)
+    }
+    pub fn effective_require_client_fp(&self) -> bool {
+        self.require_client_fp.unwrap_or(false)
+    }
+    pub fn effective_js_fp_beacon(&self) -> bool {
+        self.js_fp_beacon.unwrap_or(true)
+    }
+    pub fn effective_js_fp_ttl_secs(&self) -> u64 {
+        self.js_fp_ttl_secs.unwrap_or_else(default_js_fp_ttl_secs).max(60)
+    }
 }
 
 impl Default for GuardProfile {
@@ -252,12 +304,14 @@ impl Default for GuardProfile {
             reject_threshold: default_reject_threshold(),
             pow_difficulty: default_pow_difficulty(),
             clearance_ttl_secs: default_clearance_ttl_secs(),
-            bind_ua: true,
-            bind_ip_prefix: false,
+            bind_ua: None,
+            bind_ip_prefix: None,
             api_bypass_headers: Vec::new(),
-            block_bots: false,
-            block_headless: false,
-            require_client_fp: false,
+            block_bots: None,
+            block_headless: None,
+            require_client_fp: None,
+            js_fp_beacon: None,
+            js_fp_ttl_secs: None,
         }
     }
 }
@@ -289,10 +343,18 @@ pub struct IngressRule {
     pub service_tag: String,
     /// Next hop Peer Tag, or this node's own `node_tag` / `"local"` for co-located egress.
     pub next_peer: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
-    #[serde(default)]
-    pub intercept_errors: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+}
+
+impl IngressRule {
+    pub fn effective_intercept_errors(&self) -> bool {
+        self.intercept_errors.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,10 +386,25 @@ pub struct IngressConfig {
     /// HMAC signing secret for Entry Guard challenges & clearance cookies (must be high-entropy random).
     #[serde(default)]
     pub clearance_secret: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_store_dir: Option<String>,
     #[serde(default = "default_server_header")]
     pub server_header: String,
+    /// Node-level default for passive HTML JS fingerprint beacon injection (tri-state: Default/On/Off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+    /// Cooldown TTL in seconds before re-injecting passive JS fingerprint beacon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_ttl_secs: Option<u64>,
+}
+
+impl IngressConfig {
+    pub fn effective_js_fp_beacon(&self) -> bool {
+        self.js_fp_beacon.unwrap_or(true)
+    }
+    pub fn effective_js_fp_ttl_secs(&self) -> u64 {
+        self.js_fp_ttl_secs.unwrap_or_else(default_js_fp_ttl_secs).max(60)
+    }
 }
 
 impl Default for IngressConfig {
@@ -341,6 +418,8 @@ impl Default for IngressConfig {
             clearance_secret: String::new(),
             cert_store_dir: None,
             server_header: default_server_header(),
+            js_fp_beacon: None,
+            js_fp_ttl_secs: None,
         }
     }
 }
@@ -382,25 +461,40 @@ pub struct EgressServiceConfig {
     pub backend: String,
     #[serde(default)]
     pub protocol: BackendProtocol,
-    #[serde(default)]
-    pub tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
     /// Optional path to custom PEM root CA certificate bundle for verifying `tls: true` backends.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert_path: Option<String>,
     /// Explicitly skip backend server certificate chain verification (still verifies TLS handshake signatures).
-    #[serde(default)]
-    pub insecure_skip_verify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_skip_verify: Option<bool>,
     /// Allowed origin ingress Node Tags. Empty => deny unless `allow_any_origin: true`.
     #[serde(default)]
     pub allow_from: Vec<String>,
-    #[serde(default)]
-    pub allow_any_origin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_any_origin: Option<bool>,
     #[serde(default = "default_backend_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
-    pub intercept_errors: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_health_check: Option<LocalHealthCheckConfig>,
+}
+
+impl EgressServiceConfig {
+    pub fn effective_tls(&self) -> bool {
+        self.tls.unwrap_or(false)
+    }
+    pub fn effective_insecure_skip_verify(&self) -> bool {
+        self.insecure_skip_verify.unwrap_or(false)
+    }
+    pub fn effective_allow_any_origin(&self) -> bool {
+        self.allow_any_origin.unwrap_or(false)
+    }
+    pub fn effective_intercept_errors(&self) -> bool {
+        self.intercept_errors.unwrap_or(false)
+    }
 }
 
 fn default_backend_timeout_ms() -> u64 {
@@ -774,9 +868,163 @@ fn default_pull_interval() -> u64 {
     30
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressDefaults {
+    #[serde(default = "default_server_header")]
+    pub server_header: String,
+    #[serde(default)]
+    pub clearance_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_store_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_guard: Option<String>,
+    #[serde(default)]
+    pub intercept_errors: bool,
+    #[serde(default = "default_true")]
+    pub js_fp_beacon: bool,
+    #[serde(default = "default_js_fp_ttl_secs")]
+    pub js_fp_ttl_secs: u64,
+}
+
+impl Default for IngressDefaults {
+    fn default() -> Self {
+        Self {
+            server_header: default_server_header(),
+            clearance_secret: String::new(),
+            cert_store_dir: None,
+            default_guard: None,
+            intercept_errors: false,
+            js_fp_beacon: true,
+            js_fp_ttl_secs: default_js_fp_ttl_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardDefaults {
+    #[serde(default)]
+    pub antibot: AntibotMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bucket: Option<String>,
+    #[serde(default = "default_challenge_threshold")]
+    pub challenge_threshold: u8,
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: u8,
+    #[serde(default = "default_pow_difficulty")]
+    pub pow_difficulty: u8,
+    #[serde(default = "default_clearance_ttl_secs")]
+    pub clearance_ttl_secs: u64,
+    #[serde(default = "default_true")]
+    pub bind_ua: bool,
+    #[serde(default)]
+    pub bind_ip_prefix: bool,
+    #[serde(default)]
+    pub block_bots: bool,
+    #[serde(default)]
+    pub block_headless: bool,
+    #[serde(default)]
+    pub require_client_fp: bool,
+    #[serde(default = "default_true")]
+    pub js_fp_beacon: bool,
+    #[serde(default = "default_js_fp_ttl_secs")]
+    pub js_fp_ttl_secs: u64,
+}
+
+impl Default for GuardDefaults {
+    fn default() -> Self {
+        Self {
+            antibot: AntibotMode::Challenge,
+            rate_limit_bucket: None,
+            challenge_threshold: default_challenge_threshold(),
+            reject_threshold: default_reject_threshold(),
+            pow_difficulty: default_pow_difficulty(),
+            clearance_ttl_secs: default_clearance_ttl_secs(),
+            bind_ua: true,
+            bind_ip_prefix: false,
+            block_bots: false,
+            block_headless: false,
+            require_client_fp: false,
+            js_fp_beacon: true,
+            js_fp_ttl_secs: default_js_fp_ttl_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressDefaults {
+    #[serde(default)]
+    pub protocol: BackendProtocol,
+    #[serde(default = "default_backend_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default)]
+    pub allow_any_origin: bool,
+    #[serde(default)]
+    pub intercept_errors: bool,
+}
+
+impl Default for EgressDefaults {
+    fn default() -> Self {
+        Self {
+            protocol: BackendProtocol::Auto,
+            timeout_ms: default_backend_timeout_ms(),
+            tls: false,
+            ca_cert_path: None,
+            insecure_skip_verify: false,
+            allow_any_origin: false,
+            intercept_errors: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkListenerDefaults {
+    #[serde(default = "default_true")]
+    pub allow_on_demand: bool,
+    #[serde(default = "default_true")]
+    pub allow_tunnel: bool,
+    #[serde(default)]
+    pub allow_bootstrap: bool,
+}
+
+impl Default for LinkListenerDefaults {
+    fn default() -> Self {
+        Self {
+            allow_on_demand: true,
+            allow_tunnel: true,
+            allow_bootstrap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TopologyDefaults {
+    #[serde(default)]
+    pub ingress: IngressDefaults,
+    #[serde(default)]
+    pub guard: GuardDefaults,
+    #[serde(default)]
+    pub egress: EgressDefaults,
+    #[serde(default)]
+    pub link_listener: LinkListenerDefaults,
+}
+
 /// High-level topology table edited in Control and compiled into per-node configs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TopologySpec {
+    #[serde(default)]
+    pub defaults: TopologyDefaults,
+    /// Globally reusable Guard profile templates selectable on any Ingress node/rule.
+    #[serde(default)]
+    pub guard_templates: BTreeMap<String, GuardProfile>,
+    /// Globally reusable Rate-Limit bucket templates selectable by any Guard template or Ingress node.
+    #[serde(default)]
+    pub bucket_templates: BTreeMap<String, RateLimitBucket>,
     #[serde(default)]
     pub nodes: BTreeMap<String, TopologyNodeSpec>,
     #[serde(default)]

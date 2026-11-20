@@ -28,6 +28,17 @@ async fn spawn_echo_backend() -> std::net::SocketAddr {
             };
             tokio::spawn(async move {
                 let svc = service_fn(|req: Request<Incoming>| async move {
+                    if req.uri().path() == "/page.html" {
+                        return Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/html; charset=utf-8")
+                                .body(Full::new(Bytes::from(
+                                    "<!doctype html><html><body><h1>Hello Exposure</h1></body></html>",
+                                )))
+                                .unwrap(),
+                        );
+                    }
                     let body = format!(
                         "echo:ver={:?}:path={}",
                         req.version(),
@@ -49,10 +60,10 @@ async fn spawn_echo_backend() -> std::net::SocketAddr {
     addr
 }
 
-fn temp_seg_cfg(name: &str) -> LoggerConfig {
+fn temp_seg_cfg(name: &str, shared_hmac: &str) -> LoggerConfig {
     let dir = std::env::temp_dir().join(format!("exposure-e2e-{name}-{}", uuid::Uuid::new_v4()));
     LoggerConfig {
-        hmac_key: generate_random_secret_hex(32),
+        hmac_key: shared_hmac.to_string(),
         segment: SegmentConfig {
             dir: dir.to_string_lossy().to_string(),
             flush_interval_secs: 60,
@@ -82,6 +93,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     let kp_maint_cert = NodeKeyPair::generate();
     let kp_ctrl_sign = NodeKeyPair::generate();
     let kp_ctrl_link = NodeKeyPair::generate();
+    let shared_hmac = generate_random_secret_hex(32);
 
     // 1. Start Maintainer Node
     let maint_cfg = NodeConfig {
@@ -95,9 +107,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         },
         link_listener: Some(LinkListenConfig {
             listen_addr: "127.0.0.1:0".into(),
-            allow_on_demand: true,
-            allow_tunnel: true,
-            allow_bootstrap: false,
+            allow_on_demand: Some(true),
+            allow_tunnel: Some(true),
+            allow_bootstrap: Some(false),
         }),
         peers: vec![],
         probe: ProbeConfig::default(),
@@ -105,14 +117,14 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         maintainer_hops: vec![],
         trusted_maintainers: vec![],
         trusted_origins: vec![],
-        logger: temp_seg_cfg("maint"),
+        logger: temp_seg_cfg("maint", &shared_hmac),
         ingress: Default::default(),
         egress: Default::default(),
         relay: Default::default(),
         maintainer: Some(MaintainerConfig {
             cert_signing_secret_key: Some(kp_maint_cert.secret_key_b64()),
             is_primary_cert_manager: true,
-            logger: temp_seg_cfg("maint-agg"),
+            logger: temp_seg_cfg("maint-agg", &shared_hmac),
             acme: AcmeConfig {
                 directory_url: "self-signed".into(),
                 storage_dir: std::env::temp_dir()
@@ -141,9 +153,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         },
         link_listener: Some(LinkListenConfig {
             listen_addr: "127.0.0.1:0".into(),
-            allow_on_demand: true,
-            allow_tunnel: true,
-            allow_bootstrap: false,
+            allow_on_demand: Some(true),
+            allow_tunnel: Some(true),
+            allow_bootstrap: Some(false),
         }),
         peers: vec![
             PeerConfig {
@@ -186,7 +198,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         maintainer_hops: vec!["relay-1".into(), "maintainer-1".into()],
         trusted_maintainers: vec![],
         trusted_origins: vec![],
-        logger: temp_seg_cfg("relay"),
+        logger: temp_seg_cfg("relay", &shared_hmac),
         ingress: Default::default(),
         egress: Default::default(),
         relay: RelayConfig {
@@ -232,13 +244,13 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         EgressServiceConfig {
             backend: backend_addr.to_string(),
             protocol: BackendProtocol::Auto,
-            tls: false,
+            tls: Some(false),
             ca_cert_path: None,
-            insecure_skip_verify: false,
+            insecure_skip_verify: Some(false),
             allow_from: vec!["ingress-a".into()],
-            allow_any_origin: false,
+            allow_any_origin: Some(false),
             timeout_ms: 5000,
-            intercept_errors: false,
+            intercept_errors: Some(false),
             local_health_check: None,
         },
     );
@@ -274,7 +286,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             node_tag: "ingress-a".into(),
             public_key: kp_ingress.public_key_b64(),
         }],
-        logger: temp_seg_cfg("egress"),
+        logger: temp_seg_cfg("egress", &shared_hmac),
         ingress: Default::default(),
         egress: EgressConfig {
             services: egress_services,
@@ -305,8 +317,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             reject_threshold: 95,
             pow_difficulty: 8,
             clearance_ttl_secs: 600,
-            bind_ua: true,
-            bind_ip_prefix: false,
+            bind_ua: Some(true),
+            bind_ip_prefix: Some(false),
             ..Default::default()
         },
     );
@@ -316,7 +328,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         RateLimitBucket {
             capacity: 2.0,
             refill_per_sec: 0.01,
-            per_ip: true,
+            per_ip: Some(true),
         },
     );
     let mut local_services = BTreeMap::new();
@@ -325,13 +337,13 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         EgressServiceConfig {
             backend: backend_addr.to_string(),
             protocol: BackendProtocol::Auto,
-            tls: false,
+            tls: Some(false),
             ca_cert_path: None,
-            insecure_skip_verify: false,
+            insecure_skip_verify: Some(false),
             allow_from: vec!["ingress-a".into()],
-            allow_any_origin: false,
+            allow_any_origin: Some(false),
             timeout_ms: 5000,
-            intercept_errors: false,
+            intercept_errors: Some(false),
             local_health_check: Some(LocalHealthCheckConfig {
                 enabled: true,
                 interval_secs: 10,
@@ -354,9 +366,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         },
         link_listener: Some(LinkListenConfig {
             listen_addr: "127.0.0.1:0".into(),
-            allow_on_demand: true,
-            allow_tunnel: true,
-            allow_bootstrap: true,
+            allow_on_demand: Some(true),
+            allow_tunnel: Some(true),
+            allow_bootstrap: Some(true),
         }),
         peers: vec![PeerConfig {
             peer_tag: "relay-1".into(),
@@ -380,7 +392,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             public_key: kp_maint_cert.public_key_b64(),
         }],
         trusted_origins: vec![],
-        logger: temp_seg_cfg("ingress"),
+        logger: temp_seg_cfg("ingress", &shared_hmac),
         ingress: IngressConfig {
             listeners: vec![IngressListener {
                 listen_addr: "127.0.0.1:0".into(),
@@ -396,7 +408,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     service_tag: "web@remote".into(),
                     next_peer: "relay-1".into(),
                     guard: None,
-                    intercept_errors: false,
+                    intercept_errors: Some(false),
+                    js_fp_beacon: Some(true),
                 },
                 IngressRule {
                     name: Some("local-self-tag".into()),
@@ -407,7 +420,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     service_tag: "web@local".into(),
                     next_peer: "ingress-a".into(),
                     guard: None,
-                    intercept_errors: false,
+                    intercept_errors: Some(false),
+                    js_fp_beacon: Some(true),
                 },
                 IngressRule {
                     name: Some("rate-limited".into()),
@@ -418,7 +432,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     service_tag: "web@local".into(),
                     next_peer: "ingress-a".into(),
                     guard: Some("rl".into()),
-                    intercept_errors: false,
+                    intercept_errors: Some(false),
+                    js_fp_beacon: Some(false),
                 },
                 IngressRule {
                     name: Some("pow-protected".into()),
@@ -429,7 +444,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     service_tag: "web@local".into(),
                     next_peer: "ingress-a".into(),
                     guard: Some("pow".into()),
-                    intercept_errors: false,
+                    intercept_errors: Some(false),
+                    js_fp_beacon: Some(true),
                 },
             ],
             guards,
@@ -438,6 +454,8 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             clearance_secret: generate_random_secret_hex(32),
             cert_store_dir: None,
             server_header: "nginx".into(),
+            js_fp_beacon: Some(true),
+            js_fp_ttl_secs: Some(3600),
         },
         egress: EgressConfig {
             services: local_services,
@@ -509,6 +527,110 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .unwrap();
     assert_eq!(local_resp.status(), 200);
     assert!(local_resp.text().await.unwrap().contains("path=/local-direct"));
+
+    // --- TEST C2: Adaptive Passive JS Fingerprint Beacon Injection + Secure /cdn-cgi/fp-report ---
+    let browser_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
+    let html_resp = http_client
+        .get(format!("http://{ingress_http}/page.html"))
+        .header("Host", "remote.test")
+        .header("User-Agent", browser_ua)
+        .header("Accept", "text/html,application/xhtml+xml")
+        .header("Sec-Fetch-Dest", "document")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(html_resp.status(), 200);
+    let html_body = html_resp.text().await.unwrap();
+    assert!(
+        html_body.contains(r#"<script defer src="/cdn-cgi/fp.js" data-t=""#),
+        "expected passive FP beacon script in HTML: {html_body}"
+    );
+    let marker = r#"data-t=""#;
+    let tok_start = html_body.find(marker).unwrap() + marker.len();
+    let tok_end = html_body[tok_start..].find('"').unwrap() + tok_start;
+    let fp_token = html_body[tok_start..tok_end].to_string();
+
+    // Cross-site FP report MUST be rejected
+    let bad_fp_resp = http_client
+        .post(format!("http://{ingress_http}/cdn-cgi/fp-report"))
+        .header("Host", "remote.test")
+        .header("User-Agent", browser_ua)
+        .header("Sec-Fetch-Site", "cross-site")
+        .json(&serde_json::json!({ "token": fp_token, "fp": { "canvas_hash": "abc12345" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_fp_resp.status(), 403);
+
+    // Legitimate same-origin FP report succeeds, sets signed exposure_fp cookie, and rejects replay
+    let fp_report_payload = serde_json::json!({
+        "token": fp_token,
+        "fp": {
+            "webdriver": false,
+            "webgl": "ANGLE (NVIDIA RTX 4090)",
+            "platform": "Linux x86_64",
+            "screen": "2560x1440x24",
+            "tz": "Asia/Shanghai",
+            "lang": "zh-CN",
+            "cores": 16,
+            "mem": 32,
+            "touch": 0,
+            "canvas_hash": "cafebabe99",
+            "dpr": "2",
+            "plugins_count": 5
+        }
+    });
+    let ok_fp_resp = http_client
+        .post(format!("http://{ingress_http}/cdn-cgi/fp-report"))
+        .header("Host", "remote.test")
+        .header("User-Agent", browser_ua)
+        .header("Sec-Fetch-Site", "same-origin")
+        .json(&fp_report_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_fp_resp.status(), 204);
+    let fp_cookie = ok_fp_resp
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(fp_cookie.starts_with("exposure_fp="));
+
+    // Replaying the same single-use FP token MUST fail!
+    let replay_fp_resp = http_client
+        .post(format!("http://{ingress_http}/cdn-cgi/fp-report"))
+        .header("Host", "remote.test")
+        .header("User-Agent", browser_ua)
+        .header("Sec-Fetch-Site", "same-origin")
+        .json(&fp_report_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay_fp_resp.status(), 403);
+
+    // Subsequent HTML request carrying valid exposure_fp cookie must NOT re-inject beacon!
+    let html_resp2 = http_client
+        .get(format!("http://{ingress_http}/page.html"))
+        .header("Host", "remote.test")
+        .header("User-Agent", browser_ua)
+        .header("Accept", "text/html")
+        .header("Sec-Fetch-Dest", "document")
+        .header("Cookie", &fp_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(html_resp2.status(), 200);
+    let html_body2 = html_resp2.text().await.unwrap();
+    assert!(
+        !html_body2.contains("/cdn-cgi/fp.js"),
+        "should not re-inject beacon when valid exposure_fp cookie is present"
+    );
 
     // --- TEST D: Guard Token Bucket Rate Limiting (429 + Retry-After) ---
     for _ in 0..2 {
@@ -637,9 +759,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .unwrap();
     assert_eq!(ingress_rt.cert_resolver().cert_count(), 1);
 
-    // Push ingress logs along Hop Table to Maintainer
-    let (recs, sums) = ingress_rt.logger().drain_for_maintainer().await;
+    // Push ingress logs & fingerprint observations along Hop Table to Maintainer
+    let (recs, sums, fps) = ingress_rt.logger().drain_for_maintainer().await;
     assert!(!sums.is_empty());
+    assert!(!fps.is_empty(), "expected collected fingerprint observations");
     let log_frame = SpecialFrame::new(
         uuid::Uuid::new_v4().to_string(),
         vec!["ingress-a".into(), "relay-1".into(), "maintainer-1".into()],
@@ -648,6 +771,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             from_node: "ingress-a".into(),
             records: recs,
             minute_summaries: sums,
+            fingerprints: fps,
         },
     );
     let log_ack = ingress_rt
@@ -760,12 +884,75 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     match pulled.payload {
         SpecialPayload::PullTelemetryResp(snap) => {
             assert!(!snap.summaries.is_empty());
+            assert!(
+                snap.fingerprints.iter().any(|f| f.js_verified && f.fp_source == "beacon"),
+                "expected JS-verified beacon fingerprint in Maintainer snapshot"
+            );
             assert_eq!(snap.certificates.len(), 1);
             assert_eq!(snap.certificates[0].domain, "secure.test");
             assert_eq!(snap.certificates[0].status, "valid");
         }
         other => panic!("unexpected pull telemetry reply: {other:?}"),
     }
+
+    // Trigger Control telemetry pull via HTTP API (populates CachedTelemetry for /api/overview, /api/telemetry, /api/fingerprints)
+    // First store a minimal topology YAML with shared_hmac so Control can resolve IP HMAC search + Maintainer hops
+    let min_topo_yaml = format!(
+        "global_logger:\n  hmac_key: \"{shared_hmac}\"\nnodes:\n  ingress-a:\n    roles:\n      ingress: true\n  relay-1:\n    roles:\n      relay: true\n  maintainer-1:\n    roles:\n      maintainer: true\nlinks:\n  - from: ingress-a\n    to: relay-1\n    mode: tunnel\n    tunnel_direction: outbound\n    endpoints:\n      - address: \"198.51.100.1:9443\"\n  - from: relay-1\n    to: maintainer-1\n    mode: on-demand\n    bidirectional: false\n    endpoints:\n      - address: \"198.51.100.2:9443\"\n"
+    );
+    ctrl_rt.client().db().set_topology_yaml(&min_topo_yaml).await.unwrap();
+    let pull_api_resp = http_client
+        .post(format!("http://{panel_addr}/api/telemetry/pull"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pull_api_resp.status(), 200);
+
+    // Verify exact UV == 1 (single 127.0.0.1 visitor across multiple requests/services/roles, never double-counted!)
+    let tel_json: serde_json::Value = http_client
+        .get(format!("http://{panel_addr}/api/telemetry?window_secs=3600"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        tel_json["traffic"]["uv_estimate"].as_f64(),
+        Some(1.0),
+        "exact UV for single 127.0.0.1 visitor must be 1.0: {tel_json}"
+    );
+
+    // Verify /api/fingerprints search by IP (auto-HMAC matched!) AND by browser FP (canvas_hash / webgl)
+    let fp_by_ip: serde_json::Value = http_client
+        .get(format!("http://{panel_addr}/api/fingerprints?ip=127.0.0.1&verified=js"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        fp_by_ip["items"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "IP search must match via HMAC even when store_raw_ip is false: {fp_by_ip}"
+    );
+    let fp_by_canvas: serde_json::Value = http_client
+        .get(format!("http://{panel_addr}/api/fingerprints?fp=cafebabe99"))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        fp_by_canvas["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "FP search by canvas_hash must find exact browser observation: {fp_by_canvas}"
+    );
 
     // Verify Preflight bundle CANNOT be replayed as ConfigPush (domain separation!)
     let mut updated_cfg = ingress_rt.config_snapshot().await;

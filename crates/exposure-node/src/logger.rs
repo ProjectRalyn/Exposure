@@ -1,11 +1,15 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::Utc;
 use exposure_core::config::LoggerConfig;
 use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret};
+use exposure_core::routing::canonical_ip;
 use exposure_core::segment::SegmentWriter;
-use exposure_core::telemetry::{AlertRecord, MinuteSummary, SessionSummary};
+use exposure_core::telemetry::{
+    AlertRecord, ClientJsFingerprint, FingerprintObservation, MinuteSummary, SessionSummary,
+};
 use exposure_core::Result;
 use rand::Rng;
 use tokio::sync::{Mutex, RwLock};
@@ -13,7 +17,30 @@ use tracing::{debug, warn};
 
 const MAX_MINUTE_BUCKETS: usize = 4096;
 const MINUTE_BUCKET_RETENTION_SECS: i64 = 3600;
+const MAX_FP_OBSERVATIONS: usize = 4096;
+const FP_RETENTION_SECS: i64 = 3600 * 6;
 const MAX_ALERT_MSG_LEN: usize = 512;
+
+fn canonical_ip_str(raw: &str) -> String {
+    raw.trim()
+        .parse::<IpAddr>()
+        .map(|ip| canonical_ip(ip).to_string())
+        .unwrap_or_else(|_| raw.trim().to_string())
+}
+
+pub fn ip_subnet_label(raw: &str) -> String {
+    match raw.trim().parse::<IpAddr>().map(canonical_ip) {
+        Ok(IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        Ok(IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+        Err(_) => String::new(),
+    }
+}
 
 fn sanitize_alert_msg(raw: String) -> String {
     raw.chars()
@@ -33,12 +60,13 @@ fn ensure_strong_hmac_key(mut cfg: LoggerConfig) -> LoggerConfig {
 /// - Applies configured `sample_rate`
 /// - Stores HMAC IP by default; raw IP only when `store_raw_ip: true`
 /// - Writes batches atomically to disk segments via `spawn_blocking` (never blocking Tokio workers)
-/// - Maintains bounded per-(node, minute, service) summaries for periodic push to Maintainer
+/// - Maintains bounded per-(node, role, minute, service) summaries and visitor fingerprint observations
 pub struct NodeLogger {
     node_tag: String,
     cfg: Arc<RwLock<Arc<LoggerConfig>>>,
     writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
-    minute_buckets: Arc<Mutex<HashMap<(i64, String), MinuteSummary>>>,
+    minute_buckets: Arc<Mutex<HashMap<(i64, String, String), MinuteSummary>>>,
+    fp_observations: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
     recent_records: Arc<Mutex<Vec<SessionSummary>>>,
     alerts: Arc<Mutex<Vec<AlertRecord>>>,
 }
@@ -53,6 +81,7 @@ impl NodeLogger {
             cfg: Arc::new(RwLock::new(Arc::new(cfg))),
             writer: Arc::new(StdMutex::new(writer)),
             minute_buckets: Arc::new(Mutex::new(HashMap::new())),
+            fp_observations: Arc::new(Mutex::new(HashMap::new())),
             recent_records: Arc::new(Mutex::new(Vec::new())),
             alerts: Arc::new(Mutex::new(Vec::new())),
         }))
@@ -141,7 +170,8 @@ impl NodeLogger {
         };
 
         let now = Utc::now();
-        let ip_tag = hmac_ip(&cfg.hmac_key, client_ip);
+        let canon_ip = canonical_ip_str(client_ip);
+        let ip_tag = hmac_ip(&cfg.hmac_key, &canon_ip);
         let rec = SessionSummary {
             timestamp_ms: now.timestamp_millis(),
             node_tag: self.node_tag.clone(),
@@ -153,7 +183,7 @@ impl NodeLogger {
             bytes_out,
             ip_hmac: ip_tag,
             raw_ip: if cfg.store_raw_ip {
-                Some(client_ip.to_string())
+                Some(canon_ip)
             } else {
                 None
             },
@@ -173,17 +203,18 @@ impl NodeLogger {
             let mut buckets = self.minute_buckets.lock().await;
             if buckets.len() >= MAX_MINUTE_BUCKETS {
                 let cutoff = now.timestamp().saturating_sub(MINUTE_BUCKET_RETENTION_SECS);
-                buckets.retain(|(min, _), _| *min >= cutoff);
+                buckets.retain(|(min, _, _), _| *min >= cutoff);
                 if buckets.len() >= MAX_MINUTE_BUCKETS {
                     buckets.clear();
                 }
             }
             let entry = buckets
-                .entry((minute_epoch, service_tag.to_string()))
+                .entry((minute_epoch, role.to_string(), service_tag.to_string()))
                 .or_insert_with(|| {
                     MinuteSummary::new(
                         minute_epoch,
                         &self.node_tag,
+                        role,
                         service_tag,
                         cfg.hll_precision,
                         cfg.hll_seed,
@@ -242,8 +273,95 @@ impl NodeLogger {
         .map_err(|e| exposure_core::ExposureError::Storage(format!("flush join: {e}")))?
     }
 
-    /// Drain pending minute summaries & sampled records to send to Maintainer.
-    pub async fn drain_for_maintainer(&self) -> (Vec<SessionSummary>, Vec<MinuteSummary>) {
+    /// Record or enrich a visitor + browser fingerprint observation (server UA/TLS + optional JS beacon/PoW).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_fingerprint(
+        &self,
+        service_tag: &str,
+        host: &str,
+        client_ip: &str,
+        fp_hash: &str,
+        js_verified: bool,
+        fp_source: &str,
+        user_agent: &str,
+        accept_language: &str,
+        device_type: &str,
+        browser_family: &str,
+        os_family: &str,
+        is_bot: bool,
+        is_headless: bool,
+        suspicion_score: u8,
+        tls_cipher_count: u16,
+        tls_alpn: bool,
+        js_fp: Option<ClientJsFingerprint>,
+        request_inc: u64,
+        challenge_inc: u64,
+        rate_limited_inc: u64,
+    ) {
+        let cfg = Arc::clone(&*self.cfg.read().await);
+        let now_ts = Utc::now().timestamp();
+        let canon_ip = canonical_ip_str(client_ip);
+        let ip_tag = hmac_ip(&cfg.hmac_key, &canon_ip);
+        let prefix = ip_subnet_label(&canon_ip);
+        let id = format!("{ip_tag}:{fp_hash}");
+
+        let mut obs = FingerprintObservation {
+            id: id.clone(),
+            ip_hmac: ip_tag,
+            client_ip: if cfg.store_raw_ip { Some(canon_ip) } else { None },
+            ip_prefix: prefix,
+            fp_hash: fp_hash.to_string(),
+            js_verified,
+            fp_source: fp_source.to_string(),
+            node_tag: self.node_tag.clone(),
+            service_tag: service_tag.to_string(),
+            host: host.to_string(),
+            user_agent: user_agent.to_string(),
+            accept_language: accept_language.to_string(),
+            device_type: device_type.to_string(),
+            browser_family: browser_family.to_string(),
+            os_family: os_family.to_string(),
+            is_bot,
+            is_headless,
+            suspicion_score,
+            tls_cipher_count,
+            tls_alpn,
+            js_fp,
+            first_seen_ts: now_ts,
+            last_seen_ts: now_ts,
+            request_count: request_inc,
+            challenge_count: challenge_inc,
+            rate_limited_count: rate_limited_inc,
+        };
+        obs.sanitize();
+
+        let mut map = self.fp_observations.lock().await;
+        if map.len() >= MAX_FP_OBSERVATIONS && !map.contains_key(&obs.id) {
+            let cutoff = now_ts.saturating_sub(FP_RETENTION_SECS);
+            map.retain(|_, v| v.last_seen_ts >= cutoff);
+            if map.len() >= MAX_FP_OBSERVATIONS {
+                // Evict oldest 25% entries
+                let mut entries: Vec<(String, i64)> =
+                    map.iter().map(|(k, v)| (k.clone(), v.last_seen_ts)).collect();
+                entries.sort_by_key(|(_, ts)| *ts);
+                for (k, _) in entries.into_iter().take(MAX_FP_OBSERVATIONS / 4) {
+                    map.remove(&k);
+                }
+            }
+        }
+        map.entry(obs.id.clone())
+            .and_modify(|existing| existing.merge_from(&obs))
+            .or_insert(obs);
+    }
+
+    /// Drain pending minute summaries, sampled records, and fingerprint observations to send to Maintainer.
+    pub async fn drain_for_maintainer(
+        &self,
+    ) -> (
+        Vec<SessionSummary>,
+        Vec<MinuteSummary>,
+        Vec<FingerprintObservation>,
+    ) {
         let records = {
             let mut r = self.recent_records.lock().await;
             std::mem::take(&mut *r)
@@ -252,14 +370,19 @@ impl NodeLogger {
             let mut b = self.minute_buckets.lock().await;
             b.drain().map(|(_, v)| v).collect()
         };
-        (records, summaries)
+        let fingerprints = {
+            let mut f = self.fp_observations.lock().await;
+            f.drain().map(|(_, v)| v).collect()
+        };
+        (records, summaries, fingerprints)
     }
 
-    /// Requeue drained records & summaries if pushing a LogBatch to Maintainer fails transiently.
+    /// Requeue drained records, summaries, and fingerprints if pushing a LogBatch to Maintainer fails transiently.
     pub async fn requeue_for_maintainer(
         &self,
         records: Vec<SessionSummary>,
         summaries: Vec<MinuteSummary>,
+        fingerprints: Vec<FingerprintObservation>,
     ) {
         if !records.is_empty() {
             let mut r = self.recent_records.lock().await;
@@ -279,12 +402,28 @@ impl NodeLogger {
                 if s.minute_epoch < cutoff {
                     continue;
                 }
-                if b.len() >= MAX_MINUTE_BUCKETS && !b.contains_key(&(s.minute_epoch, s.service_tag.clone())) {
+                let key = (s.minute_epoch, s.role.clone(), s.service_tag.clone());
+                if b.len() >= MAX_MINUTE_BUCKETS && !b.contains_key(&key) {
                     break;
                 }
-                b.entry((s.minute_epoch, s.service_tag.clone()))
+                b.entry(key)
                     .and_modify(|existing| existing.merge_from(&s))
                     .or_insert(s);
+            }
+        }
+        if !fingerprints.is_empty() {
+            let mut f = self.fp_observations.lock().await;
+            let cutoff = Utc::now().timestamp().saturating_sub(FP_RETENTION_SECS);
+            for fp in fingerprints {
+                if fp.last_seen_ts < cutoff {
+                    continue;
+                }
+                if f.len() >= MAX_FP_OBSERVATIONS && !f.contains_key(&fp.id) {
+                    break;
+                }
+                f.entry(fp.id.clone())
+                    .and_modify(|existing| existing.merge_from(&fp))
+                    .or_insert(fp);
             }
         }
     }

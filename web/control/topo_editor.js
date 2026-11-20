@@ -39,14 +39,177 @@ function generateRandomSecretHex(bytes = 32) {
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function normalizeTri(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  return null;
+}
+
+function defaultTopologyDefaults() {
+  return {
+    ingress: {
+      server_header: "nginx",
+      clearance_secret: "",
+      cert_store_dir: null,
+      default_guard: null,
+      intercept_errors: false,
+      js_fp_beacon: true,
+      js_fp_ttl_secs: 3600,
+    },
+    guard: {
+      antibot: "challenge",
+      rate_limit_bucket: null,
+      challenge_threshold: 50,
+      reject_threshold: 85,
+      pow_difficulty: 16,
+      clearance_ttl_secs: 1800,
+      bind_ua: true,
+      bind_ip_prefix: false,
+      block_bots: false,
+      block_headless: false,
+      require_client_fp: false,
+      js_fp_beacon: true,
+      js_fp_ttl_secs: 3600,
+    },
+    egress: {
+      protocol: "auto",
+      timeout_ms: 30000,
+      tls: false,
+      ca_cert_path: null,
+      insecure_skip_verify: false,
+      allow_any_origin: false,
+      intercept_errors: false,
+    },
+    link_listener: {
+      allow_on_demand: true,
+      allow_tunnel: true,
+      allow_bootstrap: false,
+    },
+  };
+}
+
+function defaultGuardProfile(defs = null) {
+  const gd = defs || defaultTopologyDefaults().guard;
+  return {
+    antibot: gd.antibot || "challenge",
+    rate_limit_bucket: null,
+    allow_cidrs: [],
+    deny_cidrs: [],
+    challenge_threshold: gd.challenge_threshold ?? 50,
+    reject_threshold: gd.reject_threshold ?? 85,
+    pow_difficulty: gd.pow_difficulty ?? 16,
+    clearance_ttl_secs: gd.clearance_ttl_secs ?? 1800,
+    bind_ua: null,
+    bind_ip_prefix: null,
+    api_bypass_headers: [],
+    block_bots: null,
+    block_headless: null,
+    require_client_fp: null,
+    js_fp_beacon: null,
+    js_fp_ttl_secs: null,
+  };
+}
+
+function normalizeGuardProfile(g) {
+  const src = g && typeof g === "object" ? g : {};
+  return {
+    antibot: src.antibot || "off",
+    rate_limit_bucket: src.rate_limit_bucket || null,
+    allow_cidrs: Array.isArray(src.allow_cidrs) ? src.allow_cidrs : [],
+    deny_cidrs: Array.isArray(src.deny_cidrs) ? src.deny_cidrs : [],
+    challenge_threshold: src.challenge_threshold ?? 50,
+    reject_threshold: src.reject_threshold ?? 85,
+    pow_difficulty: src.pow_difficulty ?? 16,
+    clearance_ttl_secs: src.clearance_ttl_secs ?? 1800,
+    bind_ua: normalizeTri(src.bind_ua),
+    bind_ip_prefix: normalizeTri(src.bind_ip_prefix),
+    api_bypass_headers: Array.isArray(src.api_bypass_headers) ? src.api_bypass_headers : [],
+    block_bots: normalizeTri(src.block_bots),
+    block_headless: normalizeTri(src.block_headless),
+    require_client_fp: normalizeTri(src.require_client_fp),
+    js_fp_beacon: normalizeTri(src.js_fp_beacon),
+    js_fp_ttl_secs: src.js_fp_ttl_secs != null && src.js_fp_ttl_secs !== "" ? Number(src.js_fp_ttl_secs) : null,
+  };
+}
+
+function normalizeBucket(b) {
+  const src = b && typeof b === "object" ? b : {};
+  return {
+    capacity: src.capacity ?? 60,
+    refill_per_sec: src.refill_per_sec ?? 10,
+    per_ip: normalizeTri(src.per_ip),
+  };
+}
+
+function normalizeEgressService(svc) {
+  const src = svc && typeof svc === "object" ? svc : {};
+  return {
+    backend: src.backend || "",
+    protocol: src.protocol || "auto",
+    tls: normalizeTri(src.tls),
+    ca_cert_path: src.ca_cert_path || null,
+    insecure_skip_verify: normalizeTri(src.insecure_skip_verify),
+    allow_from: Array.isArray(src.allow_from) ? src.allow_from : [],
+    allow_any_origin: normalizeTri(src.allow_any_origin),
+    timeout_ms: src.timeout_ms ?? 30000,
+    intercept_errors: normalizeTri(src.intercept_errors),
+    local_health_check: src.local_health_check || null,
+  };
+}
+
+function normalizeDefaults(raw) {
+  const base = defaultTopologyDefaults();
+  const src = raw && typeof raw === "object" ? raw : {};
+  return {
+    ingress: {
+      ...base.ingress,
+      ...(src.ingress || {}),
+      cert_store_dir: src.ingress?.cert_store_dir || null,
+      default_guard: src.ingress?.default_guard || null,
+      intercept_errors: Boolean(src.ingress?.intercept_errors ?? base.ingress.intercept_errors),
+      js_fp_beacon: Boolean(src.ingress?.js_fp_beacon ?? base.ingress.js_fp_beacon),
+      js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
+    },
+    guard: {
+      ...base.guard,
+      ...(src.guard || {}),
+      rate_limit_bucket: src.guard?.rate_limit_bucket || null,
+      bind_ua: Boolean(src.guard?.bind_ua ?? base.guard.bind_ua),
+      bind_ip_prefix: Boolean(src.guard?.bind_ip_prefix ?? base.guard.bind_ip_prefix),
+      block_bots: Boolean(src.guard?.block_bots ?? base.guard.block_bots),
+      block_headless: Boolean(src.guard?.block_headless ?? base.guard.block_headless),
+      require_client_fp: Boolean(src.guard?.require_client_fp ?? base.guard.require_client_fp),
+      js_fp_beacon: Boolean(src.guard?.js_fp_beacon ?? base.guard.js_fp_beacon),
+      js_fp_ttl_secs: Number(src.guard?.js_fp_ttl_secs ?? base.guard.js_fp_ttl_secs) || 3600,
+    },
+    egress: {
+      ...base.egress,
+      ...(src.egress || {}),
+      ca_cert_path: src.egress?.ca_cert_path || null,
+      tls: Boolean(src.egress?.tls ?? base.egress.tls),
+      insecure_skip_verify: Boolean(src.egress?.insecure_skip_verify ?? base.egress.insecure_skip_verify),
+      allow_any_origin: Boolean(src.egress?.allow_any_origin ?? base.egress.allow_any_origin),
+      intercept_errors: Boolean(src.egress?.intercept_errors ?? base.egress.intercept_errors),
+      timeout_ms: Number(src.egress?.timeout_ms ?? base.egress.timeout_ms) || 30000,
+    },
+    link_listener: {
+      ...base.link_listener,
+      ...(src.link_listener || {}),
+      allow_on_demand: Boolean(src.link_listener?.allow_on_demand ?? base.link_listener.allow_on_demand),
+      allow_tunnel: Boolean(src.link_listener?.allow_tunnel ?? base.link_listener.allow_tunnel),
+      allow_bootstrap: Boolean(src.link_listener?.allow_bootstrap ?? base.link_listener.allow_bootstrap),
+    },
+  };
+}
+
 function defaultNodeSpec() {
   return {
     roles: { ingress: false, egress: false, relay: false, maintainer: false },
     link_listener: {
       listen_addr: "0.0.0.0:10802",
-      allow_on_demand: true,
-      allow_tunnel: true,
-      allow_bootstrap: false,
+      allow_on_demand: null,
+      allow_tunnel: null,
+      allow_bootstrap: null,
     },
     maintainer_template: null,
     maintainer_hops: [],
@@ -56,8 +219,11 @@ function defaultNodeSpec() {
       guards: {},
       rate_limit_buckets: {},
       tls_certs: [],
-      clearance_secret: generateRandomSecretHex(32),
+      clearance_secret: "",
       cert_store_dir: null,
+      server_header: "",
+      js_fp_beacon: null,
+      js_fp_ttl_secs: null,
     },
     egress: { services: {} },
     relay: { rules: [] },
@@ -97,17 +263,47 @@ function normalizeNode(n) {
   const base = defaultNodeSpec();
   const out = { ...base, ...(n || {}) };
   out.roles = rolesFromAny(n?.roles);
-  out.ingress = { ...base.ingress, ...(n?.ingress || {}) };
-  if (!out.ingress.clearance_secret) {
-    out.ingress.clearance_secret = base.ingress.clearance_secret;
+  if (n && n.link_listener === null) {
+    out.link_listener = null;
+  } else if (n?.link_listener && typeof n.link_listener === "object") {
+    out.link_listener = {
+      listen_addr: n.link_listener.listen_addr || "",
+      allow_on_demand: normalizeTri(n.link_listener.allow_on_demand),
+      allow_tunnel: normalizeTri(n.link_listener.allow_tunnel),
+      allow_bootstrap: normalizeTri(n.link_listener.allow_bootstrap),
+    };
   }
+  out.ingress = { ...base.ingress, ...(n?.ingress || {}) };
+  out.ingress.clearance_secret = n?.ingress?.clearance_secret || "";
+  out.ingress.server_header = n?.ingress?.server_header ?? "";
+  out.ingress.js_fp_beacon = normalizeTri(n?.ingress?.js_fp_beacon);
+  out.ingress.js_fp_ttl_secs =
+    n?.ingress?.js_fp_ttl_secs != null && n?.ingress?.js_fp_ttl_secs !== ""
+      ? Number(n.ingress.js_fp_ttl_secs)
+      : null;
   out.ingress.listeners = Array.isArray(out.ingress.listeners) ? out.ingress.listeners : [];
-  out.ingress.rules = Array.isArray(out.ingress.rules) ? out.ingress.rules : [];
-  out.ingress.guards = sanitizeRecord(out.ingress.guards);
-  out.ingress.rate_limit_buckets = sanitizeRecord(out.ingress.rate_limit_buckets);
+  out.ingress.rules = Array.isArray(out.ingress.rules)
+    ? out.ingress.rules.map((r) => ({
+        name: r.name || null,
+        match: r.match || {},
+        service_tag: r.service_tag || "",
+        next_peer: r.next_peer || "",
+        guard: r.guard || null,
+        intercept_errors: normalizeTri(r.intercept_errors),
+        js_fp_beacon: normalizeTri(r.js_fp_beacon),
+      }))
+    : [];
+  const rawGuards = sanitizeRecord(out.ingress.guards);
+  out.ingress.guards = {};
+  for (const [k, v] of Object.entries(rawGuards)) out.ingress.guards[k] = normalizeGuardProfile(v);
+  const rawBuckets = sanitizeRecord(out.ingress.rate_limit_buckets);
+  out.ingress.rate_limit_buckets = {};
+  for (const [k, v] of Object.entries(rawBuckets)) out.ingress.rate_limit_buckets[k] = normalizeBucket(v);
   out.ingress.tls_certs = Array.isArray(out.ingress.tls_certs) ? out.ingress.tls_certs : [];
   out.egress = { ...base.egress, ...(n?.egress || {}) };
-  out.egress.services = sanitizeRecord(out.egress.services);
+  const rawSvcs = sanitizeRecord(out.egress.services);
+  out.egress.services = {};
+  for (const [k, v] of Object.entries(rawSvcs)) out.egress.services[k] = normalizeEgressService(v);
   out.relay = { ...base.relay, ...(n?.relay || {}) };
   out.relay.rules = Array.isArray(out.relay.rules) ? out.relay.rules : [];
   out.maintainer_hops = Array.isArray(n?.maintainer_hops) ? n.maintainer_hops : [];
@@ -128,6 +324,17 @@ function defaultMaintainerTemplate() {
 }
 
 function normalizeSpec(raw) {
+  const defaults = normalizeDefaults(raw?.defaults);
+  const rawGuardTpls = sanitizeRecord(raw?.guard_templates);
+  const guard_templates = {};
+  for (const [k, v] of Object.entries(rawGuardTpls)) {
+    guard_templates[k] = normalizeGuardProfile(v);
+  }
+  const rawBucketTpls = sanitizeRecord(raw?.bucket_templates);
+  const bucket_templates = {};
+  for (const [k, v] of Object.entries(rawBucketTpls)) {
+    bucket_templates[k] = normalizeBucket(v);
+  }
   const nodes = {};
   if (raw && raw.nodes && typeof raw.nodes === "object") {
     for (const [tag, n] of Object.entries(raw.nodes)) {
@@ -153,8 +360,8 @@ function normalizeSpec(raw) {
       ? deepClone(raw.maintainer_templates)
       : {}
   );
-  const global_logger = raw?.global_logger || null;
-  return { nodes, links, maintainer_templates, global_logger };
+  const global_logger = raw?.global_logger ? deepClone(raw.global_logger) : null;
+  return { defaults, guard_templates, bucket_templates, nodes, links, maintainer_templates, global_logger };
 }
 
 function parseNum(raw, fallback, min = -Infinity, max = Infinity) {
@@ -171,6 +378,65 @@ function escapeHtml(s) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function renderTriSlider({ attrName, attrVal, label, sub = "", val = null, inherited = false }) {
+  const cur = val === true ? "on" : val === false ? "off" : "default";
+  const defText = `Default (${inherited ? "On" : "Off"})`;
+  return `
+    <div class="tri-row">
+      <div class="tri-label-wrap">
+        <span class="tri-label">${escapeHtml(label)}</span>
+        ${sub ? `<span class="tri-sub">${escapeHtml(sub)}</span>` : ""}
+      </div>
+      <div class="tri-slider" role="radiogroup" aria-label="${escapeHtml(label)}" ${attrName}="${escapeHtml(attrVal)}">
+        <button type="button" class="tri-opt ${cur === "default" ? "active" : ""}" data-tri-val="default">${defText}</button>
+        <button type="button" class="tri-opt ${cur === "off" ? "active" : ""}" data-tri-val="off">Off</button>
+        <button type="button" class="tri-opt ${cur === "on" ? "active" : ""}" data-tri-val="on">On</button>
+      </div>
+    </div>`;
+}
+
+function renderBinSlider({ attrName, attrVal, label, sub = "", val = false }) {
+  const on = Boolean(val);
+  return `
+    <div class="tri-row">
+      <div class="tri-label-wrap">
+        <span class="tri-label">${escapeHtml(label)}</span>
+        ${sub ? `<span class="tri-sub">${escapeHtml(sub)}</span>` : ""}
+      </div>
+      <div class="bin-slider" role="radiogroup" aria-label="${escapeHtml(label)}" ${attrName}="${escapeHtml(attrVal)}">
+        <button type="button" class="bin-opt ${!on ? "active" : ""}" data-bin-val="off">Off</button>
+        <button type="button" class="bin-opt ${on ? "active" : ""}" data-bin-val="on">On</button>
+      </div>
+    </div>`;
+}
+
+function wireTriSliders(root, attrName, onChange) {
+  root.querySelectorAll(`.tri-slider[${attrName}]`).forEach((group) => {
+    const key = group.getAttribute(attrName);
+    group.querySelectorAll(".tri-opt").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const raw = btn.dataset.triVal;
+        const next = raw === "on" ? true : raw === "off" ? false : null;
+        group.querySelectorAll(".tri-opt").forEach((b) => b.classList.toggle("active", b === btn));
+        onChange(key, next);
+      });
+    });
+  });
+}
+
+function wireBinSliders(root, attrName, onChange) {
+  root.querySelectorAll(`.bin-slider[${attrName}]`).forEach((group) => {
+    const key = group.getAttribute(attrName);
+    group.querySelectorAll(".bin-opt").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.binVal === "on";
+        group.querySelectorAll(".bin-opt").forEach((b) => b.classList.toggle("active", b === btn));
+        onChange(key, next);
+      });
+    });
+  });
 }
 
 function shortestPathBFS(links, start, goal) {
@@ -225,12 +491,20 @@ function rectAnchor(rect, target) {
 
 export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
   const editor = {
-    spec: { nodes: {}, links: [], maintainer_templates: {}, global_logger: null },
+    spec: {
+      defaults: defaultTopologyDefaults(),
+      guard_templates: {},
+      bucket_templates: {},
+      nodes: {},
+      links: [],
+      maintainer_templates: {},
+      global_logger: null,
+    },
     positions: loadPositions(),
     nodeHeights: {},
     selected: null, // { type: 'node', tag } | { type: 'link', index }
     inspectorTab: "general", // general | ingress | guard | egress | relay | maintainer
-    mode: "visual", // visual | yaml
+    mode: "visual", // visual | defaults | yaml
     connectMode: false,
     connectSource: null,
     // Viewport transform
@@ -1177,7 +1451,154 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     wireTabEvents(box, tag, node, maintainerNodes);
   }
 
+  function buildGuardSelectOptions(selectedVal, localGuards = {}) {
+    const globalNames = Object.keys(editor.spec.guard_templates || {});
+    const localNames = Object.keys(localGuards || {});
+    const defGuard = editor.spec.defaults?.ingress?.default_guard || "";
+    const parts = [
+      `<option value="">${defGuard ? `(Default: ${escapeHtml(defGuard)})` : "(Default: none)"}</option>`,
+    ];
+    if (globalNames.length) {
+      parts.push(
+        `<optgroup label="Global Guard Templates">${globalNames
+          .map(
+            (g) =>
+              `<option value="${escapeHtml(g)}" ${selectedVal === g ? "selected" : ""}>${escapeHtml(g)}${
+                Object.hasOwn(localGuards, g) ? " (overridden locally)" : ""
+              }</option>`
+          )
+          .join("")}</optgroup>`
+      );
+    }
+    const localOnly = localNames.filter((g) => !Object.hasOwn(editor.spec.guard_templates || {}, g));
+    if (localOnly.length) {
+      parts.push(
+        `<optgroup label="Node Local Guards">${localOnly
+          .map((g) => `<option value="${escapeHtml(g)}" ${selectedVal === g ? "selected" : ""}>${escapeHtml(g)}</option>`)
+          .join("")}</optgroup>`
+      );
+    }
+    if (selectedVal && !globalNames.includes(selectedVal) && !localNames.includes(selectedVal)) {
+      parts.push(`<option value="${escapeHtml(selectedVal)}" selected>${escapeHtml(selectedVal)} (missing)</option>`);
+    }
+    return parts.join("");
+  }
+
+  function buildBucketSelectOptions(selectedVal, localBuckets = {}) {
+    const globalNames = Object.keys(editor.spec.bucket_templates || {});
+    const localNames = Object.keys(localBuckets || {});
+    const defBucket = editor.spec.defaults?.guard?.rate_limit_bucket || "";
+    const parts = [
+      `<option value="">${defBucket ? `(Default: ${escapeHtml(defBucket)})` : "(Default: none)"}</option>`,
+    ];
+    if (globalNames.length) {
+      parts.push(
+        `<optgroup label="Global Bucket Templates">${globalNames
+          .map(
+            (b) =>
+              `<option value="${escapeHtml(b)}" ${selectedVal === b ? "selected" : ""}>${escapeHtml(b)}${
+                Object.hasOwn(localBuckets, b) ? " (overridden locally)" : ""
+              }</option>`
+          )
+          .join("")}</optgroup>`
+      );
+    }
+    const localOnly = localNames.filter((b) => !Object.hasOwn(editor.spec.bucket_templates || {}, b));
+    if (localOnly.length) {
+      parts.push(
+        `<optgroup label="Node Local Buckets">${localOnly
+          .map((b) => `<option value="${escapeHtml(b)}" ${selectedVal === b ? "selected" : ""}>${escapeHtml(b)}</option>`)
+          .join("")}</optgroup>`
+      );
+    }
+    if (selectedVal && !globalNames.includes(selectedVal) && !localNames.includes(selectedVal)) {
+      parts.push(`<option value="${escapeHtml(selectedVal)}" selected>${escapeHtml(selectedVal)} (missing)</option>`);
+    }
+    return parts.join("");
+  }
+
+  function renderBucketCard({ bName, b, prefix = "bk", badge = "" }) {
+    return `
+      <div class="subcard">
+        <div class="subcard-head">
+          <span>Bucket: ${escapeHtml(bName)}${badge ? ` ${badge}` : ""}</span>
+          <button type="button" class="btn sm danger" data-del-${prefix}="${escapeHtml(bName)}">Remove</button>
+        </div>
+        <div class="inspector-row">
+          <label><span>Name</span><input data-${prefix}-name="${escapeHtml(bName)}" value="${escapeHtml(bName)}" /></label>
+          <label><span>Capacity (burst)</span><input type="number" step="1" data-${prefix}-cap="${escapeHtml(bName)}" value="${b.capacity ?? 60}" /></label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Refill / sec</span><input type="number" step="0.5" data-${prefix}-refill="${escapeHtml(bName)}" value="${b.refill_per_sec ?? 10}" /></label>
+          <div style="align-self:end;">
+            ${renderTriSlider({
+              attrName: `data-${prefix}-perip`,
+              attrVal: bName,
+              label: "Per-IP Scope",
+              val: b.per_ip,
+              inherited: true,
+            })}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function renderGuardCard({ gName, g, prefix = "gd", localBuckets = {}, badgeHtml = "", extraBtnsHtml = "" }) {
+    const gDefs = editor.spec.defaults?.guard || defaultTopologyDefaults().guard;
+    return `
+      <div class="subcard">
+        <div class="subcard-head">
+          <span>Guard: ${escapeHtml(gName)} ${badgeHtml}</span>
+          <div class="btn-row">
+            ${extraBtnsHtml}
+            <button type="button" class="btn sm danger" data-del-${prefix}="${escapeHtml(gName)}">Remove</button>
+          </div>
+        </div>
+        <div class="inspector-row">
+          <label><span>Profile Name</span><input data-${prefix}-name="${escapeHtml(gName)}" value="${escapeHtml(gName)}" /></label>
+          <label><span>Antibot Mode</span>
+            <select data-${prefix}-mode="${escapeHtml(gName)}">
+              <option value="off" ${g.antibot === "off" ? "selected" : ""}>off (rate-limit/CIDR only)</option>
+              <option value="silent" ${g.antibot === "silent" ? "selected" : ""}>silent (score block, no UI)</option>
+              <option value="challenge" ${g.antibot === "challenge" ? "selected" : ""}>challenge (PoW on score ≥ threshold)</option>
+              <option value="always" ${g.antibot === "always" ? "selected" : ""}>always (Under Attack / force PoW)</option>
+            </select>
+          </label>
+        </div>
+        <div class="inspector-row">
+          <label><span>PoW Difficulty (bits)</span><input type="number" min="4" max="28" data-${prefix}-pow="${escapeHtml(gName)}" value="${g.pow_difficulty ?? gDefs.pow_difficulty ?? 16}" /></label>
+          <label><span>Rate Limit Bucket</span>
+            <select data-${prefix}-bucket="${escapeHtml(gName)}">
+              ${buildBucketSelectOptions(g.rate_limit_bucket || "", localBuckets)}
+            </select>
+          </label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Challenge Score (0 = all)</span><input type="number" min="0" max="100" data-${prefix}-cthresh="${escapeHtml(gName)}" value="${g.challenge_threshold ?? gDefs.challenge_threshold ?? 50}" /></label>
+          <label><span>Reject Score (0 = off)</span><input type="number" min="0" max="100" data-${prefix}-rthresh="${escapeHtml(gName)}" value="${g.reject_threshold ?? gDefs.reject_threshold ?? 85}" /></label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Allow CIDRs (CSV)</span><input data-${prefix}-allow="${escapeHtml(gName)}" value="${escapeHtml((g.allow_cidrs || []).join(", "))}" placeholder="10.0.0.0/8" /></label>
+          <label><span>Deny CIDRs (CSV)</span><input data-${prefix}-deny="${escapeHtml(gName)}" value="${escapeHtml((g.deny_cidrs || []).join(", "))}" placeholder="198.51.100.0/24" /></label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Clearance TTL (s)</span><input type="number" min="10" data-${prefix}-ttl="${escapeHtml(gName)}" value="${g.clearance_ttl_secs ?? gDefs.clearance_ttl_secs ?? 1800}" /></label>
+          <label><span>JS FP Cooldown TTL (s)</span><input type="number" min="60" data-${prefix}-fpttl="${escapeHtml(gName)}" value="${g.js_fp_ttl_secs ?? ""}" placeholder="Default (${gDefs.js_fp_ttl_secs ?? 3600}s)" /></label>
+        </div>
+        <label><span>API Bypass Headers (CSV, Name: secret)</span><input data-${prefix}-bypass="${escapeHtml(gName)}" value="${escapeHtml((g.api_bypass_headers || []).join(", "))}" placeholder="X-Api-Key: secret" /></label>
+        <div class="tri-stack">
+          ${renderTriSlider({ attrName: `data-${prefix}-ua`, attrVal: gName, label: "Bind User-Agent", val: g.bind_ua, inherited: gDefs.bind_ua })}
+          ${renderTriSlider({ attrName: `data-${prefix}-ip`, attrVal: gName, label: "Bind IP Prefix (/24 /48)", val: g.bind_ip_prefix, inherited: gDefs.bind_ip_prefix })}
+          ${renderTriSlider({ attrName: `data-${prefix}-bots`, attrVal: gName, label: "Block Known Bots", val: g.block_bots, inherited: gDefs.block_bots })}
+          ${renderTriSlider({ attrName: `data-${prefix}-headless`, attrVal: gName, label: "Block Headless Browsers", val: g.block_headless, inherited: gDefs.block_headless })}
+          ${renderTriSlider({ attrName: `data-${prefix}-fp`, attrVal: gName, label: "Require Verified JS FP", val: g.require_client_fp, inherited: gDefs.require_client_fp })}
+          ${renderTriSlider({ attrName: `data-${prefix}-beacon`, attrVal: gName, label: "Passive JS FP Beacon", sub: "Inject lightweight HTML beacon when unverified", val: g.js_fp_beacon, inherited: gDefs.js_fp_beacon })}
+        </div>
+      </div>`;
+  }
+
   function renderGeneralTab(tag, node, maintainerNodes) {
+    const llDefs = editor.spec.defaults?.link_listener || defaultTopologyDefaults().link_listener;
     return `
       <div class="inspector-sec">
         <div class="inspector-sec-head"><span>Identity &amp; Mesh Listener</span></div>
@@ -1185,11 +1606,15 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         <label><span>Link Listener Address (empty = outbound-only)</span>
           <input id="inp-link-listen" value="${escapeHtml(node.link_listener?.listen_addr || "")}" placeholder="0.0.0.0:10802" />
         </label>
-        <div class="inspector-checks">
-          <label class="check-inline"><input type="checkbox" id="chk-allow-ondemand" ${node.link_listener?.allow_on_demand !== false ? "checked" : ""} /> on-demand</label>
-          <label class="check-inline"><input type="checkbox" id="chk-allow-tunnel" ${node.link_listener?.allow_tunnel !== false ? "checked" : ""} /> tunnel</label>
-          <label class="check-inline"><input type="checkbox" id="chk-allow-boot" ${node.link_listener?.allow_bootstrap ? "checked" : ""} /> allow bootstrap</label>
-        </div>
+        ${
+          node.link_listener?.listen_addr
+            ? `<div class="tri-stack">
+                ${renderTriSlider({ attrName: "data-ll-tri", attrVal: "allow_on_demand", label: "Allow On-Demand Links", val: node.link_listener.allow_on_demand, inherited: llDefs.allow_on_demand })}
+                ${renderTriSlider({ attrName: "data-ll-tri", attrVal: "allow_tunnel", label: "Allow Reverse Tunnels", val: node.link_listener.allow_tunnel, inherited: llDefs.allow_tunnel })}
+                ${renderTriSlider({ attrName: "data-ll-tri", attrVal: "allow_bootstrap", label: "Allow Bootstrap Onboarding", val: node.link_listener.allow_bootstrap, inherited: llDefs.allow_bootstrap })}
+              </div>`
+            : `<div class="muted-sm">Set a Link Listener Address above to accept inbound mesh links.</div>`
+        }
       </div>
       <div class="inspector-sec">
         <div class="inspector-sec-head">
@@ -1204,32 +1629,46 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
   }
 
   function renderIngressTab(node) {
-    const guardNames = Object.keys(node.ingress.guards || {});
+    const igDefs = editor.spec.defaults?.ingress || defaultTopologyDefaults().ingress;
+    const gDefs = editor.spec.defaults?.guard || defaultTopologyDefaults().guard;
+    const nodeEffectiveBeacon =
+      node.ingress.js_fp_beacon != null ? node.ingress.js_fp_beacon : igDefs.js_fp_beacon;
+
     const listenersHtml = (node.ingress.listeners || [])
       .map(
         (l, i) => `
       <div class="subcard">
         <div class="subcard-head">
           <span>Listener #${i + 1}</span>
-          <button class="btn sm danger" data-del-listener="${i}">Remove</button>
+          <button type="button" class="btn sm danger" data-del-listener="${i}">Remove</button>
         </div>
         <div class="inspector-row">
           <label><span>Listen Addr</span><input data-l-addr="${i}" value="${escapeHtml(l.listen_addr || "")}" placeholder="0.0.0.0:8080" /></label>
-          <label class="check-inline" style="align-self:end;padding-bottom:8px;">
-            <input type="checkbox" data-l-tls="${i}" ${l.tls ? "checked" : ""} /> TLS (HTTPS + h2)
-          </label>
+          <div style="align-self:end;">
+            ${renderBinSlider({ attrName: "data-l-tls", attrVal: String(i), label: "TLS (HTTPS + h2)", val: l.tls })}
+          </div>
         </div>
       </div>`
       )
       .join("");
 
     const rulesHtml = (node.ingress.rules || [])
-      .map(
-        (r, i) => `
+      .map((r, i) => {
+        const effGuardName = r.guard || igDefs.default_guard || "";
+        const effGuardObj =
+          (effGuardName && (node.ingress.guards?.[effGuardName] || editor.spec.guard_templates?.[effGuardName])) ||
+          null;
+        const ruleInheritedBeacon = effGuardObj
+          ? effGuardObj.js_fp_beacon != null
+            ? effGuardObj.js_fp_beacon
+            : gDefs.js_fp_beacon
+          : nodeEffectiveBeacon;
+
+        return `
       <div class="subcard">
         <div class="subcard-head">
           <span>Rule #${i + 1}${r.service_tag ? ` · ${escapeHtml(r.service_tag)}` : ""}</span>
-          <button class="btn sm danger" data-del-irule="${i}">Remove</button>
+          <button type="button" class="btn sm danger" data-del-irule="${i}">Remove</button>
         </div>
         <div class="inspector-row">
           <label><span>Rule Name</span><input data-ir-name="${i}" value="${escapeHtml(r.name || "")}" placeholder="web-main" /></label>
@@ -1245,18 +1684,30 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         </div>
         <div class="inspector-row">
           <label><span>Source CIDRs (CSV)</span><input data-ir-cidrs="${i}" value="${escapeHtml((r.match?.source_cidrs || []).join(", "))}" placeholder="203.0.113.0/24" /></label>
-          <label><span>Guard Profile</span>
+          <label><span>Guard Profile (Global / Local)</span>
             <select data-ir-guard="${i}">
-              <option value="">(none)</option>
-              ${guardNames.map((g) => `<option value="${escapeHtml(g)}" ${r.guard === g ? "selected" : ""}>${escapeHtml(g)}</option>`).join("")}
+              ${buildGuardSelectOptions(r.guard || "", node.ingress.guards)}
             </select>
           </label>
         </div>
-        <div class="inspector-checks">
-          <label class="check-inline"><input type="checkbox" data-ir-intercept="${i}" ${r.intercept_errors ? "checked" : ""} /> Intercept Errors (429 / 5xx Exposure Page)</label>
+        <div class="tri-stack">
+          ${renderTriSlider({
+            attrName: "data-ir-intercept",
+            attrVal: String(i),
+            label: "Intercept Errors (429 / 5xx)",
+            val: r.intercept_errors,
+            inherited: igDefs.intercept_errors,
+          })}
+          ${renderTriSlider({
+            attrName: "data-ir-beacon",
+            attrVal: String(i),
+            label: "Passive JS FP Beacon",
+            val: r.js_fp_beacon,
+            inherited: ruleInheritedBeacon,
+          })}
         </div>
-      </div>`
-      )
+      </div>`;
+      })
       .join("");
 
     const tlsCertsHtml = (node.ingress.tls_certs || [])
@@ -1265,7 +1716,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       <div class="subcard">
         <div class="subcard-head">
           <span>Static Cert #${i + 1}</span>
-          <button class="btn sm danger" data-del-cert="${i}">Remove</button>
+          <button type="button" class="btn sm danger" data-del-cert="${i}">Remove</button>
         </div>
         <label><span>Domain</span><input data-ic-dom="${i}" value="${escapeHtml(c.domain || "")}" placeholder="example.com" /></label>
         <div class="inspector-row">
@@ -1280,31 +1731,50 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       <div class="inspector-sec">
         <div class="inspector-sec-head">
           <span>Listeners (${node.ingress.listeners.length})</span>
-          <button id="btn-add-listener" class="btn sm">+ Listener</button>
+          <button type="button" id="btn-add-listener" class="btn sm">+ Listener</button>
         </div>
         ${listenersHtml || '<div class="muted-sm">No ingress listeners yet.</div>'}
       </div>
       <div class="inspector-sec">
         <div class="inspector-sec-head">
           <span>Routing Rules (${node.ingress.rules.length})</span>
-          <button id="btn-add-irule" class="btn sm">+ Rule</button>
+          <button type="button" id="btn-add-irule" class="btn sm">+ Rule</button>
         </div>
         ${rulesHtml || '<div class="muted-sm">No ingress routing rules yet.</div>'}
       </div>
       <div class="inspector-sec">
         <div class="inspector-sec-head">
-          <span>TLS &amp; Clearance</span>
-          <button id="btn-add-cert" class="btn sm">+ Static Cert</button>
+          <span>TLS, Clearance &amp; Telemetry</span>
+          <button type="button" id="btn-add-cert" class="btn sm">+ Static Cert</button>
         </div>
         <div class="inspector-row">
-          <label><span>Cert Store Dir</span><input id="inp-cert-dir" value="${escapeHtml(node.ingress.cert_store_dir || "")}" placeholder="./data/ingress-certs" /></label>
+          <label><span>Cert Store Dir</span><input id="inp-cert-dir" value="${escapeHtml(node.ingress.cert_store_dir || "")}" placeholder="${escapeHtml(igDefs.cert_store_dir || "./data/ingress-certs (Default)")}" /></label>
           <label><span>Server Header</span>
             <select id="sel-server-hdr">
-              <option value="nginx" ${(node.ingress.server_header || "nginx") === "nginx" ? "selected" : ""}>nginx (Disguised)</option>
+              <option value="" ${!node.ingress.server_header ? "selected" : ""}>(Default: ${escapeHtml(igDefs.server_header || "nginx")})</option>
+              <option value="nginx" ${node.ingress.server_header === "nginx" ? "selected" : ""}>nginx (Disguised)</option>
               <option value="exposure" ${node.ingress.server_header === "exposure" ? "selected" : ""}>exposure</option>
             </select>
           </label>
-          <label><span>Clearance Secret</span><input id="inp-clear-sec" type="password" autocomplete="off" spellcheck="false" value="${escapeHtml(node.ingress.clearance_secret || "")}" /></label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Clearance Secret (empty = Default)</span>
+            <div style="display:flex;gap:6px;">
+              <input id="inp-clear-sec" type="password" autocomplete="off" spellcheck="false" value="${escapeHtml(node.ingress.clearance_secret || "")}" placeholder="${igDefs.clearance_secret ? "Inherited from Defaults" : "Auto-generate or paste secret"}" />
+              <button type="button" id="btn-gen-node-secret" class="btn sm" title="Generate random 64-char hex secret">Gen</button>
+            </div>
+          </label>
+          <label><span>JS FP Cooldown TTL (s)</span><input id="inp-node-fpttl" type="number" min="60" value="${node.ingress.js_fp_ttl_secs ?? ""}" placeholder="Default (${igDefs.js_fp_ttl_secs ?? 3600}s)" /></label>
+        </div>
+        <div class="tri-stack">
+          ${renderTriSlider({
+            attrName: "data-ig-beacon",
+            attrVal: "node",
+            label: "Passive JS FP Beacon (Node Default)",
+            sub: "Collect browser JS fingerprints on unverified HTML pages",
+            val: node.ingress.js_fp_beacon,
+            inherited: igDefs.js_fp_beacon,
+          })}
         </div>
         ${tlsCertsHtml}
       </div>
@@ -1312,104 +1782,88 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
   }
 
   function renderGuardTab(node) {
-    const bucketNames = Object.keys(node.ingress.rate_limit_buckets || {});
+    const globalGuards = Object.keys(editor.spec.guard_templates || {});
+    const globalBuckets = Object.keys(editor.spec.bucket_templates || {});
+    const totalRules = (node.ingress.rules || []).length;
+
+    const globalGuardQuickBtns = globalGuards
+      .map((gName) => {
+        const boundRules = (node.ingress.rules || []).filter((r) => r.guard === gName).length;
+        return `<button type="button" class="acl-chip ${boundRules === totalRules && totalRules > 0 ? "active" : ""}" data-bind-guard-all="${escapeHtml(gName)}" title="Bind global guard template '${escapeHtml(gName)}' to all rules on this node">${escapeHtml(gName)}${totalRules > 0 ? ` (${boundRules}/${totalRules})` : ""}</button>`;
+      })
+      .join("");
+
     const bucketsHtml = Object.entries(node.ingress.rate_limit_buckets || {})
-      .map(
-        ([bName, b]) => `
-      <div class="subcard">
-        <div class="subcard-head">
-          <span>Bucket: ${escapeHtml(bName)}</span>
-          <button class="btn sm danger" data-del-bucket="${escapeHtml(bName)}">Remove</button>
-        </div>
-        <div class="inspector-row">
-          <label><span>Name</span><input data-bk-name="${escapeHtml(bName)}" value="${escapeHtml(bName)}" /></label>
-          <label><span>Capacity</span><input type="number" step="1" data-bk-cap="${escapeHtml(bName)}" value="${b.capacity ?? 60}" /></label>
-        </div>
-        <div class="inspector-row">
-          <label><span>Refill / sec</span><input type="number" step="0.5" data-bk-refill="${escapeHtml(bName)}" value="${b.refill_per_sec ?? 10}" /></label>
-          <label class="check-inline" style="align-self:end;padding-bottom:8px;">
-            <input type="checkbox" data-bk-perip="${escapeHtml(bName)}" ${b.per_ip !== false ? "checked" : ""} /> Per-IP
-          </label>
-        </div>
-      </div>`
+      .map(([bName, b]) =>
+        renderBucketCard({
+          bName,
+          b,
+          prefix: "bk",
+          badge: Object.hasOwn(editor.spec.bucket_templates || {}, bName)
+            ? `<span class="pill warn">Overrides Global</span>`
+            : "",
+        })
       )
       .join("");
 
     const guardsHtml = Object.entries(node.ingress.guards || {})
       .map(([gName, g]) => {
         const boundRules = (node.ingress.rules || []).filter((r) => r.guard === gName).length;
-        const totalRules = (node.ingress.rules || []).length;
-        return `
-      <div class="subcard">
-        <div class="subcard-head">
-          <span>Guard: ${escapeHtml(gName)} <span class="pill ${boundRules > 0 ? "ok" : "warn"}">${boundRules}/${totalRules} rules</span></span>
-          <div class="btn-row">
-            ${totalRules > 0 && boundRules < totalRules ? `<button class="btn sm" data-bind-guard-all="${escapeHtml(gName)}" title="Attach this guard to all ingress rules">Bind All Rules</button>` : ""}
-            <button class="btn sm danger" data-del-guard="${escapeHtml(gName)}">Remove</button>
-          </div>
-        </div>
-        <div class="inspector-row">
-          <label><span>Profile Name</span><input data-gd-name="${escapeHtml(gName)}" value="${escapeHtml(gName)}" /></label>
-          <label><span>Antibot Mode</span>
-            <select data-gd-mode="${escapeHtml(gName)}">
-              <option value="off" ${g.antibot === "off" ? "selected" : ""}>off (rate-limit/CIDR only)</option>
-              <option value="silent" ${g.antibot === "silent" ? "selected" : ""}>silent (score block, no UI)</option>
-              <option value="challenge" ${g.antibot === "challenge" ? "selected" : ""}>challenge (PoW on score ≥ threshold)</option>
-              <option value="always" ${g.antibot === "always" ? "selected" : ""}>always (Under Attack / force PoW)</option>
-            </select>
-          </label>
-        </div>
-        <div class="inspector-row">
-          <label><span>PoW Difficulty (bits)</span><input type="number" min="4" max="28" data-gd-pow="${escapeHtml(gName)}" value="${g.pow_difficulty ?? 16}" /></label>
-          <label><span>Rate Limit Bucket</span>
-            <select data-gd-bucket="${escapeHtml(gName)}">
-              <option value="">(none)</option>
-              ${bucketNames.map((b) => `<option value="${escapeHtml(b)}" ${g.rate_limit_bucket === b ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
-            </select>
-          </label>
-        </div>
-        <div class="inspector-row">
-          <label><span>Challenge Score (0 = all)</span><input type="number" min="0" max="100" data-gd-cthresh="${escapeHtml(gName)}" value="${g.challenge_threshold ?? 50}" /></label>
-          <label><span>Reject Score (0 = off)</span><input type="number" min="0" max="100" data-gd-rthresh="${escapeHtml(gName)}" value="${g.reject_threshold ?? 85}" /></label>
-        </div>
-        <div class="inspector-row">
-          <label><span>Allow CIDRs (CSV)</span><input data-gd-allow="${escapeHtml(gName)}" value="${escapeHtml((g.allow_cidrs || []).join(", "))}" /></label>
-          <label><span>Deny CIDRs (CSV)</span><input data-gd-deny="${escapeHtml(gName)}" value="${escapeHtml((g.deny_cidrs || []).join(", "))}" /></label>
-        </div>
-        <div class="inspector-row">
-          <label><span>Clearance TTL (s)</span><input type="number" min="10" data-gd-ttl="${escapeHtml(gName)}" value="${g.clearance_ttl_secs ?? 1800}" /></label>
-          <label><span>API Bypass Headers</span><input data-gd-bypass="${escapeHtml(gName)}" value="${escapeHtml((g.api_bypass_headers || []).join(", "))}" placeholder="X-Api-Key" /></label>
-        </div>
-        <div class="inspector-checks">
-          <label class="check-inline"><input type="checkbox" data-gd-ua="${escapeHtml(gName)}" ${g.bind_ua !== false ? "checked" : ""} /> Bind UA</label>
-          <label class="check-inline"><input type="checkbox" data-gd-ip="${escapeHtml(gName)}" ${g.bind_ip_prefix ? "checked" : ""} /> Bind IP Prefix</label>
-          <label class="check-inline"><input type="checkbox" data-gd-bots="${escapeHtml(gName)}" ${g.block_bots ? "checked" : ""} /> Block Bots</label>
-          <label class="check-inline"><input type="checkbox" data-gd-headless="${escapeHtml(gName)}" ${g.block_headless ? "checked" : ""} /> Block Headless</label>
-          <label class="check-inline"><input type="checkbox" data-gd-fp="${escapeHtml(gName)}" ${g.require_client_fp ? "checked" : ""} /> Require JS FP</label>
-        </div>
-      </div>`;
+        const badgeHtml = `<span class="pill ${boundRules > 0 ? "ok" : "warn"}">${boundRules}/${totalRules} rules</span>${
+          Object.hasOwn(editor.spec.guard_templates || {}, gName)
+            ? ` <span class="pill warn">Overrides Global</span>`
+            : ""
+        }`;
+        const extraBtnsHtml =
+          totalRules > 0 && boundRules < totalRules
+            ? `<button type="button" class="btn sm" data-bind-guard-all="${escapeHtml(gName)}" title="Attach this guard to all ingress rules">Bind All Rules</button>`
+            : "";
+        return renderGuardCard({
+          gName,
+          g,
+          prefix: "gd",
+          localBuckets: node.ingress.rate_limit_buckets,
+          badgeHtml,
+          extraBtnsHtml,
+        });
       })
       .join("");
 
     return `
+      <div class="tpl-banner">
+        <div>
+          <strong>Global Templates Available</strong>
+          <div class="muted-sm">${globalGuards.length} Guard template(s) · ${globalBuckets.length} Bucket template(s) — select directly in Ingress Rules without duplicating per node.</div>
+        </div>
+        <button type="button" id="btn-open-defaults-from-guard" class="btn sm primary">Manage Templates →</button>
+      </div>
+      ${
+        globalGuards.length && totalRules > 0
+          ? `<div class="inspector-sec">
+              <div class="inspector-sec-head"><span>Quick-Bind Global Guard to All Rules</span></div>
+              <div class="acl-chips-row">${globalGuardQuickBtns}</div>
+            </div>`
+          : ""
+      }
       <div class="inspector-sec">
         <div class="inspector-sec-head">
-          <span>Rate Limit Buckets</span>
-          <button id="btn-add-bucket" class="btn sm">+ Bucket</button>
+          <span>Node-Local Bucket Overrides (${Object.keys(node.ingress.rate_limit_buckets || {}).length})</span>
+          <button type="button" id="btn-add-bucket" class="btn sm">+ Local Bucket</button>
         </div>
-        ${bucketsHtml || '<div class="muted-sm">No token buckets defined.</div>'}
+        ${bucketsHtml || '<div class="muted-sm">Inheriting global bucket templates. Add a local bucket only to override this node.</div>'}
       </div>
       <div class="inspector-sec">
         <div class="inspector-sec-head">
-          <span>Guard Profiles</span>
-          <button id="btn-add-guard" class="btn sm">+ Guard</button>
+          <span>Node-Local Guard Overrides (${Object.keys(node.ingress.guards || {}).length})</span>
+          <button type="button" id="btn-add-guard" class="btn sm">+ Local Guard</button>
         </div>
-        ${guardsHtml || '<div class="muted-sm">No guard profiles defined.</div>'}
+        ${guardsHtml || '<div class="muted-sm">Inheriting global guard templates. Add a local guard only to customize this specific node.</div>'}
       </div>
     `;
   }
 
   function renderEgressTab(node, ingressNodes) {
+    const egDefs = editor.spec.defaults?.egress || defaultTopologyDefaults().egress;
     const servicesHtml = Object.entries(node.egress.services || {})
       .map(([sTag, svc]) => {
         const allowSet = new Set(svc.allow_from || []);
@@ -1419,11 +1873,12 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
               `<button type="button" class="acl-chip ${allowSet.has(ig) ? "active" : ""}" data-acl-toggle="${escapeHtml(sTag)}" data-acl-node="${escapeHtml(ig)}">${escapeHtml(ig)}</button>`
           )
           .join("");
+        const effTls = svc.tls != null ? svc.tls : egDefs.tls;
         return `
       <div class="subcard">
         <div class="subcard-head">
           <span>Service: ${escapeHtml(sTag)}</span>
-          <button class="btn sm danger" data-del-esvc="${escapeHtml(sTag)}">Remove</button>
+          <button type="button" class="btn sm danger" data-del-esvc="${escapeHtml(sTag)}">Remove</button>
         </div>
         <div class="inspector-row">
           <label><span>Service Tag</span><input data-es-tag="${escapeHtml(sTag)}" value="${escapeHtml(sTag)}" /></label>
@@ -1437,25 +1892,31 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
               <option value="h2" ${svc.protocol === "h2" ? "selected" : ""}>h2</option>
             </select>
           </label>
-          <label><span>Timeout (ms)</span><input type="number" data-es-timeout="${escapeHtml(sTag)}" value="${svc.timeout_ms ?? 15000}" /></label>
+          <label><span>Timeout (ms, 0 = Default)</span><input type="number" min="0" data-es-timeout="${escapeHtml(sTag)}" value="${svc.timeout_ms ?? egDefs.timeout_ms ?? 30000}" placeholder="Default (${egDefs.timeout_ms ?? 30000})" /></label>
         </div>
         <label><span>Allow From Origin Node Tags (CSV)</span>
           <input data-es-allow="${escapeHtml(sTag)}" value="${escapeHtml((svc.allow_from || []).join(", "))}" placeholder="ingress-hk" />
         </label>
         ${chips ? `<div class="acl-chips-row"><span class="muted-sm">Quick ACL:</span>${chips}</div>` : ""}
-        <div class="inspector-checks">
-          <label class="check-inline"><input type="checkbox" data-es-tls="${escapeHtml(sTag)}" ${svc.tls ? "checked" : ""} /> Backend TLS</label>
-          <label class="check-inline"><input type="checkbox" data-es-any="${escapeHtml(sTag)}" ${svc.allow_any_origin ? "checked" : ""} /> Allow Any Origin</label>
-          <label class="check-inline"><input type="checkbox" data-es-intercept="${escapeHtml(sTag)}" ${svc.intercept_errors ? "checked" : ""} /> Intercept Errors (5xx Page)</label>
+        <div class="tri-stack">
+          ${renderTriSlider({ attrName: "data-es-tls", attrVal: sTag, label: "Backend TLS (HTTPS)", val: svc.tls, inherited: egDefs.tls })}
+          ${
+            effTls
+              ? renderTriSlider({
+                  attrName: "data-es-insecure",
+                  attrVal: sTag,
+                  label: "Allow Insecure Backend Cert",
+                  val: svc.insecure_skip_verify,
+                  inherited: egDefs.insecure_skip_verify,
+                })
+              : ""
+          }
+          ${renderTriSlider({ attrName: "data-es-any", attrVal: sTag, label: "Allow Any Origin Node", val: svc.allow_any_origin, inherited: egDefs.allow_any_origin })}
+          ${renderTriSlider({ attrName: "data-es-intercept", attrVal: sTag, label: "Intercept Errors (5xx Page)", val: svc.intercept_errors, inherited: egDefs.intercept_errors })}
         </div>
         ${
-          svc.tls
-            ? `<div class="inspector-row">
-                <label><span>CA Cert Path (optional PEM)</span><input data-es-ca="${escapeHtml(sTag)}" value="${escapeHtml(svc.ca_cert_path || "")}" placeholder="/etc/exposure/ca.pem" /></label>
-                <label class="check-inline" style="align-self:end;padding-bottom:8px;">
-                  <input type="checkbox" data-es-insecure="${escapeHtml(sTag)}" ${svc.insecure_skip_verify ? "checked" : ""} /> Allow Insecure Cert
-                </label>
-              </div>`
+          effTls
+            ? `<label><span>CA Cert Path (optional PEM)</span><input data-es-ca="${escapeHtml(sTag)}" value="${escapeHtml(svc.ca_cert_path || "")}" placeholder="${escapeHtml(egDefs.ca_cert_path || "/etc/exposure/ca.pem")}" /></label>`
             : ""
         }
       </div>`;
@@ -1466,7 +1927,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       <div class="inspector-sec">
         <div class="inspector-sec-head">
           <span>Egress Services (${Object.keys(node.egress.services || {}).length})</span>
-          <button id="btn-add-esvc" class="btn sm">+ Service</button>
+          <button type="button" id="btn-add-esvc" class="btn sm">+ Service</button>
         </div>
         ${servicesHtml || '<div class="muted-sm">No egress services configured.</div>'}
       </div>
@@ -1587,6 +2048,159 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     `;
   }
 
+  function wireBucketCardEvents(root, bucketsMap, prefix, { onRename, onDelete, onAfterMutate }) {
+    root.querySelectorAll(`[data-del-${prefix}]`).forEach((btn) =>
+      btn.addEventListener("click", () => {
+        markDirty(true);
+        const bName = btn.getAttribute(`data-del-${prefix}`);
+        delete bucketsMap[bName];
+        if (onDelete) onDelete(bName);
+        onAfterMutate();
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-name]`).forEach((inp) =>
+      inp.addEventListener("change", () => {
+        const oldN = inp.getAttribute(`data-${prefix}-name`);
+        const newN = inp.value.trim();
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(bucketsMap, newN)) {
+          inp.value = oldN;
+          return;
+        }
+        markDirty(true);
+        bucketsMap[newN] = bucketsMap[oldN];
+        delete bucketsMap[oldN];
+        if (onRename) onRename(oldN, newN);
+        onAfterMutate();
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-cap]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        bucketsMap[inp.getAttribute(`data-${prefix}-cap`)].capacity = parseNum(inp.value, 60, 1);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-refill]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        bucketsMap[inp.getAttribute(`data-${prefix}-refill`)].refill_per_sec = parseNum(inp.value, 10, 0.01);
+      })
+    );
+    wireTriSliders(root, `data-${prefix}-perip`, (bName, val) => {
+      markDirty(false);
+      bucketsMap[bName].per_ip = val;
+    });
+  }
+
+  function wireGuardCardEvents(root, guardsMap, prefix, { onRename, onDelete, onAfterMutate }) {
+    root.querySelectorAll(`[data-del-${prefix}]`).forEach((btn) =>
+      btn.addEventListener("click", () => {
+        markDirty(true);
+        const gName = btn.getAttribute(`data-del-${prefix}`);
+        delete guardsMap[gName];
+        if (onDelete) onDelete(gName);
+        onAfterMutate();
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-name]`).forEach((inp) =>
+      inp.addEventListener("change", () => {
+        const oldN = inp.getAttribute(`data-${prefix}-name`);
+        const newN = inp.value.trim();
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(guardsMap, newN)) {
+          inp.value = oldN;
+          return;
+        }
+        markDirty(true);
+        guardsMap[newN] = guardsMap[oldN];
+        delete guardsMap[oldN];
+        if (onRename) onRename(oldN, newN);
+        onAfterMutate();
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-mode]`).forEach((sel) =>
+      sel.addEventListener("change", () => {
+        markDirty(false);
+        guardsMap[sel.getAttribute(`data-${prefix}-mode`)].antibot = sel.value;
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-pow]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-pow`)].pow_difficulty = parseNum(inp.value, 16, 4, 28);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-bucket]`).forEach((sel) =>
+      sel.addEventListener("change", () => {
+        markDirty(false);
+        guardsMap[sel.getAttribute(`data-${prefix}-bucket`)].rate_limit_bucket = sel.value || null;
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-cthresh]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-cthresh`)].challenge_threshold = parseNum(inp.value, 50, 0, 100);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-rthresh]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-rthresh`)].reject_threshold = parseNum(inp.value, 85, 0, 100);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-allow]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-allow`)].allow_cidrs = inp.value
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-deny]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-deny`)].deny_cidrs = inp.value
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-ttl]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-ttl`)].clearance_ttl_secs = parseNum(
+          inp.value,
+          1800,
+          10,
+          86400 * 30
+        );
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-fpttl]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        const v = inp.value.trim();
+        guardsMap[inp.getAttribute(`data-${prefix}-fpttl`)].js_fp_ttl_secs = v
+          ? parseNum(v, 3600, 60, 86400 * 30)
+          : null;
+      })
+    );
+    root.querySelectorAll(`[data-${prefix}-bypass]`).forEach((inp) =>
+      inp.addEventListener("input", () => {
+        markDirty(false);
+        guardsMap[inp.getAttribute(`data-${prefix}-bypass`)].api_bypass_headers = inp.value
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      })
+    );
+    wireTriSliders(root, `data-${prefix}-ua`, (gName, val) => { markDirty(false); guardsMap[gName].bind_ua = val; });
+    wireTriSliders(root, `data-${prefix}-ip`, (gName, val) => { markDirty(false); guardsMap[gName].bind_ip_prefix = val; });
+    wireTriSliders(root, `data-${prefix}-bots`, (gName, val) => { markDirty(false); guardsMap[gName].block_bots = val; });
+    wireTriSliders(root, `data-${prefix}-headless`, (gName, val) => { markDirty(false); guardsMap[gName].block_headless = val; });
+    wireTriSliders(root, `data-${prefix}-fp`, (gName, val) => { markDirty(false); guardsMap[gName].require_client_fp = val; });
+    wireTriSliders(root, `data-${prefix}-beacon`, (gName, val) => { markDirty(false); guardsMap[gName].js_fp_beacon = val; });
+  }
+
   function wireTabEvents(box, tag, node, maintainerNodes) {
     // General tab
     box.querySelector("#inp-node-tag")?.addEventListener("change", (ev) => {
@@ -1641,26 +2255,34 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       render();
     });
 
-    const syncLinkListener = () => {
+    box.querySelector("#inp-link-listen")?.addEventListener("input", (ev) => {
       markDirty(false);
-      const addr = box.querySelector("#inp-link-listen").value.trim();
+      const addr = ev.target.value.trim();
+      const wasNull = !node.link_listener;
       if (!addr) {
         node.link_listener = null;
+        if (!wasNull) renderInspector();
       } else {
-        node.link_listener = {
-          listen_addr: addr,
-          allow_on_demand: box.querySelector("#chk-allow-ondemand").checked,
-          allow_tunnel: box.querySelector("#chk-allow-tunnel").checked,
-          allow_bootstrap: box.querySelector("#chk-allow-boot").checked,
-        };
+        if (!node.link_listener) {
+          node.link_listener = {
+            listen_addr: addr,
+            allow_on_demand: null,
+            allow_tunnel: null,
+            allow_bootstrap: null,
+          };
+          renderInspector();
+        } else {
+          node.link_listener.listen_addr = addr;
+        }
       }
       renderNodes();
       renderEdges();
-    };
-    box.querySelector("#inp-link-listen")?.addEventListener("input", syncLinkListener);
-    box.querySelector("#chk-allow-ondemand")?.addEventListener("change", syncLinkListener);
-    box.querySelector("#chk-allow-tunnel")?.addEventListener("change", syncLinkListener);
-    box.querySelector("#chk-allow-boot")?.addEventListener("change", syncLinkListener);
+    });
+    wireTriSliders(box, "data-ll-tri", (field, val) => {
+      if (!node.link_listener) return;
+      markDirty(false);
+      node.link_listener[field] = val;
+    });
 
     box.querySelector("#inp-maint-hops")?.addEventListener("input", (ev) => {
       markDirty(false);
@@ -1700,12 +2322,10 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         renderNodes();
       })
     );
-    box.querySelectorAll("[data-l-tls]").forEach((chk) =>
-      chk.addEventListener("change", () => {
-        markDirty(false);
-        node.ingress.listeners[Number(chk.dataset.lTls)].tls = chk.checked;
-      })
-    );
+    wireBinSliders(box, "data-l-tls", (idxStr, val) => {
+      markDirty(false);
+      node.ingress.listeners[Number(idxStr)].tls = val;
+    });
 
     box.querySelector("#btn-add-irule")?.addEventListener("click", () => {
       markDirty(true);
@@ -1714,6 +2334,9 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         match: {},
         service_tag: "",
         next_peer: "",
+        guard: null,
+        intercept_errors: null,
+        js_fp_beacon: null,
       });
       render();
     });
@@ -1780,14 +2403,17 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       sel.addEventListener("change", () => {
         markDirty(false);
         node.ingress.rules[Number(sel.dataset.irGuard)].guard = sel.value || null;
+        renderInspector();
       })
     );
-    box.querySelectorAll("[data-ir-intercept]").forEach((chk) =>
-      chk.addEventListener("change", () => {
-        markDirty(false);
-        node.ingress.rules[Number(chk.dataset.irIntercept)].intercept_errors = chk.checked;
-      })
-    );
+    wireTriSliders(box, "data-ir-intercept", (idxStr, val) => {
+      markDirty(false);
+      node.ingress.rules[Number(idxStr)].intercept_errors = val;
+    });
+    wireTriSliders(box, "data-ir-beacon", (idxStr, val) => {
+      markDirty(false);
+      node.ingress.rules[Number(idxStr)].js_fp_beacon = val;
+    });
     box.querySelector("#inp-cert-dir")?.addEventListener("input", (ev) => {
       markDirty(false);
       node.ingress.cert_store_dir = ev.target.value.trim() || null;
@@ -1799,6 +2425,22 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelector("#inp-clear-sec")?.addEventListener("input", (ev) => {
       markDirty(false);
       node.ingress.clearance_secret = ev.target.value.trim();
+    });
+    box.querySelector("#btn-gen-node-secret")?.addEventListener("click", () => {
+      markDirty(true);
+      node.ingress.clearance_secret = generateRandomSecretHex(32);
+      renderInspector();
+      showToast("Generated node clearance secret");
+    });
+    box.querySelector("#inp-node-fpttl")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      const v = ev.target.value.trim();
+      node.ingress.js_fp_ttl_secs = v ? parseNum(v, 3600, 60, 86400 * 30) : null;
+    });
+    wireTriSliders(box, "data-ig-beacon", (_k, val) => {
+      markDirty(false);
+      node.ingress.js_fp_beacon = val;
+      renderInspector();
     });
     box.querySelector("#btn-add-cert")?.addEventListener("click", () => {
       markDirty(true);
@@ -1832,62 +2474,35 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     );
 
     // Guard tab
+    box.querySelector("#btn-open-defaults-from-guard")?.addEventListener("click", () => {
+      switchMode("defaults");
+    });
     box.querySelector("#btn-add-bucket")?.addEventListener("click", () => {
       markDirty(true);
-      let name = "web-default", k = 1;
-      while (node.ingress.rate_limit_buckets[name]) name = `bucket-${k++}`;
-      node.ingress.rate_limit_buckets[name] = { capacity: 60, refill_per_sec: 10, per_ip: true };
+      let name = "local-bucket", k = 1;
+      while (node.ingress.rate_limit_buckets[name]) name = `local-bucket-${k++}`;
+      node.ingress.rate_limit_buckets[name] = { capacity: 60, refill_per_sec: 10, per_ip: null };
       render();
     });
-    box.querySelectorAll("[data-del-bucket]").forEach((btn) =>
-      btn.addEventListener("click", () => {
-        markDirty(true);
-        const bName = btn.dataset.delBucket;
-        delete node.ingress.rate_limit_buckets[bName];
+    wireBucketCardEvents(box, node.ingress.rate_limit_buckets, "bk", {
+      onDelete: (bName) => {
         for (const g of Object.values(node.ingress.guards || {})) {
           if (g.rate_limit_bucket === bName) g.rate_limit_bucket = null;
         }
-        render();
-      })
-    );
-    box.querySelectorAll("[data-bk-name]").forEach((inp) =>
-      inp.addEventListener("change", () => {
-        const oldN = inp.dataset.bkName, newN = inp.value.trim();
-        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(node.ingress.rate_limit_buckets, newN)) {
-          inp.value = oldN;
-          return;
-        }
-        markDirty(true);
-        node.ingress.rate_limit_buckets[newN] = node.ingress.rate_limit_buckets[oldN];
-        delete node.ingress.rate_limit_buckets[oldN];
+      },
+      onRename: (oldN, newN) => {
         for (const g of Object.values(node.ingress.guards || {})) {
           if (g.rate_limit_bucket === oldN) g.rate_limit_bucket = newN;
         }
-        render();
-      })
-    );
-    box.querySelectorAll("[data-bk-cap]").forEach((inp) =>
-      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkCap].capacity = parseNum(inp.value, 60, 1); })
-    );
-    box.querySelectorAll("[data-bk-refill]").forEach((inp) =>
-      inp.addEventListener("input", () => { markDirty(false); node.ingress.rate_limit_buckets[inp.dataset.bkRefill].refill_per_sec = parseNum(inp.value, 10, 0.01); })
-    );
-    box.querySelectorAll("[data-bk-perip]").forEach((chk) =>
-      chk.addEventListener("change", () => { markDirty(false); node.ingress.rate_limit_buckets[chk.dataset.bkPerip].per_ip = chk.checked; })
-    );
+      },
+      onAfterMutate: () => render(),
+    });
 
     box.querySelector("#btn-add-guard")?.addEventListener("click", () => {
       markDirty(true);
-      let name = "standard", k = 1;
-      while (node.ingress.guards[name]) name = `guard-${k++}`;
-      node.ingress.guards[name] = {
-        antibot: "challenge",
-        rate_limit_bucket: Object.keys(node.ingress.rate_limit_buckets)[0] || null,
-        allow_cidrs: [], deny_cidrs: [],
-        challenge_threshold: 50, reject_threshold: 85,
-        pow_difficulty: 16, clearance_ttl_secs: 1800,
-        bind_ua: true, bind_ip_prefix: false, api_bypass_headers: [],
-      };
+      let name = "local-guard", k = 1;
+      while (node.ingress.guards[name]) name = `local-guard-${k++}`;
+      node.ingress.guards[name] = defaultGuardProfile(editor.spec.defaults?.guard);
       render();
     });
     box.querySelectorAll("[data-bind-guard-all]").forEach((btn) =>
@@ -1901,57 +2516,36 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         showToast(`Bound guard "${gName}" to all ${node.ingress.rules.length} ingress rule(s)`);
       })
     );
-    box.querySelectorAll("[data-del-guard]").forEach((btn) =>
-      btn.addEventListener("click", () => {
-        markDirty(true);
-        const gName = btn.dataset.delGuard;
-        delete node.ingress.guards[gName];
+    wireGuardCardEvents(box, node.ingress.guards, "gd", {
+      onDelete: (gName) => {
         for (const r of node.ingress.rules || []) {
-          if (r.guard === gName) r.guard = null;
+          if (r.guard === gName && !Object.hasOwn(editor.spec.guard_templates || {}, gName)) r.guard = null;
         }
-        render();
-      })
-    );
-    box.querySelectorAll("[data-gd-name]").forEach((inp) =>
-      inp.addEventListener("change", () => {
-        const oldN = inp.dataset.gdName, newN = inp.value.trim();
-        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(node.ingress.guards, newN)) {
-          inp.value = oldN;
-          return;
-        }
-        markDirty(true);
-        node.ingress.guards[newN] = node.ingress.guards[oldN];
-        delete node.ingress.guards[oldN];
-        // Keep ingress rules synced with renamed guard profile!
+      },
+      onRename: (oldN, newN) => {
         for (const r of node.ingress.rules || []) {
           if (r.guard === oldN) r.guard = newN;
         }
-        render();
-      })
-    );
-    box.querySelectorAll("[data-gd-mode]").forEach((sel) => sel.addEventListener("change", () => { markDirty(false); node.ingress.guards[sel.dataset.gdMode].antibot = sel.value; }));
-    box.querySelectorAll("[data-gd-pow]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdPow].pow_difficulty = parseNum(inp.value, 16, 4, 28); }));
-    box.querySelectorAll("[data-gd-bucket]").forEach((sel) => sel.addEventListener("change", () => { markDirty(false); node.ingress.guards[sel.dataset.gdBucket].rate_limit_bucket = sel.value || null; }));
-    box.querySelectorAll("[data-gd-cthresh]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdCthresh].challenge_threshold = parseNum(inp.value, 50, 0, 100); }));
-    box.querySelectorAll("[data-gd-rthresh]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdRthresh].reject_threshold = parseNum(inp.value, 85, 0, 100); }));
-    box.querySelectorAll("[data-gd-allow]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdAllow].allow_cidrs = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-gd-deny]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdDeny].deny_cidrs = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-gd-ttl]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdTtl].clearance_ttl_secs = parseNum(inp.value, 1800, 10, 86400 * 30); }));
-    box.querySelectorAll("[data-gd-bypass]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.ingress.guards[inp.dataset.gdBypass].api_bypass_headers = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-gd-ua]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.ingress.guards[chk.dataset.gdUa].bind_ua = chk.checked; }));
-    box.querySelectorAll("[data-gd-ip]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.ingress.guards[chk.dataset.gdIp].bind_ip_prefix = chk.checked; }));
-    box.querySelectorAll("[data-gd-bots]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.ingress.guards[chk.dataset.gdBots].block_bots = chk.checked; }));
-    box.querySelectorAll("[data-gd-headless]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.ingress.guards[chk.dataset.gdHeadless].block_headless = chk.checked; }));
-    box.querySelectorAll("[data-gd-fp]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.ingress.guards[chk.dataset.gdFp].require_client_fp = chk.checked; }));
+      },
+      onAfterMutate: () => render(),
+    });
 
     // Egress tab
     box.querySelector("#btn-add-esvc")?.addEventListener("click", () => {
       markDirty(true);
+      const egDefs = editor.spec.defaults?.egress || defaultTopologyDefaults().egress;
       let name = "svc", k = 1;
       while (node.egress.services[name]) name = `svc-${k++}`;
       node.egress.services[name] = {
-        backend: "127.0.0.1:8080", protocol: "auto", tls: false,
-        allow_from: [], allow_any_origin: false, timeout_ms: 15000,
+        backend: "127.0.0.1:8080",
+        protocol: egDefs.protocol || "auto",
+        tls: null,
+        ca_cert_path: null,
+        insecure_skip_verify: null,
+        allow_from: [],
+        allow_any_origin: null,
+        timeout_ms: egDefs.timeout_ms ?? 30000,
+        intercept_errors: null,
       };
       render();
     });
@@ -1973,29 +2567,31 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     );
     box.querySelectorAll("[data-es-backend]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esBackend].backend = inp.value.trim(); }));
     box.querySelectorAll("[data-es-proto]").forEach((sel) => sel.addEventListener("change", () => { markDirty(false); node.egress.services[sel.dataset.esProto].protocol = sel.value; }));
-    box.querySelectorAll("[data-es-timeout]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esTimeout].timeout_ms = parseNum(inp.value, 15000, 100); }));
+    box.querySelectorAll("[data-es-timeout]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esTimeout].timeout_ms = parseNum(inp.value, 0, 0); }));
     box.querySelectorAll("[data-es-allow]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); node.egress.services[inp.dataset.esAllow].allow_from = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
-    box.querySelectorAll("[data-es-tls]").forEach((chk) =>
-      chk.addEventListener("change", () => {
-        markDirty(true);
-        node.egress.services[chk.dataset.esTls].tls = chk.checked;
-        renderInspector();
-      })
-    );
+    wireTriSliders(box, "data-es-tls", (sTag, val) => {
+      markDirty(true);
+      node.egress.services[sTag].tls = val;
+      renderInspector();
+    });
     box.querySelectorAll("[data-es-ca]").forEach((inp) =>
       inp.addEventListener("input", () => {
         markDirty(false);
         node.egress.services[inp.dataset.esCa].ca_cert_path = inp.value.trim() || null;
       })
     );
-    box.querySelectorAll("[data-es-insecure]").forEach((chk) =>
-      chk.addEventListener("change", () => {
-        markDirty(false);
-        node.egress.services[chk.dataset.esInsecure].insecure_skip_verify = chk.checked;
-      })
-    );
-    box.querySelectorAll("[data-es-intercept]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.egress.services[chk.dataset.esIntercept].intercept_errors = chk.checked; }));
-    box.querySelectorAll("[data-es-any]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); node.egress.services[chk.dataset.esAny].allow_any_origin = chk.checked; }));
+    wireTriSliders(box, "data-es-insecure", (sTag, val) => {
+      markDirty(false);
+      node.egress.services[sTag].insecure_skip_verify = val;
+    });
+    wireTriSliders(box, "data-es-intercept", (sTag, val) => {
+      markDirty(false);
+      node.egress.services[sTag].intercept_errors = val;
+    });
+    wireTriSliders(box, "data-es-any", (sTag, val) => {
+      markDirty(false);
+      node.egress.services[sTag].allow_any_origin = val;
+    });
     box.querySelectorAll("[data-acl-toggle]").forEach((btn) =>
       btn.addEventListener("click", () => {
         markDirty(true);
@@ -2300,11 +2896,331 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     );
   }
 
+  function renderDefaultsWorkspace() {
+    const wrap = el("topo-defaults-wrap");
+    if (!wrap) return;
+    if (!editor.spec.defaults) editor.spec.defaults = defaultTopologyDefaults();
+    const defs = editor.spec.defaults;
+    const igDefs = defs.ingress;
+    const gDefs = defs.guard;
+    const egDefs = defs.egress;
+    const llDefs = defs.link_listener;
+    const gl = editor.spec.global_logger || {
+      hmac_key: "",
+      store_raw_ip: false,
+      sample_rate: 1.0,
+      hll_precision: 12,
+      segment: { retention_hours: 72 },
+    };
+
+    const guardTplNames = Object.keys(editor.spec.guard_templates || {});
+    const bucketTplNames = Object.keys(editor.spec.bucket_templates || {});
+
+    // Count usage of each global guard template across all ingress rules
+    const guardUsage = {};
+    for (const n of Object.values(editor.spec.nodes || {})) {
+      for (const r of n.ingress?.rules || []) {
+        const g = r.guard || igDefs.default_guard;
+        if (g) guardUsage[g] = (guardUsage[g] || 0) + 1;
+      }
+    }
+
+    const globalBucketsHtml = Object.entries(editor.spec.bucket_templates || {})
+      .map(([bName, b]) => renderBucketCard({ bName, b, prefix: "gbk" }))
+      .join("");
+
+    const globalGuardsHtml = Object.entries(editor.spec.guard_templates || {})
+      .map(([gName, g]) => {
+        const cnt = guardUsage[gName] || 0;
+        const badgeHtml = `<span class="pill ${cnt > 0 ? "ok" : ""}">Used by ${cnt} rule(s)</span>${
+          igDefs.default_guard === gName ? ` <span class="pill">Default Guard</span>` : ""
+        }`;
+        return renderGuardCard({
+          gName,
+          g,
+          prefix: "ggd",
+          localBuckets: {},
+          badgeHtml,
+        });
+      })
+      .join("");
+
+    wrap.innerHTML = `
+      <div class="tpl-banner">
+        <div>
+          <strong>Cluster-Wide Defaults &amp; Reusable Templates</strong>
+          <div class="muted-sm">Configure shared defaults once here. Individual nodes inherit these values automatically unless explicitly overridden with a tri-state switch (Default / Off / On).</div>
+        </div>
+        <button type="button" id="btn-back-to-visual" class="btn sm">← Back to Visual Graph</button>
+      </div>
+
+      <div class="defaults-grid">
+        <div class="inspector-sec">
+          <div class="inspector-sec-head"><span>Ingress Defaults</span></div>
+          <div class="inspector-row">
+            <label><span>Server Header</span>
+              <select id="def-ig-server">
+                <option value="nginx" ${(igDefs.server_header || "nginx") === "nginx" ? "selected" : ""}>nginx (Disguised)</option>
+                <option value="exposure" ${igDefs.server_header === "exposure" ? "selected" : ""}>exposure</option>
+              </select>
+            </label>
+            <label><span>Default Guard Template</span>
+              <select id="def-ig-guard">
+                <option value="">(none)</option>
+                ${guardTplNames.map((g) => `<option value="${escapeHtml(g)}" ${igDefs.default_guard === g ? "selected" : ""}>${escapeHtml(g)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+          <div class="inspector-row">
+            <label><span>Cert Store Dir</span><input id="def-ig-certdir" value="${escapeHtml(igDefs.cert_store_dir || "")}" placeholder="./data/ingress-certs" /></label>
+            <label><span>JS FP Cooldown TTL (s)</span><input id="def-ig-fpttl" type="number" min="60" value="${igDefs.js_fp_ttl_secs ?? 3600}" /></label>
+          </div>
+          <label><span>Shared Clearance Secret (used by all Ingress nodes without a local secret)</span>
+            <div style="display:flex;gap:6px;">
+              <input id="def-ig-secret" type="password" autocomplete="off" spellcheck="false" value="${escapeHtml(igDefs.clearance_secret || "")}" placeholder="Click Generate for a 64-char random secret" />
+              <button type="button" id="btn-gen-def-secret" class="btn sm">Generate</button>
+            </div>
+          </label>
+          <div class="tri-stack">
+            ${renderBinSlider({ attrName: "data-def-ig-bin", attrVal: "intercept_errors", label: "Intercept Errors (429 / 5xx Page)", val: igDefs.intercept_errors })}
+            ${renderBinSlider({ attrName: "data-def-ig-bin", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", sub: "Inject lightweight HTML beacon when client JS fingerprint not yet collected", val: igDefs.js_fp_beacon })}
+          </div>
+        </div>
+
+        <div class="inspector-sec">
+          <div class="inspector-sec-head"><span>Guard Profile Defaults</span></div>
+          <div class="inspector-row">
+            <label><span>Default Antibot Mode</span>
+              <select id="def-gd-mode">
+                <option value="off" ${gDefs.antibot === "off" ? "selected" : ""}>off</option>
+                <option value="silent" ${gDefs.antibot === "silent" ? "selected" : ""}>silent</option>
+                <option value="challenge" ${gDefs.antibot === "challenge" ? "selected" : ""}>challenge</option>
+                <option value="always" ${gDefs.antibot === "always" ? "selected" : ""}>always (Under Attack)</option>
+              </select>
+            </label>
+            <label><span>Default Bucket Template</span>
+              <select id="def-gd-bucket">
+                <option value="">(none)</option>
+                ${bucketTplNames.map((b) => `<option value="${escapeHtml(b)}" ${gDefs.rate_limit_bucket === b ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+          <div class="inspector-row">
+            <label><span>Challenge Score</span><input id="def-gd-cthresh" type="number" min="0" max="100" value="${gDefs.challenge_threshold ?? 50}" /></label>
+            <label><span>Reject Score</span><input id="def-gd-rthresh" type="number" min="0" max="100" value="${gDefs.reject_threshold ?? 85}" /></label>
+          </div>
+          <div class="inspector-row">
+            <label><span>PoW Difficulty (bits)</span><input id="def-gd-pow" type="number" min="4" max="28" value="${gDefs.pow_difficulty ?? 16}" /></label>
+            <label><span>Clearance TTL (s)</span><input id="def-gd-ttl" type="number" min="10" value="${gDefs.clearance_ttl_secs ?? 1800}" /></label>
+          </div>
+          <div class="tri-stack">
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "bind_ua", label: "Bind User-Agent", val: gDefs.bind_ua })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "bind_ip_prefix", label: "Bind IP Prefix (/24 /48)", val: gDefs.bind_ip_prefix })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "block_bots", label: "Block Known Bots", val: gDefs.block_bots })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "block_headless", label: "Block Headless Browsers", val: gDefs.block_headless })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "require_client_fp", label: "Require Verified JS FP", val: gDefs.require_client_fp })}
+            ${renderBinSlider({ attrName: "data-def-gd-bin", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: gDefs.js_fp_beacon })}
+          </div>
+        </div>
+
+        <div class="inspector-sec">
+          <div class="inspector-sec-head"><span>Egress Defaults</span></div>
+          <div class="inspector-row">
+            <label><span>Default Backend Protocol</span>
+              <select id="def-eg-proto">
+                <option value="auto" ${egDefs.protocol === "auto" ? "selected" : ""}>auto (h2/h1)</option>
+                <option value="http1" ${egDefs.protocol === "http1" ? "selected" : ""}>http1</option>
+                <option value="h2" ${egDefs.protocol === "h2" ? "selected" : ""}>h2</option>
+              </select>
+            </label>
+            <label><span>Default Timeout (ms)</span><input id="def-eg-timeout" type="number" min="100" value="${egDefs.timeout_ms ?? 30000}" /></label>
+          </div>
+          <label><span>Default Backend CA Cert Path (optional PEM)</span><input id="def-eg-ca" value="${escapeHtml(egDefs.ca_cert_path || "")}" placeholder="/etc/exposure/ca.pem" /></label>
+          <div class="tri-stack">
+            ${renderBinSlider({ attrName: "data-def-eg-bin", attrVal: "tls", label: "Backend TLS (HTTPS)", val: egDefs.tls })}
+            ${renderBinSlider({ attrName: "data-def-eg-bin", attrVal: "insecure_skip_verify", label: "Allow Insecure Backend Cert", val: egDefs.insecure_skip_verify })}
+            ${renderBinSlider({ attrName: "data-def-eg-bin", attrVal: "allow_any_origin", label: "Allow Any Origin Node", val: egDefs.allow_any_origin })}
+            ${renderBinSlider({ attrName: "data-def-eg-bin", attrVal: "intercept_errors", label: "Intercept Errors (5xx Page)", val: egDefs.intercept_errors })}
+          </div>
+        </div>
+
+        <div class="inspector-sec">
+          <div class="inspector-sec-head"><span>Mesh Listener &amp; Telemetry Defaults</span></div>
+          <div class="tri-stack">
+            ${renderBinSlider({ attrName: "data-def-ll-bin", attrVal: "allow_on_demand", label: "Allow On-Demand Links", val: llDefs.allow_on_demand })}
+            ${renderBinSlider({ attrName: "data-def-ll-bin", attrVal: "allow_tunnel", label: "Allow Reverse Tunnels", val: llDefs.allow_tunnel })}
+            ${renderBinSlider({ attrName: "data-def-ll-bin", attrVal: "allow_bootstrap", label: "Allow Bootstrap Onboarding", val: llDefs.allow_bootstrap })}
+            ${renderBinSlider({ attrName: "data-def-log-bin", attrVal: "store_raw_ip", label: "Store Raw Client IP in Fingerprints", sub: "Off = privacy-first subnet + HMAC (exact IP lookup still supported)", val: Boolean(gl.store_raw_ip) })}
+          </div>
+          <div class="inspector-row">
+            <label><span>Sample Rate (0.01 - 1.0)</span><input id="def-log-sample" type="number" step="0.05" min="0.01" max="1" value="${gl.sample_rate ?? 1.0}" /></label>
+            <label><span>Retention (hours)</span><input id="def-log-ret" type="number" min="1" value="${gl.segment?.retention_hours ?? 72}" /></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="inspector-sec">
+        <div class="inspector-sec-head">
+          <span>Global Rate-Limit Bucket Templates (${bucketTplNames.length})</span>
+          <button type="button" id="btn-add-global-bucket" class="btn sm primary">+ Global Bucket</button>
+        </div>
+        ${
+          globalBucketsHtml
+            ? `<div class="tpl-card-grid">${globalBucketsHtml}</div>`
+            : `<div class="muted-sm">No global rate-limit buckets defined yet. Click "+ Global Bucket" to create a reusable token bucket shared across all Guard templates and Ingress nodes.</div>`
+        }
+      </div>
+
+      <div class="inspector-sec">
+        <div class="inspector-sec-head">
+          <span>Global Guard Profile Templates (${guardTplNames.length})</span>
+          <button type="button" id="btn-add-global-guard" class="btn sm primary">+ Global Guard</button>
+        </div>
+        ${
+          globalGuardsHtml
+            ? `<div class="tpl-card-grid">${globalGuardsHtml}</div>`
+            : `<div class="muted-sm">No global guard templates defined yet. Create templates like "web-standard" or "under-attack" once, then select them on any Ingress rule.</div>`
+        }
+      </div>
+    `;
+
+    // Wire Defaults workspace events
+    wrap.querySelector("#btn-back-to-visual")?.addEventListener("click", () => switchMode("visual"));
+
+    // Ingress defaults
+    wrap.querySelector("#def-ig-server")?.addEventListener("change", (ev) => { markDirty(false); igDefs.server_header = ev.target.value; });
+    wrap.querySelector("#def-ig-guard")?.addEventListener("change", (ev) => { markDirty(true); igDefs.default_guard = ev.target.value || null; renderDefaultsWorkspace(); });
+    wrap.querySelector("#def-ig-certdir")?.addEventListener("input", (ev) => { markDirty(false); igDefs.cert_store_dir = ev.target.value.trim() || null; });
+    wrap.querySelector("#def-ig-fpttl")?.addEventListener("input", (ev) => { markDirty(false); igDefs.js_fp_ttl_secs = parseNum(ev.target.value, 3600, 60, 86400 * 30); });
+    wrap.querySelector("#def-ig-secret")?.addEventListener("input", (ev) => { markDirty(false); igDefs.clearance_secret = ev.target.value.trim(); });
+    wrap.querySelector("#btn-gen-def-secret")?.addEventListener("click", () => {
+      markDirty(true);
+      igDefs.clearance_secret = generateRandomSecretHex(32);
+      renderDefaultsWorkspace();
+      showToast("Generated cluster-wide default clearance secret");
+    });
+    wireBinSliders(wrap, "data-def-ig-bin", (field, val) => { markDirty(false); igDefs[field] = val; });
+
+    // Guard defaults
+    wrap.querySelector("#def-gd-mode")?.addEventListener("change", (ev) => { markDirty(false); gDefs.antibot = ev.target.value; });
+    wrap.querySelector("#def-gd-bucket")?.addEventListener("change", (ev) => { markDirty(false); gDefs.rate_limit_bucket = ev.target.value || null; });
+    wrap.querySelector("#def-gd-cthresh")?.addEventListener("input", (ev) => { markDirty(false); gDefs.challenge_threshold = parseNum(ev.target.value, 50, 0, 100); });
+    wrap.querySelector("#def-gd-rthresh")?.addEventListener("input", (ev) => { markDirty(false); gDefs.reject_threshold = parseNum(ev.target.value, 85, 0, 100); });
+    wrap.querySelector("#def-gd-pow")?.addEventListener("input", (ev) => { markDirty(false); gDefs.pow_difficulty = parseNum(ev.target.value, 16, 4, 28); });
+    wrap.querySelector("#def-gd-ttl")?.addEventListener("input", (ev) => { markDirty(false); gDefs.clearance_ttl_secs = parseNum(ev.target.value, 1800, 10, 86400 * 30); });
+    wireBinSliders(wrap, "data-def-gd-bin", (field, val) => {
+      markDirty(false);
+      gDefs[field] = val;
+      renderDefaultsWorkspace(); // refresh "Default (On/Off)" hints inside template cards
+    });
+
+    // Egress defaults
+    wrap.querySelector("#def-eg-proto")?.addEventListener("change", (ev) => { markDirty(false); egDefs.protocol = ev.target.value; });
+    wrap.querySelector("#def-eg-timeout")?.addEventListener("input", (ev) => { markDirty(false); egDefs.timeout_ms = parseNum(ev.target.value, 30000, 100); });
+    wrap.querySelector("#def-eg-ca")?.addEventListener("input", (ev) => { markDirty(false); egDefs.ca_cert_path = ev.target.value.trim() || null; });
+    wireBinSliders(wrap, "data-def-eg-bin", (field, val) => { markDirty(false); egDefs[field] = val; });
+
+    // Link listener & global logger defaults
+    wireBinSliders(wrap, "data-def-ll-bin", (field, val) => { markDirty(false); llDefs[field] = val; });
+    const ensureGlobalLogger = () => {
+      if (!editor.spec.global_logger) {
+        editor.spec.global_logger = {
+          hmac_key: "",
+          store_raw_ip: false,
+          sample_rate: 1.0,
+          hll_precision: 12,
+          segment: { retention_hours: 72 },
+        };
+      }
+      if (!editor.spec.global_logger.segment) editor.spec.global_logger.segment = { retention_hours: 72 };
+      return editor.spec.global_logger;
+    };
+    wireBinSliders(wrap, "data-def-log-bin", (field, val) => {
+      markDirty(false);
+      ensureGlobalLogger()[field] = val;
+    });
+    wrap.querySelector("#def-log-sample")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      ensureGlobalLogger().sample_rate = parseNum(ev.target.value, 1.0, 0.01, 1.0);
+    });
+    wrap.querySelector("#def-log-ret")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      ensureGlobalLogger().segment.retention_hours = parseNum(ev.target.value, 72, 1, 24 * 365);
+    });
+
+    // Global Bucket Templates CRUD
+    wrap.querySelector("#btn-add-global-bucket")?.addEventListener("click", () => {
+      markDirty(true);
+      let name = "web-standard", k = 1;
+      while (editor.spec.bucket_templates[name]) name = `bucket-${k++}`;
+      editor.spec.bucket_templates[name] = { capacity: 120, refill_per_sec: 20, per_ip: null };
+      renderDefaultsWorkspace();
+    });
+    wireBucketCardEvents(wrap, editor.spec.bucket_templates, "gbk", {
+      onDelete: (bName) => {
+        if (gDefs.rate_limit_bucket === bName) gDefs.rate_limit_bucket = null;
+        for (const g of Object.values(editor.spec.guard_templates || {})) {
+          if (g.rate_limit_bucket === bName) g.rate_limit_bucket = null;
+        }
+        for (const n of Object.values(editor.spec.nodes || {})) {
+          for (const g of Object.values(n.ingress?.guards || {})) {
+            if (g.rate_limit_bucket === bName && !Object.hasOwn(n.ingress?.rate_limit_buckets || {}, bName)) {
+              g.rate_limit_bucket = null;
+            }
+          }
+        }
+      },
+      onRename: (oldN, newN) => {
+        if (gDefs.rate_limit_bucket === oldN) gDefs.rate_limit_bucket = newN;
+        for (const g of Object.values(editor.spec.guard_templates || {})) {
+          if (g.rate_limit_bucket === oldN) g.rate_limit_bucket = newN;
+        }
+        for (const n of Object.values(editor.spec.nodes || {})) {
+          for (const g of Object.values(n.ingress?.guards || {})) {
+            if (g.rate_limit_bucket === oldN && !Object.hasOwn(n.ingress?.rate_limit_buckets || {}, oldN)) {
+              g.rate_limit_bucket = newN;
+            }
+          }
+        }
+      },
+      onAfterMutate: () => renderDefaultsWorkspace(),
+    });
+
+    // Global Guard Templates CRUD
+    wrap.querySelector("#btn-add-global-guard")?.addEventListener("click", () => {
+      markDirty(true);
+      let name = "standard", k = 1;
+      while (editor.spec.guard_templates[name]) name = `guard-${k++}`;
+      editor.spec.guard_templates[name] = defaultGuardProfile(gDefs);
+      renderDefaultsWorkspace();
+    });
+    wireGuardCardEvents(wrap, editor.spec.guard_templates, "ggd", {
+      onDelete: (gName) => {
+        if (igDefs.default_guard === gName) igDefs.default_guard = null;
+        for (const n of Object.values(editor.spec.nodes || {})) {
+          for (const r of n.ingress?.rules || []) {
+            if (r.guard === gName && !Object.hasOwn(n.ingress?.guards || {}, gName)) r.guard = null;
+          }
+        }
+      },
+      onRename: (oldN, newN) => {
+        if (igDefs.default_guard === oldN) igDefs.default_guard = newN;
+        for (const n of Object.values(editor.spec.nodes || {})) {
+          for (const r of n.ingress?.rules || []) {
+            if (r.guard === oldN && !Object.hasOwn(n.ingress?.guards || {}, oldN)) r.guard = newN;
+          }
+        }
+      },
+      onAfterMutate: () => renderDefaultsWorkspace(),
+    });
+  }
+
   function render() {
     ensurePositions();
     renderNodes();
     renderEdges();
     renderInspector();
+    if (editor.mode === "defaults") renderDefaultsWorkspace();
     refreshTracerDropdown();
     renderValidationBar();
     applyViewportTransform();
@@ -2431,7 +3347,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
   // Keyboard shortcuts (Undo, Redo, Escape, Delete, Fit)
   window.addEventListener("keydown", (ev) => {
     const topoPanel = el("tab-topology");
-    if (!topoPanel || topoPanel.classList.contains("hidden") || editor.mode !== "visual") return;
+    if (!topoPanel || topoPanel.classList.contains("hidden") || editor.mode === "yaml") return;
     const isInput = ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName);
 
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
@@ -2446,6 +3362,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       redo();
       return;
     }
+    if (editor.mode !== "visual") return;
     if (ev.key === "Escape") {
       if (editor.connectMode) {
         editor.connectMode = false;
@@ -2537,51 +3454,67 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     }
   });
 
-  el("btn-mode-visual")?.addEventListener("click", async () => {
-    if (editor.mode === "visual") return;
-    try {
-      const res = await api("/api/topology/validate", {
-        method: "POST",
-        body: JSON.stringify({ yaml: el("topology-editor").value }),
-      });
-      if (!res?.spec) {
-        const msg = (res?.errors && res.errors[0]) || "Invalid YAML syntax; fix errors before switching to Visual Graph";
-        showToast(msg, true);
+  async function switchMode(nextMode) {
+    if (editor.mode === nextMode) return;
+    if (editor.mode === "yaml") {
+      try {
+        const res = await api("/api/topology/validate", {
+          method: "POST",
+          body: JSON.stringify({ yaml: el("topology-editor").value }),
+        });
+        if (!res?.spec) {
+          const msg = (res?.errors && res.errors[0]) || "Invalid YAML syntax; fix errors before switching views";
+          showToast(msg, true);
+          return;
+        }
+        editor.spec = normalizeSpec(res.spec);
+        if (res.paths) editor.compiledPaths = res.paths;
+        editor.validationErrors = res.errors || [];
+        editor.validationWarnings = res.warnings || [];
+      } catch (e) {
+        showToast(`YAML parse error: ${e.message}`, true);
         return;
       }
-      editor.spec = normalizeSpec(res.spec);
-      if (res.paths) editor.compiledPaths = res.paths;
-      editor.validationErrors = res.errors || [];
-      editor.validationWarnings = res.warnings || [];
-    } catch (e) {
-      showToast(`YAML parse error: ${e.message}`, true);
-      return;
+    } else if (nextMode === "yaml") {
+      try {
+        const res = await api("/api/topology/validate", {
+          method: "POST",
+          body: JSON.stringify({ spec: editor.spec }),
+        });
+        if (res.yaml) el("topology-editor").value = res.yaml;
+      } catch (e) {
+        showToast(e.message, true);
+      }
     }
-    editor.mode = "visual";
-    el("topo-visual-wrap").classList.remove("hidden");
-    el("topo-yaml-wrap").classList.add("hidden");
-    el("btn-mode-visual").classList.add("primary");
-    el("btn-mode-yaml").classList.remove("primary");
-    render();
-  });
 
-  el("btn-mode-yaml")?.addEventListener("click", async () => {
-    if (editor.mode === "yaml") return;
-    try {
-      const res = await api("/api/topology/validate", {
-        method: "POST",
-        body: JSON.stringify({ spec: editor.spec }),
-      });
-      if (res.yaml) el("topology-editor").value = res.yaml;
-    } catch (e) {
-      showToast(e.message, true);
+    editor.mode = nextMode;
+    el("topo-visual-wrap")?.classList.toggle("hidden", nextMode !== "visual");
+    el("topo-defaults-wrap")?.classList.toggle("hidden", nextMode !== "defaults");
+    el("topo-yaml-wrap")?.classList.toggle("hidden", nextMode !== "yaml");
+
+    el("btn-mode-visual")?.classList.toggle("primary", nextMode === "visual");
+    el("btn-mode-defaults")?.classList.toggle("primary", nextMode === "defaults");
+    el("btn-mode-yaml")?.classList.toggle("primary", nextMode === "yaml");
+
+    // Disable canvas-only toolbar buttons outside Visual Graph mode
+    const isVisual = nextMode === "visual";
+    ["btn-connect-mode", "btn-auto-layout", "topo-trace-select"].forEach((id) => {
+      const nodeEl = el(id);
+      if (nodeEl) nodeEl.disabled = !isVisual;
+    });
+
+    if (nextMode === "visual") {
+      render();
+    } else if (nextMode === "defaults") {
+      renderDefaultsWorkspace();
+      renderValidationBar();
+      updateDirtyBadge();
     }
-    editor.mode = "yaml";
-    el("topo-visual-wrap").classList.add("hidden");
-    el("topo-yaml-wrap").classList.remove("hidden");
-    el("btn-mode-yaml").classList.add("primary");
-    el("btn-mode-visual").classList.remove("primary");
-  });
+  }
+
+  el("btn-mode-visual")?.addEventListener("click", () => switchMode("visual"));
+  el("btn-mode-defaults")?.addEventListener("click", () => switchMode("defaults"));
+  el("btn-mode-yaml")?.addEventListener("click", () => switchMode("yaml"));
 
   return {
     isDirty() {
@@ -2631,7 +3564,11 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       render();
     },
     focusNode(tag) {
-      focusNodeOnCanvas(tag);
+      if (editor.mode !== "visual") {
+        switchMode("visual").then(() => focusNodeOnCanvas(tag));
+      } else {
+        focusNodeOnCanvas(tag);
+      }
     },
     fitToView,
     getPayload(push = false) {

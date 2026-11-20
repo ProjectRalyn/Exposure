@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use chrono::Utc;
 use exposure_core::config::NodeRoles;
 use exposure_core::crypto::{
-    parse_verifying_key_b64, pubkey_fingerprint_b64, restrict_dir_permissions_0700,
-    restrict_file_permissions_0600, verify_passphrase_proof, NodeKeyPair,
+    generate_random_secret_hex, parse_verifying_key_b64, pubkey_fingerprint_b64,
+    restrict_dir_permissions_0700, restrict_file_permissions_0600, verify_passphrase_proof,
+    NodeKeyPair,
 };
 use exposure_core::{ExposureError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -197,6 +198,54 @@ impl ControlDb {
             )
             .map_err(|e| ExposureError::Storage(e.to_string()))?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Read cluster-wide logger IP HMAC key if already provisioned (read-only).
+    pub async fn get_cluster_hmac_key(&self) -> Result<Option<String>> {
+        self.run(|conn| {
+            let v: Option<String> = conn
+                .query_row(
+                    "SELECT v FROM kv_store WHERE k = 'cluster_logger_hmac_key'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            Ok(v.filter(|s| !s.trim().is_empty()))
+        })
+        .await
+    }
+
+    /// Atomically read or generate a persistent cluster-wide 32-byte logger IP HMAC key
+    /// so every node hashes client IPs consistently for accurate UV union & IP search.
+    pub async fn get_or_create_cluster_hmac_key(&self) -> Result<String> {
+        self.run(|conn| {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT v FROM kv_store WHERE k = 'cluster_logger_hmac_key'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            if let Some(k) = existing.filter(|s| s.trim().len() >= 32) {
+                return Ok(k);
+            }
+            let key = generate_random_secret_hex(32);
+            tx.execute(
+                "INSERT INTO kv_store (k, v) VALUES ('cluster_logger_hmac_key', ?1)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![&key],
+            )
+            .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            Ok(key)
         })
         .await
     }

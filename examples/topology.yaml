@@ -1,14 +1,73 @@
 # Example Exposure Topology Specification (loaded into Control & compiled to all Nodes)
+defaults:
+  ingress:
+    server_header: "nginx"
+    cert_store_dir: "./data/ingress-certs"
+    # Replace with your own 32-byte random hex secret (e.g. `openssl rand -hex 32`)
+    clearance_secret: "9f8e7d6c5b4a392817162534435261708f9ea0b1c2d3e4f5a6b7c8d9e0f1a2b3"
+    default_guard: "standard"
+    intercept_errors: false
+    js_fp_beacon: true
+    js_fp_ttl_secs: 3600
+  guard:
+    antibot: challenge
+    rate_limit_bucket: web-default
+    challenge_threshold: 50
+    reject_threshold: 85
+    pow_difficulty: 16
+    clearance_ttl_secs: 1800
+    bind_ua: true
+    bind_ip_prefix: false
+    block_bots: false
+    block_headless: false
+    require_client_fp: false
+    js_fp_beacon: true
+    js_fp_ttl_secs: 3600
+  egress:
+    protocol: auto
+    timeout_ms: 15000
+    tls: false
+    insecure_skip_verify: false
+    allow_any_origin: false
+    intercept_errors: false
+  link_listener:
+    allow_on_demand: true
+    allow_tunnel: true
+    # Keep bootstrap disabled after initial node onboarding
+    allow_bootstrap: false
+
+# Globally reusable rate-limit buckets selectable by any Guard template or Ingress node
+bucket_templates:
+  web-default:
+    capacity: 60
+    refill_per_sec: 10
+  strict-api:
+    capacity: 20
+    refill_per_sec: 4
+
+# Globally reusable Guard templates selectable directly on Ingress rules
+guard_templates:
+  standard:
+    antibot: challenge
+    rate_limit_bucket: web-default
+    challenge_threshold: 50
+    reject_threshold: 85
+    pow_difficulty: 16
+    clearance_ttl_secs: 1800
+  under-attack:
+    antibot: always
+    rate_limit_bucket: strict-api
+    pow_difficulty: 18
+    block_bots: true
+    block_headless: true
+    require_client_fp: true
+
 nodes:
   ingress-hk:
     roles:
       ingress: true
     link_listener:
       listen_addr: "0.0.0.0:9443"
-      allow_on_demand: true
-      allow_tunnel: true
-      # Keep bootstrap disabled after initial node onboarding
-      allow_bootstrap: false
     maintainer_hops:
       - ingress-hk
       - relay-sg
@@ -19,23 +78,6 @@ nodes:
           tls: false
         - listen_addr: "0.0.0.0:8443"
           tls: true
-      cert_store_dir: "./data/ingress-certs"
-      # Replace with your own 32-byte random hex secret (e.g. `openssl rand -hex 32`)
-      clearance_secret: "9f8e7d6c5b4a392817162534435261708f9ea0b1c2d3e4f5a6b7c8d9e0f1a2b3"
-      rate_limit_buckets:
-        web-default:
-          capacity: 60
-          refill_per_sec: 10
-          per_ip: true
-      guards:
-        standard:
-          antibot: challenge
-          rate_limit_bucket: web-default
-          challenge_threshold: 50
-          reject_threshold: 85
-          pow_difficulty: 16
-          clearance_ttl_secs: 1800
-          bind_ua: true
       rules:
         - name: web-region-a
           match:
@@ -43,7 +85,7 @@ nodes:
             source_cidrs: ["203.0.113.0/24"]
           service_tag: "web@region-a"
           next_peer: "relay-sg"
-          guard: "standard"
+          # Inherits defaults.ingress.default_guard ("standard")
         - name: web-default
           match:
             host: "example.com"
@@ -56,9 +98,6 @@ nodes:
       relay: true
     link_listener:
       listen_addr: "0.0.0.0:9443"
-      allow_on_demand: true
-      allow_tunnel: true
-      allow_bootstrap: false
     maintainer_hops:
       - relay-sg
       - maintainer-1
@@ -80,31 +119,21 @@ nodes:
       services:
         web@region-a:
           backend: "192.168.1.3:10808"
-          protocol: auto
-          # Optional Backend TLS (verifies WebPKI roots by default):
-          # tls: true
-          # ca_cert_path: "/etc/exposure/backend-ca.pem"
-          # insecure_skip_verify: false
+          # Inherits protocol/timeout/tls defaults; override any option with true/false
           allow_from: ["ingress-hk"]
-          timeout_ms: 15000
           local_health_check:
             enabled: true
             interval_secs: 10
             timeout_ms: 2000
         web@default:
           backend: "192.168.1.3:10808"
-          protocol: auto
           allow_from: ["ingress-hk"]
-          timeout_ms: 15000
 
   maintainer-1:
     roles:
       maintainer: true
     link_listener:
       listen_addr: "0.0.0.0:9443"
-      allow_on_demand: true
-      allow_tunnel: true
-      allow_bootstrap: false
     maintainer_template: "default-maint"
 
 links:

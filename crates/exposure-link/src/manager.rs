@@ -266,9 +266,9 @@ impl LinkManager {
         info!(
             node = %self.local_tag,
             addr = %bound,
-            allow_on_demand = cfg.allow_on_demand,
-            allow_tunnel = cfg.allow_tunnel,
-            allow_bootstrap = cfg.allow_bootstrap,
+            allow_on_demand = cfg.effective_allow_on_demand(),
+            allow_tunnel = cfg.effective_allow_tunnel(),
+            allow_bootstrap = cfg.effective_allow_bootstrap(),
             "link listener started"
         );
 
@@ -377,7 +377,7 @@ impl LinkManager {
             {
                 old.session.close().await;
             }
-        } else if outcome.bootstrap_pending && listen_policy.allow_bootstrap {
+        } else if outcome.bootstrap_pending && listen_policy.effective_allow_bootstrap() {
             // Strictly isolate unauthenticated bootstrap sessions so they can NEVER overwrite inbound_sessions
             self.bootstrap_sessions.retain(|_, v| !v.session.is_closed());
             if self.bootstrap_sessions.len() >= MAX_BOOTSTRAP_SESSIONS {

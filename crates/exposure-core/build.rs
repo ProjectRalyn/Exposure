@@ -165,6 +165,22 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
         if fs::write(dst.join("index.html"), patched).is_err() {
             return false;
         }
+
+        // Also bundle standalone passive fingerprint beacon `/cdn-cgi/fp.js` into challenge dist
+        if app == "challenge" && src.join("fp.js").exists() {
+            let fp_ok = Command::new(&esbuild)
+                .arg(src.join("fp.js"))
+                .arg("--bundle")
+                .arg("--format=iife")
+                .arg("--minify")
+                .arg(format!("--outfile={}", dst.join("fp.js").display()))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !fp_ok {
+                return false;
+            }
+        }
     }
     true
 }

@@ -381,7 +381,7 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             .any(|pk| !pk.trim().is_empty() && pk.trim() == hello.public_key.trim())
         {
             authenticated = true;
-        } else if listen_policy.allow_bootstrap {
+        } else if listen_policy.effective_allow_bootstrap() {
             if let Some(ref proof) = hello.bootstrap_proof {
                 match bootstrap_state
                     .verify_and_consume(&hello.node_tag, &hello.public_key, &hello.nonce, proof)
@@ -463,7 +463,7 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         // Enforce LinkListenConfig policy flags
         let is_inbound_tunnel =
             peer.mode == LinkMode::Tunnel && peer.tunnel_direction == Some(TunnelDirection::Inbound);
-        if is_inbound_tunnel && !listen_policy.allow_tunnel {
+        if is_inbound_tunnel && !listen_policy.effective_allow_tunnel() {
             let msg = format!("inbound tunnel peer {} rejected by listener policy", hello.node_tag);
             warn!("{msg}");
             let ack = build_signed_ack(
@@ -479,7 +479,7 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = write_json_frame(stream, &ack).await;
             return Err(ExposureError::Auth(msg));
         }
-        if !is_inbound_tunnel && !listen_policy.allow_on_demand {
+        if !is_inbound_tunnel && !listen_policy.effective_allow_on_demand() {
             let msg = format!("on-demand peer {} rejected by listener policy", hello.node_tag);
             warn!("{msg}");
             let ack = build_signed_ack(
@@ -555,7 +555,7 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = write_json_frame(stream, &ack).await;
             return Err(ExposureError::Auth(msg));
         }
-    } else if listen_policy.allow_bootstrap {
+    } else if listen_policy.effective_allow_bootstrap() {
         if let Some(ref proof) = hello.bootstrap_proof {
             if bootstrap_state.has_active().await {
                 // Listening node being dialed via DialEnrollReq by a relay node with local passphrase proof

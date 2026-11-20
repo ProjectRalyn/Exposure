@@ -165,7 +165,7 @@ impl EgressHandler {
 
                         let timeout = Duration::from_millis(hc.timeout_ms.max(200));
                         let healthy = if let Some(ref http_path) = hc.http_path {
-                            let scheme = if svc.tls { "https" } else { "http" };
+                            let scheme = if svc.effective_tls() { "https" } else { "http" };
                             let path = if http_path.starts_with('/') {
                                 http_path.as_str()
                             } else {
@@ -286,7 +286,7 @@ impl EgressHandler {
         };
 
         // Enforce origin Node Tag ACL (default deny unless explicitly allowed or allow_any_origin)
-        if !svc.allow_any_origin {
+        if !svc.effective_allow_any_origin() {
             if !svc
                 .allow_from
                 .iter()
@@ -344,7 +344,7 @@ impl EgressHandler {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service Unavailable",
                     "The upstream backend failed local health checks.",
-                    svc.intercept_errors,
+                    svc.effective_intercept_errors(),
                 );
         }
 
@@ -389,7 +389,7 @@ impl EgressHandler {
                     StatusCode::BAD_GATEWAY,
                     "Bad Gateway",
                     "Could not connect to the upstream server.",
-                    svc.intercept_errors,
+                    svc.effective_intercept_errors(),
                 );
             }
             Err(_) => {
@@ -418,7 +418,7 @@ impl EgressHandler {
                     StatusCode::GATEWAY_TIMEOUT,
                     "Gateway Timeout",
                     "The upstream server did not respond in time.",
-                    svc.intercept_errors,
+                    svc.effective_intercept_errors(),
                 );
             }
         };
@@ -435,10 +435,10 @@ impl EgressHandler {
                 && req.version() == http::Version::HTTP_2
                 && !is_upgrade);
 
-        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.tls {
+        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.effective_tls() {
             match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, use_h2)).await {
                 Ok(Ok(tls_stream)) => {
-                    forward_http_stream(tls_stream, req, use_h2, is_upgrade, svc.tls, &svc.backend, timeout)
+                    forward_http_stream(tls_stream, req, use_h2, is_upgrade, true, &svc.backend, timeout)
                         .await
                 }
                 Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
@@ -505,7 +505,12 @@ impl EgressHandler {
                 } else {
                     ("Bad Gateway", "The upstream server is temporarily unavailable.")
                 };
-                self.build_error_response(err_status, title, detail, svc.intercept_errors)
+                self.build_error_response(
+                    err_status,
+                    title,
+                    detail,
+                    svc.effective_intercept_errors(),
+                )
             }
         }
     }
@@ -651,7 +656,7 @@ async fn connect_backend_tls(
 ) -> std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut cfg = if svc.insecure_skip_verify {
+    let mut cfg = if svc.effective_insecure_skip_verify() {
         let algos = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         ClientConfig::builder()
             .dangerous()

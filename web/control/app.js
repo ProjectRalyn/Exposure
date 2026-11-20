@@ -16,12 +16,17 @@ const state = {
   authenticated: false,
   activeTab: "overview",
   obsHeroMetric: "requests", // requests | uv | bandwidth | guard | latency
+  fpFilters: {
+    verified: "all",
+    risk: "all",
+  },
   autoRefreshMs: 30000,
   refreshTimer: null,
   cache: {
     overview: null,
     nodesData: null,
     telemetry: null,
+    fingerprints: null,
     audit: null,
     versions: [],
   },
@@ -600,25 +605,29 @@ el("btn-save-topo")?.addEventListener("click", () => saveTopologyNow(true));
 /* ==================== ANALYTICS & CERTS ==================== */
 
 async function refreshObservability() {
-  const data = await api("/api/telemetry");
+  const nodeF = el("obs-node-filter")?.value || "all";
+  const svcF = el("obs-svc-filter")?.value || "all";
+  const winSec = Number(el("obs-window-filter")?.value || 0);
+  const qs = new URLSearchParams();
+  if (nodeF !== "all") qs.set("node", nodeF);
+  if (svcF !== "all") qs.set("service", svcF);
+  if (winSec > 0) qs.set("window_secs", String(winSec));
+
+  const data = await api(`/api/telemetry${qs.toString() ? `?${qs}` : ""}`);
   state.cache.telemetry = data;
   updateTopbarTimestamp(data.last_pulled_at);
 
-  const sums = data.summaries || [];
   const nodeSel = el("obs-node-filter");
   const svcSel = el("obs-svc-filter");
-  const prevNode = nodeSel.value || "all";
-  const prevSvc = svcSel.value || "all";
-
-  const nodes = [...new Set(sums.map((s) => s.node_tag))].sort();
-  const svcs = [...new Set(sums.map((s) => s.service_tag))].sort();
+  const nodes = (data.available_nodes || []).slice().sort();
+  const svcs = (data.available_services || []).slice().sort();
 
   nodeSel.innerHTML =
     `<option value="all">All Nodes (${nodes.length})</option>` +
-    nodes.map((n) => `<option value="${esc(n)}" ${prevNode === n ? "selected" : ""}>${esc(n)}</option>`).join("");
+    nodes.map((n) => `<option value="${esc(n)}" ${nodeF === n ? "selected" : ""}>${esc(n)}</option>`).join("");
   svcSel.innerHTML =
     `<option value="all">All Services (${svcs.length})</option>` +
-    svcs.map((s) => `<option value="${esc(s)}" ${prevSvc === s ? "selected" : ""}>${esc(s)}</option>`).join("");
+    svcs.map((s) => `<option value="${esc(s)}" ${svcF === s ? "selected" : ""}>${esc(s)}</option>`).join("");
 
   renderMaintainerStrip(el("obs-maint-strip"), data.maintainers || []);
   renderObservabilityCharts();
@@ -628,119 +637,40 @@ async function refreshObservability() {
 function renderObservabilityCharts() {
   const data = state.cache.telemetry;
   if (!data) return;
-  const nodeF = el("obs-node-filter")?.value || "all";
-  const svcF = el("obs-svc-filter")?.value || "all";
-  const winSec = Number(el("obs-window-filter")?.value || 0);
-  const cutoff = winSec > 0 ? Math.floor(Date.now() / 1000) - winSec : 0;
 
-  const filtered = (data.summaries || []).filter((s) => {
-    if (nodeF !== "all" && s.node_tag !== nodeF) return false;
-    if (svcF !== "all" && s.service_tag !== svcF) return false;
-    if (cutoff > 0 && s.minute_epoch < cutoff) return false;
-    return true;
-  });
-
-  // Group by minute, service, and node
-  const byMin = new Map();
-  const bySvc = new Map();
-  const byNode = new Map();
-  const agg = {
-    total_requests: 0,
-    total_uv: 0,
-    total_errors: 0,
-    total_rate_limited: 0,
-    total_challenges_issued: 0,
-    total_challenges_passed: 0,
-    total_bytes_in: 0,
-    total_bytes_out: 0,
-    p50_wsum: 0,
-    p95_wsum: 0,
-    p99_wsum: 0,
-    lat_weight: 0,
-  };
-
-  for (const s of filtered) {
-    const reqs = Number(s.requests) || 0;
-    agg.total_requests += reqs;
-    agg.total_uv += Number(s.uv_estimate) || 0;
-    agg.total_errors += Number(s.errors) || 0;
-    agg.total_rate_limited += Number(s.rate_limited) || 0;
-    agg.total_challenges_issued += Number(s.challenges_issued) || 0;
-    agg.total_challenges_passed += Number(s.challenges_passed) || 0;
-    agg.total_bytes_in += Number(s.bytes_in) || 0;
-    agg.total_bytes_out += Number(s.bytes_out) || 0;
-    if (reqs > 0) {
-      agg.p50_wsum += (Number(s.p50_ms) || 0) * reqs;
-      agg.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
-      agg.p99_wsum += (Number(s.p99_ms) || 0) * reqs;
-      agg.lat_weight += reqs;
-    }
-
-    let b = byMin.get(s.minute_epoch);
-    if (!b) {
-      b = {
-        minute_epoch: s.minute_epoch,
-        requests: 0, uv: 0, errors: 0, rl: 0, ch_i: 0, ch_p: 0, bytes_in: 0, bytes_out: 0,
-        p50_wsum: 0, p95_wsum: 0, p99_wsum: 0, lat_weight: 0,
-      };
-      byMin.set(s.minute_epoch, b);
-    }
-    b.requests += reqs;
-    b.uv += Number(s.uv_estimate) || 0;
-    b.errors += Number(s.errors) || 0;
-    b.rl += Number(s.rate_limited) || 0;
-    b.ch_i += Number(s.challenges_issued) || 0;
-    b.ch_p += Number(s.challenges_passed) || 0;
-    b.bytes_in += Number(s.bytes_in) || 0;
-    b.bytes_out += Number(s.bytes_out) || 0;
-    if (reqs > 0) {
-      b.p50_wsum += (Number(s.p50_ms) || 0) * reqs;
-      b.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
-      b.p99_wsum += (Number(s.p99_ms) || 0) * reqs;
-      b.lat_weight += reqs;
-    }
-
-    const accumGroup = (map, key, field) => {
-      let g = map.get(key);
-      if (!g) {
-        g = { [field]: key, requests: 0, errors: 0, p95_wsum: 0, lat_weight: 0 };
-        map.set(key, g);
-      }
-      g.requests += reqs;
-      g.errors += Number(s.errors) || 0;
-      if (reqs > 0) {
-        g.p95_wsum += (Number(s.p95_ms) || 0) * reqs;
-        g.lat_weight += reqs;
-      }
-    };
-    accumGroup(bySvc, s.service_tag, "service_tag");
-    accumGroup(byNode, s.node_tag, "node_tag");
-  }
-
-  // Update Cloudflare Hero Metric Tabs
-  const errPct = agg.total_requests > 0 ? ((agg.total_errors / agg.total_requests) * 100).toFixed(2) : "0.00";
-  const avgP50 = agg.lat_weight > 0 ? agg.p50_wsum / agg.lat_weight : 0;
-  const avgP95 = agg.lat_weight > 0 ? agg.p95_wsum / agg.lat_weight : 0;
-  const avgP99 = agg.lat_weight > 0 ? agg.p99_wsum / agg.lat_weight : 0;
-  const totalBytes = agg.total_bytes_in + agg.total_bytes_out;
-  const totalGuard = agg.total_challenges_issued + agg.total_rate_limited;
+  // Use true server-side HLL union & LatencyHistogram merge computed by Rust Control
+  const tr = data.traffic || {};
+  const totalReq = Number(tr.total_requests) || 0;
+  const totalUv = Math.round(Number(tr.uv_estimate) || 0);
+  const totalErr = Number(tr.total_errors) || 0;
+  const totalRl = Number(tr.total_rate_limited) || 0;
+  const totalChI = Number(tr.total_challenges_issued) || 0;
+  const totalChP = Number(tr.total_challenges_passed) || 0;
+  const bytesIn = Number(tr.total_bytes_in) || 0;
+  const bytesOut = Number(tr.total_bytes_out) || 0;
+  const p50 = Number(tr.p50_ms) || 0;
+  const p95 = Number(tr.p95_ms) || 0;
+  const p99 = Number(tr.p99_ms) || 0;
+  const errPct = totalReq > 0 ? ((totalErr / totalReq) * 100).toFixed(2) : "0.00";
+  const totalBytes = bytesIn + bytesOut;
+  const totalGuard = totalChI + totalRl;
 
   if (el("cf-val-requests")) {
-    el("cf-val-requests").textContent = formatCompact(agg.total_requests);
-    el("cf-sub-requests").textContent = `${errPct}% errors · ${formatCompact(agg.total_errors)} 5xx`;
-    el("cf-val-uv").textContent = formatCompact(agg.total_uv);
+    el("cf-val-requests").textContent = formatCompact(totalReq);
+    el("cf-sub-requests").textContent = `${errPct}% errors · ${formatCompact(totalErr)} 5xx`;
+    el("cf-val-uv").textContent = formatCompact(totalUv);
     el("cf-sub-uv").textContent =
-      agg.total_uv > 0 ? `${(agg.total_requests / agg.total_uv).toFixed(1)} req / bucket-UV` : "Sum of bucket UVs";
+      totalUv > 0 ? `${(totalReq / totalUv).toFixed(1)} req / visitor` : "Exact / HLL union";
     el("cf-val-bandwidth").textContent = formatBytes(totalBytes);
-    el("cf-sub-bandwidth").textContent = `${formatBytes(agg.total_bytes_in)} in · ${formatBytes(agg.total_bytes_out)} out`;
+    el("cf-sub-bandwidth").textContent = `${formatBytes(bytesIn)} in · ${formatBytes(bytesOut)} out`;
     el("cf-val-guard").textContent = formatCompact(totalGuard);
-    el("cf-sub-guard").textContent = `${formatCompact(agg.total_challenges_issued)} PoW · ${formatCompact(agg.total_rate_limited)} 429`;
-    el("cf-val-latency").textContent = `${avgP95.toFixed(1)} ms`;
-    el("cf-sub-latency").textContent = `p50 ${avgP50.toFixed(1)}ms · p99 ${avgP99.toFixed(1)}ms`;
+    el("cf-sub-guard").textContent = `${formatCompact(totalChI)} PoW · ${formatCompact(totalRl)} 429`;
+    el("cf-val-latency").textContent = `${p95.toFixed(1)} ms`;
+    el("cf-sub-latency").textContent = `p50 ${p50.toFixed(1)}ms · p99 ${p99.toFixed(1)}ms`;
   }
 
   // Render full-width Cloudflare Hero Chart for active metric tab
-  const pts = [...byMin.values()].sort((a, b) => a.minute_epoch - b.minute_epoch);
+  const pts = data.timeseries || [];
   const labels = pts.map((p) => formatMinute(p.minute_epoch));
 
   const heroConfigs = {
@@ -748,14 +678,14 @@ function renderObservabilityCharts() {
       unit: "",
       series: [
         { name: "Total Requests", color: "#4DA9D6", values: pts.map((p) => p.requests), area: true },
-        { name: "Rate-Limited (429)", color: "#FAC800", values: pts.map((p) => p.rl) },
+        { name: "Rate-Limited (429)", color: "#FAC800", values: pts.map((p) => p.rate_limited) },
         { name: "Errors (5xx)", color: "#C40233", values: pts.map((p) => p.errors) },
       ],
     },
     uv: {
       unit: "",
       series: [
-        { name: "Bucket UV Sum (HLL)", color: "#009F6B", values: pts.map((p) => Math.round(p.uv)), area: true },
+        { name: "Unique Visitors (Exact/HLL)", color: "#009F6B", values: pts.map((p) => Math.round(p.uv_estimate || 0)), area: true },
         { name: "Requests", color: "#4DA9D6", values: pts.map((p) => p.requests), dashed: true },
       ],
     },
@@ -769,17 +699,17 @@ function renderObservabilityCharts() {
     guard: {
       unit: "",
       series: [
-        { name: "PoW Challenged", color: "#6A5ACD", values: pts.map((p) => p.ch_i), area: true },
-        { name: "PoW Cleared", color: "#009F6B", values: pts.map((p) => p.ch_p) },
-        { name: "Rate-Limited (429)", color: "#FAC800", values: pts.map((p) => p.rl) },
+        { name: "PoW Challenged", color: "#6A5ACD", values: pts.map((p) => p.challenges_issued), area: true },
+        { name: "PoW Cleared", color: "#009F6B", values: pts.map((p) => p.challenges_passed) },
+        { name: "Rate-Limited (429)", color: "#FAC800", values: pts.map((p) => p.rate_limited) },
       ],
     },
     latency: {
       unit: "ms",
       series: [
-        { name: "p99", color: "#C40233", values: pts.map((p) => (p.lat_weight > 0 ? p.p99_wsum / p.lat_weight : 0)), dashed: true },
-        { name: "p95", color: "#FAC800", values: pts.map((p) => (p.lat_weight > 0 ? p.p95_wsum / p.lat_weight : 0)) },
-        { name: "p50", color: "#009F6B", values: pts.map((p) => (p.lat_weight > 0 ? p.p50_wsum / p.lat_weight : 0)), area: true },
+        { name: "p99", color: "#C40233", values: pts.map((p) => p.p99_ms), dashed: true },
+        { name: "p95", color: "#FAC800", values: pts.map((p) => p.p95_ms) },
+        { name: "p50", color: "#009F6B", values: pts.map((p) => p.p50_ms), area: true },
       ],
     },
   };
@@ -793,44 +723,30 @@ function renderObservabilityCharts() {
     emptyText: "No traffic telemetry pulled yet — click Pull Telemetry in topbar",
   });
 
-  // Service & Node breakdown bar charts
-  const svcList = [...bySvc.values()]
-    .map((g) => ({ ...g, p95_ms: g.lat_weight > 0 ? g.p95_wsum / g.lat_weight : 0 }))
-    .sort((a, b) => b.requests - a.requests);
-  const nodeList = [...byNode.values()]
-    .map((g) => ({ ...g, p95_ms: g.lat_weight > 0 ? g.p95_wsum / g.lat_weight : 0 }))
-    .sort((a, b) => b.requests - a.requests);
+  renderBarList(el("obs-service-bars"), data.service_breakdown || [], "No service traffic in selected window");
+  renderBarList(el("obs-node-bars"), data.node_breakdown || [], "No node traffic in selected window");
+  renderGuardFunnel(el("obs-guard-funnel"), tr);
 
-  renderBarList(el("obs-service-bars"), svcList, "No service traffic in selected window");
-  renderBarList(el("obs-node-bars"), nodeList, "No node traffic in selected window");
-  renderGuardFunnel(el("obs-guard-funnel"), agg);
-
-  const cleanReqs = Math.max(0, agg.total_requests - agg.total_errors - agg.total_rate_limited - agg.total_challenges_issued);
-  const cleanOrPassed = Math.min(agg.total_requests, cleanReqs + agg.total_challenges_passed);
+  const cleanReqs = Math.max(0, totalReq - totalErr - totalRl - totalChI);
+  const cleanOrPassed = Math.min(totalReq, cleanReqs + totalChP);
   renderDonutChart(el("obs-outcome-donut"), {
-    centerValue: formatCompact(agg.total_requests),
+    centerValue: formatCompact(totalReq),
     centerLabel: "Requests",
     slices: [
       { label: "Clean / Passed", value: cleanOrPassed, color: "#009F6B" },
-      { label: "PoW Challenged", value: Math.max(0, agg.total_challenges_issued - agg.total_challenges_passed), color: "#6A5ACD" },
-      { label: "Rate-Limited (429)", value: agg.total_rate_limited, color: "#FAC800" },
-      { label: "Errors (5xx)", value: agg.total_errors, color: "#C40233" },
+      { label: "PoW Challenged", value: Math.max(0, totalChI - totalChP), color: "#6A5ACD" },
+      { label: "Rate-Limited (429)", value: totalRl, color: "#FAC800" },
+      { label: "Errors (5xx)", value: totalErr, color: "#C40233" },
     ],
   });
 
   // Client Fingerprint Breakdown (Devices / Browsers / OS)
-  const devMap = new Map();
-  const brwMap = new Map();
-  const osMap = new Map();
-  let fpVerified = 0;
-  for (const s of filtered) {
-    fpVerified += s.client_fp_verified || 0;
-    for (const [k, v] of Object.entries(s.device_counts || {})) devMap.set(k, (devMap.get(k) || 0) + v);
-    for (const [k, v] of Object.entries(s.browser_counts || {})) brwMap.set(k, (brwMap.get(k) || 0) + v);
-    for (const [k, v] of Object.entries(s.os_counts || {})) osMap.set(k, (osMap.get(k) || 0) + v);
-  }
+  const devMap = new Map(Object.entries(data.device_counts || {}));
+  const brwMap = new Map(Object.entries(data.browser_counts || {}));
+  const osMap = new Map(Object.entries(data.os_counts || {}));
+  const fpVerified = Number(data.client_fp_verified) || 0;
   const fpBadge = el("obs-fp-verified-badge");
-  if (fpBadge) fpBadge.textContent = `${formatCompact(fpVerified)} JS-verified FP`;
+  if (fpBadge) fpBadge.textContent = `${formatCompact(fpVerified)} JS-verified reqs`;
   const fpBox = el("obs-fp-breakdown");
   if (fpBox) {
     const renderFpCol = (title, map, color) => {
@@ -842,7 +758,7 @@ function renderObservabilityCharts() {
         ${entries.length
           ? entries
               .map(([k, v]) => `<div class="bar-item" style="margin-bottom:6px;">
-                  <div class="bar-head"><span>${esc(k)}</span><span>${formatCompact(v)} (${((v / tot) * 100).toFixed(0)}%)</span></div>
+                  <div class="bar-item-head"><span>${esc(k)}</span><span>${formatCompact(v)} (${((v / tot) * 100).toFixed(0)}%)</span></div>
                   <div class="bar-track"><div class="bar-fill" style="width:${((v / maxVal) * 100).toFixed(1)}%;background:${color};"></div></div>
                 </div>`)
               .join("")
@@ -856,6 +772,7 @@ function renderObservabilityCharts() {
   }
 
   // Raw detail table (collapsed by default inside <details>)
+  const filtered = data.summaries || [];
   el("stats-tbody").innerHTML =
     filtered
       .slice()
@@ -865,6 +782,7 @@ function renderObservabilityCharts() {
       <tr>
         <td>${esc(formatDateTime(s.minute_epoch))}</td>
         <td>${esc(s.node_tag)}</td>
+        <td><span class="role-chip ${esc(s.role || "ingress")}">${esc(s.role || "ingress")}</span></td>
         <td><code>${esc(s.service_tag)}</code></td>
         <td>${formatCompact(s.requests)}</td>
         <td>${Math.round(s.uv_estimate || 0)}</td>
@@ -875,7 +793,7 @@ function renderObservabilityCharts() {
         <td>${(s.p50_ms || 0).toFixed(1)} / ${(s.p95_ms || 0).toFixed(1)} / ${(s.p99_ms || 0).toFixed(1)}</td>
       </tr>`
       )
-      .join("") || `<tr><td colspan="10" class="muted">No aggregated summaries match current filter</td></tr>`;
+      .join("") || `<tr><td colspan="11" class="muted">No aggregated summaries match current filter</td></tr>`;
 }
 
 document.querySelectorAll("[data-cf-metric]").forEach((btn) => {
@@ -887,6 +805,8 @@ document.querySelectorAll("[data-cf-metric]").forEach((btn) => {
     renderObservabilityCharts();
   });
 });
+
+el("btn-open-fp-explorer")?.addEventListener("click", () => switchTab("fingerprints"));
 
 function renderCertificatesCards(certs) {
   const grid = el("obs-certs-grid");
@@ -923,9 +843,210 @@ function renderCertificatesCards(certs) {
     .join("");
 }
 
-el("obs-node-filter")?.addEventListener("change", renderObservabilityCharts);
-el("obs-svc-filter")?.addEventListener("change", renderObservabilityCharts);
-el("obs-window-filter")?.addEventListener("change", renderObservabilityCharts);
+el("obs-node-filter")?.addEventListener("change", refreshObservability);
+el("obs-svc-filter")?.addEventListener("change", refreshObservability);
+el("obs-window-filter")?.addEventListener("change", refreshObservability);
+
+/* ==================== FINGERPRINTS EXPLORER ==================== */
+
+async function refreshFingerprints() {
+  const qs = new URLSearchParams();
+  const qVal = (el("fp-search-q")?.value || "").trim();
+  const ipVal = (el("fp-search-ip")?.value || "").trim();
+  const fpVal = (el("fp-search-fp")?.value || "").trim();
+  const nodeF = el("fp-node-filter")?.value || "all";
+  const svcF = el("fp-svc-filter")?.value || "all";
+  const winSec = Number(el("sel-time-window")?.value || 0);
+
+  if (qVal) qs.set("q", qVal);
+  if (ipVal) qs.set("ip", ipVal);
+  if (fpVal) qs.set("fp", fpVal);
+  if (nodeF !== "all") qs.set("node", nodeF);
+  if (svcF !== "all") qs.set("service", svcF);
+  if (state.fpFilters.verified !== "all") qs.set("verified", state.fpFilters.verified);
+  if (state.fpFilters.risk !== "all") qs.set("risk", state.fpFilters.risk);
+  if (winSec > 0) qs.set("window_secs", String(winSec));
+
+  const data = await api(`/api/fingerprints${qs.toString() ? `?${qs}` : ""}`);
+  state.cache.fingerprints = data;
+  updateTopbarTimestamp(data.last_pulled_at);
+
+  const sum = data.summary || {};
+  el("fp-kpi-total").textContent = formatCompact(sum.total_visitors || 0);
+  el("fp-kpi-ips").textContent = `${formatCompact(sum.unique_ips || 0)} unique IPs`;
+  el("fp-kpi-verified").textContent = formatCompact(sum.js_verified || 0);
+  el("fp-kpi-sources").textContent = `${formatCompact(sum.beacon_count || 0)} beacon · ${formatCompact(sum.pow_count || 0)} PoW`;
+  el("fp-kpi-unique-fp").textContent = formatCompact(sum.unique_fps || 0);
+  el("fp-kpi-risk").textContent = `${sum.bots || 0} / ${sum.headless || 0}`;
+
+  const nodes = (data.available_nodes || []).slice().sort();
+  const svcs = (data.available_services || []).slice().sort();
+  if (el("fp-node-filter")) {
+    el("fp-node-filter").innerHTML =
+      `<option value="all">All Nodes (${nodes.length})</option>` +
+      nodes.map((n) => `<option value="${esc(n)}" ${nodeF === n ? "selected" : ""}>${esc(n)}</option>`).join("");
+  }
+  if (el("fp-svc-filter")) {
+    el("fp-svc-filter").innerHTML =
+      `<option value="all">All Services (${svcs.length})</option>` +
+      svcs.map((s) => `<option value="${esc(s)}" ${svcF === s ? "selected" : ""}>${esc(s)}</option>`).join("");
+  }
+
+  const hint = el("fp-privacy-hint");
+  if (hint) {
+    hint.textContent = data.store_raw_ip_enabled
+      ? "Raw IP storage is enabled (global_logger.store_raw_ip = true). You can search exact IPs, subnets, HMAC tags, and browser fingerprints."
+      : "Privacy mode active (store_raw_ip = false): displaying /24 subnets & HMAC tags. Typing an exact IP in Search automatically matches via cluster IP HMAC.";
+  }
+
+  const items = data.items || [];
+  if (el("fp-result-meta")) {
+    el("fp-result-meta").textContent = `Showing ${items.length} of ${data.total_matched ?? items.length} observation(s) — click a row for details`;
+  }
+
+  const tbody = el("fp-tbody");
+  tbody.innerHTML =
+    items
+      .map((obs, idx) => {
+        const ipPrimary = obs.client_ip || obs.ip_prefix || "-";
+        const srcBadge = obs.js_verified
+          ? obs.fp_source === "pow"
+            ? `<span class="pill ok">PoW JS</span>`
+            : `<span class="pill info">Beacon JS</span>`
+          : `<span class="pill">UA Only</span>`;
+        const js = obs.js_fp;
+        const jsSummary = js
+          ? `${js.screen || "-"} · ${js.webgl ? js.webgl.slice(0, 32) : js.platform || "-"} · ${js.tz || "-"}`
+          : "Pending passive JS beacon";
+        const riskCls = obs.is_headless || obs.is_bot || obs.suspicion_score >= 60 ? "err" : obs.suspicion_score >= 30 ? "warn" : "ok";
+        const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `Score ${Number(obs.suspicion_score) || 0}`;
+        return `
+      <tr class="fp-table-row" data-fp-idx="${idx}">
+        <td>
+          <div><strong>${esc(ipPrimary)}</strong></div>
+          <div class="muted-sm"><span class="fp-code">${esc(obs.ip_hmac)}</span>${obs.client_ip && obs.ip_prefix ? ` · ${esc(obs.ip_prefix)}` : ""}</div>
+        </td>
+        <td>
+          <div><span class="fp-code">${esc(obs.fp_hash)}</span> ${srcBadge}</div>
+          ${js?.canvas_hash ? `<div class="muted-sm">canvas: <code>${esc(js.canvas_hash)}</code></div>` : ""}
+        </td>
+        <td>
+          <div><strong>${esc(obs.browser_family || "-")}</strong> · ${esc(obs.os_family || "-")}</div>
+          <div class="muted-sm">${esc(obs.device_type || "-")}</div>
+        </td>
+        <td><span class="muted-sm">${esc(jsSummary)}</span></td>
+        <td>
+          <div><code>${esc(obs.service_tag)}</code></div>
+          <div class="muted-sm">${esc(obs.node_tag)}${obs.host ? ` · ${esc(obs.host)}` : ""}</div>
+        </td>
+        <td><span class="pill ${riskCls}">${esc(riskLbl)}</span></td>
+        <td>
+          <div><strong>${formatCompact(obs.request_count)}</strong> req</div>
+          <div class="muted-sm">${obs.challenge_count || 0} ch · ${obs.rate_limited_count || 0} 429</div>
+        </td>
+        <td>${esc(formatDateTime(obs.last_seen_ts))}</td>
+      </tr>`;
+      })
+      .join("") || `<tr><td colspan="8" class="muted">No visitor fingerprints match the current query.</td></tr>`;
+
+  tbody.querySelectorAll("[data-fp-idx]").forEach((tr) => {
+    tr.addEventListener("click", () => {
+      const obs = items[Number(tr.dataset.fpIdx)];
+      if (obs) openFingerprintDetailModal(obs);
+    });
+  });
+}
+
+function openFingerprintDetailModal(obs) {
+  const js = obs.js_fp || null;
+  const jsSection = js
+    ? `<div class="inspector-sec" style="margin-bottom:12px;">
+        <div class="inspector-sec-head"><span>Client JS Fingerprint (${esc(obs.fp_source || "beacon").toUpperCase()})</span></div>
+        <div class="fp-detail-grid" style="margin-bottom:0;">
+          <div class="fp-kv"><div class="fp-kv-lbl">WebGL Renderer</div><div class="fp-kv-val">${esc(js.webgl || "-")}</div></div>
+          <div class="fp-kv"><div class="fp-kv-lbl">Canvas Hash</div><div class="fp-kv-val"><code>${esc(js.canvas_hash || "-")}</code></div></div>
+          <div class="fp-kv"><div class="fp-kv-lbl">Platform / Screen / DPR</div><div class="fp-kv-val">${esc(js.platform || "-")} · ${esc(js.screen || "-")} @ ${esc(js.dpr || "1")}x</div></div>
+          <div class="fp-kv"><div class="fp-kv-lbl">Timezone &amp; Language</div><div class="fp-kv-val">${esc(js.tz || "-")} · ${esc(js.lang || "-")}</div></div>
+          <div class="fp-kv"><div class="fp-kv-lbl">Hardware (Cores · RAM · Touch)</div><div class="fp-kv-val">${Number(js.cores) || 0} cores · ${Number(js.mem) || 0} GB · ${Number(js.touch) || 0} touch</div></div>
+          <div class="fp-kv"><div class="fp-kv-lbl">WebDriver / Plugins</div><div class="fp-kv-val">${js.webdriver ? '<span class="pill err">webdriver=true</span>' : '<span class="pill ok">webdriver=false</span>'} · ${Number(js.plugins_count) || 0} plugins</div></div>
+        </div>
+      </div>`
+    : `<div class="muted-sm" style="margin-bottom:12px;">No client JS report captured yet for this visitor (only server-side HTTP/TLS headers observed).</div>`;
+
+  const bodyHtml = `
+    <div class="fp-detail-grid">
+      <div class="fp-kv"><div class="fp-kv-lbl">Client IP / Subnet</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")}<br/><small class="muted">HMAC: <code>${esc(obs.ip_hmac)}</code></small></div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Fingerprint Hash</div><div class="fp-kv-val"><code>${esc(obs.fp_hash)}</code><br/><small class="muted">${obs.js_verified ? `JS Verified (${esc(obs.fp_source)})` : "Server UA Fallback"}</small></div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Classification</div><div class="fp-kv-val">${esc(obs.device_type)} · ${esc(obs.browser_family)} · ${esc(obs.os_family)}</div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Risk &amp; TLS Signals</div><div class="fp-kv-val">Score ${Number(obs.suspicion_score) || 0}/100 · ${obs.is_bot ? "Bot" : obs.is_headless ? "Headless" : "Normal"}<br/><small class="muted">TLS ciphers: ${Number(obs.tls_cipher_count) || 0} · ALPN: ${obs.tls_alpn ? "Yes" : "No"}</small></div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Route Context</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}<br/><small class="muted">Host: ${esc(obs.host || "-")}</small></div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Activity Window</div><div class="fp-kv-val">${formatCompact(obs.request_count)} req · ${obs.challenge_count || 0} ch · ${obs.rate_limited_count || 0} 429<br/><small class="muted">${esc(formatDateTime(obs.first_seen_ts))} → ${esc(formatDateTime(obs.last_seen_ts))}</small></div></div>
+    </div>
+    <div class="fp-kv-lbl" style="margin-bottom:4px;">User-Agent</div>
+    <div class="fp-ua-box">${esc(obs.user_agent || "(empty)")}${obs.accept_language ? `\nAccept-Language: ${esc(obs.accept_language)}` : ""}</div>
+    ${jsSection}
+  `;
+
+  openModal({
+    title: `Fingerprint Inspector — ${obs.fp_hash}`,
+    bodyHtml,
+    actions: [
+      {
+        label: "Filter by this IP",
+        onClick: () => {
+          if (el("fp-search-ip")) el("fp-search-ip").value = obs.client_ip || obs.ip_hmac;
+          refreshFingerprints();
+        },
+      },
+      {
+        label: "Filter by this FP",
+        onClick: () => {
+          if (el("fp-search-fp")) el("fp-search-fp").value = obs.fp_hash;
+          refreshFingerprints();
+        },
+      },
+      { label: "Close", cls: "primary" },
+    ],
+  });
+}
+
+el("btn-fp-search")?.addEventListener("click", refreshFingerprints);
+el("btn-fp-clear")?.addEventListener("click", () => {
+  if (el("fp-search-q")) el("fp-search-q").value = "";
+  if (el("fp-search-ip")) el("fp-search-ip").value = "";
+  if (el("fp-search-fp")) el("fp-search-fp").value = "";
+  if (el("fp-node-filter")) el("fp-node-filter").value = "all";
+  if (el("fp-svc-filter")) el("fp-svc-filter").value = "all";
+  state.fpFilters.verified = "all";
+  state.fpFilters.risk = "all";
+  document.querySelectorAll("[data-fp-ver]").forEach((b) => b.classList.toggle("active", b.dataset.fpVer === "all"));
+  document.querySelectorAll("[data-fp-risk]").forEach((b) => b.classList.toggle("active", b.dataset.fpRisk === "all"));
+  refreshFingerprints();
+});
+["fp-search-q", "fp-search-ip", "fp-search-fp"].forEach((id) => {
+  el(id)?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      refreshFingerprints();
+    }
+  });
+});
+el("fp-node-filter")?.addEventListener("change", refreshFingerprints);
+el("fp-svc-filter")?.addEventListener("change", refreshFingerprints);
+document.querySelectorAll("[data-fp-ver]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.fpFilters.verified = btn.dataset.fpVer;
+    document.querySelectorAll("[data-fp-ver]").forEach((b) => b.classList.toggle("active", b === btn));
+    refreshFingerprints();
+  });
+});
+document.querySelectorAll("[data-fp-risk]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    state.fpFilters.risk = btn.dataset.fpRisk;
+    document.querySelectorAll("[data-fp-risk]").forEach((b) => b.classList.toggle("active", b === btn));
+    refreshFingerprints();
+  });
+});
 
 /* ==================== ONBOARDING ==================== */
 
@@ -1070,6 +1191,7 @@ async function refreshCurrentTab(opts = {}) {
     else if (state.activeTab === "topology") await refreshTopology(opts);
     else if (state.activeTab === "onboarding") await refreshOnboarding();
     else if (state.activeTab === "observability") await refreshObservability();
+    else if (state.activeTab === "fingerprints") await refreshFingerprints();
     else if (state.activeTab === "audit") await refreshAudit();
   } catch (e) {
     showToast(e.message, true);

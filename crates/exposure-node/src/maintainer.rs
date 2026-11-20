@@ -12,7 +12,9 @@ use exposure_core::protocol::{
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::SegmentWriter;
-use exposure_core::telemetry::{AlertRecord, CertStatusInfo, MinuteSummary, SessionSummary};
+use exposure_core::telemetry::{
+    AlertRecord, CertStatusInfo, FingerprintObservation, MinuteSummary, SessionSummary,
+};
 use exposure_core::{ExposureError, Result};
 use tokio::process::Command;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -23,6 +25,7 @@ use crate::forwarder::Forwarder;
 use crate::tls::generate_self_signed_pem;
 
 const MAX_MERGED_SUMMARIES: usize = 50_000;
+const MAX_MERGED_FINGERPRINTS: usize = 20_000;
 const EXEC_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -107,7 +110,8 @@ async fn validate_webhook_url(raw_url: &str) -> Result<()> {
 pub struct MaintainerService {
     node_tag: String,
     cfg: Arc<RwLock<MaintainerConfig>>,
-    merged_summaries: Arc<Mutex<HashMap<(i64, String, String), MinuteSummary>>>,
+    merged_summaries: Arc<Mutex<HashMap<(i64, String, String, String), MinuteSummary>>>,
+    merged_fingerprints: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
     segment_writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
     cert_statuses: Arc<Mutex<HashMap<String, CertStatusInfo>>>,
     alerts: Arc<Mutex<Vec<AlertRecord>>>,
@@ -144,6 +148,7 @@ impl MaintainerService {
             node_tag: tag,
             cfg: Arc::new(RwLock::new(cfg)),
             merged_summaries: Arc::new(Mutex::new(HashMap::new())),
+            merged_fingerprints: Arc::new(Mutex::new(HashMap::new())),
             segment_writer: Arc::new(StdMutex::new(writer)),
             cert_statuses: Arc::new(Mutex::new(cert_map)),
             alerts: Arc::new(Mutex::new(Vec::new())),
@@ -186,12 +191,13 @@ impl MaintainerService {
         Ok(())
     }
 
-    /// Merge incoming LogBatch from an authenticated Node (bounded timestamps, bounded map, respects `store_raw_ip`).
+    /// Merge incoming LogBatch from an authenticated Node (bounded timestamps, bounded maps, respects `store_raw_ip`).
     pub async fn ingest_log_batch(
         &self,
         from_node: &str,
         mut records: Vec<SessionSummary>,
         summaries: Vec<MinuteSummary>,
+        fingerprints: Vec<FingerprintObservation>,
     ) -> usize {
         let start = Instant::now();
         let store_raw_ip = self.cfg.read().await.logger.store_raw_ip;
@@ -232,7 +238,12 @@ impl MaintainerService {
                 if !s.uv_hll.is_valid() {
                     continue;
                 }
-                let key = (s.minute_epoch, s.node_tag.clone(), s.service_tag.clone());
+                let key = (
+                    s.minute_epoch,
+                    s.node_tag.clone(),
+                    s.role.clone(),
+                    s.service_tag.clone(),
+                );
                 if map.len() >= MAX_MERGED_SUMMARIES && !map.contains_key(&key) {
                     continue;
                 }
@@ -241,11 +252,37 @@ impl MaintainerService {
                     .or_insert(s);
                 accepted_summaries += 1;
             }
-            map.retain(|(min, _, _), _| *min >= min_cutoff && *min <= max_allowed);
+            map.retain(|(min, _, _, _), _| *min >= min_cutoff && *min <= max_allowed);
+        }
+
+        let mut accepted_fps = 0usize;
+        if !fingerprints.is_empty() {
+            let mut fp_map = self.merged_fingerprints.lock().await;
+            for mut fp in fingerprints.into_iter().take(2048) {
+                if fp.last_seen_ts < min_cutoff || fp.last_seen_ts > max_allowed {
+                    continue;
+                }
+                if !store_raw_ip {
+                    fp.client_ip = None;
+                }
+                fp.sanitize();
+                if fp.id.is_empty() {
+                    continue;
+                }
+                if fp_map.len() >= MAX_MERGED_FINGERPRINTS && !fp_map.contains_key(&fp.id) {
+                    continue;
+                }
+                fp_map
+                    .entry(fp.id.clone())
+                    .and_modify(|existing| existing.merge_from(&fp))
+                    .or_insert(fp);
+                accepted_fps += 1;
+            }
+            fp_map.retain(|_, v| v.last_seen_ts >= min_cutoff && v.last_seen_ts <= max_allowed);
         }
 
         *self.last_merge_latency_ms.lock().await = start.elapsed().as_secs_f64() * 1000.0;
-        rec_count + accepted_summaries
+        rec_count + accepted_summaries + accepted_fps
     }
 
     pub async fn flush_segments(&self) -> Result<()> {
@@ -271,6 +308,17 @@ impl MaintainerService {
                 .cloned()
                 .collect()
         };
+        let fingerprints = {
+            let fp_map = self.merged_fingerprints.lock().await;
+            let mut list: Vec<FingerprintObservation> = fp_map
+                .values()
+                .filter(|f| since_minute.map(|m| f.last_seen_ts >= m).unwrap_or(true))
+                .cloned()
+                .collect();
+            list.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
+            list.truncate(5000);
+            list
+        };
         let certificates = self
             .cert_statuses
             .lock()
@@ -289,6 +337,7 @@ impl MaintainerService {
         MaintainerTelemetrySnapshot {
             maintainer_tag: self.node_tag.clone(),
             summaries,
+            fingerprints,
             certificates,
             segment_backlog,
             merge_latency_ms,

@@ -15,7 +15,9 @@ use exposure_core::protocol::{
     dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, read_json_frame, write_json_frame,
     MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
 };
-use exposure_core::telemetry::{AlertRecord, CertStatusInfo, LinkStatusSnapshot, MinuteSummary};
+use exposure_core::telemetry::{
+    AlertRecord, CertStatusInfo, FingerprintObservation, LinkStatusSnapshot, MinuteSummary,
+};
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -24,7 +26,7 @@ use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::compiler::{compile_topology_with_options, compute_control_hops, CompileReport};
+use crate::compiler::{compile_topology_full, compute_control_hops, CompileReport};
 use crate::db::ControlDb;
 
 const MAX_INCOMING_DISPATCH_TASKS: usize = 128;
@@ -43,6 +45,7 @@ pub struct MaintainerHealthInfo {
 pub struct CachedTelemetry {
     pub links: Vec<LinkStatusSnapshot>,
     pub summaries: Vec<MinuteSummary>,
+    pub fingerprints: Vec<FingerprintObservation>,
     pub certificates: Vec<CertStatusInfo>,
     pub alerts: Vec<AlertRecord>,
     pub maintainers: Vec<MaintainerHealthInfo>,
@@ -113,6 +116,20 @@ impl ControlClient {
 
     pub fn db(&self) -> &Arc<ControlDb> {
         &self.db
+    }
+
+    /// Return the effective cluster-wide logger IP HMAC key (from topology `global_logger` or persisted SQLite key).
+    pub async fn effective_logger_hmac_key(&self) -> Option<String> {
+        if let Ok(yaml) = self.db.get_topology_yaml().await {
+            if let Ok(topo) = serde_yaml::from_str::<TopologySpec>(&yaml) {
+                if let Some(gl) = topo.global_logger {
+                    if !gl.hmac_key.trim().is_empty() {
+                        return Some(gl.hmac_key);
+                    }
+                }
+            }
+        }
+        self.db.get_cluster_hmac_key().await.ok().flatten()
     }
 
     pub async fn cached_telemetry(&self) -> CachedTelemetry {
@@ -512,18 +529,20 @@ impl ControlClient {
             }
         }
 
-        let (report, compiled) = compile_topology_with_options(
+        let cluster_hmac = self.db.get_cluster_hmac_key().await.ok().flatten();
+        let (report, compiled) = compile_topology_full(
             &topo,
             &self.signing_kp.public_key_b64(),
             &self.link_public_key_b64(),
             &node_pubkeys,
             &maint_keys,
             true,
+            cluster_hmac.as_deref(),
         );
         Ok((topo, report, compiled))
     }
 
-    /// Compile topology AND provision persistent maintainer keypairs (Active role mutating operations ONLY).
+    /// Compile topology AND provision persistent maintainer keypairs & cluster logger HMAC key (Active role ONLY).
     pub async fn compile_yaml_and_provision(
         &self,
         yaml: &str,
@@ -547,13 +566,15 @@ impl ControlClient {
             }
         }
 
-        let (report, compiled) = compile_topology_with_options(
+        let cluster_hmac = self.db.get_or_create_cluster_hmac_key().await?;
+        let (report, compiled) = compile_topology_full(
             &topo,
             &self.signing_kp.public_key_b64(),
             &self.link_public_key_b64(),
             &node_pubkeys,
             &maint_keys,
             true,
+            Some(&cluster_hmac),
         );
         Ok((topo, report, compiled))
     }
@@ -966,7 +987,9 @@ impl ControlClient {
 
         let mut cache = CachedTelemetry::default();
         let mut pulled = 0usize;
-        let mut dedup_summaries: HashMap<(i64, String, String), MinuteSummary> = HashMap::new();
+        let mut dedup_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
+            HashMap::new();
+        let mut dedup_fingerprints: HashMap<String, FingerprintObservation> = HashMap::new();
         let mut dedup_certs: HashMap<String, CertStatusInfo> = HashMap::new();
 
         while let Some(res) = futs.next().await {
@@ -986,6 +1009,7 @@ impl ControlClient {
                 if let Some(MaintainerTelemetrySnapshot {
                     maintainer_tag,
                     summaries,
+                    fingerprints,
                     certificates,
                     segment_backlog,
                     merge_latency_ms,
@@ -999,7 +1023,12 @@ impl ControlClient {
                     });
                     for s in summaries {
                         // Deduplicate summaries reported by multiple maintainers by keeping the highest-count entry
-                        let key = (s.minute_epoch, s.node_tag.clone(), s.service_tag.clone());
+                        let key = (
+                            s.minute_epoch,
+                            s.node_tag.clone(),
+                            s.role.clone(),
+                            s.service_tag.clone(),
+                        );
                         dedup_summaries
                             .entry(key)
                             .and_modify(|existing| {
@@ -1008,6 +1037,19 @@ impl ControlClient {
                                 }
                             })
                             .or_insert(s);
+                    }
+                    for fp in fingerprints {
+                        dedup_fingerprints
+                            .entry(fp.id.clone())
+                            .and_modify(|existing| {
+                                if fp.request_count > existing.request_count
+                                    || (fp.js_verified && !existing.js_verified)
+                                    || fp.last_seen_ts > existing.last_seen_ts
+                                {
+                                    existing.merge_from(&fp);
+                                }
+                            })
+                            .or_insert(fp);
                     }
                     for c in certificates {
                         dedup_certs.insert(c.domain.clone(), c);
@@ -1018,6 +1060,10 @@ impl ControlClient {
         }
 
         cache.summaries = dedup_summaries.into_values().collect();
+        let mut fps: Vec<FingerprintObservation> = dedup_fingerprints.into_values().collect();
+        fps.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
+        fps.truncate(10_000);
+        cache.fingerprints = fps;
         cache.certificates = dedup_certs.into_values().collect();
         cache.last_pulled_at = Some(Utc::now().to_rfc3339());
         *self.telemetry_cache.write().await = cache;

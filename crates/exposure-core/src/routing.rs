@@ -271,7 +271,8 @@ mod tests {
                 service_tag: "web@region-a".into(),
                 next_peer: "relay-a".into(),
                 guard: None,
-                intercept_errors: false,
+                intercept_errors: Some(false),
+                js_fp_beacon: None,
             },
             IngressRule {
                 name: Some("default".into()),
@@ -284,7 +285,8 @@ mod tests {
                 service_tag: "web@default".into(),
                 next_peer: "relay-b".into(),
                 guard: None,
-                intercept_errors: false,
+                intercept_errors: Some(false),
+                js_fp_beacon: None,
             },
         ];
 

@@ -177,9 +177,9 @@ async fn main() -> Result<()> {
                 },
                 link_listener: listen.map(|addr| LinkListenConfig {
                     listen_addr: addr,
-                    allow_on_demand: true,
-                    allow_tunnel: true,
-                    allow_bootstrap: true,
+                    allow_on_demand: Some(true),
+                    allow_tunnel: Some(true),
+                    allow_bootstrap: Some(true),
                 }),
                 peers: vec![],
                 probe: Default::default(),

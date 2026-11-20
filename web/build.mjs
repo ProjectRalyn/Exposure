@@ -29,6 +29,23 @@ for (const app of apps) {
     },
     logLevel: "warn",
   });
+  if (app.name === "challenge") {
+    await build({
+      root: app.root,
+      build: {
+        outDir: app.outDir,
+        emptyOutDir: false,
+        minify: "esbuild",
+        lib: {
+          entry: resolve(app.root, "fp.js"),
+          formats: ["iife"],
+          name: "ExposureFpBeacon",
+          fileName: () => "fp.js",
+        },
+      },
+      logLevel: "warn",
+    });
+  }
 }
 
 console.log("[exposure-web] All vanilla H5/JS apps built and minified.");

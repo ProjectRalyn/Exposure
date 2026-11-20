@@ -15,9 +15,10 @@ use exposure_core::config::{
     ControlConfig, ControlRole, Dns01ProviderConfig, NodeConfig, TopologySpec,
 };
 use exposure_core::crypto::{
-    ct_eq_hashed, generate_random_secret_hex, validate_identifier, verify_password,
+    ct_eq_hashed, generate_random_secret_hex, hmac_ip, validate_identifier, verify_password,
 };
 use exposure_core::routing::{canonical_ip, LinkHealthState};
+use exposure_core::telemetry::{HyperLogLog, LatencyHistogram, MinuteSummary};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -81,7 +82,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/nodes", get(list_nodes))
         .route("/api/nodes/{tag}/push", post(push_single_node))
-        .route("/api/topology", get(get_topology).post(save_topology))
+        .route("/api/topology", get(get_topology).post(save_topology).put(save_topology))
         .route("/api/topology/validate", post(validate_topology))
         .route("/api/topology/preflight", post(preflight_topology))
         .route("/api/config-versions", get(list_config_versions))
@@ -91,6 +92,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/discovery/run", post(run_discovery))
         .route("/api/telemetry", get(get_telemetry))
         .route("/api/telemetry/pull", post(pull_telemetry))
+        .route("/api/fingerprints", get(list_fingerprints))
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
         .layer(middleware::from_fn(security_headers_middleware))
@@ -195,6 +197,16 @@ fn json_err(status: StatusCode, msg: impl Into<String>) -> Response {
 
 /// Redact all sensitive fields in `TopologySpec` before returning to API callers.
 fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
+    if !spec.defaults.ingress.clearance_secret.is_empty() {
+        spec.defaults.ingress.clearance_secret = REDACTED_SECRET.into();
+    }
+    for g in spec.guard_templates.values_mut() {
+        for h in &mut g.api_bypass_headers {
+            if let Some((name, _)) = h.split_once(':') {
+                *h = format!("{}: {REDACTED_SECRET}", name.trim());
+            }
+        }
+    }
     if let Some(ref mut gl) = spec.global_logger {
         if !gl.hmac_key.is_empty() {
             gl.hmac_key = REDACTED_SECRET.into();
@@ -240,6 +252,27 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
 
 /// Restore redacted sentinel (`"********"`) secrets from previously stored topology on save.
 fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec) -> TopologySpec {
+    if incoming.defaults.ingress.clearance_secret == REDACTED_SECRET {
+        incoming.defaults.ingress.clearance_secret =
+            existing.defaults.ingress.clearance_secret.clone();
+    }
+    for (g_name, new_g) in &mut incoming.guard_templates {
+        if let Some(old_g) = existing.guard_templates.get(g_name) {
+            for h in &mut new_g.api_bypass_headers {
+                if let Some((name, val)) = h.split_once(':') {
+                    if val.trim() == REDACTED_SECRET {
+                        if let Some(old_h) = old_g.api_bypass_headers.iter().find(|oh| {
+                            oh.split_once(':')
+                                .map(|(on, _)| on.trim().eq_ignore_ascii_case(name.trim()))
+                                .unwrap_or(false)
+                        }) {
+                            *h = old_h.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let (Some(ref mut new_gl), Some(ref old_gl)) =
         (&mut incoming.global_logger, &existing.global_logger)
     {
@@ -452,6 +485,229 @@ async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Response 
     }
 }
 
+struct AggregatedTraffic {
+    traffic_json: serde_json::Value,
+    timeseries: Vec<serde_json::Value>,
+    service_breakdown: Vec<serde_json::Value>,
+    node_breakdown: Vec<serde_json::Value>,
+    device_counts: std::collections::BTreeMap<String, u64>,
+    browser_counts: std::collections::BTreeMap<String, u64>,
+    os_counts: std::collections::BTreeMap<String, u64>,
+    client_fp_verified: u64,
+}
+
+/// Role-aware, true HLL-union & LatencyHistogram-merge aggregation over MinuteSummary records.
+/// Prefers `role == "ingress"` summaries for end-user traffic totals & timeseries whenever ingress
+/// telemetry exists so Ingress -> Egress hops are NEVER double-counted!
+fn aggregate_summaries(
+    summaries: &[MinuteSummary],
+    node_filter: Option<&str>,
+    service_filter: Option<&str>,
+    cutoff: i64,
+) -> AggregatedTraffic {
+    let base: Vec<&MinuteSummary> = summaries
+        .iter()
+        .filter(|s| {
+            if s.minute_epoch < cutoff {
+                return false;
+            }
+            if let Some(nf) = node_filter {
+                if s.node_tag != nf {
+                    return false;
+                }
+            }
+            if let Some(sf) = service_filter {
+                if s.service_tag != sf {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    // Avoid Ingress + Egress double-counting for cluster-wide & service-wide totals:
+    // If ingress summaries exist in the filtered set, aggregate ingress for primary totals/timeseries/services.
+    let has_ingress = base.iter().any(|s| s.role == "ingress");
+    let primary: Vec<&MinuteSummary> = if has_ingress {
+        base.iter()
+            .copied()
+            .filter(|s| s.role == "ingress" || s.role.is_empty())
+            .collect()
+    } else {
+        base.clone()
+    };
+
+    let mut total_requests: u64 = 0;
+    let mut total_errors: u64 = 0;
+    let mut total_rate_limited: u64 = 0;
+    let mut total_challenges_issued: u64 = 0;
+    let mut total_challenges_passed: u64 = 0;
+    let mut total_bytes_in: u64 = 0;
+    let mut total_bytes_out: u64 = 0;
+    let mut client_fp_verified: u64 = 0;
+    let mut merged_hll: Option<HyperLogLog> = None;
+    let mut merged_hist: Option<LatencyHistogram> = None;
+    let mut device_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut browser_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut os_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+
+    let mut by_minute: std::collections::BTreeMap<i64, MinuteSummary> =
+        std::collections::BTreeMap::new();
+    let mut by_service: std::collections::BTreeMap<String, MinuteSummary> =
+        std::collections::BTreeMap::new();
+    let mut by_node: std::collections::BTreeMap<String, MinuteSummary> =
+        std::collections::BTreeMap::new();
+
+    for s in &primary {
+        total_requests = total_requests.saturating_add(s.requests);
+        total_errors = total_errors.saturating_add(s.errors);
+        total_rate_limited = total_rate_limited.saturating_add(s.rate_limited);
+        total_challenges_issued = total_challenges_issued.saturating_add(s.challenges_issued);
+        total_challenges_passed = total_challenges_passed.saturating_add(s.challenges_passed);
+        total_bytes_in = total_bytes_in.saturating_add(s.bytes_in);
+        total_bytes_out = total_bytes_out.saturating_add(s.bytes_out);
+        client_fp_verified = client_fp_verified.saturating_add(s.client_fp_verified);
+
+        for (k, v) in &s.device_counts {
+            *device_counts.entry(k.clone()).or_insert(0) += *v;
+        }
+        for (k, v) in &s.browser_counts {
+            *browser_counts.entry(k.clone()).or_insert(0) += *v;
+        }
+        for (k, v) in &s.os_counts {
+            *os_counts.entry(k.clone()).or_insert(0) += *v;
+        }
+
+        match &mut merged_hll {
+            Some(h) => h.merge(&s.uv_hll),
+            None => merged_hll = Some(s.uv_hll.clone()),
+        }
+        match &mut merged_hist {
+            Some(h) => h.merge(&s.latency_hist),
+            None => merged_hist = Some(s.latency_hist.clone()),
+        }
+
+        by_minute
+            .entry(s.minute_epoch)
+            .and_modify(|acc| acc.merge_from(s))
+            .or_insert_with(|| (*s).clone());
+
+        by_service
+            .entry(s.service_tag.clone())
+            .and_modify(|acc| acc.merge_from(s))
+            .or_insert_with(|| (*s).clone());
+    }
+
+    // Node breakdown shows all nodes (both ingress and egress), deduplicating co-located roles by preferring ingress
+    let mut node_has_ingress: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for s in &base {
+        if s.role == "ingress" {
+            node_has_ingress.insert(s.node_tag.as_str());
+        }
+    }
+    for s in &base {
+        if node_has_ingress.contains(s.node_tag.as_str()) && s.role == "egress" {
+            continue;
+        }
+        by_node
+            .entry(s.node_tag.clone())
+            .and_modify(|acc| acc.merge_from(s))
+            .or_insert_with(|| (*s).clone());
+    }
+
+    let timeseries: Vec<serde_json::Value> = by_minute
+        .into_iter()
+        .map(|(minute_epoch, s)| {
+            serde_json::json!({
+                "minute_epoch": minute_epoch,
+                "requests": s.requests,
+                "errors": s.errors,
+                "rate_limited": s.rate_limited,
+                "challenges_issued": s.challenges_issued,
+                "challenges_passed": s.challenges_passed,
+                "bytes_in": s.bytes_in,
+                "bytes_out": s.bytes_out,
+                "uv_estimate": s.uv_estimate().round(),
+                "p50_ms": s.p50_ms(),
+                "p95_ms": s.p95_ms(),
+                "p99_ms": s.p99_ms(),
+            })
+        })
+        .collect();
+
+    let mut service_breakdown: Vec<serde_json::Value> = by_service
+        .into_iter()
+        .map(|(service_tag, s)| {
+            serde_json::json!({
+                "service_tag": service_tag,
+                "requests": s.requests,
+                "errors": s.errors,
+                "rate_limited": s.rate_limited,
+                "uv_estimate": s.uv_estimate().round(),
+                "p50_ms": s.p50_ms(),
+                "p95_ms": s.p95_ms(),
+                "p99_ms": s.p99_ms(),
+            })
+        })
+        .collect();
+    service_breakdown.sort_by(|a, b| {
+        b["requests"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["requests"].as_u64().unwrap_or(0))
+    });
+
+    let mut node_breakdown: Vec<serde_json::Value> = by_node
+        .into_iter()
+        .map(|(node_tag, s)| {
+            serde_json::json!({
+                "node_tag": node_tag,
+                "role": s.role,
+                "requests": s.requests,
+                "errors": s.errors,
+                "rate_limited": s.rate_limited,
+                "uv_estimate": s.uv_estimate().round(),
+                "p50_ms": s.p50_ms(),
+                "p95_ms": s.p95_ms(),
+                "p99_ms": s.p99_ms(),
+            })
+        })
+        .collect();
+    node_breakdown.sort_by(|a, b| {
+        b["requests"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["requests"].as_u64().unwrap_or(0))
+    });
+
+    let uv_exact_or_hll = merged_hll.map(|h| h.estimate().round()).unwrap_or(0.0);
+    let traffic_json = serde_json::json!({
+        "total_requests": total_requests,
+        "total_errors": total_errors,
+        "total_rate_limited": total_rate_limited,
+        "total_challenges_issued": total_challenges_issued,
+        "total_challenges_passed": total_challenges_passed,
+        "total_bytes_in": total_bytes_in,
+        "total_bytes_out": total_bytes_out,
+        "uv_estimate": uv_exact_or_hll,
+        "p50_ms": merged_hist.as_ref().map(|h| h.quantile(0.50)).unwrap_or(0.0),
+        "p95_ms": merged_hist.as_ref().map(|h| h.quantile(0.95)).unwrap_or(0.0),
+        "p99_ms": merged_hist.as_ref().map(|h| h.quantile(0.99)).unwrap_or(0.0),
+        "client_fp_verified": client_fp_verified,
+    });
+
+    AggregatedTraffic {
+        traffic_json,
+        timeseries,
+        service_breakdown,
+        node_breakdown,
+        device_counts,
+        browser_counts,
+        os_counts,
+        client_fp_verified,
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct OverviewQuery {
     #[serde(default)]
@@ -500,120 +756,7 @@ async fn overview(
         .filter(|l| l.state == LinkHealthState::Down)
         .count();
 
-    let mut total_requests: u64 = 0;
-    let mut total_errors: u64 = 0;
-    let mut total_rate_limited: u64 = 0;
-    let mut total_challenges_issued: u64 = 0;
-    let mut total_challenges_passed: u64 = 0;
-    let mut total_bytes_in: u64 = 0;
-    let mut total_bytes_out: u64 = 0;
-    let mut merged_hll: Option<exposure_core::telemetry::HyperLogLog> = None;
-    let mut merged_hist: Option<exposure_core::telemetry::LatencyHistogram> = None;
-
-    let mut by_minute: std::collections::BTreeMap<i64, exposure_core::telemetry::MinuteSummary> =
-        std::collections::BTreeMap::new();
-    let mut by_service: std::collections::BTreeMap<String, exposure_core::telemetry::MinuteSummary> =
-        std::collections::BTreeMap::new();
-    let mut by_node: std::collections::BTreeMap<String, exposure_core::telemetry::MinuteSummary> =
-        std::collections::BTreeMap::new();
-
-    for s in tel.summaries.iter().filter(|s| s.minute_epoch >= cutoff) {
-        total_requests = total_requests.saturating_add(s.requests);
-        total_errors = total_errors.saturating_add(s.errors);
-        total_rate_limited = total_rate_limited.saturating_add(s.rate_limited);
-        total_challenges_issued = total_challenges_issued.saturating_add(s.challenges_issued);
-        total_challenges_passed = total_challenges_passed.saturating_add(s.challenges_passed);
-        total_bytes_in = total_bytes_in.saturating_add(s.bytes_in);
-        total_bytes_out = total_bytes_out.saturating_add(s.bytes_out);
-
-        match &mut merged_hll {
-            Some(h) => h.merge(&s.uv_hll),
-            None => merged_hll = Some(s.uv_hll.clone()),
-        }
-        match &mut merged_hist {
-            Some(h) => h.merge(&s.latency_hist),
-            None => merged_hist = Some(s.latency_hist.clone()),
-        }
-
-        by_minute
-            .entry(s.minute_epoch)
-            .and_modify(|acc| acc.merge_from(s))
-            .or_insert_with(|| s.clone());
-
-        by_service
-            .entry(s.service_tag.clone())
-            .and_modify(|acc| acc.merge_from(s))
-            .or_insert_with(|| s.clone());
-
-        by_node
-            .entry(s.node_tag.clone())
-            .and_modify(|acc| acc.merge_from(s))
-            .or_insert_with(|| s.clone());
-    }
-
-    let timeseries: Vec<serde_json::Value> = by_minute
-        .into_iter()
-        .map(|(minute_epoch, s)| {
-            serde_json::json!({
-                "minute_epoch": minute_epoch,
-                "requests": s.requests,
-                "errors": s.errors,
-                "rate_limited": s.rate_limited,
-                "challenges_issued": s.challenges_issued,
-                "challenges_passed": s.challenges_passed,
-                "bytes_in": s.bytes_in,
-                "bytes_out": s.bytes_out,
-                "uv_estimate": s.uv_estimate(),
-                "p50_ms": s.p50_ms(),
-                "p95_ms": s.p95_ms(),
-                "p99_ms": s.p99_ms(),
-            })
-        })
-        .collect();
-
-    let mut service_breakdown: Vec<serde_json::Value> = by_service
-        .into_iter()
-        .map(|(service_tag, s)| {
-            serde_json::json!({
-                "service_tag": service_tag,
-                "requests": s.requests,
-                "errors": s.errors,
-                "rate_limited": s.rate_limited,
-                "uv_estimate": s.uv_estimate(),
-                "p50_ms": s.p50_ms(),
-                "p95_ms": s.p95_ms(),
-                "p99_ms": s.p99_ms(),
-            })
-        })
-        .collect();
-    service_breakdown.sort_by(|a, b| {
-        b["requests"]
-            .as_u64()
-            .unwrap_or(0)
-            .cmp(&a["requests"].as_u64().unwrap_or(0))
-    });
-
-    let mut node_breakdown: Vec<serde_json::Value> = by_node
-        .into_iter()
-        .map(|(node_tag, s)| {
-            serde_json::json!({
-                "node_tag": node_tag,
-                "requests": s.requests,
-                "errors": s.errors,
-                "rate_limited": s.rate_limited,
-                "uv_estimate": s.uv_estimate(),
-                "p50_ms": s.p50_ms(),
-                "p95_ms": s.p95_ms(),
-                "p99_ms": s.p99_ms(),
-            })
-        })
-        .collect();
-    node_breakdown.sort_by(|a, b| {
-        b["requests"]
-            .as_u64()
-            .unwrap_or(0)
-            .cmp(&a["requests"].as_u64().unwrap_or(0))
-    });
+    let agg = aggregate_summaries(&tel.summaries, None, None, cutoff);
 
     let certs_valid = tel.certificates.iter().filter(|c| c.status == "valid").count();
     let certs_degraded = tel.certificates.len().saturating_sub(certs_valid);
@@ -638,27 +781,15 @@ async fn overview(
         "latest_sequence": seq,
         "alerts": tel.alerts,
         "maintainers": tel.maintainers,
-        "traffic": {
-            "total_requests": total_requests,
-            "total_errors": total_errors,
-            "total_rate_limited": total_rate_limited,
-            "total_challenges_issued": total_challenges_issued,
-            "total_challenges_passed": total_challenges_passed,
-            "total_bytes_in": total_bytes_in,
-            "total_bytes_out": total_bytes_out,
-            "uv_estimate": merged_hll.map(|h| h.estimate()).unwrap_or(0.0),
-            "p50_ms": merged_hist.as_ref().map(|h| h.quantile(0.50)).unwrap_or(0.0),
-            "p95_ms": merged_hist.as_ref().map(|h| h.quantile(0.95)).unwrap_or(0.0),
-            "p99_ms": merged_hist.as_ref().map(|h| h.quantile(0.99)).unwrap_or(0.0),
-        },
+        "traffic": agg.traffic_json,
         "certificates_summary": {
             "total": tel.certificates.len(),
             "valid": certs_valid,
             "degraded": certs_degraded,
         },
-        "timeseries": timeseries,
-        "service_breakdown": service_breakdown,
-        "node_breakdown": node_breakdown,
+        "timeseries": agg.timeseries,
+        "service_breakdown": agg.service_breakdown,
+        "node_breakdown": agg.node_breakdown,
         "nodes": nodes,
         "links": tel.links,
         "spec": spec,
@@ -1214,6 +1345,7 @@ async fn run_discovery(State(state): State<ApiState>, headers: HeaderMap) -> Res
 struct SummaryDto {
     minute_epoch: i64,
     node_tag: String,
+    role: String,
     service_tag: String,
     requests: u64,
     uv_estimate: f64,
@@ -1232,20 +1364,66 @@ struct SummaryDto {
     client_fp_verified: u64,
 }
 
-async fn get_telemetry(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+#[derive(Deserialize, Default)]
+struct TelemetryQuery {
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    window_secs: Option<i64>,
+}
+
+async fn get_telemetry(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<TelemetryQuery>,
+) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
         return r;
     }
     let tel = state.client.cached_telemetry().await;
+    let node_f = q
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
+    let svc_f = q
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
+    let cutoff = q
+        .window_secs
+        .filter(|&w| w > 0)
+        .map(|w| Utc::now().timestamp().saturating_sub(w))
+        .unwrap_or(0);
+
+    let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut available_services: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for s in &tel.summaries {
+        available_nodes.insert(s.node_tag.clone());
+        available_services.insert(s.service_tag.clone());
+    }
+
+    let agg = aggregate_summaries(&tel.summaries, node_f, svc_f, cutoff);
+
     let mut summaries: Vec<SummaryDto> = tel
         .summaries
         .iter()
+        .filter(|s| {
+            s.minute_epoch >= cutoff
+                && node_f.map(|n| s.node_tag == n).unwrap_or(true)
+                && svc_f.map(|sv| s.service_tag == sv).unwrap_or(true)
+        })
         .map(|s| SummaryDto {
             minute_epoch: s.minute_epoch,
             node_tag: s.node_tag.clone(),
+            role: s.role.clone(),
             service_tag: s.service_tag.clone(),
             requests: s.requests,
-            uv_estimate: s.uv_estimate(),
+            uv_estimate: s.uv_estimate().round(),
             errors: s.errors,
             rate_limited: s.rate_limited,
             challenges_issued: s.challenges_issued,
@@ -1261,14 +1439,307 @@ async fn get_telemetry(State(state): State<ApiState>, headers: HeaderMap) -> Res
             client_fp_verified: s.client_fp_verified,
         })
         .collect();
-    summaries.sort_by_key(|s| (s.minute_epoch, s.node_tag.clone(), s.service_tag.clone()));
+    summaries.sort_by_key(|s| {
+        (
+            s.minute_epoch,
+            s.node_tag.clone(),
+            s.role.clone(),
+            s.service_tag.clone(),
+        )
+    });
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
+        "traffic": agg.traffic_json,
+        "timeseries": agg.timeseries,
+        "service_breakdown": agg.service_breakdown,
+        "node_breakdown": agg.node_breakdown,
+        "device_counts": agg.device_counts,
+        "browser_counts": agg.browser_counts,
+        "os_counts": agg.os_counts,
+        "client_fp_verified": agg.client_fp_verified,
+        "available_nodes": available_nodes.into_iter().collect::<Vec<_>>(),
+        "available_services": available_services.into_iter().collect::<Vec<_>>(),
         "summaries": summaries,
         "certificates": tel.certificates,
         "maintainers": tel.maintainers,
         "links": tel.links,
         "alerts": tel.alerts,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct FingerprintQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    fp: Option<String>,
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    /// `"all" | "js" | "ua" | "beacon" | "pow"`
+    #[serde(default)]
+    verified: Option<String>,
+    /// `"all" | "bot" | "headless" | "suspicious" | "clean"`
+    #[serde(default)]
+    risk: Option<String>,
+    #[serde(default)]
+    window_secs: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn list_fingerprints(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<FingerprintQuery>,
+) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let tel = state.client.cached_telemetry().await;
+    let hmac_key = state.client.effective_logger_hmac_key().await;
+
+    let cutoff = q
+        .window_secs
+        .filter(|&w| w > 0)
+        .map(|w| Utc::now().timestamp().saturating_sub(w))
+        .unwrap_or(0);
+    let node_f = q
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
+    let svc_f = q
+        .service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "all");
+    let verified_f = q
+        .verified
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("all")
+        .to_ascii_lowercase();
+    let risk_f = q
+        .risk
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("all")
+        .to_ascii_lowercase();
+    let q_str = q
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let ip_str = q
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let fp_str = q
+        .fp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+
+    // Auto-compute cluster IP HMAC when the search query or IP filter is a literal IP address,
+    // allowing exact IP lookup even when `store_raw_ip: false`!
+    let compute_query_ip_hmac = |raw: &Option<String>| -> Option<String> {
+        let s = raw.as_deref()?;
+        let parsed = s.parse::<IpAddr>().ok()?;
+        let key = hmac_key.as_deref()?;
+        Some(hmac_ip(key, &canonical_ip(parsed).to_string()))
+    };
+    let q_ip_hmac = compute_query_ip_hmac(&q_str);
+    let ip_filter_hmac = compute_query_ip_hmac(&ip_str);
+
+    let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut available_services: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for obs in &tel.fingerprints {
+        available_nodes.insert(obs.node_tag.clone());
+        available_services.insert(obs.service_tag.clone());
+    }
+
+    let mut matched = Vec::new();
+    let mut unique_ips = std::collections::HashSet::new();
+    let mut unique_fps = std::collections::HashSet::new();
+    let mut js_verified_count: usize = 0;
+    let mut beacon_count: usize = 0;
+    let mut pow_count: usize = 0;
+    let mut bot_count: usize = 0;
+    let mut headless_count: usize = 0;
+    let mut device_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut browser_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut os_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+
+    for obs in &tel.fingerprints {
+        if obs.last_seen_ts < cutoff {
+            continue;
+        }
+        if let Some(nf) = node_f {
+            if obs.node_tag != nf {
+                continue;
+            }
+        }
+        if let Some(sf) = svc_f {
+            if obs.service_tag != sf {
+                continue;
+            }
+        }
+        match verified_f.as_str() {
+            "js" if !obs.js_verified => continue,
+            "ua" if obs.js_verified => continue,
+            "beacon" if obs.fp_source != "beacon" => continue,
+            "pow" if obs.fp_source != "pow" => continue,
+            _ => {}
+        }
+        match risk_f.as_str() {
+            "bot" if !obs.is_bot => continue,
+            "headless" if !obs.is_headless => continue,
+            "suspicious" if obs.suspicion_score < 40 && !obs.is_bot && !obs.is_headless => continue,
+            "clean" if obs.is_bot || obs.is_headless || obs.suspicion_score >= 40 => continue,
+            _ => {}
+        }
+        if let Some(ref ipq) = ip_str {
+            let raw_match = obs
+                .client_ip
+                .as_deref()
+                .map(|v| v.to_ascii_lowercase().contains(ipq))
+                .unwrap_or(false);
+            let prefix_match = obs.ip_prefix.to_ascii_lowercase().contains(ipq);
+            let hmac_sub_match = obs.ip_hmac.to_ascii_lowercase().contains(ipq);
+            let hmac_exact_match = ip_filter_hmac
+                .as_deref()
+                .map(|h| obs.ip_hmac.eq_ignore_ascii_case(h))
+                .unwrap_or(false);
+            if !(raw_match || prefix_match || hmac_sub_match || hmac_exact_match) {
+                continue;
+            }
+        }
+        if let Some(ref fpq) = fp_str {
+            let hash_match = obs.fp_hash.to_ascii_lowercase().contains(fpq);
+            let canvas_match = obs
+                .js_fp
+                .as_ref()
+                .map(|j| {
+                    j.canvas_hash.to_ascii_lowercase().contains(fpq)
+                        || j.webgl.to_ascii_lowercase().contains(fpq)
+                        || j.platform.to_ascii_lowercase().contains(fpq)
+                        || j.screen.to_ascii_lowercase().contains(fpq)
+                })
+                .unwrap_or(false);
+            if !(hash_match || canvas_match) {
+                continue;
+            }
+        }
+        if let Some(ref qs) = q_str {
+            let hmac_exact = q_ip_hmac
+                .as_deref()
+                .map(|h| obs.ip_hmac.eq_ignore_ascii_case(h))
+                .unwrap_or(false);
+            let hit = hmac_exact
+                || obs
+                    .client_ip
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || obs.ip_prefix.to_ascii_lowercase().contains(qs)
+                || obs.ip_hmac.to_ascii_lowercase().contains(qs)
+                || obs.fp_hash.to_ascii_lowercase().contains(qs)
+                || obs.user_agent.to_ascii_lowercase().contains(qs)
+                || obs.host.to_ascii_lowercase().contains(qs)
+                || obs.service_tag.to_ascii_lowercase().contains(qs)
+                || obs.node_tag.to_ascii_lowercase().contains(qs)
+                || obs.browser_family.to_ascii_lowercase().contains(qs)
+                || obs.os_family.to_ascii_lowercase().contains(qs)
+                || obs.device_type.to_ascii_lowercase().contains(qs)
+                || obs
+                    .js_fp
+                    .as_ref()
+                    .map(|j| {
+                        j.webgl.to_ascii_lowercase().contains(qs)
+                            || j.canvas_hash.to_ascii_lowercase().contains(qs)
+                            || j.platform.to_ascii_lowercase().contains(qs)
+                            || j.tz.to_ascii_lowercase().contains(qs)
+                            || j.screen.to_ascii_lowercase().contains(qs)
+                    })
+                    .unwrap_or(false);
+            if !hit {
+                continue;
+            }
+        }
+
+        unique_ips.insert(obs.ip_hmac.clone());
+        unique_fps.insert(obs.fp_hash.clone());
+        if obs.js_verified {
+            js_verified_count += 1;
+        }
+        if obs.fp_source == "beacon" {
+            beacon_count += 1;
+        } else if obs.fp_source == "pow" {
+            pow_count += 1;
+        }
+        if obs.is_bot {
+            bot_count += 1;
+        }
+        if obs.is_headless {
+            headless_count += 1;
+        }
+        if !obs.device_type.is_empty() {
+            *device_counts.entry(obs.device_type.clone()).or_insert(0) += 1;
+        }
+        if !obs.browser_family.is_empty() {
+            *browser_counts.entry(obs.browser_family.clone()).or_insert(0) += 1;
+        }
+        if !obs.os_family.is_empty() {
+            *os_counts.entry(obs.os_family.clone()).or_insert(0) += 1;
+        }
+        matched.push(obs);
+    }
+
+    let total_matched = matched.len();
+    let limit = q.limit.unwrap_or(150).clamp(1, 500);
+    matched.truncate(limit);
+
+    let store_raw_ip_enabled = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .ok()
+        .and_then(|y| serde_yaml::from_str::<TopologySpec>(&y).ok())
+        .and_then(|t| t.global_logger)
+        .map(|l| l.store_raw_ip)
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "last_pulled_at": tel.last_pulled_at,
+        "total_matched": total_matched,
+        "store_raw_ip_enabled": store_raw_ip_enabled,
+        "summary": {
+            "total_visitors": total_matched,
+            "unique_ips": unique_ips.len(),
+            "unique_fps": unique_fps.len(),
+            "js_verified": js_verified_count,
+            "beacon_count": beacon_count,
+            "pow_count": pow_count,
+            "bots": bot_count,
+            "headless": headless_count,
+        },
+        "device_counts": device_counts,
+        "browser_counts": browser_counts,
+        "os_counts": os_counts,
+        "available_nodes": available_nodes.into_iter().collect::<Vec<_>>(),
+        "available_services": available_services.into_iter().collect::<Vec<_>>(),
+        "items": matched,
     }))
     .into_response()
 }

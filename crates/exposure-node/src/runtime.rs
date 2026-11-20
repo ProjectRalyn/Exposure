@@ -435,12 +435,13 @@ impl NodeRuntime {
                 from_node,
                 records,
                 minute_summaries,
+                fingerprints,
             } => {
                 if !incoming.authenticated {
                     None
                 } else if let Some(maint) = self.maintainer.read().await.clone() {
                     let accepted = maint
-                        .ingest_log_batch(&from_node, records, minute_summaries)
+                        .ingest_log_batch(&from_node, records, minute_summaries, fingerprints)
                         .await;
                     Some(SpecialPayload::LogAck { accepted })
                 } else {
@@ -536,7 +537,7 @@ impl NodeRuntime {
                     .await
                     .link_listener
                     .as_ref()
-                    .map(|l| l.allow_bootstrap)
+                    .map(|l| l.effective_allow_bootstrap())
                     .unwrap_or(false);
                 if !allow_boot {
                     Some(SpecialPayload::BootstrapReply {
@@ -1393,8 +1394,8 @@ impl NodeRuntime {
                 }
                 let hops = rt.config.read().await.maintainer_hops.clone();
                 if hops.len() >= 2 {
-                    let (records, summaries) = rt.logger.drain_for_maintainer().await;
-                    if !records.is_empty() || !summaries.is_empty() {
+                    let (records, summaries, fingerprints) = rt.logger.drain_for_maintainer().await;
+                    if !records.is_empty() || !summaries.is_empty() || !fingerprints.is_empty() {
                         let frame = SpecialFrame::new(
                             Uuid::new_v4().to_string(),
                             hops,
@@ -1403,11 +1404,14 @@ impl NodeRuntime {
                                 from_node: rt.node_tag(),
                                 records: records.clone(),
                                 minute_summaries: summaries.clone(),
+                                fingerprints: fingerprints.clone(),
                             },
                         );
                         if let Err(e) = rt.forwarder.send_special(frame).await {
                             warn!(error = %e, "failed to push log batch to maintainer; requeuing");
-                            rt.logger.requeue_for_maintainer(records, summaries).await;
+                            rt.logger
+                                .requeue_for_maintainer(records, summaries, fingerprints)
+                                .await;
                         }
                     }
                 }

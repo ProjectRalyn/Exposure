@@ -523,6 +523,98 @@ pub fn verify_challenge_token(
     expected.len() == sig.len() && bool::from(expected.as_bytes().ct_eq(sig.as_bytes()))
 }
 
+/// Signed passive JS fingerprint cookie claims (avoids re-injecting FP beacon until TTL expires).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FpCookieClaims {
+    pub host: String,
+    pub expires_at: i64,
+    pub ua_hash: String,
+    pub ip_prefix: String,
+    pub fp_hash: String,
+    #[serde(default)]
+    pub is_headless: bool,
+}
+
+pub fn sign_fp_cookie(secret: &str, claims: &FpCookieClaims) -> Result<String> {
+    let payload = serde_json::to_vec(claims)
+        .map_err(|e| ExposureError::Crypto(format!("serialize fp cookie claims: {e}")))?;
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload);
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"exposure-fp-cookie-v1:");
+    mac.update(payload_b64.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{payload_b64}.{sig_b64}"))
+}
+
+pub fn verify_fp_cookie(secret: &str, cookie_val: &str) -> Result<FpCookieClaims> {
+    let (payload_b64, sig_b64) = cookie_val
+        .split_once('.')
+        .ok_or_else(|| ExposureError::Auth("malformed fp cookie".into()))?;
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"exposure-fp-cookie-v1:");
+    mac.update(payload_b64.as_bytes());
+    let expected_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let eq: bool = expected_b64.len() == sig_b64.len()
+        && bool::from(expected_b64.as_bytes().ct_eq(sig_b64.as_bytes()));
+    if !eq {
+        return Err(ExposureError::Auth("invalid fp cookie signature".into()));
+    }
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|e| ExposureError::Auth(format!("invalid fp cookie payload: {e}")))?;
+    let claims: FpCookieClaims = serde_json::from_slice(&payload)
+        .map_err(|e| ExposureError::Auth(format!("invalid fp cookie JSON: {e}")))?;
+    Ok(claims)
+}
+
+/// Sign a short-lived single-use passive JS fingerprint report token bound to
+/// `(host, client_ip_prefix, ua_hash, service_tag, token_id, expires_at)`.
+pub fn sign_fp_token(
+    secret: &str,
+    host: &str,
+    ip_prefix: &str,
+    ua_hash: &str,
+    service_tag: &str,
+    token_id: &str,
+    expires_at: i64,
+) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"exposure-fp-report-v1:");
+    mac_update_lp(&mut mac, host.as_bytes());
+    mac_update_lp(&mut mac, ip_prefix.as_bytes());
+    mac_update_lp(&mut mac, ua_hash.as_bytes());
+    mac_update_lp(&mut mac, service_tag.as_bytes());
+    mac_update_lp(&mut mac, token_id.as_bytes());
+    mac.update(&expires_at.to_be_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_fp_token(
+    secret: &str,
+    host: &str,
+    ip_prefix: &str,
+    ua_hash: &str,
+    service_tag: &str,
+    token_id: &str,
+    expires_at: i64,
+    sig: &str,
+) -> bool {
+    let expected = sign_fp_token(
+        secret,
+        host,
+        ip_prefix,
+        ua_hash,
+        service_tag,
+        token_id,
+        expires_at,
+    );
+    expected.len() == sig.len() && bool::from(expected.as_bytes().ct_eq(sig.as_bytes()))
+}
+
 pub fn short_sha256_hex(input: &str) -> String {
     let mut h = Sha256::new();
     h.update(input.as_bytes());

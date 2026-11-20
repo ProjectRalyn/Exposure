@@ -1,18 +1,23 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::{IngressConfig, IngressListener};
-use exposure_core::crypto::{generate_random_secret_hex, is_weak_secret, NodeKeyPair};
+use exposure_core::crypto::{
+    generate_random_secret_hex, is_weak_secret, short_sha256_hex, NodeKeyPair,
+};
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
 use exposure_core::routing::{canonical_ip, match_ingress_rule, normalize_host};
 use exposure_core::Result;
 use http::{header, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Limited};
-use hyper::body::{Body, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
@@ -25,7 +30,7 @@ use uuid::Uuid;
 
 use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
-use crate::guard::{sanitize_redirect, GuardDecision, GuardEngine};
+use crate::guard::{compute_suspicion_score, sanitize_redirect, GuardDecision, GuardEngine};
 use crate::logger::NodeLogger;
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
 
@@ -33,6 +38,7 @@ const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
+const MAX_HTML_INJECT_BYTES: usize = 2 * 1024 * 1024;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn ensure_strong_clearance_secret(mut cfg: IngressConfig, node_tag: &str) -> IngressConfig {
@@ -384,7 +390,7 @@ impl IngressServer {
                 }
             }
 
-            let g_resp = self.guard.handle_cdn_cgi(
+            let (g_resp, verified_fp_sub) = self.guard.handle_cdn_cgi(
                 &method,
                 &path,
                 &body_bytes,
@@ -394,15 +400,59 @@ impl IngressServer {
                 is_tls,
                 guard_profile,
                 &cfg.clearance_secret,
+                cfg.effective_js_fp_ttl_secs(),
             );
 
             let passed = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::OK;
+            let ua_str = headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let al_str = headers
+                .get(header::ACCEPT_LANGUAGE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let cfp_cls = crate::guard::classify_client(&headers);
+            let score = compute_suspicion_score(&headers, tls_signal);
+
+            if let Some(sub) = verified_fp_sub {
+                let svc_tag = sub
+                    .service_tag
+                    .as_deref()
+                    .or_else(|| matched_rule.map(|r| r.service_tag.as_str()))
+                    .unwrap_or("_cdn_cgi");
+                self.logger
+                    .record_fingerprint(
+                        svc_tag,
+                        &host,
+                        &client_ip.to_string(),
+                        &sub.fp_hash,
+                        true,
+                        sub.fp_source,
+                        ua_str,
+                        al_str,
+                        cfp_cls.device_type,
+                        cfp_cls.browser_family,
+                        cfp_cls.os_family,
+                        cfp_cls.is_bot,
+                        sub.is_headless,
+                        score,
+                        tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                        tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                        Some(sub.js_fp),
+                        if sub.fp_source == "pow" { 1 } else { 0 },
+                        0,
+                        0,
+                    )
+                    .await;
+            }
+
             if passed {
                 let svc_tag = matched_rule
                     .map(|r| r.service_tag.as_str())
                     .unwrap_or("_cdn_cgi");
                 self.logger
-                    .record_session(
+                    .record_session_with_fp(
                         "ingress",
                         svc_tag,
                         &client_ip.to_string(),
@@ -414,6 +464,10 @@ impl IngressServer {
                         false,
                         true,
                         None,
+                        Some(cfp_cls.device_type.to_string()),
+                        Some(cfp_cls.browser_family.to_string()),
+                        Some(cfp_cls.os_family.to_string()),
+                        true,
                     )
                     .await;
             }
@@ -438,6 +492,22 @@ impl IngressServer {
             }
         };
 
+        let client_fp = crate::guard::classify_client(req.headers());
+        let ua_str = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let al_str = req
+            .headers()
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let suspicion_score = compute_suspicion_score(req.headers(), tls_signal);
+        let fallback_fp_hash = short_sha256_hex(&format!("ua|{ua_str}|{al_str}"));
+
         let mut active_profile = None;
         // Evaluate Entry Guard if attached to this route (fail closed on undefined guard name!)
         if let Some(ref guard_name) = rule.guard {
@@ -457,7 +527,7 @@ impl IngressServer {
                         GuardDecision::Allow => {}
                         GuardDecision::RateLimited { retry_after_secs } => {
                             self.logger
-                                .record_session(
+                                .record_session_with_fp(
                                     "ingress",
                                     &rule.service_tag,
                                     &client_ip.to_string(),
@@ -469,9 +539,37 @@ impl IngressServer {
                                     false,
                                     false,
                                     None,
+                                    Some(client_fp.device_type.to_string()),
+                                    Some(client_fp.browser_family.to_string()),
+                                    Some(client_fp.os_family.to_string()),
+                                    false,
                                 )
                                 .await;
-                            if rule.intercept_errors {
+                            self.logger
+                                .record_fingerprint(
+                                    &rule.service_tag,
+                                    &host,
+                                    &client_ip.to_string(),
+                                    &fallback_fp_hash,
+                                    false,
+                                    "none",
+                                    &ua_str,
+                                    &al_str,
+                                    client_fp.device_type,
+                                    client_fp.browser_family,
+                                    client_fp.os_family,
+                                    client_fp.is_bot,
+                                    false,
+                                    suspicion_score,
+                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                    None,
+                                    1,
+                                    0,
+                                    1,
+                                )
+                                .await;
+                            if rule.effective_intercept_errors() {
                                 let html = exposure_core::assets::render_exposure_error_html(
                                     429,
                                     "Too Many Requests",
@@ -495,7 +593,7 @@ impl IngressServer {
                         }
                         GuardDecision::Reject { status, reason } => {
                             self.logger
-                                .record_session(
+                                .record_session_with_fp(
                                     "ingress",
                                     &rule.service_tag,
                                     &client_ip.to_string(),
@@ -507,6 +605,34 @@ impl IngressServer {
                                     true,
                                     false,
                                     Some(reason),
+                                    Some(client_fp.device_type.to_string()),
+                                    Some(client_fp.browser_family.to_string()),
+                                    Some(client_fp.os_family.to_string()),
+                                    false,
+                                )
+                                .await;
+                            self.logger
+                                .record_fingerprint(
+                                    &rule.service_tag,
+                                    &host,
+                                    &client_ip.to_string(),
+                                    &fallback_fp_hash,
+                                    false,
+                                    "none",
+                                    &ua_str,
+                                    &al_str,
+                                    client_fp.device_type,
+                                    client_fp.browser_family,
+                                    client_fp.os_family,
+                                    client_fp.is_bot,
+                                    false,
+                                    suspicion_score,
+                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                    None,
+                                    1,
+                                    1,
+                                    0,
                                 )
                                 .await;
                             return Response::builder()
@@ -516,7 +642,7 @@ impl IngressServer {
                         }
                         GuardDecision::ChallengeRedirect { location } => {
                             self.logger
-                                .record_session(
+                                .record_session_with_fp(
                                     "ingress",
                                     &rule.service_tag,
                                     &client_ip.to_string(),
@@ -528,6 +654,34 @@ impl IngressServer {
                                     true,
                                     false,
                                     None,
+                                    Some(client_fp.device_type.to_string()),
+                                    Some(client_fp.browser_family.to_string()),
+                                    Some(client_fp.os_family.to_string()),
+                                    false,
+                                )
+                                .await;
+                            self.logger
+                                .record_fingerprint(
+                                    &rule.service_tag,
+                                    &host,
+                                    &client_ip.to_string(),
+                                    &fallback_fp_hash,
+                                    false,
+                                    "none",
+                                    &ua_str,
+                                    &al_str,
+                                    client_fp.device_type,
+                                    client_fp.browser_family,
+                                    client_fp.os_family,
+                                    client_fp.is_bot,
+                                    false,
+                                    suspicion_score,
+                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                    None,
+                                    1,
+                                    1,
+                                    0,
                                 )
                                 .await;
                             return Response::builder()
@@ -553,14 +707,44 @@ impl IngressServer {
             }
         }
 
-        let client_fp = crate::guard::classify_client(req.headers());
-        let fp_verified = self.guard.has_valid_fp_clearance(
+        let verified_info = self.guard.verified_fp_info(
             active_profile,
             &cfg.clearance_secret,
             &host,
             client_ip,
             req.headers(),
         );
+        let fp_verified = verified_info.is_some();
+        let (obs_fp_hash, obs_fp_source, obs_is_headless) = match verified_info {
+            Some((h, src, hl)) => (h, src, hl),
+            None => (fallback_fp_hash, "none", false),
+        };
+
+        let is_upgrade = req.headers().contains_key(header::UPGRADE);
+        // Decide BEFORE upstream forwarding whether this single HTML navigation needs passive JS FP beacon injection
+        let fp_inject_token = if self.guard.should_inject_fp_beacon(
+            req.method(),
+            is_upgrade,
+            client_ip,
+            &host,
+            req.headers(),
+            &cfg.clearance_secret,
+            active_profile,
+            cfg.effective_js_fp_beacon(),
+            rule.js_fp_beacon,
+        ) {
+            // Request uncompressed HTML from upstream for this single probe request only (once per TTL per browser)
+            req.headers_mut().remove(header::ACCEPT_ENCODING);
+            Some(self.guard.mint_fp_token(
+                &cfg.clearance_secret,
+                &host,
+                client_ip,
+                req.headers(),
+                &rule.service_tag,
+            ))
+        } else {
+            None
+        };
 
         // Strip untrusted client-supplied forwarding headers before injecting authoritative values
         for h in [
@@ -593,7 +777,6 @@ impl IngressServer {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| req.body().size_hint().lower());
 
-        let is_upgrade = req.headers().contains_key(header::UPGRADE);
         let use_h2_mesh = req.version() == Version::HTTP_2 && !is_upgrade;
         strip_hop_by_hop_headers(req.headers_mut(), use_h2_mesh, is_upgrade);
 
@@ -767,7 +950,10 @@ impl IngressServer {
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         match proxy_res {
-            Ok(resp) => {
+            Ok(mut resp) => {
+                if let Some(ref fp_token) = fp_inject_token {
+                    resp = maybe_inject_fp_beacon(resp, fp_token).await;
+                }
                 let resp_bytes_out = resp
                     .headers()
                     .get(header::CONTENT_LENGTH)
@@ -791,6 +977,30 @@ impl IngressServer {
                         Some(client_fp.browser_family.to_string()),
                         Some(client_fp.os_family.to_string()),
                         fp_verified,
+                    )
+                    .await;
+                self.logger
+                    .record_fingerprint(
+                        &rule.service_tag,
+                        &host,
+                        &client_ip.to_string(),
+                        &obs_fp_hash,
+                        fp_verified,
+                        obs_fp_source,
+                        &ua_str,
+                        &al_str,
+                        client_fp.device_type,
+                        client_fp.browser_family,
+                        client_fp.os_family,
+                        client_fp.is_bot,
+                        obs_is_headless,
+                        suspicion_score,
+                        tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                        tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                        None,
+                        1,
+                        0,
+                        0,
                     )
                     .await;
                 resp
@@ -817,7 +1027,7 @@ impl IngressServer {
                 } else {
                     ("Bad Gateway", "The upstream server is temporarily unavailable.")
                 };
-                if rule.intercept_errors {
+                if rule.effective_intercept_errors() {
                     let html = exposure_core::assets::render_exposure_error_html(
                         err_status.as_u16(),
                         title,
@@ -839,6 +1049,128 @@ impl IngressServer {
             }
         }
     }
+}
+
+/// Pass-through body wrapper prepending already-buffered bytes ahead of an unconsumed stream.
+struct PrefixBody {
+    prefix: Option<Bytes>,
+    rest: ProxyBody,
+}
+
+impl Body for PrefixBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(buf) = self.prefix.take() {
+            if !buf.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(buf))));
+            }
+        }
+        Pin::new(&mut self.rest).poll_frame(cx)
+    }
+}
+
+/// Inject `<script defer src="/cdn-cgi/fp.js" data-t="..."></script>` into eligible uncompressed 2xx HTML responses.
+/// Safely passes through oversized or non-HTML responses untouched.
+async fn maybe_inject_fp_beacon(resp: Response<ProxyBody>, fp_token: &str) -> Response<ProxyBody> {
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().starts_with("text/html"))
+        .unwrap_or(false);
+    if !is_html {
+        return resp;
+    }
+    let is_uncompressed = resp
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|ce| ce.trim().is_empty() || ce.eq_ignore_ascii_case("identity"))
+        .unwrap_or(true);
+    if !is_uncompressed {
+        return resp;
+    }
+    if let Some(cl) = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if cl > MAX_HTML_INJECT_BYTES {
+            return resp;
+        }
+    }
+
+    let (mut parts, mut body) = resp.into_parts();
+    let mut collected = Vec::new();
+    let mut exceeded = false;
+    while let Some(frame_res) = body.frame().await {
+        match frame_res {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    collected.extend_from_slice(data);
+                    if collected.len() > MAX_HTML_INJECT_BYTES {
+                        exceeded = true;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                return Response::from_parts(parts, full_body(collected));
+            }
+        }
+    }
+
+    if exceeded {
+        let chained = PrefixBody {
+            prefix: Some(Bytes::from(collected)),
+            rest: body,
+        };
+        return Response::from_parts(parts, chained.boxed());
+    }
+
+    let snippet = format!(
+        r#"<script defer src="/cdn-cgi/fp.js" data-t="{fp_token}"></script>"#
+    );
+    let injected = inject_script_into_html(&collected, snippet.as_bytes());
+    parts.headers.remove(header::ETAG);
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    if let Ok(hv) = HeaderValue::from_str(&injected.len().to_string()) {
+        parts.headers.insert(header::CONTENT_LENGTH, hv);
+    }
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    Response::from_parts(parts, full_body(injected))
+}
+
+fn find_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
+    if needle_lower.is_empty() || haystack.len() < needle_lower.len() {
+        return None;
+    }
+    haystack
+        .windows(needle_lower.len())
+        .position(|w| w.iter().zip(needle_lower).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
+fn inject_script_into_html(html: &[u8], snippet: &[u8]) -> Vec<u8> {
+    let pos = find_ascii_case_insensitive(html, b"</body>")
+        .or_else(|| find_ascii_case_insensitive(html, b"</head>"))
+        .unwrap_or(html.len());
+    let mut out = Vec::with_capacity(html.len() + snippet.len());
+    out.extend_from_slice(&html[..pos]);
+    out.extend_from_slice(snippet);
+    out.extend_from_slice(&html[pos..]);
+    out
 }
 
 fn extract_and_validate_host(
