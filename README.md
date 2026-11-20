@@ -10,6 +10,94 @@ Exposure lets you securely publish internal or NAT-bound services across untrust
 
 ---
 
+## Quick Start
+
+### 1. One-Line Install (Linux systemd, Recommended)
+
+Run the installer to automatically download the latest release binary (with `SHA256SUMS.txt` verification), interactively configure `node` or `control` initialization settings, register the hardened `systemd` service, and print the **Onboarding** details (including the one-time 5-word passphrase and node public key):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash
+```
+
+Non-interactive examples:
+
+```bash
+# Install and start an Ingress + Relay node
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash -s -- \
+  --role node -y --tag ingress-hk --listen 0.0.0.0:10802 --ingress --relay
+
+# Install and start the Control plane
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash -s -- \
+  --role control -y --panel 127.0.0.1:8090
+
+# Uninstall (add --purge to also remove /etc/exposure and /var/lib/exposure)
+sudo ./install.sh --uninstall
+```
+
+> Pass `--bin /path/to/exposure` to install a locally compiled binary instead of downloading from GitHub Releases, or `--version <tag>` to pin a specific release.
+
+### 2. Build from Source (Manual)
+
+Prerequisites:
+- Rust toolchain (`rustc` / `cargo`, 2021 edition)
+- Node.js & `pnpm` (only needed if rebuilding the embedded web UI in `web/`)
+
+```bash
+# Optional: rebuild embedded web UI assets (Control Panel & PoW Challenge UI)
+cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
+
+# Build the release binary
+cargo build --release --bin exposure
+```
+
+The compiled binary will be at `target/release/exposure`.
+
+### 3. Initialize a Control Plane & First Node
+
+Generate a node configuration (which emits a one-time 5-word onboarding passphrase valid for 10 minutes on first start):
+
+```bash
+./target/release/exposure init-node \
+  --tag edge-1 \
+  --output ./node.yaml \
+  --listen 0.0.0.0:10802 \
+  --ingress --egress
+```
+
+Initialize the Control plane configuration:
+
+```bash
+./target/release/exposure init-control \
+  --id control-1 \
+  --output ./control.yaml \
+  --panel 127.0.0.1:8090 \
+  --admin-user admin \
+  --admin-password "change-me-now" \
+  --bootstrap-tag edge-1 \
+  --bootstrap-addr 127.0.0.1:10802 \
+  --bootstrap-passphrase "<five-word-passphrase>"
+```
+
+Start the Node and Control plane in separate terminals:
+
+```bash
+./target/release/exposure node --config ./node.yaml
+./target/release/exposure control --config ./control.yaml
+```
+
+Open `http://127.0.0.1:8090` in your browser to access the Control Web Admin Panel.
+
+### 4. Validate a Topology File
+
+Before applying a declarative topology (see [`examples/topology.yaml`](examples/topology.yaml)), validate it with the Control compiler:
+
+```bash
+./target/release/exposure validate-topology --file examples/topology.yaml
+```
+
+---
+
 ## Features
 
 - **Encrypted & Multiplexed Mesh Links (`exposure-link`)**
@@ -54,88 +142,6 @@ Exposure lets you securely publish internal or NAT-bound services across untrust
 ```
 
 For a deep dive into the protocol, security model, routing, and subsystem internals, see [DESIGN.md](DESIGN.md).
-
----
-
-## Quick Start
-
-### 1. Build from Source
-
-Prerequisites:
-- Rust toolchain (`rustc` / `cargo`, 2021 edition)
-- Node.js & `pnpm` (only needed if rebuilding the embedded web UI in `web/`)
-
-```bash
-# Optional: rebuild embedded web UI assets (Control Panel & PoW Challenge UI)
-cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
-
-# Build the release binary
-cargo build --release --bin exposure
-```
-
-The compiled binary will be at `target/release/exposure`.
-
-### 2. Initialize a Control Plane & First Node
-
-Generate a node configuration (which emits a one-time 5-word onboarding passphrase valid for 10 minutes):
-
-```bash
-./target/release/exposure init-node \
-  --tag edge-1 \
-  --output ./node.yaml \
-  --listen 0.0.0.0:9443 \
-  --ingress --egress
-```
-
-Initialize the Control plane configuration:
-
-```bash
-./target/release/exposure init-control \
-  --id control-1 \
-  --output ./control.yaml \
-  --panel 127.0.0.1:8090 \
-  --admin-user admin \
-  --admin-password "change-me-now" \
-  --bootstrap-tag edge-1 \
-  --bootstrap-addr 127.0.0.1:9443 \
-  --bootstrap-passphrase "<five-word-passphrase>"
-```
-
-Start the Node and Control plane in separate terminals:
-
-```bash
-./target/release/exposure node --config ./node.yaml
-./target/release/exposure control --config ./control.yaml
-```
-
-Open `http://127.0.0.1:8090` in your browser to access the Control Web Admin Panel.
-
-### 3. Validate a Topology File
-
-Before applying a declarative topology (see [`examples/topology.yaml`](examples/topology.yaml)), validate it with the Control compiler:
-
-```bash
-./target/release/exposure validate-topology --file examples/topology.yaml
-```
-
----
-
-## Linux Installation (`install.sh`)
-
-For systemd-based Linux deployments, `install.sh` automates binary installation, config initialization, and service setup:
-
-```bash
-# Install binary and configure an Ingress + Relay node
-sudo ./install.sh --role node --bin ./target/release/exposure \
-  --tag ingress-hk --listen 0.0.0.0:9443 --ingress --relay
-
-# Install binary and configure the Control plane
-sudo ./install.sh --role control --bin ./target/release/exposure \
-  --panel 127.0.0.1:8090
-
-# Uninstall (add --purge to remove /etc/exposure and /var/lib/exposure)
-sudo ./install.sh --uninstall
-```
 
 ---
 

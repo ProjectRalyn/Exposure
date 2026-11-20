@@ -10,6 +10,94 @@ Exposure 支持通过可组合的 **Ingress**、**Relay**、**Egress** 和 **Mai
 
 ---
 
+## 快速开始
+
+### 1. 一键安装（Linux systemd，推荐）
+
+运行安装脚本会自动从最新 GitHub Release 拉取对应架构产物（并通过 `SHA256SUMS.txt` 校验完整性）、交互式引导填写 `node` 或 `control` 的初始化参数、注册加固版 `systemd` 服务，并在完成后直接输出可直接填入 Control 面板 **Onboarding** 页面的信息（含一次性 5 词口令、节点公钥与接入地址）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash
+```
+
+非交互模式示例：
+
+```bash
+# 安装并启动 Ingress + Relay 节点
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash -s -- \
+  --role node -y --tag ingress-hk --listen 0.0.0.0:10802 --ingress --relay
+
+# 安装并启动 Control 控制面
+curl -fsSL https://raw.githubusercontent.com/ProjectRalyn/Exposure/main/install.sh | sudo bash -s -- \
+  --role control -y --panel 127.0.0.1:8090
+
+# 卸载（附加 --purge 将同时清理 /etc/exposure 与 /var/lib/exposure）
+sudo ./install.sh --uninstall
+```
+
+> 如需使用本地编译的二进制文件，可传入 `--bin /path/to/exposure`；如需指定版本，可传入 `--version <tag>`。
+
+### 2. 从源码构建（手动部署）
+
+前置依赖：
+- Rust 工具链（`rustc` / `cargo`，2021 edition）
+- Node.js 与 `pnpm`（仅在需要重新构建 `web/` 内的前端资源时使用）
+
+```bash
+# 可选：重新构建内嵌前端资源（Control 管理面板与 PoW 挑战页）
+cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
+
+# 构建 Release 二进制文件
+cargo build --release --bin exposure
+```
+
+编译产物位于 `target/release/exposure`。
+
+### 3. 初始化控制面与首个节点
+
+生成节点配置（首次启动节点时将输出一个有效期为 10 分钟的一次性 5 词引导口令）：
+
+```bash
+./target/release/exposure init-node \
+  --tag edge-1 \
+  --output ./node.yaml \
+  --listen 0.0.0.0:10802 \
+  --ingress --egress
+```
+
+初始化 Control 控制面配置：
+
+```bash
+./target/release/exposure init-control \
+  --id control-1 \
+  --output ./control.yaml \
+  --panel 127.0.0.1:8090 \
+  --admin-user admin \
+  --admin-password "change-me-now" \
+  --bootstrap-tag edge-1 \
+  --bootstrap-addr 127.0.0.1:10802 \
+  --bootstrap-passphrase "<five-word-passphrase>"
+```
+
+在不同终端中分别启动 Node 与 Control：
+
+```bash
+./target/release/exposure node --config ./node.yaml
+./target/release/exposure control --config ./control.yaml
+```
+
+在浏览器中打开 `http://127.0.0.1:8090` 即可访问 Control Web 管理面板。
+
+### 4. 校验拓扑文件
+
+在应用声明式拓扑配置（参考 [`examples/topology.yaml`](examples/topology.yaml)）前，可使用 Control 编译器进行校验：
+
+```bash
+./target/release/exposure validate-topology --file examples/topology.yaml
+```
+
+---
+
 ## 核心特性
 
 - **加密多路复用网格链路（`exposure-link`）**
@@ -54,88 +142,6 @@ Exposure 支持通过可组合的 **Ingress**、**Relay**、**Egress** 和 **Mai
 ```
 
 关于协议细节、安全模型、路由机制与子系统设计的完整说明，请参阅 [DESIGN.zh-CN.md](DESIGN.zh-CN.md)。
-
----
-
-## 快速开始
-
-### 1. 从源码构建
-
-前置依赖：
-- Rust 工具链（`rustc` / `cargo`，2021 edition）
-- Node.js 与 `pnpm`（仅在需要重新构建 `web/` 内的前端资源时使用）
-
-```bash
-# 可选：重新构建内嵌前端资源（Control 管理面板与 PoW 挑战页）
-cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
-
-# 构建 Release 二进制文件
-cargo build --release --bin exposure
-```
-
-编译产物位于 `target/release/exposure`。
-
-### 2. 初始化控制面与首个节点
-
-生成节点配置（将输出一个有效期为 10 分钟的一次性 5 词引导口令）：
-
-```bash
-./target/release/exposure init-node \
-  --tag edge-1 \
-  --output ./node.yaml \
-  --listen 0.0.0.0:9443 \
-  --ingress --egress
-```
-
-初始化 Control 控制面配置：
-
-```bash
-./target/release/exposure init-control \
-  --id control-1 \
-  --output ./control.yaml \
-  --panel 127.0.0.1:8090 \
-  --admin-user admin \
-  --admin-password "change-me-now" \
-  --bootstrap-tag edge-1 \
-  --bootstrap-addr 127.0.0.1:9443 \
-  --bootstrap-passphrase "<five-word-passphrase>"
-```
-
-在不同终端中分别启动 Node 与 Control：
-
-```bash
-./target/release/exposure node --config ./node.yaml
-./target/release/exposure control --config ./control.yaml
-```
-
-在浏览器中打开 `http://127.0.0.1:8090` 即可访问 Control Web 管理面板。
-
-### 3. 校验拓扑文件
-
-在应用声明式拓扑配置（参考 [`examples/topology.yaml`](examples/topology.yaml)）前，可使用 Control 编译器进行校验：
-
-```bash
-./target/release/exposure validate-topology --file examples/topology.yaml
-```
-
----
-
-## Linux 部署脚本（`install.sh`）
-
-针对基于 systemd 的 Linux 环境，`install.sh` 提供二进制安装、配置初始化及 systemd 服务注册的一键能力：
-
-```bash
-# 安装二进制并配置 Ingress + Relay 节点
-sudo ./install.sh --role node --bin ./target/release/exposure \
-  --tag ingress-hk --listen 0.0.0.0:9443 --ingress --relay
-
-# 安装二进制并配置 Control 控制面
-sudo ./install.sh --role control --bin ./target/release/exposure \
-  --panel 127.0.0.1:8090
-
-# 卸载（附加 --purge 将同时清理 /etc/exposure 与 /var/lib/exposure）
-sudo ./install.sh --uninstall
-```
 
 ---
 
