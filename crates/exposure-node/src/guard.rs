@@ -48,6 +48,13 @@ struct TokenBucketState {
     last_refill: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct AggregatedClientSession {
+    expires_at: i64,
+    has_fp: bool,
+    is_headless: bool,
+}
+
 pub enum GuardDecision {
     Allow,
     RateLimited { retry_after_secs: u64 },
@@ -78,6 +85,8 @@ pub struct GuardEngine {
     fp_report_limiter: DashMap<String, TokenBucketState>,
     /// Per-(ip_prefix, host) injection cooldown so parallel HTML fetches don't re-inject beacons.
     fp_inject_cooldown: DashMap<(String, String), Instant>,
+    /// Aggregated verified client/device sessions keyed by `(host, client_ip, ua_hash)` so page navigations and API/fetch calls share trust.
+    aggregated_sessions: DashMap<(String, IpAddr, String), AggregatedClientSession>,
 }
 
 impl Default for GuardEngine {
@@ -94,7 +103,45 @@ impl GuardEngine {
             spent_fp_tokens: DashMap::new(),
             fp_report_limiter: DashMap::new(),
             fp_inject_cooldown: DashMap::new(),
+            aggregated_sessions: DashMap::new(),
         }
+    }
+
+    fn client_session_key(&self, host: &str, client_ip: IpAddr, headers: &HeaderMap) -> (String, IpAddr, String) {
+        let host_clean = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        (host_clean, canonical_ip(client_ip), short_sha256_hex(ua))
+    }
+
+    fn record_aggregated_session(
+        &self,
+        host: &str,
+        client_ip: IpAddr,
+        headers: &HeaderMap,
+        expires_at: i64,
+        has_fp: bool,
+        is_headless: bool,
+    ) {
+        let now = Utc::now().timestamp();
+        if self.aggregated_sessions.len() >= MAX_RATE_LIMIT_BUCKETS {
+            self.aggregated_sessions.retain(|_, v| v.expires_at > now);
+        }
+        let key = self.client_session_key(host, client_ip, headers);
+        self.aggregated_sessions
+            .entry(key)
+            .and_modify(|e| {
+                e.expires_at = e.expires_at.max(expires_at);
+                e.has_fp = e.has_fp || has_fp;
+                e.is_headless = e.is_headless || is_headless;
+            })
+            .or_insert(AggregatedClientSession {
+                expires_at,
+                has_fp,
+                is_headless,
+            });
     }
 
     /// Evaluate ONLY CIDR + Rate Limit checks (used on `/cdn-cgi/*` before PoW handling).
@@ -195,12 +242,36 @@ impl GuardEngine {
             }
         }
 
-        // 5. Check existing clearance cookie (and client FP binding if required)
+        // 5. Check existing clearance cookie OR aggregated same-device/same-user session
         if let Some(claims) =
             self.valid_clearance_claims(profile, clearance_secret, host, client_ip, headers)
         {
+            self.record_aggregated_session(
+                host,
+                client_ip,
+                headers,
+                claims.expires_at,
+                claims.fp_hash.is_some(),
+                false,
+            );
             if !profile.effective_require_client_fp() || claims.fp_hash.is_some() {
                 return GuardDecision::Allow;
+            }
+        } else {
+            let key = self.client_session_key(host, client_ip, headers);
+            if let Some(sess) = self.aggregated_sessions.get(&key) {
+                let now = Utc::now().timestamp();
+                if sess.expires_at >= now {
+                    if profile.effective_block_headless() && sess.is_headless {
+                        return GuardDecision::Reject {
+                            status: StatusCode::FORBIDDEN,
+                            reason: "headless browser fingerprint blocked".into(),
+                        };
+                    }
+                    if !profile.effective_require_client_fp() || sess.has_fp {
+                        return GuardDecision::Allow;
+                    }
+                }
             }
         }
 
@@ -810,6 +881,7 @@ impl GuardEngine {
                 fp_hash: fp_hash.clone(),
                 is_headless,
             };
+            self.record_aggregated_session(host, client_ip, headers, claims.expires_at, true, is_headless);
             let cookie_val = match sign_fp_cookie(clearance_secret, &claims) {
                 Ok(v) => v,
                 Err(_) => {
@@ -985,6 +1057,7 @@ impl GuardEngine {
                 None
             };
 
+            let has_fp = fp_hash.is_some();
             let claims = ClearanceClaims {
                 host: host_clean,
                 expires_at: now.saturating_add(ttl as i64),
@@ -996,6 +1069,7 @@ impl GuardEngine {
                 ip_prefix: if bind_ip { Some(ip_key) } else { None },
                 fp_hash,
             };
+            self.record_aggregated_session(host, client_ip, headers, claims.expires_at, has_fp, false);
 
             let cookie_val = match sign_clearance_cookie(clearance_secret, &claims) {
                 Ok(v) => v,

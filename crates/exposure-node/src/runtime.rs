@@ -1004,24 +1004,57 @@ impl NodeRuntime {
         }
 
         for (svc_tag, svc) in &cand.egress.services {
+            let target = format!("egress:{} -> {}", svc_tag, svc.backend);
             match tokio::time::timeout(
                 Duration::from_millis(1500),
                 tokio::net::TcpStream::connect(&svc.backend),
             )
             .await
             {
-                Ok(Ok(_)) => checks.push(PreflightCheckItem {
-                    target: format!("egress:{} -> {}", svc_tag, svc.backend),
-                    ok: true,
-                    detail: "backend TCP reachable".into(),
-                }),
+                Ok(Ok(tcp)) => {
+                    if svc.tls.unwrap_or(false) {
+                        let use_h2 = svc.protocol == exposure_core::config::BackendProtocol::H2;
+                        match tokio::time::timeout(
+                            Duration::from_millis(2000),
+                            crate::egress::connect_backend_tls(tcp, svc, use_h2),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => checks.push(PreflightCheckItem {
+                                target,
+                                ok: true,
+                                detail: if svc.effective_insecure_skip_verify() {
+                                    "backend TLS reachable (insecure skip-verify)".into()
+                                } else {
+                                    "backend TLS verified & reachable".into()
+                                },
+                            }),
+                            Ok(Err(e)) => checks.push(PreflightCheckItem {
+                                target,
+                                ok: false,
+                                detail: format!("backend TLS check failed: {e}"),
+                            }),
+                            Err(_) => checks.push(PreflightCheckItem {
+                                target,
+                                ok: false,
+                                detail: "backend TLS handshake timed out (2000ms)".into(),
+                            }),
+                        }
+                    } else {
+                        checks.push(PreflightCheckItem {
+                            target,
+                            ok: true,
+                            detail: "backend TCP reachable".into(),
+                        });
+                    }
+                }
                 Ok(Err(e)) => checks.push(PreflightCheckItem {
-                    target: format!("egress:{} -> {}", svc_tag, svc.backend),
+                    target,
                     ok: false,
                     detail: format!("backend connect failed: {e}"),
                 }),
                 Err(_) => checks.push(PreflightCheckItem {
-                    target: format!("egress:{} -> {}", svc_tag, svc.backend),
+                    target,
                     ok: false,
                     detail: "backend connect timed out (1500ms)".into(),
                 }),

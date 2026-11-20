@@ -641,6 +641,33 @@ impl IngressServer {
                                 .unwrap();
                         }
                         GuardDecision::ChallengeRedirect { location } => {
+                            if !is_browser_navigation(req.method(), req.headers()) {
+                                self.logger
+                                    .record_session_with_fp(
+                                        "ingress",
+                                        &rule.service_tag,
+                                        &client_ip.to_string(),
+                                        403,
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        0,
+                                        0,
+                                        false,
+                                        true,
+                                        false,
+                                        Some("verification_required".into()),
+                                        Some(client_fp.device_type.to_string()),
+                                        Some(client_fp.browser_family.to_string()),
+                                        Some(client_fp.os_family.to_string()),
+                                        false,
+                                    )
+                                    .await;
+                                return Response::builder()
+                                    .status(StatusCode::FORBIDDEN)
+                                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                                    .header(header::CACHE_CONTROL, "no-store")
+                                    .body(full_body(r#"{"error":"verification_required"}"#))
+                                    .unwrap();
+                            }
                             self.logger
                                 .record_session_with_fp(
                                     "ingress",
@@ -1235,4 +1262,26 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+fn is_browser_navigation(method: &http::Method, headers: &http::HeaderMap) -> bool {
+    if method != http::Method::GET && method != http::Method::HEAD {
+        return false;
+    }
+    if let Some(xrw) = headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
+        if xrw.eq_ignore_ascii_case("xmlhttprequest") {
+            return false;
+        }
+    }
+    if let Some(mode) = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) {
+        return mode.eq_ignore_ascii_case("navigate");
+    }
+    if let Some(dest) = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()) {
+        return dest.eq_ignore_ascii_case("document");
+    }
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    accept.contains("text/html") || accept.is_empty() || accept == "*/*"
 }

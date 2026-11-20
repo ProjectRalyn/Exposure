@@ -304,7 +304,7 @@ pub fn compile_topology_full(
     if !topo.defaults.ingress.clearance_secret.is_empty()
         && is_weak_secret(&topo.defaults.ingress.clearance_secret)
     {
-        errors.push(
+        warnings.push(
             "defaults.ingress.clearance_secret uses a weak or default secret; set a high-entropy random secret (>=16 chars)".into(),
         );
     }
@@ -343,7 +343,7 @@ pub fn compile_topology_full(
             if (uses_any_guard || !spec.ingress.guards.is_empty())
                 && is_weak_secret(&ing.clearance_secret)
             {
-                errors.push(format!(
+                warnings.push(format!(
                     "ingress node '{node_tag}' uses a weak or default clearance_secret; set a high-entropy random secret (>=16 chars) on the node or in defaults.ingress"
                 ));
             }
@@ -468,7 +468,7 @@ pub fn compile_topology_full(
                 }
             }
             LinkMode::Tunnel => match link.tunnel_direction {
-                Some(TunnelDirection::Outbound) => {
+                Some(TunnelDirection::Outbound) | None => {
                     if link.endpoints.is_empty() {
                         errors.push(format!(
                             "tunnel outbound link '{} -> {}' must specify at least one endpoint",
@@ -487,13 +487,6 @@ pub fn compile_topology_full(
                     link_direction_valid = false;
                     errors.push(format!(
                         "tunnel link '{} -> {}' cannot use 'inbound' in topology; tunnel links always dial 'from -> to' (outbound) — swap 'from' and 'to' instead",
-                        link.from, link.to
-                    ));
-                }
-                None => {
-                    link_direction_valid = false;
-                    errors.push(format!(
-                        "tunnel link '{} -> {}' must specify tunnel_direction ('outbound')",
                         link.from, link.to
                     ));
                 }
@@ -821,7 +814,10 @@ pub fn compile_topology_full(
 
     // 5. Validate Hop Tables (maintainer_hops)
     for (node_tag, spec) in &topo.nodes {
-        if !spec.maintainer_hops.is_empty() {
+        let is_self_maintainer_hop = spec.roles.maintainer
+            && spec.maintainer_hops.len() == 1
+            && spec.maintainer_hops[0] == *node_tag;
+        if !spec.maintainer_hops.is_empty() && !is_self_maintainer_hop {
             validate_hop_path(
                 &spec.maintainer_hops,
                 node_tag,

@@ -109,21 +109,57 @@ async function api(path, opts = {}) {
   return data;
 }
 
-function resetToLogin() {
+function resetToLogin(opts = {}) {
   state.authenticated = false;
   stopAutoRefresh();
+  closeModal();
+  state.cache = {
+    overview: null,
+    nodesData: null,
+    telemetry: null,
+    fingerprints: null,
+    audit: null,
+    versions: [],
+  };
+  try {
+    localStorage.removeItem("exposure_token");
+    sessionStorage.clear();
+  } catch {
+    // ignore storage errors
+  }
   if (el("login-pass")) el("login-pass").value = "";
+  el("login-error")?.classList.add("hidden");
   el("app-view").classList.add("hidden");
   el("login-view").classList.remove("hidden");
+  document.title = "Exposure Control";
+  if (opts.clearUrl && window.location.hash) {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
 }
 
 async function logout() {
+  const btn = el("btn-logout");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Signing Out…";
+  }
   try {
-    await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    });
   } catch {
     // ignore network errors during logout
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Sign Out";
+    }
   }
-  resetToLogin();
+  resetToLogin({ clearUrl: true });
+  showToast("Signed out safely");
+  el("login-pass")?.focus();
 }
 
 function updateBootstrapBadge(bootTag) {
@@ -144,16 +180,48 @@ function updateTopbarTimestamp(iso) {
   t.textContent = iso ? `Telemetry pulled: ${formatDateTime(iso)}` : `Updated ${formatDateTime(new Date().toISOString())}`;
 }
 
+const VALID_TABS = new Set([
+  "overview",
+  "topology",
+  "observability",
+  "fingerprints",
+  "nodes",
+  "onboarding",
+  "audit",
+]);
+
+function getTabFromLocation() {
+  const rawHash = (window.location.hash || "").replace(/^#\/?/, "").trim().toLowerCase();
+  if (VALID_TABS.has(rawHash)) return rawHash;
+  const queryTab = new URLSearchParams(window.location.search).get("tab");
+  if (queryTab && VALID_TABS.has(queryTab)) return queryTab;
+  return "overview";
+}
+
 function switchTab(tab, opts = {}) {
-  state.activeTab = tab;
+  const targetTab = VALID_TABS.has(tab) ? tab : "overview";
+  state.activeTab = targetTab;
   document.querySelectorAll(".nav-item").forEach((b) => {
-    b.classList.toggle("active", b.dataset.tab === tab);
+    b.classList.toggle("active", b.dataset.tab === targetTab);
   });
   document.querySelectorAll(".tab-panel").forEach((p) => {
-    p.classList.toggle("hidden", p.id !== `tab-${tab}`);
+    p.classList.toggle("hidden", p.id !== `tab-${targetTab}`);
   });
-  const activeBtn = document.querySelector(`.nav-item[data-tab="${tab}"]`);
-  el("page-title").textContent = activeBtn ? activeBtn.textContent : tab;
+  const activeBtn = document.querySelector(`.nav-item[data-tab="${targetTab}"]`);
+  const titleText = activeBtn ? activeBtn.textContent.trim() : targetTab;
+  el("page-title").textContent = titleText;
+  document.title = `${titleText} · Exposure Control`;
+
+  if (!opts.skipHistory) {
+    const targetHash = `#${targetTab}`;
+    if (window.location.hash !== targetHash) {
+      if (opts.replaceHistory) {
+        history.replaceState({ tab: targetTab }, "", targetHash);
+      } else {
+        history.pushState({ tab: targetTab }, "", targetHash);
+      }
+    }
+  }
   refreshCurrentTab(opts);
 }
 
@@ -1250,7 +1318,7 @@ el("login-form")?.addEventListener("submit", async (ev) => {
     state.authenticated = true;
     el("login-view").classList.add("hidden");
     el("app-view").classList.remove("hidden");
-    switchTab("overview");
+    switchTab(getTabFromLocation(), { replaceHistory: true });
     startAutoRefresh();
   } catch (e) {
     el("login-error").textContent = e.message;
@@ -1295,11 +1363,22 @@ async function bootstrapSession() {
     state.authenticated = true;
     el("login-view").classList.add("hidden");
     el("app-view").classList.remove("hidden");
-    switchTab("overview");
+    switchTab(getTabFromLocation(), { replaceHistory: true });
     startAutoRefresh();
   } catch {
     resetToLogin();
   }
 }
+
+function handleRouteChange() {
+  if (!state.authenticated) return;
+  const target = getTabFromLocation();
+  if (target !== state.activeTab) {
+    switchTab(target, { skipHistory: true });
+  }
+}
+
+window.addEventListener("hashchange", handleRouteChange);
+window.addEventListener("popstate", handleRouteChange);
 
 bootstrapSession();

@@ -858,7 +858,7 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       const epCount = link.endpoints?.length || 0;
       const modeShort =
         link.mode === "tunnel"
-          ? `tunnel:${link.tunnel_direction || "out"}`
+          ? "tunnel"
           : isBidirectional
           ? "on-demand ↔"
           : "on-demand";
@@ -2747,16 +2747,9 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
               <option value="tunnel" ${link.mode === "tunnel" ? "selected" : ""}>tunnel</option>
             </select>
           </label>
-          <label><span>Tunnel Direction</span>
-            <select id="sel-tunnel-dir" ${link.mode !== "tunnel" ? "disabled" : ""}>
-              <option value="outbound" selected>outbound (from → to, use Swap ⇄ to reverse)</option>
-            </select>
-          </label>
-        </div>
-        <div class="inspector-row">
           <label><span>Peer Tag Alias (opt)</span><input id="inp-link-peertag" value="${escapeHtml(link.peer_tag || "")}" placeholder="${escapeHtml(link.to)}" /></label>
-          <label><span>Expected Client Addr</span><input id="inp-link-caddr" value="${escapeHtml(link.expected_client_addr || "")}" placeholder="203.0.113.0/24" /></label>
         </div>
+        <label><span>Expected Client Addr</span><input id="inp-link-caddr" value="${escapeHtml(link.expected_client_addr || "")}" placeholder="203.0.113.0/24" /></label>
         ${
           link.mode === "on-demand"
             ? `<div class="inspector-checks">
@@ -2821,14 +2814,8 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelector("#sel-link-mode").addEventListener("change", (ev) => {
       markDirty(true);
       link.mode = ev.target.value;
-      if (link.mode === "tunnel" && !link.tunnel_direction) link.tunnel_direction = "outbound";
-      if (link.mode !== "tunnel") link.tunnel_direction = null;
+      link.tunnel_direction = link.mode === "tunnel" ? "outbound" : null;
       render();
-    });
-    box.querySelector("#sel-tunnel-dir").addEventListener("change", (ev) => {
-      markDirty(false);
-      link.tunnel_direction = ev.target.value;
-      renderEdges();
     });
     box.querySelector("#inp-link-peertag").addEventListener("input", (ev) => {
       markDirty(false);

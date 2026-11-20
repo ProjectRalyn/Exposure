@@ -1267,3 +1267,57 @@ details[open] > .panel-summary::before { content: "▾ "; }
   word-break: break-all;
   margin-bottom: 12px;
 }
+
+/* ==================== UI MOTION & TRANSITIONS ==================== */
+@keyframes panelReveal {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes cardEntrance {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes backdropFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes modalPop {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.tab-panel:not(.hidden) {
+  animation: panelReveal 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.login-shell:not(.hidden) .login-card {
+  animation: cardEntrance 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.modal-backdrop:not(.hidden) {
+  animation: backdropFade 0.16s ease-out;
+}
+.modal-backdrop:not(.hidden) .modal-card {
+  animation: modalPop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.nav-item {
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, transform 0.14s ease;
+}
+.nav-item:hover {
+  transform: translateX(2px);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.99);
+}
+.kpi-card, .card, .node-card, .cert-card {
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+.kpi-card:hover, .node-card:hover, .cert-card:hover {
+  border-color: var(--border-hi);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -649,7 +649,7 @@ where
     }
 }
 
-async fn connect_backend_tls(
+pub(crate) async fn connect_backend_tls(
     tcp: TcpStream,
     svc: &EgressServiceConfig,
     use_h2: bool,

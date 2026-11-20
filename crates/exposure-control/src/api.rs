@@ -449,6 +449,10 @@ async fn login(State(state): State<ApiState>, Json(req): Json<LoginReq>) -> Resp
     if let Ok(hv) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
     resp
 }
 
@@ -465,24 +469,35 @@ async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     }
     let secure_flag = if state.cfg.tls.is_some() { "; Secure" } else { "" };
     let clear_cookie = format!(
-        "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict{secure_flag}; Max-Age=0"
+        "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict{secure_flag}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
     );
     let mut resp = Json(serde_json::json!({ "ok": true })).into_response();
     if let Ok(hv) = HeaderValue::from_str(&clear_cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    resp.headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     resp
 }
 
 async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Response {
-    match verify_admin_auth(&state, &headers) {
+    let mut resp = match verify_admin_auth(&state, &headers) {
         Ok(username) => Json(serde_json::json!({
             "authenticated": true,
             "username": username,
         }))
         .into_response(),
         Err(r) => r,
-    }
+    };
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    resp
 }
 
 struct AggregatedTraffic {
