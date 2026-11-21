@@ -273,7 +273,7 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
             }
         }
     }
-    if let (Some(ref mut new_gl), Some(ref old_gl)) =
+    if let (Some(new_gl), Some(old_gl)) =
         (&mut incoming.global_logger, &existing.global_logger)
     {
         if new_gl.hmac_key == REDACTED_SECRET {

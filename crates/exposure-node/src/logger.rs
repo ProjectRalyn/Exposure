@@ -166,7 +166,7 @@ impl NodeLogger {
         } else if cfg.sample_rate <= 0.0 {
             false
         } else {
-            rand::thread_rng().gen::<f64>() < cfg.sample_rate
+            rand::thread_rng().r#gen::<f64>() < cfg.sample_rate
         };
 
         let now = Utc::now();

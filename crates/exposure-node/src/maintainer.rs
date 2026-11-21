@@ -420,7 +420,7 @@ impl MaintainerService {
                     "fqdn": fqdn,
                     "value": txt_value,
                 }));
-                if let Some(ref h) = auth_header {
+                if let Some(h) = auth_header {
                     req = req.header("Authorization", h);
                 }
                 let resp = req
@@ -500,7 +500,7 @@ impl MaintainerService {
                     "fqdn": fqdn,
                     "value": txt_value,
                 }));
-                if let Some(ref h) = auth_header {
+                if let Some(h) = auth_header {
                     req = req.header("Authorization", h);
                 }
                 let _ = req.send().await;

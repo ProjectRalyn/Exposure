@@ -77,32 +77,26 @@ fn find_native_esbuild(node_modules: &Path) -> Option<PathBuf> {
     } else {
         "esbuild"
     };
-    let direct = node_modules
-        .join("@esbuild")
-        .join(target_pkg)
-        .join("bin")
-        .join(bin_name);
-    if let Ok(meta) = fs::metadata(&direct) {
-        if meta.is_file() {
-            return Some(direct);
+    let direct_pkg = node_modules.join("@esbuild").join(target_pkg);
+    for candidate in [direct_pkg.join("bin").join(bin_name), direct_pkg.join(bin_name)] {
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
-    // pnpm store layout: node_modules/.pnpm/@esbuild+<target>@.../node_modules/@esbuild/<target>/bin/esbuild
+    // pnpm store layout: node_modules/.pnpm/@esbuild+<target>@.../node_modules/@esbuild/<target>/{bin/,}esbuild
     let pnpm_dir = node_modules.join(".pnpm");
     let prefix = format!("@esbuild+{target_pkg}@");
     if let Ok(entries) = fs::read_dir(&pnpm_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with(&prefix) {
-                let candidate = entry
+                let pkg_dir = entry
                     .path()
                     .join("node_modules")
                     .join("@esbuild")
-                    .join(target_pkg)
-                    .join("bin")
-                    .join(bin_name);
-                if let Ok(meta) = fs::metadata(&candidate) {
-                    if meta.is_file() {
+                    .join(target_pkg);
+                for candidate in [pkg_dir.join("bin").join(bin_name), pkg_dir.join(bin_name)] {
+                    if candidate.is_file() {
                         return Some(candidate);
                     }
                 }
@@ -185,6 +179,28 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
     true
 }
 
+fn run_pnpm_build(web_dir: &Path, stage_dir: &Path) -> bool {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["pnpm.cmd", "pnpm.exe", "pnpm"]
+    } else {
+        &["pnpm"]
+    };
+    for bin in candidates {
+        if let Ok(status) = Command::new(bin)
+            .arg("--dir")
+            .arg(web_dir)
+            .arg("build")
+            .env("EXPOSURE_WEB_OUT_DIR", stage_dir)
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir
@@ -212,14 +228,7 @@ fn main() {
     }
 
     let stage_dir = out_dir.join("web_dist");
-    let vite_ok = Command::new("pnpm")
-        .arg("--dir")
-        .arg(&web_dir)
-        .arg("build")
-        .env("EXPOSURE_WEB_OUT_DIR", &stage_dir)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let vite_ok = run_pnpm_build(&web_dir, &stage_dir);
 
     let effective_dist = if vite_ok && stage_dir.join("control").exists() && stage_dir.join("challenge").exists() {
         stage_dir

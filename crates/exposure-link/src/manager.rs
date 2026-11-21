@@ -400,7 +400,7 @@ impl LinkManager {
 
     /// Spawn persistent outbound tunnel connectors for all configured outbound tunnel peers.
     pub fn spawn_outbound_tunnels(self: &Arc<Self>) {
-        let gen = self.tunnel_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.tunnel_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let mgr = Arc::clone(self);
         tokio::spawn(async move {
             let peers = mgr.peers.read().await.clone();
@@ -412,7 +412,7 @@ impl LinkManager {
                         let mgr2 = Arc::clone(&mgr);
                         let peer_clone = peer.clone();
                         tokio::spawn(async move {
-                            mgr2.maintain_outbound_tunnel(peer_clone, ep.address, gen)
+                            mgr2.maintain_outbound_tunnel(peer_clone, ep.address, generation)
                                 .await;
                         });
                     }
@@ -425,11 +425,11 @@ impl LinkManager {
         self: &Arc<Self>,
         peer: PeerConfig,
         addr: String,
-        gen: u64,
+        generation: u64,
     ) {
         let mut backoff_ms = 250u64;
         loop {
-            if self.tunnel_gen.load(Ordering::SeqCst) != gen {
+            if self.tunnel_gen.load(Ordering::SeqCst) != generation {
                 return;
             }
             let existing_alive = self
@@ -452,7 +452,7 @@ impl LinkManager {
                 {
                     Ok((session, outcome)) => {
                         // Re-check generation after async dial so stale tasks never clobber new config
-                        if self.tunnel_gen.load(Ordering::SeqCst) != gen {
+                        if self.tunnel_gen.load(Ordering::SeqCst) != generation {
                             session.close().await;
                             return;
                         }
