@@ -9,18 +9,18 @@
     <mask id="cut-by-e-mark">
       <rect width="512" height="512" fill="white" />
       <rect x="134" y="130" width="56" height="252" fill="black" />
-      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
-      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
-      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+      <polygon points="134,130 308,130 252,186 134,186" fill="black" />
+      <polygon points="134,228 276,228 220,284 134,284" fill="black" />
+      <polygon points="134,326 308,326 252,382 134,382" fill="black" />
     </mask>
 
     <mask id="cut-for-frame-mark">
       <rect width="512" height="512" fill="white" />
       <polygon points="93,413 413,93 473,153 153,473" fill="black" />
       <rect x="134" y="130" width="56" height="252" fill="black" />
-      <polygon points="134,130 316,130 260,186 134,186" fill="black" />
-      <polygon points="134,228 280,228 224,284 134,284" fill="black" />
-      <polygon points="134,326 316,326 260,382 134,382" fill="black" />
+      <polygon points="134,130 308,130 252,186 134,186" fill="black" />
+      <polygon points="134,228 276,228 220,284 134,284" fill="black" />
+      <polygon points="134,326 308,326 252,382 134,382" fill="black" />
     </mask>
   </defs>
 
@@ -44,8 +44,8 @@
   <!-- LAYER 3: Crisp White Geometric "E" -->
   <g fill="#f8fafc">
     <rect x="144" y="140" width="36" height="232" />
-    <polygon points="144,140 292,140 256,176 144,176" />
-    <polygon points="144,238 256,238 220,274 144,274" />
-    <polygon points="144,336 292,336 256,372 144,372" />
+    <polygon points="144,140 284,140 248,176 144,176" />
+    <polygon points="144,238 252,238 216,274 144,274" />
+    <polygon points="144,336 284,336 248,372 144,372" />
   </g>
 </svg>
