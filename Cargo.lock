@@ -748,6 +748,7 @@ dependencies = [
  "exposure-link",
  "futures",
  "hex",
+ "hmac",
  "http",
  "http-body-util",
  "hyper",

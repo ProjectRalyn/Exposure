@@ -108,7 +108,7 @@ Before applying a declarative topology (see [`examples/topology.yaml`](examples/
   - **Ingress**: Terminates HTTP/HTTPS (with SNI & dynamic TLS certs), enforces Entry Guard policies, and forwards matched traffic by `ServiceTag`.
   - **Relay**: Forwards streams across multi-hop paths with loop prevention (`TTL` & hop tracking) and health-aware peer selection.
   - **Egress**: Enforces `allow_from` origin ACLs (default deny), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSockets to local backends, and runs local backend health checks.
-  - **Maintainer**: Manages **ACME DNS-01** certificate issuance/renewal (Cloudflare, Webhook, Exec Hook, or self-signed), aggregates node telemetry, and distributes signed config/cert bundles.
+  - **Maintainer**: Manages **ACME DNS-01** certificate issuance/renewal (Cloudflare, Aliyun DNS, Webhook, Exec Hook, or self-signed), aggregates node telemetry, and distributes signed config/cert bundles.
 - **Edge Entry Guard & Anti-Bot Protection**
   - CIDR allow/deny filtering and named **token-bucket rate limiting** (`429 Too Many Requests` + `Retry-After`).
   - TLS ClientHello + HTTP header fingerprint scoring with configurable `off`, `silent`, and `challenge` modes.

@@ -58,7 +58,7 @@ Exposure 将**数据面（Nodes）**与**控制面（Control）**分离，并通
 | **Ingress** | 监听外部 HTTP/HTTPS 流量，终结 TLS（使用从 Maintainer 同步的证书），执行 Entry Guard 流水线，匹配规则（`host`、`source_cidrs`），并向 `next_peer` 打开携带 `ServiceTag` 的 `Service` 流。 |
 | **Relay** | 依据 `ServiceTag -> next_peer` 规则在多跳间转发 `Service` 流，并沿显式跳表转发 `SpecialFrame` 控制/遥测消息。 |
 | **Egress** | 终结 `Service` 流，基于 `origin_node_tag` 校验 `allow_from` ACL（除非设置 `allow_any_origin`，否则默认拒绝），向本地后端代理 HTTP/1.1、HTTP/2（`h2`/`h2c`）与 WebSocket 升级请求，并支持本地后端主动健康检查。 |
-| **Maintainer** | 管理 ACME DNS-01 证书申请与续期（支持 Cloudflare、通用 Webhook、Exec Hook 或 `self-signed`），分发签名证书包，并聚合各节点的遥测摘要与告警。 |
+| **Maintainer** | 管理 ACME DNS-01 证书申请与续期（支持 Cloudflare、阿里云 DNS、通用 Webhook、Exec Hook 或 `self-signed`），分发签名证书包，并聚合各节点的遥测摘要与告警。 |
 
 ---
 
@@ -125,14 +125,16 @@ Ingress 上的每个入站 HTTP(S) 请求都会经过 `GuardEngine` 处理：
 
 ---
 
-## 6. 证书生命周期（Maintainer）
+## 6. 证书生命周期与 DNS 解析管理（Maintainer）
 
-`Maintainer`（`maintainer.rs`）集中管理 TLS 证书生命周期：
-- 支持通过以下提供方执行 ACME **DNS-01** 验证：
-  - **Cloudflare** DNS API
+`Maintainer`（`maintainer.rs`）集中管理 TLS 证书生命周期与 DNS 解析执行：
+- 将 **DNS 服务商凭据**（`dns_providers`，支持同一服务商配置多个账号）与 **域名绑定**（`domains`，支持一级及多级域名绑定与最长后缀继承）分离配置，申请证书时自动按域名绑定匹配账号：
+  - **Cloudflare** DNS API（未填 `zone_id` 时自动查询）
+  - **阿里云 DNS**（Alidns OpenAPI V3）
   - **通用 Webhook**
   - **Exec Hook**（外部脚本或二进制程序）
   - **`self-signed`** 模式（基于 `rcgen`），适用于本地测试与私有网格
+- **声明式 DNS 解析自动同步（`DnsSyncReq` / `DnsSyncResp`）**：Control 根据 `domains[*].target_nodes` 与节点的 `external_ips` 生成目标 IPv4/IPv6 解析列表，签发带 Ed25519 签名与防重放 `request_id` 的 `DnsSyncReq` 指令（`POST /api/dns/sync`）下发至 Maintainer；Maintainer 仅使用自身凭据执行，无合法 Control 指令严禁修改 DNS 解析。
 - 证书持久化保存在 `acme.storage_dir`，并通过 `SpecialFrame` 流推送至 Ingress 节点。
 
 ---

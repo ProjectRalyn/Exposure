@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::{
-    ConfigBundlePurpose, LinkMode, NodeConfig, SignedConfigBundle, TunnelDirection,
+    ConfigBundlePurpose, DnsProviderAccountConfig, LinkMode, NodeConfig, SignedConfigBundle,
+    TunnelDirection,
 };
 use exposure_core::crypto::{
     compute_bootstrap_reply_proof, compute_passphrase_proof, generate_five_word_passphrase,
@@ -15,8 +16,8 @@ use exposure_core::crypto::{
 };
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
-    DiscoveryNeighbor, NodeStatusSnapshot, PreflightCheckItem, PreflightReport, SpecialFrame,
-    SpecialPayload, StreamKind,
+    dns_sync_req_signing_bytes, DiscoveryNeighbor, DnsSyncRecordSpec, NodeStatusSnapshot,
+    PreflightCheckItem, PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -62,6 +63,8 @@ pub struct NodeRuntime {
     cert_last_issued_at: Arc<DashMap<String, i64>>,
     /// Spent `DialEnrollReq.request_id` cache for replay protection.
     used_dial_enroll_ids: Arc<DashMap<String, i64>>,
+    /// Spent `DnsSyncReq.request_id` cache for replay protection.
+    used_dns_sync_ids: Arc<DashMap<String, i64>>,
 }
 
 fn collect_trusted_control_keys(cfg: &NodeConfig) -> Vec<String> {
@@ -164,6 +167,7 @@ impl NodeRuntime {
             connected_control_tag: Arc::new(RwLock::new(None)),
             cert_last_issued_at: Arc::new(DashMap::new()),
             used_dial_enroll_ids: Arc::new(DashMap::new()),
+            used_dns_sync_ids: Arc::new(DashMap::new()),
         });
 
         rt.spawn_stream_dispatcher();
@@ -620,6 +624,30 @@ impl NodeRuntime {
                     )
                 }
             }
+            SpecialPayload::DnsSyncReq {
+                request_id,
+                issued_at,
+                expires_at,
+                maintainer_tag,
+                records,
+                control_signature,
+            } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    Some(
+                        self.handle_dns_sync_req(
+                            request_id,
+                            issued_at,
+                            expires_at,
+                            maintainer_tag,
+                            records,
+                            control_signature,
+                        )
+                        .await,
+                    )
+                }
+            }
             SpecialPayload::BootstrapReply {
                 accepted: true,
                 control_public_key: Some(pk),
@@ -878,6 +906,81 @@ impl NodeRuntime {
                 node_public_key: None,
                 error: Some(e.to_string()),
             },
+        }
+    }
+
+    async fn handle_dns_sync_req(
+        &self,
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
+        records: Vec<DnsSyncRecordSpec>,
+        control_signature: String,
+    ) -> SpecialPayload {
+        let reject = |msg: String| SpecialPayload::DnsSyncResp {
+            request_id: request_id.clone(),
+            maintainer_tag: self.node_tag(),
+            ok: false,
+            results: Vec::new(),
+            error: Some(msg),
+        };
+
+        if maintainer_tag != self.node_tag() {
+            return reject(format!(
+                "DnsSyncReq target '{maintainer_tag}' != local node '{}'",
+                self.node_tag()
+            ));
+        }
+
+        let local_ctrl_pk = self.config.read().await.control_public_key.clone();
+        let Some(local_ctrl_pk) = local_ctrl_pk else {
+            return reject("node has no Control public key configured".into());
+        };
+
+        let now = Utc::now().timestamp();
+        if now > expires_at || issued_at > now + 60 {
+            return reject("DnsSyncReq expired or invalid timestamp".into());
+        }
+
+        let signing = dns_sync_req_signing_bytes(
+            &request_id,
+            issued_at,
+            expires_at,
+            &maintainer_tag,
+            &records,
+        );
+        if let Err(e) = verify_signature_b64(&local_ctrl_pk, &signing, &control_signature) {
+            return reject(format!("DnsSyncReq signature invalid: {e}"));
+        }
+
+        if self.used_dns_sync_ids.len() > 4096 {
+            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
+        }
+        let mut is_new = false;
+        self.used_dns_sync_ids
+            .entry(request_id.clone())
+            .or_insert_with(|| {
+                is_new = true;
+                expires_at
+            });
+        if !is_new {
+            return reject("DnsSyncReq replay rejected".into());
+        }
+
+        let maint = self.maintainer.read().await.clone();
+        let Some(maint) = maint else {
+            return reject("node is not running maintainer mode".into());
+        };
+
+        let results = maint.sync_dns_records(&records).await;
+        let all_ok = results.iter().all(|r| r.ok);
+        SpecialPayload::DnsSyncResp {
+            request_id,
+            maintainer_tag: self.node_tag(),
+            ok: all_ok,
+            results,
+            error: None,
         }
     }
 
@@ -1161,12 +1264,13 @@ impl NodeRuntime {
     pub async fn apply_signed_config(&self, bundle: SignedConfigBundle) -> Result<()> {
         let _lock = self.config_reload_lock.lock().await;
 
-        let (control_pk, control_link_pk, current_seq) = {
+        let (control_pk, control_link_pk, current_seq, prev_maint) = {
             let cfg = self.config.read().await;
             (
                 cfg.control_public_key.clone(),
                 cfg.control_link_public_key.clone(),
                 cfg.config_sequence,
+                cfg.maintainer.clone(),
             )
         };
         let control_pk = control_pk.ok_or_else(|| {
@@ -1182,6 +1286,50 @@ impl NodeRuntime {
         )?;
 
         let mut new_cfg = bundle.config;
+        // Preserve Maintainer-local DNS provider credentials when Control leaves secret fields blank
+        if let (Some(new_m), Some(old_m)) = (&mut new_cfg.maintainer, &prev_maint) {
+            for (pname, new_p) in &mut new_m.dns_providers {
+                if let Some(old_p) = old_m.dns_providers.get(pname) {
+                    match (new_p, old_p) {
+                        (
+                            DnsProviderAccountConfig::Cloudflare { api_token },
+                            DnsProviderAccountConfig::Cloudflare { api_token: old_tok },
+                        ) if api_token.trim().is_empty() && !old_tok.trim().is_empty() => {
+                            *api_token = old_tok.clone();
+                        }
+                        (
+                            DnsProviderAccountConfig::Aliyun {
+                                access_key_id,
+                                access_key_secret,
+                                ..
+                            },
+                            DnsProviderAccountConfig::Aliyun {
+                                access_key_id: old_ak,
+                                access_key_secret: old_sk,
+                                ..
+                            },
+                        ) => {
+                            if access_key_id.trim().is_empty() && !old_ak.trim().is_empty() {
+                                *access_key_id = old_ak.clone();
+                            }
+                            if access_key_secret.trim().is_empty() && !old_sk.trim().is_empty() {
+                                *access_key_secret = old_sk.clone();
+                            }
+                        }
+                        (
+                            DnsProviderAccountConfig::Webhook { auth_header, .. },
+                            DnsProviderAccountConfig::Webhook {
+                                auth_header: old_auth,
+                                ..
+                            },
+                        ) if auth_header.is_none() && old_auth.is_some() => {
+                            *auth_header = old_auth.clone();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         new_cfg.config_sequence = bundle.sequence;
         if new_cfg.control_public_key.is_none() {
             new_cfg.control_public_key = Some(control_pk);

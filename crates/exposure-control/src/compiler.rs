@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    EgressConfig, EgressDefaults, GuardDefaults, GuardProfile, IngressConfig, IngressDefaults,
-    LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig, NodeConfig, PeerConfig,
-    ProbeConfig, RateLimitBucket, RelayConfig, TopologySpec, TrustedMaintainer, TrustedOrigin,
-    TunnelDirection,
+    resolve_domain_binding, EgressConfig, EgressDefaults, GuardDefaults, GuardProfile,
+    IngressConfig, IngressDefaults, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
+    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, TopologySpec,
+    TrustedMaintainer, TrustedOrigin, TunnelDirection,
 };
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::routing::canonical_ip;
@@ -329,9 +329,82 @@ pub fn compile_topology_full(
         }
     }
 
+    for (dom_key, binding) in &topo.domains {
+        if let Err(e) = validate_dns_domain(dom_key) {
+            errors.push(format!("domains '{dom_key}': {e}"));
+        } else if dom_key.trim() == "*" {
+            errors.push("domains key '*' is not a valid DNS domain".into());
+        }
+        let prov = binding.provider.trim();
+        if prov.is_empty() {
+            errors.push(format!("domain '{dom_key}' is missing DNS provider account"));
+        } else if !topo.dns_providers.contains_key(prov) {
+            errors.push(format!(
+                "domain '{dom_key}' references unknown dns_provider '{prov}'"
+            ));
+        }
+        if let Some(ref root) = binding.root_domain {
+            let rt = root.trim().trim_end_matches('.');
+            if !rt.is_empty() {
+                if rt.contains('*') {
+                    errors.push(format!(
+                        "domain '{dom_key}' root_domain '{root}' must not be a wildcard"
+                    ));
+                } else if let Err(e) = validate_dns_domain(rt) {
+                    errors.push(format!("domain '{dom_key}' root_domain: {e}"));
+                } else {
+                    let dom_norm = dom_key
+                        .trim()
+                        .trim_start_matches("*.")
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    let rt_lower = rt.to_ascii_lowercase();
+                    if dom_norm != rt_lower && !dom_norm.ends_with(&format!(".{rt_lower}")) {
+                        errors.push(format!(
+                            "domain '{dom_key}' does not belong to configured root_domain '{root}'"
+                        ));
+                    }
+                }
+            }
+        }
+        for target in &binding.target_nodes {
+            match topo.nodes.get(target) {
+                None => errors.push(format!(
+                    "domain '{dom_key}' target_nodes references unknown node '{target}'"
+                )),
+                Some(n) if n.external_ips.is_empty() => warnings.push(format!(
+                    "domain '{dom_key}' targets node '{target}' which has no external_ips configured"
+                )),
+                _ => {}
+            }
+        }
+    }
+
     for (node_tag, spec) in &topo.nodes {
         if let Err(e) = validate_identifier(node_tag, "node_tag") {
             errors.push(e.to_string());
+        }
+        for raw_ip in &spec.external_ips {
+            let trimmed = raw_ip.trim();
+            match trimmed.parse::<IpAddr>() {
+                Ok(ip) => {
+                    let canon = canonical_ip(ip);
+                    if canon.is_unspecified() || canon.is_multicast() {
+                        errors.push(format!(
+                            "node '{node_tag}' external_ip '{raw_ip}' must be a valid unicast IP"
+                        ));
+                    } else if canon.is_loopback() {
+                        warnings.push(format!(
+                            "node '{node_tag}' external_ip '{raw_ip}' is a loopback address"
+                        ));
+                    }
+                }
+                Err(_) => {
+                    errors.push(format!(
+                        "node '{node_tag}' has invalid external_ip '{raw_ip}'"
+                    ));
+                }
+            }
         }
         if let Some(ing) = resolved_ingress.get(node_tag) {
             let uses_any_guard = ing.rules.iter().any(|r| {
@@ -871,10 +944,13 @@ pub fn compile_topology_full(
                 if let Some((sec, _)) = maintainer_keys.get(node_tag) {
                     mc.cert_signing_secret_key = Some(sec.clone());
                 }
+                mc.dns_providers = topo.dns_providers.clone();
+                mc.domains = topo.domains.clone();
             } else {
-                // Least privilege: non-primary maintainers do NOT receive ACME provider secrets or cert signing private keys
+                // Least privilege: non-primary maintainers do NOT receive DNS provider secrets, domain bindings, or cert signing private keys
                 mc.cert_signing_secret_key = None;
-                mc.acme.providers.clear();
+                mc.dns_providers.clear();
+                mc.domains.clear();
                 mc.acme.orders.clear();
             }
             Some(mc)
@@ -883,18 +959,44 @@ pub fn compile_topology_full(
         };
 
         if let Some(ref mut mc) = maint_cfg {
+            let is_self_signed = mc.acme.directory_url.trim().is_empty()
+                || mc.acme.directory_url.eq_ignore_ascii_case("self-signed");
             for order in &mc.acme.orders {
                 if let Err(e) = validate_dns_domain(&order.domain) {
                     errors.push(format!("maintainer '{node_tag}' ACME order: {e}"));
                 }
-                if !order.provider.trim().is_empty()
-                    && !order.provider.eq_ignore_ascii_case("none")
-                    && !mc.acme.providers.contains_key(&order.provider)
-                {
-                    errors.push(format!(
-                        "maintainer '{node_tag}' cert order '{}' references unknown provider '{}'",
-                        order.domain, order.provider
-                    ));
+                let explicit_prov = order
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match explicit_prov {
+                    Some(p) if p.eq_ignore_ascii_case("none") => {}
+                    Some(p) => {
+                        if !topo.dns_providers.contains_key(p) {
+                            errors.push(format!(
+                                "maintainer '{node_tag}' cert order '{}' references unknown dns_provider '{}'",
+                                order.domain, p
+                            ));
+                        }
+                    }
+                    None => {
+                        if let Some((_, binding)) =
+                            resolve_domain_binding(&topo.domains, &order.domain)
+                        {
+                            if !topo.dns_providers.contains_key(binding.provider.trim()) {
+                                errors.push(format!(
+                                    "maintainer '{node_tag}' cert order '{}' resolved domain binding with unknown dns_provider '{}'",
+                                    order.domain, binding.provider
+                                ));
+                            }
+                        } else if !is_self_signed {
+                            errors.push(format!(
+                                "maintainer '{node_tag}' cert order '{}' has no matching entry in `domains` and no explicit `provider`",
+                                order.domain
+                            ));
+                        }
+                    }
                 }
                 for target in &order.target_nodes {
                     if !topo.nodes.contains_key(target) {
@@ -1299,5 +1401,127 @@ mod tests {
         let (loop_report, _) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!loop_report.valid);
         assert!(loop_report.errors.iter().any(|e| e.contains("loop")));
+    }
+
+    #[test]
+    fn compiler_provisions_separated_dns_providers_and_domains() {
+        use exposure_core::config::{
+            AcmeConfig, CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig,
+            MaintainerConfig,
+        };
+
+        let mut topo = TopologySpec::default();
+        topo.dns_providers.insert(
+            "ali-acct1".into(),
+            DnsProviderAccountConfig::Aliyun {
+                access_key_id: "LTAI5t1".into(),
+                access_key_secret: "secret1".into(),
+                region_id: None,
+            },
+        );
+        topo.dns_providers.insert(
+            "cf-acct2".into(),
+            DnsProviderAccountConfig::Cloudflare {
+                api_token: "cf-tok".into(),
+            },
+        );
+        topo.domains.insert(
+            "example.com".into(),
+            DomainBindingConfig {
+                provider: "ali-acct1".into(),
+                target_nodes: vec!["ingress-a".into()],
+                ..Default::default()
+            },
+        );
+        topo.maintainer_templates.insert(
+            "primary".into(),
+            MaintainerConfig {
+                is_primary_cert_manager: true,
+                acme: AcmeConfig {
+                    directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
+                    orders: vec![CertOrderConfig {
+                        domain: "*.api.example.com".into(),
+                        provider: None, // auto-resolved via `domains` longest-suffix match
+                        target_nodes: vec!["ingress-a".into()],
+                        target_hops: BTreeMap::new(),
+                        renew_before_days: 30,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        topo.maintainer_templates.insert(
+            "backup".into(),
+            MaintainerConfig {
+                is_primary_cert_manager: false,
+                ..Default::default()
+            },
+        );
+
+        topo.nodes.insert(
+            "ingress-a".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
+                external_ips: vec!["203.0.113.10".into(), "2001:db8::10".into()],
+                ..Default::default()
+            },
+        );
+        topo.nodes.insert(
+            "maint-primary".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles {
+                    maintainer: true,
+                    ..Default::default()
+                },
+                maintainer_template: Some("primary".into()),
+                ..Default::default()
+            },
+        );
+        topo.nodes.insert(
+            "maint-backup".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles {
+                    maintainer: true,
+                    ..Default::default()
+                },
+                maintainer_template: Some("backup".into()),
+                ..Default::default()
+            },
+        );
+
+        let mut pubkeys = HashMap::new();
+        pubkeys.insert("ingress-a".into(), "pk-ing".into());
+        pubkeys.insert("maint-primary".into(), "pk-mp".into());
+        pubkeys.insert("maint-backup".into(), "pk-mb".into());
+
+        let (report, compiled) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(report.valid, "errors: {:?}", report.errors);
+
+        let mp = compiled["maint-primary"].maintainer.as_ref().unwrap();
+        assert_eq!(mp.dns_providers.len(), 2);
+        assert!(mp.domains.contains_key("example.com"));
+
+        // Least privilege: backup maintainer does NOT receive dns_providers or domains
+        let mb = compiled["maint-backup"].maintainer.as_ref().unwrap();
+        assert!(mb.dns_providers.is_empty());
+        assert!(mb.domains.is_empty());
+
+        // Invalid external IP fails validation
+        let mut bad_ip = topo.clone();
+        bad_ip.nodes.get_mut("ingress-a").unwrap().external_ips.push("not-an-ip".into());
+        let (bad_ip_rep, _) = compile_topology(&bad_ip, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!bad_ip_rep.valid);
+        assert!(bad_ip_rep.errors.iter().any(|e| e.contains("external_ip")));
+
+        // Unknown provider on domain fails validation
+        let mut bad_dom = topo.clone();
+        bad_dom.domains.get_mut("example.com").unwrap().provider = "missing".into();
+        let (bad_dom_rep, _) = compile_topology(&bad_dom, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!bad_dom_rep.valid);
+        assert!(bad_dom_rep.errors.iter().any(|e| e.contains("dns_provider")));
     }
 }

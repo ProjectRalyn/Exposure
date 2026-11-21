@@ -108,7 +108,7 @@ cargo build --release --bin exposure
   - **Ingress**：终结 HTTP/HTTPS 流量（支持 SNI 与动态 TLS 证书），执行 Entry Guard 安全策略，并按 `ServiceTag` 转发流量。
   - **Relay**：按多跳路径转发数据流，内置防环路机制（`TTL` 与跳数追踪）及基于健康度的节点选择。
   - **Egress**：基于 `origin_node_tag` 强制校验 `allow_from` 访问控制（默认拒绝），向本地后端代理 HTTP/1.1、HTTP/2（`h2`/`h2c`）和 WebSocket，并支持本地后端健康检查。
-  - **Maintainer**：负责 **ACME DNS-01** 证书签发与续期（支持 Cloudflare、通用 Webhook、Exec Hook 或自签名模式），聚合节点遥测数据，并分发签名配置/证书包。
+  - **Maintainer**：负责 **ACME DNS-01** 证书签发与续期（支持 Cloudflare、阿里云 DNS、通用 Webhook、Exec Hook 或自签名模式），聚合节点遥测数据，并分发签名配置/证书包。
 - **边缘 Entry Guard 与人机校验**
   - 支持 CIDR 黑白名单过滤与命名 **令牌桶限流（token-bucket）**（触发时返回 `429 Too Many Requests` 及 `Retry-After`）。
   - 结合 TLS ClientHello 与 HTTP 请求头进行浏览器指纹评分，支持 `off`、`silent` 和 `challenge` 三种模式。

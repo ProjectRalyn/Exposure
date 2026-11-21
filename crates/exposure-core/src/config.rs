@@ -587,15 +587,23 @@ impl Default for LoggerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum Dns01ProviderConfig {
+pub enum DnsProviderAccountConfig {
     Cloudflare {
         api_token: String,
-        zone_id: String,
+    },
+    #[serde(alias = "alidns")]
+    Aliyun {
+        access_key_id: String,
+        access_key_secret: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region_id: Option<String>,
     },
     Webhook {
         present_url: String,
         cleanup_url: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sync_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_header: Option<String>,
     },
     Exec {
@@ -605,10 +613,97 @@ pub enum Dns01ProviderConfig {
     },
 }
 
+fn default_dns_ttl() -> u32 {
+    600
+}
+
+/// Binding between a domain (apex, subdomain, or wildcard) and a named DNS provider account,
+/// optionally carrying zone metadata and target nodes for declarative A/AAAA DNS sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainBindingConfig {
+    /// Named account key in `dns_providers`.
+    pub provider: String,
+    /// Optional Cloudflare Zone ID (auto-queried via Cloudflare API when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+    /// Optional hosted root/apex domain name (auto-detected when omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_domain: Option<String>,
+    /// Target node tags whose configured `external_ips` are synced as A/AAAA records for this domain.
+    #[serde(default)]
+    pub target_nodes: Vec<String>,
+    /// DNS record TTL in seconds (default 600).
+    #[serde(default = "default_dns_ttl")]
+    pub ttl: u32,
+    /// Cloudflare proxy flag (ignored by non-Cloudflare providers).
+    #[serde(default)]
+    pub proxied: bool,
+}
+
+impl Default for DomainBindingConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            zone_id: None,
+            root_domain: None,
+            target_nodes: Vec::new(),
+            ttl: default_dns_ttl(),
+            proxied: false,
+        }
+    }
+}
+
+/// Resolve a domain (e.g. `*.api.sub.example.com` or `api.sub.example.com`) against
+/// `domains` using exact match first, then longest-suffix parent domain match.
+pub fn resolve_domain_binding<'a>(
+    domains: &'a BTreeMap<String, DomainBindingConfig>,
+    target_domain: &str,
+) -> Option<(&'a str, &'a DomainBindingConfig)> {
+    let raw = target_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    let norm = raw.strip_prefix("*.").unwrap_or(&raw).to_string();
+
+    // 1. Exact key match (including wildcard key if explicitly configured)
+    for (k, v) in domains {
+        let k_raw = k.trim().trim_end_matches('.').to_ascii_lowercase();
+        if k_raw == raw {
+            return Some((k.as_str(), v));
+        }
+    }
+
+    // 2. Exact match after stripping `*.` on target_domain (against non-wildcard key)
+    for (k, v) in domains {
+        let k_raw = k.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !k_raw.starts_with("*.") && k_raw == norm {
+            return Some((k.as_str(), v));
+        }
+    }
+
+    // 3. Longest-suffix parent domain match (e.g. `a.b.example.com` -> `b.example.com` -> `example.com`)
+    let mut best: Option<(&'a str, &'a DomainBindingConfig, usize)> = None;
+    for (k, v) in domains {
+        let k_raw = k.trim().trim_end_matches('.').to_ascii_lowercase();
+        if k_raw.starts_with("*.") || k_raw.is_empty() {
+            continue;
+        }
+        if norm.ends_with(&format!(".{k_raw}")) {
+            let len = k_raw.len();
+            if best.map(|(_, _, blen)| len > blen).unwrap_or(true) {
+                best = Some((k.as_str(), v, len));
+            }
+        }
+    }
+    best.map(|(k, v, _)| (k, v))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertOrderConfig {
     pub domain: String,
-    pub provider: String,
+    /// Optional DNS provider account override; when omitted, resolved via `domains` binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub target_nodes: Vec<String>,
     /// Explicit Hop Table from Maintainer to each target node (keyed by target node_tag).
@@ -624,8 +719,6 @@ pub struct AcmeConfig {
     pub directory_url: String,
     #[serde(default)]
     pub contact_email: String,
-    #[serde(default)]
-    pub providers: BTreeMap<String, Dns01ProviderConfig>,
     #[serde(default)]
     pub orders: Vec<CertOrderConfig>,
     #[serde(default = "default_cert_dir")]
@@ -647,6 +740,12 @@ pub struct MaintainerConfig {
     pub logger: LoggerConfig,
     #[serde(default)]
     pub acme: AcmeConfig,
+    /// Separated DNS provider credentials (multiple accounts per provider supported).
+    #[serde(default)]
+    pub dns_providers: BTreeMap<String, DnsProviderAccountConfig>,
+    /// Separated domain bindings (used by DNS-01 cert orders and Control-authorized DNS sync).
+    #[serde(default)]
+    pub domains: BTreeMap<String, DomainBindingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1025,6 +1124,12 @@ pub struct TopologySpec {
     /// Globally reusable Rate-Limit bucket templates selectable by any Guard template or Ingress node.
     #[serde(default)]
     pub bucket_templates: BTreeMap<String, RateLimitBucket>,
+    /// Separated DNS provider credentials (supports multiple accounts per provider).
+    #[serde(default)]
+    pub dns_providers: BTreeMap<String, DnsProviderAccountConfig>,
+    /// Separated domain bindings (1st/multi-level domains -> DNS provider account, zone metadata, & target nodes).
+    #[serde(default)]
+    pub domains: BTreeMap<String, DomainBindingConfig>,
     #[serde(default)]
     pub nodes: BTreeMap<String, TopologyNodeSpec>,
     #[serde(default)]
@@ -1039,6 +1144,9 @@ pub struct TopologySpec {
 pub struct TopologyNodeSpec {
     #[serde(default)]
     pub roles: NodeRoles,
+    /// Public/external IPv4 or IPv6 addresses advertised by this node for automatic DNS A/AAAA sync.
+    #[serde(default)]
+    pub external_ips: Vec<String>,
     #[serde(default)]
     pub link_listener: Option<LinkListenConfig>,
     #[serde(default)]
@@ -1074,4 +1182,103 @@ pub struct TopologyLinkSpec {
     pub reverse_endpoints: Vec<PeerEndpoint>,
     #[serde(default)]
     pub expected_client_addr: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{
+        resolve_domain_binding, CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig,
+    };
+
+    #[test]
+    fn aliyun_dns_provider_account_serde_yaml_and_alias() {
+        let yaml = r#"
+type: aliyun
+access_key_id: LTAI5tExampleKeyId
+access_key_secret: ExampleSecretValue
+region_id: cn-hangzhou
+"#;
+        let parsed: DnsProviderAccountConfig =
+            serde_yaml::from_str(yaml).expect("parse aliyun yaml");
+        match &parsed {
+            DnsProviderAccountConfig::Aliyun {
+                access_key_id,
+                access_key_secret,
+                region_id,
+            } => {
+                assert_eq!(access_key_id, "LTAI5tExampleKeyId");
+                assert_eq!(access_key_secret, "ExampleSecretValue");
+                assert_eq!(region_id.as_deref(), Some("cn-hangzhou"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let alias_yaml = r#"
+type: alidns
+access_key_id: LTAI5tAliasKey
+access_key_secret: AliasSecret
+"#;
+        let alias_parsed: DnsProviderAccountConfig =
+            serde_yaml::from_str(alias_yaml).expect("parse alidns alias yaml");
+        match alias_parsed {
+            DnsProviderAccountConfig::Aliyun {
+                access_key_id,
+                access_key_secret,
+                region_id,
+            } => {
+                assert_eq!(access_key_id, "LTAI5tAliasKey");
+                assert_eq!(access_key_secret, "AliasSecret");
+                assert!(region_id.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let json_val = serde_json::to_value(&parsed).expect("serialize aliyun json");
+        assert_eq!(json_val["type"], "aliyun");
+    }
+
+    #[test]
+    fn domain_binding_longest_suffix_and_cert_order_optional_provider() {
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            "example.com".to_string(),
+            DomainBindingConfig {
+                provider: "aliyun-main".to_string(),
+                ..Default::default()
+            },
+        );
+        domains.insert(
+            "sub.example.com".to_string(),
+            DomainBindingConfig {
+                provider: "cf-sub".to_string(),
+                zone_id: Some("zone-sub".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let (k1, b1) = resolve_domain_binding(&domains, "example.com").unwrap();
+        assert_eq!(k1, "example.com");
+        assert_eq!(b1.provider, "aliyun-main");
+
+        let (k2, b2) = resolve_domain_binding(&domains, "*.api.example.com").unwrap();
+        assert_eq!(k2, "example.com");
+        assert_eq!(b2.provider, "aliyun-main");
+
+        let (k3, b3) = resolve_domain_binding(&domains, "*.v2.sub.example.com").unwrap();
+        assert_eq!(k3, "sub.example.com");
+        assert_eq!(b3.provider, "cf-sub");
+        assert_eq!(b3.zone_id.as_deref(), Some("zone-sub"));
+
+        assert!(resolve_domain_binding(&domains, "other.org").is_none());
+
+        let order_yaml = r#"
+domain: "*.v2.sub.example.com"
+target_nodes: ["ingress-hk"]
+"#;
+        let order: CertOrderConfig = serde_yaml::from_str(order_yaml).unwrap();
+        assert!(order.provider.is_none());
+        assert_eq!(order.renew_before_days, 30);
+    }
 }

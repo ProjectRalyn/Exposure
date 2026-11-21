@@ -327,6 +327,41 @@ pub struct PreflightReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSyncRecordSpec {
+    pub domain: String,
+    #[serde(default)]
+    pub ipv4s: Vec<String>,
+    #[serde(default)]
+    pub ipv6s: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSyncDomainResult {
+    pub domain: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub created: usize,
+    #[serde(default)]
+    pub updated: usize,
+    #[serde(default)]
+    pub deleted: usize,
+    #[serde(default)]
+    pub unchanged: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SpecialPayload {
     ConfigPush(Box<SignedConfigBundle>),
@@ -427,6 +462,24 @@ pub enum SpecialPayload {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Control-signed command instructing a Maintainer node to declaratively sync DNS A/AAAA records.
+    /// Maintainer MUST refuse DNS sync without a valid, non-expired, non-replayed Control signature.
+    DnsSyncReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
+        records: Vec<DnsSyncRecordSpec>,
+        control_signature: String,
+    },
+    DnsSyncResp {
+        request_id: String,
+        maintainer_tag: String,
+        ok: bool,
+        results: Vec<DnsSyncDomainResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     ErrorReply {
         message: String,
     },
@@ -497,6 +550,24 @@ pub fn dial_enroll_req_signing_bytes(
     push_len_prefixed(&mut out, passphrase.as_bytes());
     push_len_prefixed(&mut out, control_public_key.as_bytes());
     push_len_prefixed(&mut out, control_link_public_key.as_bytes());
+    out
+}
+
+pub fn dns_sync_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    maintainer_tag: &str,
+    records: &[DnsSyncRecordSpec],
+) -> Vec<u8> {
+    let rec_json = serde_json::to_vec(records).unwrap_or_default();
+    let mut out = Vec::with_capacity(192 + rec_json.len());
+    out.extend_from_slice(b"exposure-dns-sync-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, maintainer_tag.as_bytes());
+    push_len_prefixed(&mut out, &rec_json);
     out
 }
 

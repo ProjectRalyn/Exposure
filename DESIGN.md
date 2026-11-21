@@ -58,7 +58,7 @@ Exposure separates the **Data Plane** (Nodes) from the **Control Plane** (Contro
 | **Ingress** | Listens for external HTTP/HTTPS traffic, terminates TLS (using certs synced from Maintainer), runs the Entry Guard pipeline, matches rules (`host`, `source_cidrs`), and opens a `Service` stream toward `next_peer` tagged with `ServiceTag`. |
 | **Relay** | Forwards `Service` streams across hops according to `ServiceTag -> next_peer` rules and relays `SpecialFrame` control/telemetry messages along explicit hop tables. |
 | **Egress** | Terminates `Service` streams, enforces `allow_from` ACLs against `origin_node_tag` (default deny unless `allow_any_origin` is set), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSocket upgrades to local backends, and runs optional local backend health checks. |
-| **Maintainer** | Manages ACME DNS-01 certificate orders and renewals (Cloudflare, Webhook, Exec Hook, or `self-signed`), distributes signed certificate bundles, and aggregates node telemetry summaries/alerts. |
+| **Maintainer** | Manages ACME DNS-01 certificate orders and renewals (Cloudflare, Aliyun DNS, Webhook, Exec Hook, or `self-signed`), distributes signed certificate bundles, and aggregates node telemetry summaries/alerts. |
 
 ---
 
@@ -125,14 +125,16 @@ Every incoming HTTP(S) request on Ingress passes through `GuardEngine`:
 
 ---
 
-## 6. Certificate Lifecycle (Maintainer)
+## 6. Certificate Lifecycle & DNS Management (Maintainer)
 
-`Maintainer` (`maintainer.rs`) centralizes TLS certificate management:
-- Supports ACME **DNS-01** challenges via configured providers:
-  - **Cloudflare** DNS API
+`Maintainer` (`maintainer.rs`) centralizes TLS certificate management and DNS record execution:
+- Separates **DNS Provider Accounts** (`dns_providers`, supporting multiple accounts per provider) from **Domain Bindings** (`domains`, supporting apex and multi-level subdomains with longest-suffix inheritance):
+  - **Cloudflare** DNS API (automatic `zone_id` lookup when omitted)
+  - **Aliyun DNS** (Alidns OpenAPI V3)
   - **Generic Webhook**
   - **Exec Hook** (external script/binary)
   - **`self-signed`** mode (via `rcgen`) for local testing and private meshes
+- **Declarative DNS A/AAAA Sync (`DnsSyncReq` / `DnsSyncResp`)**: Control computes desired IPv4/IPv6 sets from `domains[*].target_nodes` and `nodes[*].external_ips` and sends an Ed25519-signed, replay-protected `DnsSyncReq` (`POST /api/dns/sync`) to the primary Maintainer. Maintainer executes DNS changes solely with its own credentials and strictly refuses DNS record sync without a valid Control-signed command.
 - Stores certificates in `acme.storage_dir` and pushes updated certificate bundles to Ingress nodes over `SpecialFrame` streams.
 
 ---

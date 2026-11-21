@@ -62,10 +62,32 @@ guard_templates:
     block_headless: true
     require_client_fp: true
 
+dns_providers:
+  cf-prod:
+    type: cloudflare
+    api_token: "replace-with-real-api-token"
+  # aliyun-main:
+  #   type: aliyun
+  #   access_key_id: "replace-with-ram-access-key-id"
+  #   access_key_secret: "replace-with-ram-access-key-secret"
+  #   region_id: "cn-hangzhou"
+
+domains:
+  example.com:
+    provider: "cf-prod"
+    # Optional for Cloudflare (auto-queried when omitted)
+    zone_id: "0123456789abcdef0123456789abcdef"
+    # Target nodes whose external_ips are synced declaratively via Control `POST /api/dns/sync`
+    target_nodes: ["ingress-hk"]
+    ttl: 600
+    proxied: false
+
 nodes:
   ingress-hk:
     roles:
       ingress: true
+    external_ips:
+      - "203.0.113.10"
     link_listener:
       listen_addr: "0.0.0.0:9443"
     maintainer_hops:
@@ -178,14 +200,9 @@ maintainer_templates:
       directory_url: "self-signed"
       contact_email: "ops@example.com"
       storage_dir: "./data/maintainer-certs"
-      providers:
-        cf-prod:
-          type: cloudflare
-          api_token: "replace-with-real-api-token"
-          zone_id: "0123456789abcdef0123456789abcdef"
       orders:
         - domain: "example.com"
-          provider: "cf-prod"
+          # `provider` is optional — automatically resolved from `domains` (exact or longest-suffix match)
           target_nodes: ["ingress-hk"]
           target_hops:
             ingress-hk: ["maintainer-1", "relay-sg", "ingress-hk"]

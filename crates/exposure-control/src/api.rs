@@ -12,7 +12,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::assets::{load_web_asset, WebApp};
 use exposure_core::config::{
-    ControlConfig, ControlRole, Dns01ProviderConfig, NodeConfig, TopologySpec,
+    ControlConfig, ControlRole, DnsProviderAccountConfig, NodeConfig, TopologySpec,
 };
 use exposure_core::crypto::{
     ct_eq_hashed, generate_random_secret_hex, hmac_ip, validate_identifier, verify_password,
@@ -90,6 +90,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/passphrases", get(list_passphrases).post(register_passphrase))
         .route("/api/passphrases/{tag}/revoke", post(revoke_passphrase))
         .route("/api/discovery/run", post(run_discovery))
+        .route("/api/dns/sync", post(sync_dns))
         .route("/api/telemetry", get(get_telemetry))
         .route("/api/telemetry/pull", post(pull_telemetry))
         .route("/api/fingerprints", get(list_fingerprints))
@@ -195,6 +196,64 @@ fn json_err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
+fn redact_dns_provider_account(prov: &mut DnsProviderAccountConfig) {
+    match prov {
+        DnsProviderAccountConfig::Cloudflare { api_token } => {
+            if !api_token.is_empty() {
+                *api_token = REDACTED_SECRET.into();
+            }
+        }
+        DnsProviderAccountConfig::Aliyun {
+            access_key_secret, ..
+        } => {
+            if !access_key_secret.is_empty() {
+                *access_key_secret = REDACTED_SECRET.into();
+            }
+        }
+        DnsProviderAccountConfig::Webhook { auth_header, .. } => {
+            if auth_header.is_some() {
+                *auth_header = Some(REDACTED_SECRET.into());
+            }
+        }
+        DnsProviderAccountConfig::Exec { .. } => {}
+    }
+}
+
+fn restore_dns_provider_account(
+    new_p: &mut DnsProviderAccountConfig,
+    old_p: &DnsProviderAccountConfig,
+) {
+    match (new_p, old_p) {
+        (
+            DnsProviderAccountConfig::Cloudflare { api_token },
+            DnsProviderAccountConfig::Cloudflare { api_token: old_tok },
+        ) if api_token == REDACTED_SECRET => {
+            *api_token = old_tok.clone();
+        }
+        (
+            DnsProviderAccountConfig::Aliyun {
+                access_key_secret, ..
+            },
+            DnsProviderAccountConfig::Aliyun {
+                access_key_secret: old_secret,
+                ..
+            },
+        ) if access_key_secret == REDACTED_SECRET => {
+            *access_key_secret = old_secret.clone();
+        }
+        (
+            DnsProviderAccountConfig::Webhook { auth_header, .. },
+            DnsProviderAccountConfig::Webhook {
+                auth_header: old_auth,
+                ..
+            },
+        ) if auth_header.as_deref() == Some(REDACTED_SECRET) => {
+            *auth_header = old_auth.clone();
+        }
+        _ => {}
+    }
+}
+
 /// Redact all sensitive fields in `TopologySpec` before returning to API callers.
 fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
     if !spec.defaults.ingress.clearance_secret.is_empty() {
@@ -224,6 +283,9 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
             }
         }
     }
+    for prov in spec.dns_providers.values_mut() {
+        redact_dns_provider_account(prov);
+    }
     for maint in spec.maintainer_templates.values_mut() {
         if maint.cert_signing_secret_key.is_some() {
             maint.cert_signing_secret_key = Some(REDACTED_SECRET.into());
@@ -231,20 +293,8 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
         if !maint.logger.hmac_key.is_empty() {
             maint.logger.hmac_key = REDACTED_SECRET.into();
         }
-        for prov in maint.acme.providers.values_mut() {
-            match prov {
-                Dns01ProviderConfig::Cloudflare { api_token, .. } => {
-                    if !api_token.is_empty() {
-                        *api_token = REDACTED_SECRET.into();
-                    }
-                }
-                Dns01ProviderConfig::Webhook { auth_header, .. } => {
-                    if auth_header.is_some() {
-                        *auth_header = Some(REDACTED_SECRET.into());
-                    }
-                }
-                Dns01ProviderConfig::Exec { .. } => {}
-            }
+        for prov in maint.dns_providers.values_mut() {
+            redact_dns_provider_account(prov);
         }
     }
     spec
@@ -304,6 +354,11 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
             }
         }
     }
+    for (p_name, new_p) in &mut incoming.dns_providers {
+        if let Some(old_p) = existing.dns_providers.get(p_name) {
+            restore_dns_provider_account(new_p, old_p);
+        }
+    }
     for (tpl_name, new_m) in &mut incoming.maintainer_templates {
         if let Some(old_m) = existing.maintainer_templates.get(tpl_name) {
             if new_m.cert_signing_secret_key.as_deref() == Some(REDACTED_SECRET) {
@@ -312,28 +367,9 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
             if new_m.logger.hmac_key == REDACTED_SECRET {
                 new_m.logger.hmac_key = old_m.logger.hmac_key.clone();
             }
-            for (p_name, new_p) in &mut new_m.acme.providers {
-                if let Some(old_p) = old_m.acme.providers.get(p_name) {
-                    match (new_p, old_p) {
-                        (
-                            Dns01ProviderConfig::Cloudflare { api_token, .. },
-                            Dns01ProviderConfig::Cloudflare {
-                                api_token: old_tok, ..
-                            },
-                        ) if api_token == REDACTED_SECRET => {
-                            *api_token = old_tok.clone();
-                        }
-                        (
-                            Dns01ProviderConfig::Webhook { auth_header, .. },
-                            Dns01ProviderConfig::Webhook {
-                                auth_header: old_auth,
-                                ..
-                            },
-                        ) if auth_header.as_deref() == Some(REDACTED_SECRET) => {
-                            *auth_header = old_auth.clone();
-                        }
-                        _ => {}
-                    }
+            for (p_name, new_p) in &mut new_m.dns_providers {
+                if let Some(old_p) = old_m.dns_providers.get(p_name) {
+                    restore_dns_provider_account(new_p, old_p);
                 }
             }
         }
@@ -362,18 +398,8 @@ fn redact_node_config_json(raw_json: &str) -> String {
         if !m.logger.hmac_key.is_empty() {
             m.logger.hmac_key = REDACTED_SECRET.into();
         }
-        for prov in m.acme.providers.values_mut() {
-            match prov {
-                Dns01ProviderConfig::Cloudflare { api_token, .. } => {
-                    *api_token = REDACTED_SECRET.into();
-                }
-                Dns01ProviderConfig::Webhook { auth_header, .. } => {
-                    if auth_header.is_some() {
-                        *auth_header = Some(REDACTED_SECRET.into());
-                    }
-                }
-                Dns01ProviderConfig::Exec { .. } => {}
-            }
+        for prov in m.dns_providers.values_mut() {
+            redact_dns_provider_account(prov);
         }
     }
     serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".into())
@@ -922,6 +948,8 @@ struct TopoReq {
     spec: Option<TopologySpec>,
     #[serde(default)]
     push: bool,
+    #[serde(default)]
+    sync_dns: bool,
 }
 
 fn reject_yaml_bomb(yaml: &str) -> Result<(), Response> {
@@ -1103,6 +1131,15 @@ async fn save_topology(
         }
     }
 
+    let mut dns_sync_results = None;
+    let mut dns_sync_error = None;
+    if req.sync_dns {
+        match state.client.sync_dns(&actor, None, None).await {
+            Ok((_, res)) => dns_sync_results = Some(res),
+            Err(e) => dns_sync_error = Some(e.to_string()),
+        }
+    }
+
     let redacted = redact_topology_spec(topo);
     let redacted_yaml = serde_yaml::to_string(&redacted).unwrap_or_default();
     Json(serde_json::json!({
@@ -1111,6 +1148,8 @@ async fn save_topology(
         "paths": report.paths,
         "pushed_count": pushed_count,
         "push_errors": push_errors,
+        "dns_sync_results": dns_sync_results,
+        "dns_sync_error": dns_sync_error,
         "yaml": redacted_yaml,
         "spec": redacted,
     }))
@@ -1352,6 +1391,45 @@ async fn run_discovery(State(state): State<ApiState>, headers: HeaderMap) -> Res
     }
     match state.client.run_discovery(&actor).await {
         Ok(n) => Json(serde_json::json!({ "discovered_nodes": n })).into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DnsSyncApiReq {
+    #[serde(default)]
+    domains: Option<Vec<String>>,
+    #[serde(default)]
+    maintainer_tag: Option<String>,
+}
+
+async fn sync_dns(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<DnsSyncApiReq>>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    match state
+        .client
+        .sync_dns(&actor, req.domains, req.maintainer_tag)
+        .await
+    {
+        Ok((maintainer_tag, results)) => {
+            let ok = results.iter().all(|r| r.ok);
+            Json(serde_json::json!({
+                "ok": ok,
+                "maintainer_tag": maintainer_tag,
+                "results": results,
+            }))
+            .into_response()
+        }
         Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
     }
 }

@@ -205,6 +205,7 @@ function normalizeDefaults(raw) {
 function defaultNodeSpec() {
   return {
     roles: { ingress: false, egress: false, relay: false, maintainer: false },
+    external_ips: [],
     link_listener: {
       listen_addr: "0.0.0.0:10802",
       allow_on_demand: null,
@@ -263,6 +264,7 @@ function normalizeNode(n) {
   const base = defaultNodeSpec();
   const out = { ...base, ...(n || {}) };
   out.roles = rolesFromAny(n?.roles);
+  out.external_ips = Array.isArray(n?.external_ips) ? n.external_ips.map((s) => String(s).trim()).filter(Boolean) : [];
   if (n && n.link_listener === null) {
     out.link_listener = null;
   } else if (n?.link_listener && typeof n.link_listener === "object") {
@@ -317,10 +319,32 @@ function defaultMaintainerTemplate() {
       directory_url: "self-signed",
       contact_email: "",
       storage_dir: "./data/certs",
-      providers: {},
       orders: [],
     },
   };
+}
+
+function resolveDomainBindingJS(domains, targetDomain) {
+  const raw = String(targetDomain || "").trim().replace(/\.+$/, "").toLowerCase();
+  if (!raw || !domains) return null;
+  const norm = raw.startsWith("*.") ? raw.slice(2) : raw;
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (kr === raw) return [k, v];
+  }
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (!kr.startsWith("*.") && kr === norm) return [k, v];
+  }
+  let best = null;
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (!kr || kr.startsWith("*.")) continue;
+    if (norm.endsWith("." + kr)) {
+      if (!best || kr.length > best[2]) best = [k, v, kr.length];
+    }
+  }
+  return best ? [best[0], best[1]] : null;
 }
 
 function normalizeSpec(raw) {
@@ -355,13 +379,28 @@ function normalizeSpec(raw) {
         reverse_endpoints: Array.isArray(l.reverse_endpoints) ? l.reverse_endpoints : [],
       }))
     : [];
+  const dns_providers = sanitizeRecord(
+    raw?.dns_providers && typeof raw.dns_providers === "object" ? deepClone(raw.dns_providers) : {}
+  );
+  const domains = {};
+  const rawDomains = sanitizeRecord(raw?.domains);
+  for (const [dKey, dVal] of Object.entries(rawDomains)) {
+    domains[dKey] = {
+      provider: dVal?.provider || "",
+      zone_id: dVal?.zone_id || null,
+      root_domain: dVal?.root_domain || null,
+      target_nodes: Array.isArray(dVal?.target_nodes) ? dVal.target_nodes.map(String) : [],
+      ttl: dVal?.ttl != null ? Number(dVal.ttl) : 600,
+      proxied: Boolean(dVal?.proxied),
+    };
+  }
   const maintainer_templates = sanitizeRecord(
     raw?.maintainer_templates && typeof raw.maintainer_templates === "object"
       ? deepClone(raw.maintainer_templates)
       : {}
   );
   const global_logger = raw?.global_logger ? deepClone(raw.global_logger) : null;
-  return { defaults, guard_templates, bucket_templates, nodes, links, maintainer_templates, global_logger };
+  return { defaults, guard_templates, bucket_templates, dns_providers, domains, nodes, links, maintainer_templates, global_logger };
 }
 
 function parseNum(raw, fallback, min = -Infinity, max = Infinity) {
@@ -495,6 +534,8 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       defaults: defaultTopologyDefaults(),
       guard_templates: {},
       bucket_templates: {},
+      dns_providers: {},
+      domains: {},
       nodes: {},
       links: [],
       maintainer_templates: {},
@@ -1460,9 +1501,22 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       editor.spec.nodes[newTag] = deepClone(node);
       const p = editor.positions[tag] || { x: 40, y: 40 };
       editor.positions[newTag] = { x: p.x + 40, y: p.y + 40 };
+      for (const dVal of Object.values(editor.spec.domains || {})) {
+        if (Array.isArray(dVal.target_nodes)) {
+          dVal.target_nodes = dVal.target_nodes.map((t) => (t === tag ? newTag : t));
+        }
+      }
       editor.selected = { type: "node", tag: newTag };
       savePositions(editor.positions);
       render();
+    });
+
+    box.querySelector("#inp-node-ext-ips")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      node.external_ips = ev.target.value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     });
 
     ["ingress", "egress", "relay", "maintainer"].forEach((r) => {
@@ -1629,6 +1683,9 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       <div class="inspector-sec">
         <div class="inspector-sec-head"><span>Identity &amp; Mesh Listener</span></div>
         <label><span>Node Tag</span><input id="inp-node-tag" value="${escapeHtml(tag)}" /></label>
+        <label><span>External IPs (CSV, IPv4 / IPv6 for DNS sync)</span>
+          <input id="inp-node-ext-ips" value="${escapeHtml((node.external_ips || []).join(", "))}" placeholder="203.0.113.10, 2001:db8::10" />
+        </label>
         <label><span>Link Listener Address (empty = outbound-only)</span>
           <input id="inp-link-listen" value="${escapeHtml(node.link_listener?.listen_addr || "")}" placeholder="0.0.0.0:10802" />
         </label>
@@ -1998,38 +2055,22 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
             <span>Maintainer ACME &amp; SSL</span>
             <button id="btn-init-acme" class="btn sm primary">Enable ACME Template</button>
           </div>
-          <div class="muted-sm">Enable an ACME template to manage DNS01 providers and automated SSL certificate distribution.</div>
+          <div class="muted-sm">Enable an ACME template to manage automated SSL certificate orders and Hop-Table distribution.</div>
         </div>`;
     }
-    const acme = tpl.acme || { providers: {}, orders: [] };
-    const providersHtml = Object.entries(acme.providers || {})
-      .map(
-        ([pName, p]) => `
-      <div class="subcard">
-        <div class="subcard-head">
-          <span>DNS01: ${escapeHtml(pName)} (${escapeHtml(p.type || "cloudflare")})</span>
-          <button class="btn sm danger" data-del-dns="${escapeHtml(pName)}">Remove</button>
-        </div>
-        ${
-          p.type === "cloudflare"
-            ? `<div class="inspector-row">
-                <label><span>API Token</span><input type="password" autocomplete="off" spellcheck="false" data-dns-token="${escapeHtml(pName)}" value="${escapeHtml(p.api_token || "")}" /></label>
-                <label><span>Zone ID</span><input data-dns-zone="${escapeHtml(pName)}" value="${escapeHtml(p.zone_id || "")}" /></label>
-              </div>`
-            : p.type === "webhook"
-            ? `<div class="inspector-row">
-                <label><span>Present URL</span><input data-dns-present="${escapeHtml(pName)}" value="${escapeHtml(p.present_url || "")}" /></label>
-                <label><span>Cleanup URL</span><input data-dns-cleanup="${escapeHtml(pName)}" value="${escapeHtml(p.cleanup_url || "")}" /></label>
-              </div>`
-            : `<label><span>Exec Command</span><input data-dns-cmd="${escapeHtml(pName)}" value="${escapeHtml(p.command || "")}" /></label>`
-        }
-      </div>`
-      )
-      .join("");
+    const acme = tpl.acme || { orders: [] };
+    const providerNames = Object.keys(editor.spec.dns_providers || {});
+    const provDatalist = `<datalist id="dl-dns-providers">${providerNames.map((p) => `<option value="${escapeHtml(p)}"></option>`).join("")}<option value="none"></option></datalist>`;
 
     const ordersHtml = (acme.orders || [])
-      .map(
-        (o, i) => `
+      .map((o, i) => {
+        const matched = resolveDomainBindingJS(editor.spec.domains, o.domain);
+        const autoHint = o.provider
+          ? `Override: ${o.provider}`
+          : matched
+          ? `Auto: ${matched[1].provider} (via ${matched[0]})`
+          : "No domain binding matched (self-signed only)";
+        return `
       <div class="subcard">
         <div class="subcard-head">
           <span>Cert Order #${i + 1}</span>
@@ -2039,20 +2080,24 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           </div>
         </div>
         <div class="inspector-row">
-          <label><span>Domain</span><input data-ord-dom="${i}" value="${escapeHtml(o.domain || "")}" placeholder="example.com" /></label>
-          <label><span>DNS01 Provider</span><input data-ord-prov="${i}" value="${escapeHtml(o.provider || "")}" /></label>
+          <label><span>Domain</span><input data-ord-dom="${i}" value="${escapeHtml(o.domain || "")}" placeholder="*.example.com" /></label>
+          <label><span>DNS Provider (optional)</span><input list="dl-dns-providers" data-ord-prov="${i}" value="${escapeHtml(o.provider || "")}" placeholder="auto (from domain binding)" /></label>
         </div>
+        <div class="muted-sm" style="margin-bottom:6px;">${escapeHtml(autoHint)}</div>
         <div class="inspector-row">
           <label><span>Target Nodes (CSV)</span><input data-ord-targets="${i}" value="${escapeHtml((o.target_nodes || []).join(", "))}" /></label>
           <label><span>Renew Before (days)</span><input type="number" data-ord-renew="${i}" value="${o.renew_before_days ?? 30}" /></label>
         </div>
-      </div>`
-      )
+      </div>`;
+      })
       .join("");
 
     return `
       <div class="inspector-sec">
-        <div class="inspector-sec-head"><span>ACME Configuration</span></div>
+        <div class="inspector-sec-head">
+          <span>ACME Configuration</span>
+          <button type="button" id="btn-open-dns-from-maint" class="btn sm">DNS Providers &amp; Domains</button>
+        </div>
         <div class="inspector-row">
           <label><span>Template Name</span><input id="inp-maint-tpl" value="${escapeHtml(tplName)}" /></label>
           <label class="check-inline" style="align-self:end;padding-bottom:8px;">
@@ -2064,11 +2109,9 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           <label><span>Contact Email</span><input id="inp-acme-email" value="${escapeHtml(acme.contact_email || "")}" /></label>
         </div>
         <div class="btn-row">
-          <button id="btn-add-dns-cf" class="btn sm">+ Cloudflare</button>
-          <button id="btn-add-dns-wh" class="btn sm">+ Webhook</button>
           <button id="btn-add-order" class="btn sm">+ Cert Order</button>
         </div>
-        ${providersHtml}
+        ${provDatalist}
         ${ordersHtml}
       </div>
     `;
@@ -2276,9 +2319,22 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
           }
         }
       }
+      for (const dVal of Object.values(editor.spec.domains || {})) {
+        if (Array.isArray(dVal.target_nodes)) {
+          dVal.target_nodes = dVal.target_nodes.map((t) => (t === tag ? newTag : t));
+        }
+      }
       editor.selected = { type: "node", tag: newTag };
       savePositions(editor.positions);
       render();
+    });
+
+    box.querySelector("#inp-node-ext-ips")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      node.external_ips = ev.target.value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     });
 
     box.querySelector("#inp-link-listen")?.addEventListener("input", (ev) => {
@@ -2671,39 +2727,19 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     box.querySelector("#chk-primary-cm")?.addEventListener("change", (ev) => { if (tpl) { markDirty(false); tpl.is_primary_cert_manager = ev.target.checked; } });
     box.querySelector("#inp-acme-dir")?.addEventListener("input", (ev) => { if (tpl) { markDirty(false); tpl.acme.directory_url = ev.target.value.trim(); } });
     box.querySelector("#inp-acme-email")?.addEventListener("input", (ev) => { if (tpl) { markDirty(false); tpl.acme.contact_email = ev.target.value.trim(); } });
-    box.querySelector("#btn-add-dns-cf")?.addEventListener("click", () => {
-      if (!tpl) return;
-      markDirty(true);
-      let n = "cf", k = 1;
-      while (tpl.acme.providers[n]) n = `cf-${k++}`;
-      tpl.acme.providers[n] = { type: "cloudflare", api_token: "", zone_id: "" };
-      render();
+    box.querySelector("#btn-open-dns-from-maint")?.addEventListener("click", () => {
+      switchMode("defaults");
     });
-    box.querySelector("#btn-add-dns-wh")?.addEventListener("click", () => {
-      if (!tpl) return;
-      markDirty(true);
-      let n = "webhook", k = 1;
-      while (tpl.acme.providers[n]) n = `webhook-${k++}`;
-      tpl.acme.providers[n] = { type: "webhook", present_url: "", cleanup_url: "", auth_header: null };
-      render();
-    });
-    box.querySelectorAll("[data-del-dns]").forEach((btn) => btn.addEventListener("click", () => { markDirty(true); delete tpl.acme.providers[btn.dataset.delDns]; render(); }));
-    box.querySelectorAll("[data-dns-token]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.providers[inp.dataset.dnsToken].api_token = inp.value.trim(); }));
-    box.querySelectorAll("[data-dns-zone]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.providers[inp.dataset.dnsZone].zone_id = inp.value.trim(); }));
-    box.querySelectorAll("[data-dns-present]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.providers[inp.dataset.dnsPresent].present_url = inp.value.trim(); }));
-    box.querySelectorAll("[data-dns-cleanup]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.providers[inp.dataset.dnsCleanup].cleanup_url = inp.value.trim(); }));
-    box.querySelectorAll("[data-dns-cmd]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.providers[inp.dataset.dnsCmd].command = inp.value.trim(); }));
 
     box.querySelector("#btn-add-order")?.addEventListener("click", () => {
       if (!tpl) return;
       markDirty(true);
-      const firstProv = Object.keys(tpl.acme.providers)[0] || "cf";
-      tpl.acme.orders.push({ domain: "example.com", provider: firstProv, target_nodes: [], target_hops: {}, renew_before_days: 30 });
+      tpl.acme.orders.push({ domain: "example.com", provider: null, target_nodes: [], target_hops: {}, renew_before_days: 30 });
       render();
     });
     box.querySelectorAll("[data-del-order]").forEach((btn) => btn.addEventListener("click", () => { markDirty(true); tpl.acme.orders.splice(Number(btn.dataset.delOrder), 1); render(); }));
     box.querySelectorAll("[data-ord-dom]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordDom)].domain = inp.value.trim(); }));
-    box.querySelectorAll("[data-ord-prov]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordProv)].provider = inp.value.trim(); }));
+    box.querySelectorAll("[data-ord-prov]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordProv)].provider = inp.value.trim() || null; }));
     box.querySelectorAll("[data-ord-targets]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordTargets)].target_nodes = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
     box.querySelectorAll("[data-ord-renew]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); tpl.acme.orders[Number(inp.dataset.ordRenew)].renew_before_days = parseNum(inp.value, 30, 1, 365); }));
     box.querySelectorAll("[data-auto-order-hops]").forEach((btn) =>
@@ -2928,6 +2964,94 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
 
     const guardTplNames = Object.keys(editor.spec.guard_templates || {});
     const bucketTplNames = Object.keys(editor.spec.bucket_templates || {});
+    if (!editor.spec.dns_providers) editor.spec.dns_providers = {};
+    if (!editor.spec.domains) editor.spec.domains = {};
+    const dnsProvNames = Object.keys(editor.spec.dns_providers);
+    const domainNames = Object.keys(editor.spec.domains);
+
+    const dnsProvidersHtml = Object.entries(editor.spec.dns_providers)
+      .map(
+        ([pName, p]) => `
+      <div class="subcard">
+        <div class="subcard-head">
+          <div style="display:flex;gap:8px;align-items:center;flex:1;">
+            <input class="inline-name" data-dns-acc-name="${escapeHtml(pName)}" value="${escapeHtml(pName)}" />
+            <span class="pill">${escapeHtml(p.type || "cloudflare")}</span>
+          </div>
+          <button type="button" class="btn sm danger" data-del-dns-acc="${escapeHtml(pName)}">Remove</button>
+        </div>
+        ${
+          p.type === "cloudflare"
+            ? `<label><span>API Token</span><input type="password" autocomplete="off" spellcheck="false" data-dns-cf-tok="${escapeHtml(pName)}" value="${escapeHtml(p.api_token || "")}" /></label>`
+            : p.type === "aliyun" || p.type === "alidns"
+            ? `<div class="inspector-row">
+                <label><span>AccessKey ID</span><input data-dns-ali-ak="${escapeHtml(pName)}" value="${escapeHtml(p.access_key_id || "")}" placeholder="LTAI..." /></label>
+                <label><span>AccessKey Secret</span><input type="password" autocomplete="off" spellcheck="false" data-dns-ali-sk="${escapeHtml(pName)}" value="${escapeHtml(p.access_key_secret || "")}" /></label>
+              </div>
+              <label><span>Region ID (optional)</span><input data-dns-ali-reg="${escapeHtml(pName)}" value="${escapeHtml(p.region_id || "")}" placeholder="alidns.aliyuncs.com (default)" /></label>`
+            : p.type === "webhook"
+            ? `<div class="inspector-row">
+                <label><span>Present URL</span><input data-dns-wh-pres="${escapeHtml(pName)}" value="${escapeHtml(p.present_url || "")}" /></label>
+                <label><span>Cleanup URL</span><input data-dns-wh-clean="${escapeHtml(pName)}" value="${escapeHtml(p.cleanup_url || "")}" /></label>
+              </div>
+              <div class="inspector-row">
+                <label><span>Sync URL (optional)</span><input data-dns-wh-sync="${escapeHtml(pName)}" value="${escapeHtml(p.sync_url || "")}" placeholder="https://..." /></label>
+                <label><span>Auth Header (optional)</span><input type="password" autocomplete="off" spellcheck="false" data-dns-wh-auth="${escapeHtml(pName)}" value="${escapeHtml(p.auth_header || "")}" /></label>
+              </div>`
+            : `<label><span>Exec Command</span><input data-dns-ex-cmd="${escapeHtml(pName)}" value="${escapeHtml(p.command || "")}" /></label>`
+        }
+      </div>`
+      )
+      .join("");
+
+    const domainsHtml = Object.entries(editor.spec.domains)
+      .map(([dName, d]) => {
+        const resolvedIps = [];
+        for (const nt of d.target_nodes || []) {
+          const ips = editor.spec.nodes?.[nt]?.external_ips || [];
+          for (const ip of ips) resolvedIps.push(`${nt}: ${ip}`);
+        }
+        const ipHint = (d.target_nodes || []).length
+          ? resolvedIps.length
+            ? `Resolved IPs: ${resolvedIps.join(", ")}`
+            : "Target nodes have no external_ips set yet"
+          : "Cert DNS-01 / parent-zone binding only (no A/AAAA sync targets)";
+        return `
+      <div class="subcard">
+        <div class="subcard-head">
+          <input class="inline-name" data-dom-name="${escapeHtml(dName)}" value="${escapeHtml(dName)}" placeholder="example.com" />
+          <button type="button" class="btn sm danger" data-del-dom="${escapeHtml(dName)}">Remove</button>
+        </div>
+        <div class="inspector-row">
+          <label><span>Provider Account</span>
+            <select data-dom-prov="${escapeHtml(dName)}">
+              <option value="">(select provider)</option>
+              ${dnsProvNames
+                .map(
+                  (pn) =>
+                    `<option value="${escapeHtml(pn)}" ${d.provider === pn ? "selected" : ""}>${escapeHtml(pn)}</option>`
+                )
+                .join("")}
+            </select>
+          </label>
+          <label><span>Target Nodes (CSV for A/AAAA sync)</span>
+            <input data-dom-targets="${escapeHtml(dName)}" value="${escapeHtml((d.target_nodes || []).join(", "))}" placeholder="ingress-hk, ingress-sg" />
+          </label>
+        </div>
+        <div class="inspector-row">
+          <label><span>Zone ID (CF optional, auto-queried)</span><input data-dom-zone="${escapeHtml(dName)}" value="${escapeHtml(d.zone_id || "")}" placeholder="auto" /></label>
+          <label><span>Root Domain (optional apex)</span><input data-dom-root="${escapeHtml(dName)}" value="${escapeHtml(d.root_domain || "")}" placeholder="auto (e.g. example.com)" /></label>
+        </div>
+        <div class="inspector-row">
+          <label><span>TTL (s)</span><input type="number" min="1" data-dom-ttl="${escapeHtml(dName)}" value="${d.ttl ?? 600}" /></label>
+          <label class="check-inline" style="align-self:end;padding-bottom:8px;">
+            <input type="checkbox" data-dom-proxied="${escapeHtml(dName)}" ${d.proxied ? "checked" : ""} /> Cloudflare Proxied
+          </label>
+        </div>
+        <div class="muted-sm">${escapeHtml(ipHint)}</div>
+      </div>`;
+      })
+      .join("");
 
     // Count usage of each global guard template across all ingress rules
     const guardUsage = {};
@@ -3095,6 +3219,38 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
             : `<div class="muted-sm">No global guard templates defined yet. Create templates like "web-standard" or "under-attack" once, then select them on any Ingress rule.</div>`
         }
       </div>
+
+      <div class="inspector-sec">
+        <div class="inspector-sec-head">
+          <span>DNS Provider Accounts (${dnsProvNames.length})</span>
+          <div class="btn-row">
+            <button type="button" id="btn-add-dnsacc-cf" class="btn sm">+ Cloudflare</button>
+            <button type="button" id="btn-add-dnsacc-ali" class="btn sm">+ Aliyun DNS</button>
+            <button type="button" id="btn-add-dnsacc-wh" class="btn sm">+ Webhook</button>
+            <button type="button" id="btn-add-dnsacc-ex" class="btn sm">+ Exec</button>
+          </div>
+        </div>
+        ${
+          dnsProvidersHtml
+            ? `<div class="tpl-card-grid">${dnsProvidersHtml}</div>`
+            : `<div class="muted-sm">Add one or more DNS provider accounts (multiple accounts per provider supported). Credentials are provisioned only to the primary Maintainer.</div>`
+        }
+      </div>
+
+      <div class="inspector-sec">
+        <div class="inspector-sec-head">
+          <span>Domain Bindings &amp; Auto DNS Sync (${domainNames.length})</span>
+          <div class="btn-row">
+            <button type="button" id="btn-sync-dns-now" class="btn sm">Sync DNS Now</button>
+            <button type="button" id="btn-add-domain-binding" class="btn sm primary">+ Domain Binding</button>
+          </div>
+        </div>
+        ${
+          domainsHtml
+            ? `<div class="tpl-card-grid">${domainsHtml}</div>`
+            : `<div class="muted-sm">Bind any apex or multi-level domain to a DNS provider account for automatic cert DNS-01 lookup and Control-authorized A/AAAA sync from target nodes' external_ips.</div>`
+        }
+      </div>
     `;
 
     // Wire Defaults workspace events
@@ -3225,6 +3381,115 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
         }
       },
       onAfterMutate: () => renderDefaultsWorkspace(),
+    });
+
+    // DNS Provider Accounts CRUD
+    const addDnsAcc = (prefix, payload) => {
+      markDirty(true);
+      let name = prefix, k = 1;
+      while (editor.spec.dns_providers[name]) name = `${prefix}-${k++}`;
+      editor.spec.dns_providers[name] = payload;
+      renderDefaultsWorkspace();
+    };
+    wrap.querySelector("#btn-add-dnsacc-cf")?.addEventListener("click", () => addDnsAcc("cf", { type: "cloudflare", api_token: "" }));
+    wrap.querySelector("#btn-add-dnsacc-ali")?.addEventListener("click", () => addDnsAcc("aliyun", { type: "aliyun", access_key_id: "", access_key_secret: "", region_id: null }));
+    wrap.querySelector("#btn-add-dnsacc-wh")?.addEventListener("click", () => addDnsAcc("webhook", { type: "webhook", present_url: "", cleanup_url: "", sync_url: null, auth_header: null }));
+    wrap.querySelector("#btn-add-dnsacc-ex")?.addEventListener("click", () => addDnsAcc("exec", { type: "exec", command: "", args: [] }));
+
+    wrap.querySelectorAll("[data-del-dns-acc]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        markDirty(true);
+        delete editor.spec.dns_providers[btn.dataset.delDnsAcc];
+        renderDefaultsWorkspace();
+      })
+    );
+    wrap.querySelectorAll("[data-dns-acc-name]").forEach((inp) =>
+      inp.addEventListener("change", () => {
+        const oldN = inp.dataset.dnsAccName, newN = inp.value.trim();
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(editor.spec.dns_providers, newN)) {
+          inp.value = oldN;
+          return;
+        }
+        markDirty(true);
+        editor.spec.dns_providers[newN] = editor.spec.dns_providers[oldN];
+        delete editor.spec.dns_providers[oldN];
+        for (const d of Object.values(editor.spec.domains || {})) {
+          if (d.provider === oldN) d.provider = newN;
+        }
+        for (const tpl of Object.values(editor.spec.maintainer_templates || {})) {
+          for (const ord of tpl?.acme?.orders || []) {
+            if (ord.provider === oldN) ord.provider = newN;
+          }
+        }
+        renderDefaultsWorkspace();
+      })
+    );
+    wrap.querySelectorAll("[data-dns-cf-tok]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsCfTok].api_token = inp.value.trim(); }));
+    wrap.querySelectorAll("[data-dns-ali-ak]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsAliAk].access_key_id = inp.value.trim(); }));
+    wrap.querySelectorAll("[data-dns-ali-sk]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsAliSk].access_key_secret = inp.value.trim(); }));
+    wrap.querySelectorAll("[data-dns-ali-reg]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsAliReg].region_id = inp.value.trim() || null; }));
+    wrap.querySelectorAll("[data-dns-wh-pres]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsWhPres].present_url = inp.value.trim(); }));
+    wrap.querySelectorAll("[data-dns-wh-clean]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsWhClean].cleanup_url = inp.value.trim(); }));
+    wrap.querySelectorAll("[data-dns-wh-sync]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsWhSync].sync_url = inp.value.trim() || null; }));
+    wrap.querySelectorAll("[data-dns-wh-auth]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsWhAuth].auth_header = inp.value.trim() || null; }));
+    wrap.querySelectorAll("[data-dns-ex-cmd]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.dns_providers[inp.dataset.dnsExCmd].command = inp.value.trim(); }));
+
+    // Domain Bindings CRUD & Control-authorized DNS Sync
+    wrap.querySelector("#btn-add-domain-binding")?.addEventListener("click", () => {
+      markDirty(true);
+      let d = "example.com", k = 1;
+      while (editor.spec.domains[d]) d = `sub${k++}.example.com`;
+      editor.spec.domains[d] = {
+        provider: Object.keys(editor.spec.dns_providers)[0] || "",
+        zone_id: null,
+        root_domain: null,
+        target_nodes: [],
+        ttl: 600,
+        proxied: false,
+      };
+      renderDefaultsWorkspace();
+    });
+    wrap.querySelectorAll("[data-del-dom]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        markDirty(true);
+        delete editor.spec.domains[btn.dataset.delDom];
+        renderDefaultsWorkspace();
+      })
+    );
+    wrap.querySelectorAll("[data-dom-name]").forEach((inp) =>
+      inp.addEventListener("change", () => {
+        const oldN = inp.dataset.domName, newN = inp.value.trim();
+        if (!newN || newN === oldN || isReservedKey(newN) || Object.hasOwn(editor.spec.domains, newN)) {
+          inp.value = oldN;
+          return;
+        }
+        markDirty(true);
+        editor.spec.domains[newN] = editor.spec.domains[oldN];
+        delete editor.spec.domains[oldN];
+        renderDefaultsWorkspace();
+      })
+    );
+    wrap.querySelectorAll("[data-dom-prov]").forEach((sel) => sel.addEventListener("change", () => { markDirty(false); editor.spec.domains[sel.dataset.domProv].provider = sel.value; }));
+    wrap.querySelectorAll("[data-dom-targets]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.domains[inp.dataset.domTargets].target_nodes = inp.value.split(",").map((s) => s.trim()).filter(Boolean); }));
+    wrap.querySelectorAll("[data-dom-zone]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.domains[inp.dataset.domZone].zone_id = inp.value.trim() || null; }));
+    wrap.querySelectorAll("[data-dom-root]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.domains[inp.dataset.domRoot].root_domain = inp.value.trim() || null; }));
+    wrap.querySelectorAll("[data-dom-ttl]").forEach((inp) => inp.addEventListener("input", () => { markDirty(false); editor.spec.domains[inp.dataset.domTtl].ttl = parseNum(inp.value, 600, 1, 86400); }));
+    wrap.querySelectorAll("[data-dom-proxied]").forEach((chk) => chk.addEventListener("change", () => { markDirty(false); editor.spec.domains[chk.dataset.domProxied].proxied = chk.checked; }));
+
+    wrap.querySelector("#btn-sync-dns-now")?.addEventListener("click", async () => {
+      try {
+        const resp = await api("/api/dns/sync", { method: "POST", body: "{}" });
+        const summary = (resp.results || [])
+          .map((r) =>
+            r.ok
+              ? `${r.domain}: +${r.created}/~${r.updated}/-${r.deleted}`
+              : `${r.domain}: ERR (${r.error})`
+          )
+          .join("; ");
+        showToast(`DNS sync via ${resp.maintainer_tag}: ${summary || "done"}`, resp.ok ? "ok" : "error");
+      } catch (e) {
+        showToast(`DNS sync failed: ${e.message}`, "error");
+      }
     });
   }
 

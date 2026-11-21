@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,9 +13,11 @@ use exposure_core::crypto::{
     compute_bootstrap_reply_proof, compute_passphrase_proof, verify_signature_b64, NodeKeyPair,
 };
 use exposure_core::protocol::{
-    dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, read_json_frame, write_json_frame,
+    dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, dns_sync_req_signing_bytes,
+    read_json_frame, write_json_frame, DnsSyncDomainResult, DnsSyncRecordSpec,
     MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
 };
+use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
     AlertRecord, CertStatusInfo, FingerprintObservation, LinkStatusSnapshot, MinuteSummary,
 };
@@ -1169,6 +1172,216 @@ impl ControlClient {
                 let _ = self.db.revoke_passphrase(target_node_tag).await;
                 Err(ExposureError::Protocol("unexpected DialEnroll reply".into()))
             }
+        }
+    }
+
+    /// Issue a Control-signed `DnsSyncReq` command to a Maintainer node to declaratively sync
+    /// A/AAAA records for configured `domains` using target nodes' `external_ips`.
+    pub async fn sync_dns(
+        &self,
+        actor: &str,
+        filter_domains: Option<Vec<String>>,
+        maintainer_tag: Option<String>,
+    ) -> Result<(String, Vec<DnsSyncDomainResult>)> {
+        let yaml = self.db.get_topology_yaml().await?;
+        if yaml.trim().is_empty() {
+            return Err(ExposureError::Config("no topology saved in Control".into()));
+        }
+        let topo: TopologySpec = serde_yaml::from_str(&yaml)
+            .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?;
+
+        let target_maint = if let Some(ref mt) = maintainer_tag {
+            let trimmed = mt.trim();
+            let spec = topo.nodes.get(trimmed).ok_or_else(|| {
+                ExposureError::Config(format!("maintainer '{trimmed}' not found in topology"))
+            })?;
+            if !spec.roles.maintainer {
+                return Err(ExposureError::Config(format!(
+                    "node '{trimmed}' does not have maintainer role"
+                )));
+            }
+            trimmed.to_string()
+        } else {
+            let primary = topo
+                .nodes
+                .iter()
+                .find(|(_, spec)| {
+                    spec.roles.maintainer
+                        && spec
+                            .maintainer_template
+                            .as_deref()
+                            .and_then(|t| topo.maintainer_templates.get(t))
+                            .map(|mc| mc.is_primary_cert_manager)
+                            .unwrap_or(false)
+                })
+                .map(|(tag, _)| tag.clone());
+            primary
+                .or_else(|| {
+                    topo.nodes
+                        .iter()
+                        .find(|(_, spec)| spec.roles.maintainer)
+                        .map(|(tag, _)| tag.clone())
+                })
+                .ok_or_else(|| {
+                    ExposureError::Config("no maintainer node found in topology".into())
+                })?
+        };
+
+        let filter_set: Option<HashSet<String>> = filter_domains.map(|list| {
+            list.into_iter()
+                .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
+
+        let mut records = Vec::new();
+        for (dom, binding) in &topo.domains {
+            let dom_norm = dom.trim().trim_end_matches('.').to_ascii_lowercase();
+            let explicitly_requested = filter_set
+                .as_ref()
+                .map(|s| s.contains(&dom_norm))
+                .unwrap_or(false);
+            if filter_set.is_some() && !explicitly_requested {
+                continue;
+            }
+            if binding.target_nodes.is_empty() {
+                if explicitly_requested {
+                    return Err(ExposureError::Config(format!(
+                        "domain '{dom}' has no target_nodes configured for DNS sync"
+                    )));
+                }
+                continue;
+            }
+
+            let mut v4 = BTreeSet::new();
+            let mut v6 = BTreeSet::new();
+            for node_tag in &binding.target_nodes {
+                let node_spec = topo.nodes.get(node_tag).ok_or_else(|| {
+                    ExposureError::Config(format!(
+                        "domain '{dom}' references unknown target node '{node_tag}'"
+                    ))
+                })?;
+                for raw_ip in &node_spec.external_ips {
+                    let ip: IpAddr = raw_ip.trim().parse().map_err(|_| {
+                        ExposureError::Config(format!(
+                            "node '{node_tag}' has invalid external_ip '{raw_ip}'"
+                        ))
+                    })?;
+                    match canonical_ip(ip) {
+                        IpAddr::V4(addr) => {
+                            v4.insert(addr.to_string());
+                        }
+                        IpAddr::V6(addr) => {
+                            v6.insert(addr.to_string());
+                        }
+                    }
+                }
+            }
+
+            if v4.is_empty() && v6.is_empty() {
+                return Err(ExposureError::Config(format!(
+                    "domain '{dom}' target_nodes ({}) have no external_ips configured",
+                    binding.target_nodes.join(", ")
+                )));
+            }
+
+            records.push(DnsSyncRecordSpec {
+                domain: dom.clone(),
+                ipv4s: v4.into_iter().collect(),
+                ipv6s: v6.into_iter().collect(),
+                provider: Some(binding.provider.clone()),
+                zone_id: binding.zone_id.clone(),
+                root_domain: binding.root_domain.clone(),
+                ttl: Some(binding.ttl),
+                proxied: Some(binding.proxied),
+            });
+        }
+
+        if records.is_empty() {
+            return Err(ExposureError::Config(
+                "no domains with target_nodes configured for DNS sync".into(),
+            ));
+        }
+
+        let boot = self
+            .active_bootstrap_tag()
+            .await
+            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let hops = compute_control_hops(&self.cfg.control_id, &boot, &target_maint, &topo)
+            .ok_or_else(|| {
+                ExposureError::Routing(format!(
+                    "no hop path from bootstrap '{boot}' to maintainer '{target_maint}'"
+                ))
+            })?;
+
+        let now = Utc::now().timestamp();
+        let expires_at = now + 60;
+        let request_id = Uuid::new_v4().to_string();
+        let signing = dns_sync_req_signing_bytes(
+            &request_id,
+            now,
+            expires_at,
+            &target_maint,
+            &records,
+        );
+        let control_signature = self.signing_kp.sign_b64(&signing);
+
+        let frame = SpecialFrame::new(
+            Uuid::new_v4().to_string(),
+            hops,
+            16,
+            SpecialPayload::DnsSyncReq {
+                request_id: request_id.clone(),
+                issued_at: now,
+                expires_at,
+                maintainer_tag: target_maint.clone(),
+                records,
+                control_signature,
+            },
+        );
+
+        match self.send_special_rpc(frame, Duration::from_secs(30)).await? {
+            SpecialFrame {
+                payload:
+                    SpecialPayload::DnsSyncResp {
+                        request_id: resp_id,
+                        ok,
+                        results,
+                        error,
+                        ..
+                    },
+                ..
+            } => {
+                if resp_id != request_id {
+                    return Err(ExposureError::Protocol(
+                        "DnsSyncResp request_id mismatch".into(),
+                    ));
+                }
+                let detail = if ok {
+                    format!("synced {} domain(s)", results.len())
+                } else {
+                    error
+                        .clone()
+                        .unwrap_or_else(|| "one or more domains failed DNS sync".into())
+                };
+                self.db
+                    .append_audit(actor, "dns_sync", &target_maint, ok, &detail)
+                    .await;
+                if !ok && results.is_empty() {
+                    return Err(ExposureError::Protocol(detail));
+                }
+                Ok((target_maint, results))
+            }
+            SpecialFrame {
+                payload: SpecialPayload::ErrorReply { message },
+                ..
+            } => {
+                self.db
+                    .append_audit(actor, "dns_sync", &target_maint, false, &message)
+                    .await;
+                Err(ExposureError::Protocol(message))
+            }
+            _ => Err(ExposureError::Protocol("unexpected DnsSync reply".into())),
         }
     }
 }

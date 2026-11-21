@@ -133,6 +133,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     .to_string(),
                 ..Default::default()
             },
+            ..Default::default()
         }),
         bootstrap_tunnel_addr: None,
         config_sequence: 0,
@@ -783,7 +784,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     let maint_svc = maint_rt.maintainer().await.unwrap();
     let order = CertOrderConfig {
         domain: "secure.test".into(),
-        provider: "none".into(),
+        provider: Some("none".into()),
         target_nodes: vec!["ingress-a".into()],
         target_hops: BTreeMap::from([(
             "ingress-a".into(),
@@ -1042,6 +1043,50 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             node_obj.get("maintainer_signing_secret").is_none(),
             "maintainer_signing_secret must never be serialized to API"
         );
+    }
+
+    // Verify forged DnsSyncReq is rejected by Maintainer (no unauthorized DNS changes allowed!)
+    let forged_sync = SpecialFrame::new(
+        uuid::Uuid::new_v4().to_string(),
+        vec![
+            "control-1".into(),
+            "ingress-a".into(),
+            "relay-1".into(),
+            "maintainer-1".into(),
+        ],
+        16,
+        SpecialPayload::DnsSyncReq {
+            request_id: "forged-sync-1".into(),
+            issued_at: chrono::Utc::now().timestamp(),
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            maintainer_tag: "maintainer-1".into(),
+            records: vec![exposure_core::protocol::DnsSyncRecordSpec {
+                domain: "app.example.com".into(),
+                ipv4s: vec!["203.0.113.10".into()],
+                ipv6s: vec![],
+                provider: Some("missing-prov".into()),
+                zone_id: None,
+                root_domain: None,
+                ttl: Some(600),
+                proxied: Some(false),
+            }],
+            control_signature: "invalid-signature".into(),
+        },
+    );
+    let forged_reply = ctrl_rt
+        .client()
+        .send_special_rpc(forged_sync, Duration::from_secs(5))
+        .await
+        .unwrap();
+    match forged_reply.payload {
+        SpecialPayload::DnsSyncResp { ok, error, .. } => {
+            assert!(!ok);
+            assert!(
+                error.as_deref().unwrap_or("").contains("signature invalid"),
+                "expected signature rejection, got: {error:?}"
+            );
+        }
+        other => panic!("unexpected forged DnsSync reply: {other:?}"),
     }
 
     // Verify server-side logout revokes the token immediately!
