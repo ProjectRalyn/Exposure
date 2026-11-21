@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-link"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
