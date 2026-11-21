@@ -80,7 +80,17 @@ pub fn load_web_asset(app: WebApp, req_path: &str) -> Option<(Vec<u8>, &'static 
 
     #[cfg(not(debug_assertions))]
     {
-        let bytes = get_embedded(app.name(), &rel)?;
+        let bytes = get_embedded(app.name(), &rel).or_else(|| {
+            if app == WebApp::Challenge {
+                match rel.as_str() {
+                    "pow.js" => get_embedded(app.name(), "assets/app.min.js"),
+                    "styles.css" => get_embedded(app.name(), "assets/styles.min.css"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })?;
         Some((bytes.to_vec(), mime))
     }
 }
@@ -92,8 +102,10 @@ fn escape_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Render a generic, zero-leakage error page (with Ray ID) for 429 / 5xx responses when `intercept_errors` is enabled.
-pub fn render_exposure_error_html(
+/// Render an error page for 429 / 5xx responses, using a Control-provisioned custom HTML
+/// template when configured (with HTML-escaped placeholders) or falling back to the built-in page.
+pub fn render_exposure_error_html_with_template(
+    template: Option<&str>,
     status: u16,
     title: &str,
     detail: &str,
@@ -115,6 +127,20 @@ pub fn render_exposure_error_html(
             ray = escape_html(ray_id),
         ),
     };
+
+    if let Some(tpl) = template.map(str::trim).filter(|s| !s.is_empty()) {
+        let status_str = status.to_string();
+        let retry_str = retry_after_secs.map(|s| s.to_string()).unwrap_or_default();
+        return tpl
+            .replace("{{status}}", &status_str)
+            .replace("{{title}}", &escape_html(title))
+            .replace("{{detail}}", &escape_html(detail))
+            .replace("{{ray_id}}", &escape_html(ray_id))
+            .replace("{{retry_after}}", &retry_str)
+            .replace("{{accent}}", accent)
+            .replace("{{retry_note}}", &retry_note);
+    }
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -140,4 +166,37 @@ p{{margin:0 0 18px;color:#94a3b8;font-size:14px;line-height:1.55}}
         accent = accent,
         retry_note = retry_note,
     )
+}
+
+/// Render a generic, zero-leakage error page (with Ray ID) for 429 / 5xx responses when `intercept_errors` is enabled.
+pub fn render_exposure_error_html(
+    status: u16,
+    title: &str,
+    detail: &str,
+    ray_id: &str,
+    retry_after_secs: Option<u64>,
+) -> String {
+    render_exposure_error_html_with_template(None, status, title, detail, ray_id, retry_after_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_exposure_error_html_with_template;
+
+    #[test]
+    fn custom_error_template_substitutes_and_escapes_fields() {
+        let tpl = "<html><body><h1>{{status}} {{title}}</h1><p>{{detail}}</p><span>{{ray_id}}</span><div>{{retry_after}}</div></body></html>";
+        let rendered = render_exposure_error_html_with_template(
+            Some(tpl),
+            429,
+            "Slow <Down>",
+            "Wait & retry",
+            "ray<1>",
+            Some(12),
+        );
+        assert!(rendered.contains("<h1>429 Slow &lt;Down&gt;</h1>"));
+        assert!(rendered.contains("<p>Wait &amp; retry</p>"));
+        assert!(rendered.contains("<span>ray&lt;1&gt;</span>"));
+        assert!(rendered.contains("<div>12</div>"));
+    }
 }

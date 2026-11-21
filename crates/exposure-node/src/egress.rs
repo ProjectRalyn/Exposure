@@ -267,9 +267,12 @@ impl EgressHandler {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let svc = {
+        let (svc, error_html_tpl) = {
             let cfg = self.cfg.read().await;
-            cfg.services.get(&header.service_tag).cloned()
+            (
+                cfg.services.get(&header.service_tag).cloned(),
+                cfg.pages.error_html.clone(),
+            )
         };
 
         let svc = match svc {
@@ -313,12 +316,20 @@ impl EgressHandler {
         let this = Arc::clone(self);
         let svc_arc = Arc::new(svc);
         let hdr_arc = Arc::new(header);
+        let tpl_arc = Arc::new(error_html_tpl);
 
         let service = service_fn(move |req: Request<Incoming>| {
             let this2 = Arc::clone(&this);
             let svc2 = Arc::clone(&svc_arc);
             let hdr2 = Arc::clone(&hdr_arc);
-            async move { Ok::<_, hyper::Error>(this2.proxy_http_request(req, &svc2, &hdr2).await) }
+            let tpl2 = Arc::clone(&tpl_arc);
+            async move {
+                Ok::<_, hyper::Error>(
+                    this2
+                        .proxy_http_request(req, &svc2, &hdr2, tpl2.as_deref())
+                        .await,
+                )
+            }
         });
 
         let io = TokioIo::new(stream);
@@ -334,6 +345,7 @@ impl EgressHandler {
         mut req: Request<Incoming>,
         svc: &EgressServiceConfig,
         hdr: &ServiceStreamHeader,
+        error_html_tpl: Option<&str>,
     ) -> Response<ProxyBody> {
         let start = Instant::now();
         let client_ip = hdr.client_ip.as_deref().unwrap_or("0.0.0.0");
@@ -345,6 +357,7 @@ impl EgressHandler {
                     "Service Unavailable",
                     "The upstream backend failed local health checks.",
                     svc.effective_intercept_errors(),
+                    error_html_tpl,
                 );
         }
 
@@ -390,6 +403,7 @@ impl EgressHandler {
                     "Bad Gateway",
                     "Could not connect to the upstream server.",
                     svc.effective_intercept_errors(),
+                    error_html_tpl,
                 );
             }
             Err(_) => {
@@ -419,6 +433,7 @@ impl EgressHandler {
                     "Gateway Timeout",
                     "The upstream server did not respond in time.",
                     svc.effective_intercept_errors(),
+                    error_html_tpl,
                 );
             }
         };
@@ -510,6 +525,7 @@ impl EgressHandler {
                     title,
                     detail,
                     svc.effective_intercept_errors(),
+                    error_html_tpl,
                 )
             }
         }
@@ -521,10 +537,12 @@ impl EgressHandler {
         title: &str,
         detail: &str,
         intercept: bool,
+        error_html_tpl: Option<&str>,
     ) -> Response<ProxyBody> {
         if intercept {
             let ray_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
-            let html = exposure_core::assets::render_exposure_error_html(
+            let html = exposure_core::assets::render_exposure_error_html_with_template(
+                error_html_tpl,
                 status.as_u16(),
                 title,
                 detail,

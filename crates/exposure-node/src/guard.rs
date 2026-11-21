@@ -8,7 +8,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::assets::{load_web_asset, WebApp};
-use exposure_core::config::{AntibotMode, GuardProfile, RateLimitBucket};
+use exposure_core::config::{AntibotMode, CustomPagesConfig, GuardProfile, RateLimitBucket};
 use exposure_core::crypto::{
     ct_eq_hashed, keyed_short_hmac_hex, sign_challenge_token, sign_clearance_cookie,
     sign_fp_cookie, sign_fp_token, verify_challenge_token, verify_clearance_cookie,
@@ -34,6 +34,7 @@ const FP_TOKEN_TTL_SECS: i64 = 60;
 const FP_INJECT_COOLDOWN: Duration = Duration::from_secs(15);
 const ADAPTIVE_WINDOW: Duration = Duration::from_secs(60);
 const VERIFY_FAILURE_WINDOW: Duration = Duration::from_secs(300);
+const MAX_RATE_LIMIT_HTML_RESPONSES: u32 = 3;
 const CHALLENGE_CSP: &str =
     "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
 
@@ -49,6 +50,7 @@ pub struct VerifiedFpSubmission {
 struct TokenBucketState {
     tokens: f64,
     last_refill: Instant,
+    blocked_hits: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +63,10 @@ struct ChallengeActivity {
 
 pub enum GuardDecision {
     Allow,
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+        show_error_page: bool,
+    },
     Reject { status: StatusCode, reason: String },
     ChallengeRedirect { location: String },
 }
@@ -152,14 +157,55 @@ impl GuardEngine {
         }
         if let Some(ref bucket_name) = profile.rate_limit_bucket {
             if let Some(def) = bucket_defs.get(bucket_name) {
-                if let Err(retry_after) = self.consume_token(bucket_name, def, client_ip) {
+                if let Err((retry_after, show_error_page)) =
+                    self.consume_token(bucket_name, def, client_ip)
+                {
                     return GuardDecision::RateLimited {
                         retry_after_secs: retry_after,
+                        show_error_page,
                     };
                 }
             }
         }
         GuardDecision::Allow
+    }
+
+    /// Check without consuming tokens whether this client's rate-limit bucket has already
+    /// entered degraded mode (`blocked_hits >= MAX_RATE_LIMIT_HTML_RESPONSES` while still
+    /// depleted). Used on `/cdn-cgi/*` so legitimate PoW users and initial un-degraded
+    /// requests are never disrupted, while active flooders are blocked everywhere.
+    pub fn is_bucket_degraded(
+        &self,
+        profile: &GuardProfile,
+        bucket_defs: &BTreeMap<String, RateLimitBucket>,
+        client_ip: IpAddr,
+    ) -> Option<u64> {
+        let bucket_name = profile.rate_limit_bucket.as_deref()?;
+        let def = bucket_defs.get(bucket_name)?;
+        let key = (
+            bucket_name.to_string(),
+            if def.effective_per_ip() {
+                canonical_ip(client_ip).to_string()
+            } else {
+                "*".to_string()
+            },
+        );
+        let entry = self.buckets.get(&key)?;
+        if entry.blocked_hits < MAX_RATE_LIMIT_HTML_RESPONSES {
+            return None;
+        }
+        let elapsed = Instant::now().duration_since(entry.last_refill).as_secs_f64();
+        let effective_tokens = (entry.tokens + elapsed * def.refill_per_sec).min(def.capacity);
+        if effective_tokens >= 1.0 {
+            return None;
+        }
+        let needed = 1.0 - effective_tokens;
+        let wait = if def.refill_per_sec > 0.0 {
+            (needed / def.refill_per_sec).ceil().max(1.0) as u64
+        } else {
+            60
+        };
+        Some(wait)
     }
 
     fn consume_per_ip_limiter(
@@ -180,6 +226,7 @@ impl GuardEngine {
         let mut entry = map.entry(key).or_insert_with(|| TokenBucketState {
             tokens: capacity,
             last_refill: now,
+            blocked_hits: 0,
         });
         let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
         entry.tokens = (entry.tokens + elapsed * refill_per_sec).min(capacity);
@@ -432,7 +479,7 @@ impl GuardEngine {
         bucket_name: &str,
         def: &RateLimitBucket,
         client_ip: IpAddr,
-    ) -> Result<(), u64> {
+    ) -> Result<(), (u64, bool)> {
         let now = Instant::now();
         if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
             self.buckets
@@ -454,6 +501,7 @@ impl GuardEngine {
         let mut entry = self.buckets.entry(key).or_insert_with(|| TokenBucketState {
             tokens: def.capacity,
             last_refill: now,
+            blocked_hits: 0,
         });
         let elapsed = now.duration_since(entry.last_refill).as_secs_f64();
         entry.tokens = (entry.tokens + elapsed * def.refill_per_sec).min(def.capacity);
@@ -461,15 +509,18 @@ impl GuardEngine {
 
         if entry.tokens >= 1.0 {
             entry.tokens -= 1.0;
+            entry.blocked_hits = 0;
             Ok(())
         } else {
+            entry.blocked_hits = entry.blocked_hits.saturating_add(1);
+            let show_error_page = entry.blocked_hits <= MAX_RATE_LIMIT_HTML_RESPONSES;
             let needed = 1.0 - entry.tokens;
             let wait = if def.refill_per_sec > 0.0 {
                 (needed / def.refill_per_sec).ceil().max(1.0) as u64
             } else {
                 60
             };
-            Err(wait)
+            Err((wait, show_error_page))
         }
     }
 
@@ -735,6 +786,38 @@ impl GuardEngine {
         profile: Option<&GuardProfile>,
         clearance_secret: &str,
         fp_ttl_secs: u64,
+    ) -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
+        self.handle_cdn_cgi_with_pages(
+            method,
+            path,
+            body,
+            headers,
+            host,
+            client_ip,
+            is_tls,
+            tls_signal,
+            profile,
+            clearance_secret,
+            fp_ttl_secs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_cdn_cgi_with_pages(
+        &self,
+        method: &Method,
+        path: &str,
+        body: &[u8],
+        headers: &HeaderMap,
+        host: &str,
+        client_ip: IpAddr,
+        is_tls: bool,
+        tls_signal: Option<&ClientHelloSignal>,
+        profile: Option<&GuardProfile>,
+        clearance_secret: &str,
+        fp_ttl_secs: u64,
+        custom_pages: Option<&CustomPagesConfig>,
     ) -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
         let client_ip = canonical_ip(client_ip);
         let host_clean = normalize_host(host);
@@ -1197,6 +1280,48 @@ impl GuardEngine {
         }
 
         let asset_path = sub.trim_start_matches('/');
+        if let Some(pages) = custom_pages {
+            if asset_path.is_empty() || asset_path == "index.html" {
+                if let Some(custom_html) = pages
+                    .challenge_html
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let mut extra = sec_headers();
+                    extra.push(("Cache-Control".into(), "no-cache".into()));
+                    return (
+                        GuardHttpResponse {
+                            status: StatusCode::OK,
+                            content_type: "text/html; charset=utf-8",
+                            body: custom_html.as_bytes().to_vec(),
+                            extra_headers: extra,
+                        },
+                        None,
+                    );
+                }
+            }
+            if asset_path == "styles.css" || asset_path == "assets/styles.min.css" {
+                if let Some(custom_css) = pages
+                    .challenge_css
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let mut extra = sec_headers();
+                    extra.push(("Cache-Control".into(), "no-cache".into()));
+                    return (
+                        GuardHttpResponse {
+                            status: StatusCode::OK,
+                            content_type: "text/css; charset=utf-8",
+                            body: custom_css.as_bytes().to_vec(),
+                            extra_headers: extra,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
         if let Some((bytes, mime)) = load_web_asset(WebApp::Challenge, asset_path) {
             let mut extra = sec_headers();
             let cc = if asset_path == "fp.js" {
@@ -1467,10 +1592,75 @@ mod tests {
             engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None),
             GuardDecision::Allow
         ));
-        assert!(matches!(
-            engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None),
-            GuardDecision::RateLimited { .. }
-        ));
+        assert!(engine.is_bucket_degraded(&profile, &buckets, ip).is_none());
+        for hit in 1..=5 {
+            match engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None)
+            {
+                GuardDecision::RateLimited {
+                    show_error_page, ..
+                } => {
+                    assert_eq!(
+                        show_error_page,
+                        hit <= MAX_RATE_LIMIT_HTML_RESPONSES,
+                        "hit {hit} show_error_page mismatch"
+                    );
+                    assert_eq!(
+                        engine.is_bucket_degraded(&profile, &buckets, ip).is_some(),
+                        hit >= MAX_RATE_LIMIT_HTML_RESPONSES,
+                        "hit {hit} degraded state mismatch"
+                    );
+                }
+                _ => panic!("expected RateLimited on hit {hit}"),
+            }
+        }
+    }
+
+    #[test]
+    fn custom_challenge_html_and_css_served_from_memory() {
+        let engine = GuardEngine::new();
+        let pages = CustomPagesConfig {
+            error_html: None,
+            challenge_html: Some("<html><body>Custom PoW</body></html>".into()),
+            challenge_css: Some("body{background:#123456}".into()),
+        };
+        let ip: IpAddr = "203.0.113.55".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let (html_resp, _) = engine.handle_cdn_cgi_with_pages(
+            &Method::GET,
+            "/cdn-cgi/",
+            &[],
+            &headers,
+            "example.com",
+            ip,
+            true,
+            None,
+            None,
+            "sec",
+            3600,
+            Some(&pages),
+        );
+        assert_eq!(html_resp.status, StatusCode::OK);
+        assert_eq!(html_resp.content_type, "text/html; charset=utf-8");
+        assert_eq!(html_resp.body, b"<html><body>Custom PoW</body></html>");
+
+        let (css_resp, _) = engine.handle_cdn_cgi_with_pages(
+            &Method::GET,
+            "/cdn-cgi/styles.css",
+            &[],
+            &headers,
+            "example.com",
+            ip,
+            true,
+            None,
+            None,
+            "sec",
+            3600,
+            Some(&pages),
+        );
+        assert_eq!(css_resp.status, StatusCode::OK);
+        assert_eq!(css_resp.content_type, "text/css; charset=utf-8");
+        assert_eq!(css_resp.body, b"body{background:#123456}");
     }
 
     #[test]

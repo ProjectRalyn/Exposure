@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, EgressConfig, EgressDefaults, GuardDefaults, GuardProfile,
-    IngressConfig, IngressDefaults, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
-    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, TopologySpec,
+    resolve_domain_binding, CustomPagesConfig, EgressConfig, EgressDefaults, GuardDefaults,
+    GuardProfile, IngressConfig, IngressDefaults, LinkListenConfig, LinkListenerDefaults, LinkMode,
+    LoggerConfig, NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, TopologySpec,
     TrustedMaintainer, TrustedOrigin, TunnelDirection,
 };
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
@@ -13,6 +13,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 const MAX_HOP_PATH_LEN: usize = 16;
+const MAX_CUSTOM_PAGE_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRouteTrace {
@@ -119,10 +120,38 @@ fn resolve_bucket(b: &RateLimitBucket) -> RateLimitBucket {
     }
 }
 
+fn inherit_opt_page(node_val: &mut Option<String>, default_val: &Option<String>) {
+    let empty = node_val.as_deref().map(str::trim).unwrap_or("").is_empty();
+    if empty {
+        *node_val = default_val
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+    }
+}
+
+fn validate_custom_pages(pages: &CustomPagesConfig, label: &str, errors: &mut Vec<String>) {
+    for (field, val) in [
+        ("error_html", &pages.error_html),
+        ("challenge_html", &pages.challenge_html),
+        ("challenge_css", &pages.challenge_css),
+    ] {
+        if let Some(s) = val {
+            if s.len() > MAX_CUSTOM_PAGE_BYTES {
+                errors.push(format!(
+                    "{label}.pages.{field} exceeds {} byte limit",
+                    MAX_CUSTOM_PAGE_BYTES
+                ));
+            }
+        }
+    }
+}
+
 fn resolve_ingress_config(
     src: &IngressConfig,
     ingress_defs: &IngressDefaults,
     guard_defs: &GuardDefaults,
+    page_defs: &CustomPagesConfig,
     global_guards: &BTreeMap<String, GuardProfile>,
     global_buckets: &BTreeMap<String, RateLimitBucket>,
 ) -> IngressConfig {
@@ -173,10 +202,17 @@ fn resolve_ingress_config(
             rule.js_fp_beacon = out.js_fp_beacon;
         }
     }
+    inherit_opt_page(&mut out.pages.error_html, &page_defs.error_html);
+    inherit_opt_page(&mut out.pages.challenge_html, &page_defs.challenge_html);
+    inherit_opt_page(&mut out.pages.challenge_css, &page_defs.challenge_css);
     out
 }
 
-fn resolve_egress_config(src: &EgressConfig, defs: &EgressDefaults) -> EgressConfig {
+fn resolve_egress_config(
+    src: &EgressConfig,
+    defs: &EgressDefaults,
+    page_defs: &CustomPagesConfig,
+) -> EgressConfig {
     let mut out = src.clone();
     for svc in out.services.values_mut() {
         svc.tls = Some(svc.tls.unwrap_or(defs.tls));
@@ -193,6 +229,10 @@ fn resolve_egress_config(src: &EgressConfig, defs: &EgressDefaults) -> EgressCon
             svc.timeout_ms = defs.timeout_ms;
         }
     }
+    inherit_opt_page(&mut out.pages.error_html, &page_defs.error_html);
+    // Egress does not serve PoW challenge pages
+    out.pages.challenge_html = None;
+    out.pages.challenge_css = None;
     out
 }
 
@@ -274,6 +314,7 @@ pub fn compile_topology_full(
                     &spec.ingress,
                     &topo.defaults.ingress,
                     &topo.defaults.guard,
+                    &topo.defaults.pages,
                     &topo.guard_templates,
                     &topo.bucket_templates,
                 ),
@@ -288,12 +329,13 @@ pub fn compile_topology_full(
         .map(|(tag, spec)| {
             (
                 tag.clone(),
-                resolve_egress_config(&spec.egress, &topo.defaults.egress),
+                resolve_egress_config(&spec.egress, &topo.defaults.egress, &topo.defaults.pages),
             )
         })
         .collect();
 
-    // 0. Validate global logger, global templates, node tags, guards, buckets, CIDRs, and maintainer templates
+    // 0. Validate global logger, global templates, custom pages, node tags, guards, buckets, CIDRs, and maintainer templates
+    validate_custom_pages(&topo.defaults.pages, "defaults", &mut errors);
     if let Some(ref gl) = topo.global_logger {
         if !gl.hmac_key.is_empty() && is_weak_secret(&gl.hmac_key) {
             errors.push(
@@ -384,6 +426,8 @@ pub fn compile_topology_full(
         if let Err(e) = validate_identifier(node_tag, "node_tag") {
             errors.push(e.to_string());
         }
+        validate_custom_pages(&spec.ingress.pages, &format!("node '{node_tag}'.ingress"), &mut errors);
+        validate_custom_pages(&spec.egress.pages, &format!("node '{node_tag}'.egress"), &mut errors);
         for raw_ip in &spec.external_ips {
             let trimmed = raw_ip.trim();
             match trimmed.parse::<IpAddr>() {
@@ -1317,7 +1361,7 @@ mod tests {
                     allow_tunnel: Some(true),
                     allow_bootstrap: Some(false),
                 }),
-                egress: EgressConfig { services },
+                egress: EgressConfig { services, ..Default::default() },
                 ..Default::default()
             },
         );

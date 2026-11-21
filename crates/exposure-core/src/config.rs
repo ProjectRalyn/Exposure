@@ -371,6 +371,41 @@ pub struct IngressListener {
     pub tls: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CustomPagesConfig {
+    /// Custom HTML template for `intercept_errors` pages (429 / 5xx).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_html: Option<String>,
+    /// Custom HTML for `/cdn-cgi/` PoW verification page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_html: Option<String>,
+    /// Custom CSS served at `/cdn-cgi/styles.css` (and `/cdn-cgi/assets/styles.min.css`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_css: Option<String>,
+}
+
+impl CustomPagesConfig {
+    pub fn is_empty(&self) -> bool {
+        self.error_html
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+            && self
+                .challenge_html
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && self
+                .challenge_css
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngressConfig {
     #[serde(default)]
@@ -396,6 +431,9 @@ pub struct IngressConfig {
     /// Cooldown TTL in seconds before re-injecting passive JS fingerprint beacon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_ttl_secs: Option<u64>,
+    /// Optional custom HTML/CSS pages provisioned from Control (`error_html`, `challenge_html`, `challenge_css`).
+    #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
+    pub pages: CustomPagesConfig,
 }
 
 impl IngressConfig {
@@ -420,6 +458,7 @@ impl Default for IngressConfig {
             server_header: default_server_header(),
             js_fp_beacon: None,
             js_fp_ttl_secs: None,
+            pages: CustomPagesConfig::default(),
         }
     }
 }
@@ -505,6 +544,9 @@ fn default_backend_timeout_ms() -> u64 {
 pub struct EgressConfig {
     #[serde(default)]
     pub services: BTreeMap<String, EgressServiceConfig>,
+    /// Optional custom error page template provisioned from Control.
+    #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
+    pub pages: CustomPagesConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1111,6 +1153,8 @@ pub struct TopologyDefaults {
     pub egress: EgressDefaults,
     #[serde(default)]
     pub link_listener: LinkListenerDefaults,
+    #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
+    pub pages: CustomPagesConfig,
 }
 
 /// High-level topology table edited in Control and compiled into per-node configs.

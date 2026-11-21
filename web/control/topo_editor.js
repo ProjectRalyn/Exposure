@@ -85,6 +85,11 @@ function defaultTopologyDefaults() {
       allow_tunnel: true,
       allow_bootstrap: false,
     },
+    pages: {
+      error_html: null,
+      challenge_html: null,
+      challenge_css: null,
+    },
   };
 }
 
@@ -199,6 +204,11 @@ function normalizeDefaults(raw) {
       allow_tunnel: Boolean(src.link_listener?.allow_tunnel ?? base.link_listener.allow_tunnel),
       allow_bootstrap: Boolean(src.link_listener?.allow_bootstrap ?? base.link_listener.allow_bootstrap),
     },
+    pages: {
+      error_html: src.pages?.error_html || null,
+      challenge_html: src.pages?.challenge_html || null,
+      challenge_css: src.pages?.challenge_css || null,
+    },
   };
 }
 
@@ -225,8 +235,9 @@ function defaultNodeSpec() {
       server_header: "",
       js_fp_beacon: null,
       js_fp_ttl_secs: null,
+      pages: { error_html: null, challenge_html: null, challenge_css: null },
     },
-    egress: { services: {} },
+    egress: { services: {}, pages: { error_html: null, challenge_html: null, challenge_css: null } },
     relay: { rules: [] },
   };
 }
@@ -302,7 +313,17 @@ function normalizeNode(n) {
   out.ingress.rate_limit_buckets = {};
   for (const [k, v] of Object.entries(rawBuckets)) out.ingress.rate_limit_buckets[k] = normalizeBucket(v);
   out.ingress.tls_certs = Array.isArray(out.ingress.tls_certs) ? out.ingress.tls_certs : [];
+  out.ingress.pages = {
+    error_html: n?.ingress?.pages?.error_html || null,
+    challenge_html: n?.ingress?.pages?.challenge_html || null,
+    challenge_css: n?.ingress?.pages?.challenge_css || null,
+  };
   out.egress = { ...base.egress, ...(n?.egress || {}) };
+  out.egress.pages = {
+    error_html: n?.egress?.pages?.error_html || null,
+    challenge_html: null,
+    challenge_css: null,
+  };
   const rawSvcs = sanitizeRecord(out.egress.services);
   out.egress.services = {};
   for (const [k, v] of Object.entries(rawSvcs)) out.egress.services[k] = normalizeEgressService(v);
@@ -2954,6 +2975,8 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
     const gDefs = defs.guard;
     const egDefs = defs.egress;
     const llDefs = defs.link_listener;
+    if (!defs.pages) defs.pages = { error_html: null, challenge_html: null, challenge_css: null };
+    const pageDefs = defs.pages;
     const gl = editor.spec.global_logger || {
       hmac_key: "",
       store_raw_ip: false,
@@ -3251,6 +3274,27 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
             : `<div class="muted-sm">Bind any apex or multi-level domain to a DNS provider account for automatic cert DNS-01 lookup and Control-authorized A/AAAA sync from target nodes' external_ips.</div>`
         }
       </div>
+
+      <div class="inspector-sec">
+        <div class="inspector-sec-head">
+          <span>Custom Node Pages (Control-Distributed &amp; Memory-Cached)</span>
+          <button type="button" id="btn-reset-custom-pages" class="btn sm">Reset to Built-in Defaults</button>
+        </div>
+        <div class="muted-sm" style="margin-bottom:8px;">
+          Leave blank to use built-in pages. Custom templates are pushed via signed config to nodes and cached in memory (zero disk I/O per request).
+        </div>
+        <label><span>Custom Intercept Error Page HTML (<code>{{status}}</code>, <code>{{title}}</code>, <code>{{detail}}</code>, <code>{{ray_id}}</code>, <code>{{retry_after}}</code>, <code>{{accent}}</code>, <code>{{retry_note}}</code>)</span>
+          <textarea id="def-page-error-html" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for default 429 / 5xx error page">${escapeHtml(pageDefs.error_html || "")}</textarea>
+        </label>
+        <div class="inspector-row">
+          <label><span>Custom PoW Page HTML (<code>/cdn-cgi/</code>, keep <code>#status-text</code>, <code>#progress-bar</code>, <code>#meta-difficulty</code>, <code>#meta-hashes</code>, <code>#error-text</code> &amp; <code>/cdn-cgi/pow.js</code>)</span>
+            <textarea id="def-page-chal-html" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for default PoW HTML">${escapeHtml(pageDefs.challenge_html || "")}</textarea>
+          </label>
+          <label><span>Custom PoW Page CSS (<code>/cdn-cgi/styles.css</code>)</span>
+            <textarea id="def-page-chal-css" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for default PoW CSS">${escapeHtml(pageDefs.challenge_css || "")}</textarea>
+          </label>
+        </div>
+      </div>
     `;
 
     // Wire Defaults workspace events
@@ -3490,6 +3534,27 @@ export function createTopoEditor({ api, showToast, el, onDirtyChange }) {
       } catch (e) {
         showToast(`DNS sync failed: ${e.message}`, "error");
       }
+    });
+
+    wrap.querySelector("#def-page-error-html")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      pageDefs.error_html = ev.target.value.trim() ? ev.target.value : null;
+    });
+    wrap.querySelector("#def-page-chal-html")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      pageDefs.challenge_html = ev.target.value.trim() ? ev.target.value : null;
+    });
+    wrap.querySelector("#def-page-chal-css")?.addEventListener("input", (ev) => {
+      markDirty(false);
+      pageDefs.challenge_css = ev.target.value.trim() ? ev.target.value : null;
+    });
+    wrap.querySelector("#btn-reset-custom-pages")?.addEventListener("click", () => {
+      markDirty(true);
+      pageDefs.error_html = null;
+      pageDefs.challenge_html = null;
+      pageDefs.challenge_css = null;
+      renderDefaultsWorkspace();
+      showToast("Cleared custom pages (will use built-in templates)");
     });
   }
 

@@ -291,6 +291,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         ingress: Default::default(),
         egress: EgressConfig {
             services: egress_services,
+            ..Default::default()
         },
         relay: Default::default(),
         maintainer: None,
@@ -433,7 +434,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     service_tag: "web@local".into(),
                     next_peer: "ingress-a".into(),
                     guard: Some("rl".into()),
-                    intercept_errors: Some(false),
+                    intercept_errors: Some(true),
                     js_fp_beacon: Some(false),
                 },
                 IngressRule {
@@ -457,9 +458,11 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             server_header: "nginx".into(),
             js_fp_beacon: Some(true),
             js_fp_ttl_secs: Some(3600),
+            pages: Default::default(),
         },
         egress: EgressConfig {
             services: local_services,
+            pages: Default::default(),
         },
         relay: Default::default(),
         maintainer: None,
@@ -671,7 +674,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         "unknown Host header must be rejected with 421 Misdirected Request"
     );
 
-    // --- TEST D: Guard Token Bucket Rate Limiting (429 + Retry-After) ---
+    // --- TEST D: Guard Token Bucket Rate Limiting ---
+    // Un-degraded hits (1..=3) return HTML error page and do NOT block /cdn-cgi/ PoW;
+    // once degraded (4+), both normal routes AND /cdn-cgi/ PoW return ultra-short "429".
     for _ in 0..2 {
         let r = http_client
             .get(format!("http://{ingress_http}/ok"))
@@ -681,14 +686,52 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             .unwrap();
         assert_eq!(r.status(), 200);
     }
-    let rl_resp = http_client
+    // Hit 1: normal route -> 429 HTML page
+    let rl_resp1 = http_client
         .get(format!("http://{ingress_http}/blocked"))
         .header("Host", "rl.test")
         .send()
         .await
         .unwrap();
-    assert_eq!(rl_resp.status(), 429);
-    assert!(rl_resp.headers().contains_key("retry-after"));
+    assert_eq!(rl_resp1.status(), 429);
+    assert!(rl_resp1.headers().contains_key("retry-after"));
+    let rl_body1 = rl_resp1.text().await.unwrap();
+    assert!(rl_body1.contains("<!DOCTYPE html>"), "first hit should serve error page");
+
+    // Before degradation, /cdn-cgi/ PoW page must remain unaffected
+    let pre_deg_pow = http_client
+        .get(format!("http://{ingress_http}/cdn-cgi/"))
+        .header("Host", "rl.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pre_deg_pow.status(), 200);
+
+    // Hit 2 & 3: normal route -> still 429 HTML page
+    for hit in [2, 3] {
+        let rl_resp = http_client
+            .get(format!("http://{ingress_http}/blocked"))
+            .header("Host", "rl.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rl_resp.status(), 429);
+        let body = rl_resp.text().await.unwrap();
+        assert!(body.contains("<!DOCTYPE html>"), "hit {hit} should serve error page");
+    }
+
+    // Hit 4+: bucket is degraded -> normal route AND /cdn-cgi/ PoW endpoints return ultra-short "429"
+    for path in ["/blocked", "/cdn-cgi/", "/cdn-cgi/challenge"] {
+        let rl_short = http_client
+            .get(format!("http://{ingress_http}{path}"))
+            .header("Host", "rl.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rl_short.status(), 429);
+        assert!(rl_short.headers().contains_key("retry-after"));
+        assert_eq!(rl_short.text().await.unwrap(), "429");
+    }
 
     // --- TEST E: Guard PoW Challenge under /cdn-cgi/, Replay Rejection & Clearance Cookie ---
     let bot_resp = http_client
@@ -996,6 +1039,11 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     // Verify Preflight bundle CANNOT be replayed as ConfigPush (domain separation!)
     let mut updated_cfg = ingress_rt.config_snapshot().await;
     updated_cfg.default_ttl = 12;
+    updated_cfg.ingress.pages = exposure_core::config::CustomPagesConfig {
+        error_html: Some("<html>custom-err-{{status}}</html>".into()),
+        challenge_html: Some("<html><body>Custom PoW Page</body></html>".into()),
+        challenge_css: Some("body{background:#010203}".into()),
+    };
     let preflight_bundle = ctrl_rt
         .client()
         .sign_config_bundle_with_purpose(
@@ -1019,6 +1067,27 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     ingress_rt.apply_signed_config(bundle_v2).await.unwrap();
     assert_eq!(ingress_rt.config_snapshot().await.config_sequence, 2);
     assert_eq!(ingress_rt.config_snapshot().await.default_ttl, 12);
+
+    // Verify custom Control-distributed PoW HTML & CSS are served immediately from memory
+    let custom_pow_html = http_client
+        .get(format!("http://{ingress_http}/cdn-cgi/"))
+        .header("Host", "pow.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(custom_pow_html.status(), 200);
+    assert_eq!(
+        custom_pow_html.text().await.unwrap(),
+        "<html><body>Custom PoW Page</body></html>"
+    );
+    let custom_pow_css = http_client
+        .get(format!("http://{ingress_http}/cdn-cgi/styles.css"))
+        .header("Host", "pow.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(custom_pow_css.status(), 200);
+    assert_eq!(custom_pow_css.text().await.unwrap(), "body{background:#010203}");
 
     // Attempt rollback with seq=1 -> must be rejected and seq remains 2
     let bundle_rollback = ctrl_rt

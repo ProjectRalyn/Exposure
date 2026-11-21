@@ -446,16 +446,21 @@ impl IngressServer {
                 .and_then(|r| r.guard.as_ref())
                 .and_then(|g| cfg.guards.get(g));
 
-            // Enforce CIDR policy on `/cdn-cgi/*` (rate limiting on `/cdn-cgi/*` is isolated per-IP inside `handle_cdn_cgi`)
+            // Enforce CIDR policy on `/cdn-cgi/*`, and block PoW endpoints once the route bucket enters degraded mode
             if let Some(profile) = guard_profile {
                 match self.guard.evaluate_access_cidrs(profile, client_ip) {
                     GuardDecision::Allow => {}
-                    GuardDecision::RateLimited { retry_after_secs } => {
-                        return Response::builder()
-                            .status(StatusCode::TOO_MANY_REQUESTS)
-                            .header(header::RETRY_AFTER, retry_after_secs.to_string())
-                            .body(full_body("Too Many Requests"))
-                            .unwrap();
+                    GuardDecision::RateLimited {
+                        retry_after_secs,
+                        show_error_page,
+                    } => {
+                        return build_rate_limit_response(
+                            retry_after_secs,
+                            show_error_page,
+                            false,
+                            &ray_id,
+                            cfg.pages.error_html.as_deref(),
+                        );
                     }
                     GuardDecision::Reject { status, .. } => {
                         return Response::builder()
@@ -465,9 +470,21 @@ impl IngressServer {
                     }
                     GuardDecision::ChallengeRedirect { .. } => {}
                 }
+                if let Some(retry_after_secs) =
+                    self.guard
+                        .is_bucket_degraded(profile, &cfg.rate_limit_buckets, client_ip)
+                {
+                    return build_rate_limit_response(
+                        retry_after_secs,
+                        false,
+                        false,
+                        &ray_id,
+                        cfg.pages.error_html.as_deref(),
+                    );
+                }
             }
 
-            let (g_resp, verified_fp_sub) = self.guard.handle_cdn_cgi(
+            let (g_resp, verified_fp_sub) = self.guard.handle_cdn_cgi_with_pages(
                 &method,
                 &path,
                 &body_bytes,
@@ -479,6 +496,7 @@ impl IngressServer {
                 guard_profile,
                 &cfg.clearance_secret,
                 cfg.effective_js_fp_ttl_secs(),
+                Some(&cfg.pages),
             );
 
             let passed = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::OK;
@@ -609,7 +627,10 @@ impl IngressServer {
                         tls_signal,
                     ) {
                         GuardDecision::Allow => {}
-                        GuardDecision::RateLimited { retry_after_secs } => {
+                        GuardDecision::RateLimited {
+                            retry_after_secs,
+                            show_error_page,
+                        } => {
                             self.logger
                                 .record_session_with_fp(
                                     "ingress",
@@ -653,27 +674,13 @@ impl IngressServer {
                                     1,
                                 )
                                 .await;
-                            if rule.effective_intercept_errors() {
-                                let html = exposure_core::assets::render_exposure_error_html(
-                                    429,
-                                    "Too Many Requests",
-                                    "Rate limit exceeded. Please try again shortly.",
-                                    &ray_id,
-                                    Some(retry_after_secs),
-                                );
-                                return Response::builder()
-                                    .status(StatusCode::TOO_MANY_REQUESTS)
-                                    .header(header::RETRY_AFTER, retry_after_secs.to_string())
-                                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                                    .header(header::CACHE_CONTROL, "no-store")
-                                    .body(full_body(html))
-                                    .unwrap();
-                            }
-                            return Response::builder()
-                                .status(StatusCode::TOO_MANY_REQUESTS)
-                                .header(header::RETRY_AFTER, retry_after_secs.to_string())
-                                .body(full_body("Too Many Requests"))
-                                .unwrap();
+                            return build_rate_limit_response(
+                                retry_after_secs,
+                                show_error_page,
+                                rule.effective_intercept_errors(),
+                                &ray_id,
+                                cfg.pages.error_html.as_deref(),
+                            );
                         }
                         GuardDecision::Reject { status, reason } => {
                             self.logger
@@ -1141,7 +1148,8 @@ impl IngressServer {
                     ("Bad Gateway", "The upstream server is temporarily unavailable.")
                 };
                 if rule.effective_intercept_errors() {
-                    let html = exposure_core::assets::render_exposure_error_html(
+                    let html = exposure_core::assets::render_exposure_error_html_with_template(
+                        cfg.pages.error_html.as_deref(),
                         err_status.as_u16(),
                         title,
                         detail,
@@ -1370,6 +1378,44 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+fn build_rate_limit_response(
+    retry_after_secs: u64,
+    show_error_page: bool,
+    intercept_errors: bool,
+    ray_id: &str,
+    error_html_template: Option<&str>,
+) -> Response<ProxyBody> {
+    if intercept_errors && show_error_page {
+        let html = exposure_core::assets::render_exposure_error_html_with_template(
+            error_html_template,
+            429,
+            "Too Many Requests",
+            "Rate limit exceeded. Please try again shortly.",
+            ray_id,
+            Some(retry_after_secs),
+        );
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::RETRY_AFTER, retry_after_secs.to_string())
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(full_body(html))
+            .unwrap();
+    }
+    let body = if show_error_page {
+        "Too Many Requests"
+    } else {
+        "429"
+    };
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::RETRY_AFTER, retry_after_secs.to_string())
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(full_body(body))
+        .unwrap()
+}
+
 fn is_browser_navigation(method: &http::Method, headers: &http::HeaderMap) -> bool {
     if method != http::Method::GET && method != http::Method::HEAD {
         return false;
@@ -1403,5 +1449,40 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("<script>var s = '</body>';</script>"));
         assert!(s.ends_with("<p>ok</p><script src=\"/cdn-cgi/fp.js\"></script></body></html>"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_response_degrades_after_initial_error_pages() {
+        let html_resp = build_rate_limit_response(5, true, true, "ray1", None);
+        assert_eq!(html_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            html_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let html_bytes = html_resp.into_body().collect().await.unwrap().to_bytes();
+        let html_str = String::from_utf8(html_bytes.to_vec()).unwrap();
+        assert!(html_str.contains("<!DOCTYPE html>"));
+
+        let custom_resp = build_rate_limit_response(
+            5,
+            true,
+            true,
+            "rayc",
+            Some("<html>custom {{status}} {{ray_id}}</html>"),
+        );
+        let custom_bytes = custom_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8(custom_bytes.to_vec()).unwrap(),
+            "<html>custom 429 rayc</html>"
+        );
+
+        let degraded_resp = build_rate_limit_response(5, false, true, "ray2", None);
+        assert_eq!(degraded_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            degraded_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let degraded_bytes = degraded_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&degraded_bytes[..], b"429");
     }
 }
