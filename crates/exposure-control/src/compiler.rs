@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, CustomPagesConfig, EgressConfig, EgressDefaults, GuardDefaults,
-    GuardProfile, IngressConfig, IngressDefaults, LinkListenConfig, LinkListenerDefaults, LinkMode,
-    LoggerConfig, NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, TopologySpec,
-    TrustedMaintainer, TrustedOrigin, TunnelDirection,
+    resolve_domain_binding, CertOrderConfig, CustomPagesConfig, DomainLineRecordType,
+    EgressConfig, EgressDefaults, EgressServiceConfig, GuardDefaults, GuardProfile, IngressConfig,
+    IngressDefaults, IngressRule, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
+    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
+    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
+    TunnelDirection,
 };
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::routing::canonical_ip;
@@ -274,6 +276,457 @@ pub fn compile_topology_with_options(
     )
 }
 
+fn cert_covers_host(cert_domain: &str, host: &str) -> bool {
+    let cert = cert_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if cert.is_empty() || h.is_empty() {
+        return false;
+    }
+    if cert == h {
+        return true;
+    }
+    if let Some(suffix) = cert.strip_prefix("*.") {
+        if let Some(prefix) = h.strip_suffix(&format!(".{suffix}")) {
+            return !prefix.is_empty() && !prefix.contains('.');
+        }
+    }
+    false
+}
+
+fn build_mesh_adj(topo: &TopologySpec) -> HashMap<String, Vec<String>> {
+    let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+    for link in &topo.links {
+        if !topo.nodes.contains_key(&link.from) || !topo.nodes.contains_key(&link.to) || link.from == link.to {
+            continue;
+        }
+        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound) {
+            continue;
+        }
+        adj.entry(link.from.clone()).or_default().insert(link.to.clone());
+        if link.mode == LinkMode::Tunnel
+            || (link.mode == LinkMode::OnDemand
+                && link.bidirectional
+                && !link.reverse_endpoints.is_empty())
+        {
+            adj.entry(link.to.clone()).or_default().insert(link.from.clone());
+        }
+    }
+    adj.into_iter()
+        .map(|(k, v)| {
+            let mut list: Vec<String> = v.into_iter().collect();
+            list.sort();
+            (k, list)
+        })
+        .collect()
+}
+
+fn find_mesh_path_bfs(
+    start: &str,
+    goal: &str,
+    topo: &TopologySpec,
+    adj: &HashMap<String, Vec<String>>,
+    require_relay_intermediate: bool,
+) -> Option<Vec<String>> {
+    if start == goal {
+        return Some(vec![start.to_string()]);
+    }
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<Vec<String>> = VecDeque::new();
+    visited.insert(start);
+    queue.push_back(vec![start.to_string()]);
+    while let Some(path) = queue.pop_front() {
+        if path.len() >= MAX_HOP_PATH_LEN {
+            continue;
+        }
+        let last = path.last().unwrap().as_str();
+        if let Some(nbs) = adj.get(last) {
+            for nb in nbs {
+                if !visited.insert(nb.as_str()) {
+                    continue;
+                }
+                if nb != goal && require_relay_intermediate {
+                    let is_relay = topo.nodes.get(nb).map(|n| n.roles.relay).unwrap_or(false);
+                    if !is_relay {
+                        continue;
+                    }
+                }
+                let mut next = path.clone();
+                next.push(nb.clone());
+                if nb == goal {
+                    return Some(next);
+                }
+                queue.push_back(next);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_link_peer_tag(topo: &TopologySpec, from: &str, to: &str) -> String {
+    for link in &topo.links {
+        if link.from == from && link.to == to {
+            if let Some(ref pt) = link.peer_tag {
+                if !pt.trim().is_empty() {
+                    return pt.clone();
+                }
+            }
+            return to.to_string();
+        }
+    }
+    to.to_string()
+}
+
+/// Expand top-level declarative `TopologySpec.services` into per-node Ingress rules,
+/// intermediate Relay rules, Egress service entries (with automatic `allow_from` ACLs),
+/// and optional Primary Maintainer ACME cert orders.
+fn expand_declarative_services(
+    src: &TopologySpec,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> TopologySpec {
+    if src.services.is_empty() {
+        return src.clone();
+    }
+
+    let mut out = src.clone();
+    let adj = build_mesh_adj(src);
+    let all_ingress_nodes: Vec<String> = src
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.roles.ingress)
+        .map(|(tag, _)| tag.clone())
+        .collect();
+
+    // Locate primary maintainer (for auto_tls)
+    let primary_maint: Option<(String, String)> = src.nodes.iter().find_map(|(tag, n)| {
+        if !n.roles.maintainer {
+            return None;
+        }
+        let tpl_name = n.maintainer_template.as_deref()?;
+        let tpl = src.maintainer_templates.get(tpl_name)?;
+        if tpl.is_primary_cert_manager {
+            Some((tag.clone(), tpl_name.to_string()))
+        } else {
+            None
+        }
+    });
+
+    for (svc_name, svc) in &src.services {
+        if let Err(e) = validate_identifier(svc_name, "service") {
+            errors.push(e.to_string());
+            continue;
+        }
+        if !svc.enabled {
+            continue;
+        }
+        let hosts: Vec<String> = svc
+            .hosts
+            .iter()
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.is_empty() {
+            errors.push(format!(
+                "service '{svc_name}' must specify at least one host (use '*' explicitly for wildcard)"
+            ));
+            continue;
+        }
+        validate_cidr_list(
+            &svc.source_cidrs,
+            &format!("service '{svc_name}'.source_cidrs"),
+            errors,
+        );
+        for (ov_node, ov) in &svc.ingress.overrides {
+            if !src.nodes.contains_key(ov_node) {
+                errors.push(format!(
+                    "service '{svc_name}' ingress override references unknown node '{ov_node}'"
+                ));
+            }
+            validate_cidr_list(
+                &ov.source_cidrs,
+                &format!("service '{svc_name}'.ingress.overrides['{ov_node}'].source_cidrs"),
+                errors,
+            );
+        }
+
+        let egress_node = svc.egress.node.trim();
+        if egress_node.is_empty() {
+            errors.push(format!("service '{svc_name}' is missing egress.node"));
+            continue;
+        }
+        match src.nodes.get(egress_node) {
+            None => {
+                errors.push(format!(
+                    "service '{svc_name}' references unknown egress node '{egress_node}'"
+                ));
+                continue;
+            }
+            Some(n) if !n.roles.egress => {
+                errors.push(format!(
+                    "service '{svc_name}' targets node '{egress_node}' which does not have egress role enabled"
+                ));
+                continue;
+            }
+            _ => {}
+        }
+        if svc.egress.backend.trim().is_empty() {
+            errors.push(format!("service '{svc_name}' is missing egress.backend"));
+            continue;
+        }
+
+        // Resolve target ingress nodes according to ingress.mode
+        let target_ingresses: Vec<String> = match svc.ingress.mode {
+            ServiceIngressMode::All => all_ingress_nodes.clone(),
+            ServiceIngressMode::Selected => {
+                let mut list = Vec::new();
+                for tag in &svc.ingress.nodes {
+                    match src.nodes.get(tag) {
+                        None => errors.push(format!(
+                            "service '{svc_name}' ingress.nodes references unknown node '{tag}'"
+                        )),
+                        Some(n) if !n.roles.ingress => errors.push(format!(
+                            "service '{svc_name}' ingress.nodes references '{tag}' which does not have ingress role enabled"
+                        )),
+                        Some(_) => {
+                            if !list.contains(tag) {
+                                list.push(tag.clone());
+                            }
+                        }
+                    }
+                }
+                list
+            }
+            ServiceIngressMode::Exclude => {
+                let excl: HashSet<&str> = svc.ingress.nodes.iter().map(|s| s.as_str()).collect();
+                for tag in &svc.ingress.nodes {
+                    if !src.nodes.contains_key(tag) {
+                        warnings.push(format!(
+                            "service '{svc_name}' excludes unknown ingress node '{tag}'"
+                        ));
+                    }
+                }
+                all_ingress_nodes
+                    .iter()
+                    .filter(|t| !excl.contains(t.as_str()))
+                    .cloned()
+                    .collect()
+            }
+        };
+
+        if target_ingresses.is_empty() {
+            warnings.push(format!(
+                "service '{svc_name}' matches zero ingress nodes and will not receive external traffic"
+            ));
+        }
+
+        // Register egress service on target egress node (reject collision with manual egress.services)
+        if let Some(eg_spec) = out.nodes.get_mut(egress_node) {
+            if eg_spec.egress.services.contains_key(svc_name) {
+                errors.push(format!(
+                    "service '{svc_name}' conflicts with existing node-level egress service '{svc_name}' on '{egress_node}'"
+                ));
+                continue;
+            }
+            eg_spec.egress.services.insert(
+                svc_name.clone(),
+                EgressServiceConfig {
+                    backend: svc.egress.backend.trim().to_string(),
+                    protocol: svc.egress.protocol,
+                    tls: svc.egress.tls,
+                    ca_cert_path: svc.egress.ca_cert_path.clone(),
+                    insecure_skip_verify: svc.egress.insecure_skip_verify,
+                    allow_from: target_ingresses.clone(),
+                    allow_any_origin: Some(false),
+                    timeout_ms: svc.egress.timeout_ms,
+                    intercept_errors: svc.egress.intercept_errors,
+                    local_health_check: svc.egress.local_health_check.clone(),
+                },
+            );
+        }
+
+        // Expand ingress rules & intermediate relay rules for every targeted ingress node
+        for ig_tag in &target_ingresses {
+            let hops: Option<Vec<String>> = if ig_tag == egress_node {
+                Some(vec![ig_tag.clone()])
+            } else if svc.routing.mode == ServiceRoutingMode::Pinned {
+                if let Some(pinned) = svc.routing.pinned_paths.get(ig_tag) {
+                    if !pinned.is_empty() {
+                        Some(pinned.clone())
+                    } else {
+                        find_mesh_path_bfs(ig_tag, egress_node, src, &adj, true)
+                    }
+                } else {
+                    find_mesh_path_bfs(ig_tag, egress_node, src, &adj, true)
+                }
+            } else {
+                find_mesh_path_bfs(ig_tag, egress_node, src, &adj, true)
+            };
+
+            let Some(hops) = hops else {
+                errors.push(format!(
+                    "service '{svc_name}': no reachable mesh route from ingress '{ig_tag}' to egress '{egress_node}'"
+                ));
+                continue;
+            };
+
+            // Validate pinned path shape if >1 hop
+            if hops.len() >= 2 {
+                if hops.first().map(String::as_str) != Some(ig_tag.as_str())
+                    || hops.last().map(String::as_str) != Some(egress_node)
+                {
+                    errors.push(format!(
+                        "service '{svc_name}' pinned path for '{ig_tag}' must start at '{ig_tag}' and end at '{egress_node}'"
+                    ));
+                    continue;
+                }
+                let mut path_ok = true;
+                for win in hops.windows(2) {
+                    let linked = adj
+                        .get(&win[0])
+                        .map(|nbs| nbs.iter().any(|x| x == &win[1]))
+                        .unwrap_or(false);
+                    if !linked {
+                        errors.push(format!(
+                            "service '{svc_name}' route from '{ig_tag}': no link from '{}' to '{}'",
+                            win[0], win[1]
+                        ));
+                        path_ok = false;
+                    }
+                }
+                for mid in &hops[1..hops.len() - 1] {
+                    if !src.nodes.get(mid).map(|n| n.roles.relay).unwrap_or(false) {
+                        errors.push(format!(
+                            "service '{svc_name}' route from '{ig_tag}': intermediate hop '{mid}' does not enable relay role"
+                        ));
+                        path_ok = false;
+                    }
+                }
+                if !path_ok {
+                    continue;
+                }
+            }
+
+            let next_peer = if hops.len() <= 1 {
+                "local".to_string()
+            } else {
+                resolve_link_peer_tag(src, ig_tag, &hops[1])
+            };
+
+            let ov = svc.ingress.overrides.get(ig_tag);
+            let eff_guard = ov
+                .and_then(|o| o.guard.clone())
+                .or_else(|| svc.guard.clone());
+            let eff_cidrs = ov
+                .filter(|o| !o.source_cidrs.is_empty())
+                .map(|o| o.source_cidrs.clone())
+                .unwrap_or_else(|| svc.source_cidrs.clone());
+            let eff_intercept = ov
+                .and_then(|o| o.intercept_errors)
+                .or(svc.intercept_errors);
+            let eff_beacon = ov.and_then(|o| o.js_fp_beacon).or(svc.js_fp_beacon);
+
+            if let Some(ig_spec) = out.nodes.get_mut(ig_tag) {
+                for (hi, host) in hosts.iter().enumerate() {
+                    let rule_name = if hosts.len() == 1 {
+                        format!("svc:{svc_name}")
+                    } else {
+                        format!("svc:{svc_name}#{}", hi + 1)
+                    };
+                    ig_spec.ingress.rules.push(IngressRule {
+                        name: Some(rule_name),
+                        r#match: RuleMatch {
+                            host: Some(host.clone()),
+                            url_prefix: svc.url_prefix.clone().filter(|s| !s.trim().is_empty()),
+                            source_cidrs: eff_cidrs.clone(),
+                            sni: svc.sni.clone().filter(|s| !s.trim().is_empty()),
+                        },
+                        service_tag: svc_name.clone(),
+                        next_peer: next_peer.clone(),
+                        guard: eff_guard.clone(),
+                        intercept_errors: eff_intercept,
+                        js_fp_beacon: eff_beacon,
+                    });
+                }
+            }
+
+            // Inject intermediate relay rules (deduplicated; detect conflicting next_peer)
+            for idx in 1..hops.len().saturating_sub(1) {
+                let relay_tag = &hops[idx];
+                let hop_next = resolve_link_peer_tag(src, relay_tag, &hops[idx + 1]);
+                if let Some(r_spec) = out.nodes.get_mut(relay_tag) {
+                    if let Some(existing) = r_spec
+                        .relay
+                        .rules
+                        .iter()
+                        .find(|r| r.service_tag == *svc_name)
+                    {
+                        if existing.next_peer != hop_next {
+                            errors.push(format!(
+                                "service '{svc_name}' has conflicting relay next_peer on '{relay_tag}' ('{}' vs '{}')",
+                                existing.next_peer, hop_next
+                            ));
+                        }
+                    } else {
+                        r_spec.relay.rules.push(RelayRule {
+                            service_tag: svc_name.clone(),
+                            next_peer: hop_next,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Auto-TLS: ensure Primary Maintainer has cert coverage & target_hops for every non-wildcard host
+        if svc.auto_tls && !target_ingresses.is_empty() {
+            if let Some((ref maint_tag, ref tpl_name)) = primary_maint {
+                if let Some(tpl) = out.maintainer_templates.get_mut(tpl_name) {
+                    for host in &hosts {
+                        if host == "*" {
+                            continue;
+                        }
+                        let covered_idx = tpl
+                            .acme
+                            .orders
+                            .iter()
+                            .position(|ord| cert_covers_host(&ord.domain, host));
+                        let order = match covered_idx {
+                            Some(i) => &mut tpl.acme.orders[i],
+                            None => {
+                                tpl.acme.orders.push(CertOrderConfig {
+                                    domain: host.clone(),
+                                    provider: None,
+                                    target_nodes: Vec::new(),
+                                    target_hops: BTreeMap::new(),
+                                    renew_before_days: 30,
+                                });
+                                tpl.acme.orders.last_mut().unwrap()
+                            }
+                        };
+                        for ig_tag in &target_ingresses {
+                            if !order.target_nodes.contains(ig_tag) {
+                                order.target_nodes.push(ig_tag.clone());
+                            }
+                            if ig_tag != maint_tag && !order.target_hops.contains_key(ig_tag) {
+                                if let Some(m_hops) =
+                                    find_mesh_path_bfs(maint_tag, ig_tag, src, &adj, false)
+                                {
+                                    order.target_hops.insert(ig_tag.clone(), m_hops);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                warnings.push(format!(
+                    "service '{svc_name}' enables auto_tls, but no primary maintainer node is configured"
+                ));
+            }
+        }
+    }
+
+    out
+}
+
 /// Full topology compiler supporting cluster-wide logger HMAC key injection for accurate cross-node UV.
 pub fn compile_topology_full(
     topo: &TopologySpec,
@@ -286,6 +739,8 @@ pub fn compile_topology_full(
 ) -> (CompileReport, BTreeMap<String, NodeConfig>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
+    let expanded_topo = expand_declarative_services(topo, &mut errors, &mut warnings);
+    let topo = &expanded_topo;
     let mut peer_map: HashMap<String, Vec<PeerConfig>> = HashMap::new();
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -418,6 +873,72 @@ pub fn compile_topology_full(
                     "domain '{dom_key}' targets node '{target}' which has no external_ips configured"
                 )),
                 _ => {}
+            }
+        }
+        let mut seen_lines = HashSet::new();
+        for (ri, lr) in binding.line_routes.iter().enumerate() {
+            let line = lr.line.trim();
+            if line.is_empty()
+                || line.len() > 64
+                || !line
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                errors.push(format!(
+                    "domain '{dom_key}' line_routes[{ri}] has invalid line code '{}'",
+                    lr.line
+                ));
+            } else if !seen_lines.insert(line.to_ascii_lowercase()) {
+                warnings.push(format!(
+                    "domain '{dom_key}' defines multiple line_routes entries for line '{line}'"
+                ));
+            }
+            if !lr.enabled {
+                continue;
+            }
+            if lr.target_nodes.is_empty() && lr.values.is_empty() {
+                warnings.push(format!(
+                    "domain '{dom_key}' line '{line}' has no target_nodes or explicit values"
+                ));
+            }
+            for target in &lr.target_nodes {
+                match topo.nodes.get(target) {
+                    None => errors.push(format!(
+                        "domain '{dom_key}' line '{line}' references unknown node '{target}'"
+                    )),
+                    Some(n) if n.external_ips.is_empty() && lr.values.is_empty() => warnings.push(
+                        format!(
+                            "domain '{dom_key}' line '{line}' targets node '{target}' which has no external_ips configured"
+                        ),
+                    ),
+                    _ => {}
+                }
+            }
+            for raw_val in &lr.values {
+                let v = raw_val.trim();
+                match lr.record_type {
+                    DomainLineRecordType::Auto => match v.parse::<IpAddr>() {
+                        Ok(ip) => {
+                            let c = canonical_ip(ip);
+                            if c.is_unspecified() || c.is_multicast() {
+                                errors.push(format!(
+                                    "domain '{dom_key}' line '{line}' value '{raw_val}' must be a valid unicast IP"
+                                ));
+                            }
+                        }
+                        Err(_) => errors.push(format!(
+                            "domain '{dom_key}' line '{line}' value '{raw_val}' is not a valid IP address"
+                        )),
+                    },
+                    DomainLineRecordType::Cname => {
+                        let clean = v.trim_end_matches('.');
+                        if clean.contains('*') || validate_dns_domain(clean).is_err() {
+                            errors.push(format!(
+                                "domain '{dom_key}' line '{line}' CNAME target '{raw_val}' is not a valid DNS domain"
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1567,5 +2088,154 @@ mod tests {
         let (bad_dom_rep, _) = compile_topology(&bad_dom, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_dom_rep.valid);
         assert!(bad_dom_rep.errors.iter().any(|e| e.contains("dns_provider")));
+    }
+
+    #[test]
+    fn compiler_expands_declarative_services_across_all_ingresses_and_relays() {
+        use exposure_core::config::{
+            DomainLineRecordType, DomainLineRoute, ServiceEgressTarget, ServiceIngressMode,
+            ServiceIngressOverride, ServiceIngressScope, ServiceSpec,
+        };
+
+        let mut topo = TopologySpec::default();
+        topo.defaults.ingress.clearance_secret = "super-secret-global-clearance-key-0123456789".into();
+        topo.guard_templates.insert("std".into(), GuardProfile::default());
+        topo.guard_templates.insert("strict".into(), GuardProfile::default());
+
+        for (tag, roles) in [
+            ("ingress-hk", NodeRoles { ingress: true, ..Default::default() }),
+            ("ingress-jp", NodeRoles { ingress: true, ..Default::default() }),
+            ("relay-sg", NodeRoles { relay: true, ..Default::default() }),
+            ("egress-home", NodeRoles { egress: true, ..Default::default() }),
+        ] {
+            topo.nodes.insert(
+                tag.into(),
+                TopologyNodeSpec {
+                    roles,
+                    external_ips: vec!["203.0.113.10".into()],
+                    link_listener: Some(LinkListenConfig {
+                        listen_addr: "0.0.0.0:9443".into(),
+                        allow_on_demand: Some(true),
+                        allow_tunnel: Some(true),
+                        allow_bootstrap: Some(false),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+
+        topo.links.push(TopologyLinkSpec {
+            from: "ingress-hk".into(),
+            to: "relay-sg".into(),
+            peer_tag: None,
+            mode: LinkMode::OnDemand,
+            tunnel_direction: None,
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
+            expected_client_addr: None,
+        });
+        topo.links.push(TopologyLinkSpec {
+            from: "ingress-jp".into(),
+            to: "relay-sg".into(),
+            peer_tag: None,
+            mode: LinkMode::OnDemand,
+            tunnel_direction: None,
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
+            expected_client_addr: None,
+        });
+        topo.links.push(TopologyLinkSpec {
+            from: "egress-home".into(),
+            to: "relay-sg".into(),
+            peer_tag: None,
+            mode: LinkMode::Tunnel,
+            tunnel_direction: Some(TunnelDirection::Outbound),
+            bidirectional: false,
+            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            reverse_endpoints: vec![],
+            expected_client_addr: None,
+        });
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "ingress-jp".into(),
+            ServiceIngressOverride {
+                guard: Some("strict".into()),
+                ..Default::default()
+            },
+        );
+        topo.services.insert(
+            "web-app".into(),
+            ServiceSpec {
+                hosts: vec!["app.example.com".into(), "www.example.com".into()],
+                ingress: ServiceIngressScope {
+                    mode: ServiceIngressMode::All,
+                    nodes: vec![],
+                    overrides,
+                },
+                guard: Some("std".into()),
+                egress: ServiceEgressTarget {
+                    node: "egress-home".into(),
+                    backend: "127.0.0.1:8080".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        topo.dns_providers.insert(
+            "ali".into(),
+            exposure_core::config::DnsProviderAccountConfig::Aliyun {
+                access_key_id: "LTAI5t1".into(),
+                access_key_secret: "secret".into(),
+                region_id: None,
+            },
+        );
+        topo.domains.insert(
+            "app.example.com".into(),
+            exposure_core::config::DomainBindingConfig {
+                provider: "ali".into(),
+                line_routes: vec![
+                    DomainLineRoute {
+                        line: "default".into(),
+                        target_nodes: vec!["ingress-hk".into()],
+                        ..Default::default()
+                    },
+                    DomainLineRoute {
+                        line: "telecom".into(),
+                        record_type: DomainLineRecordType::Cname,
+                        values: vec!["cdn.example.net".into()],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+
+        let mut pubkeys = HashMap::new();
+        for tag in ["ingress-hk", "ingress-jp", "relay-sg", "egress-home"] {
+            pubkeys.insert(tag.into(), format!("pk-{tag}"));
+        }
+
+        let (report, compiled) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(report.valid, "errors: {:?}", report.errors);
+        // Both ingress nodes receive 2 rules (one per host)
+        assert_eq!(compiled["ingress-hk"].ingress.rules.len(), 2);
+        assert_eq!(compiled["ingress-jp"].ingress.rules.len(), 2);
+        assert_eq!(compiled["ingress-hk"].ingress.rules[0].guard.as_deref(), Some("std"));
+        assert_eq!(compiled["ingress-jp"].ingress.rules[0].guard.as_deref(), Some("strict"));
+        // Relay receives deduplicated relay rule
+        assert_eq!(compiled["relay-sg"].relay.rules.len(), 1);
+        assert_eq!(compiled["relay-sg"].relay.rules[0].next_peer, "egress-home");
+        // Egress receives service with automatic allow_from covering both ingresses
+        let esvc = &compiled["egress-home"].egress.services["web-app"];
+        assert_eq!(esvc.backend, "127.0.0.1:8080");
+        assert!(esvc.allow_from.contains(&"ingress-hk".to_string()));
+        assert!(esvc.allow_from.contains(&"ingress-jp".to_string()));
+        // 4 valid service route traces (2 ingresses x 2 hosts)
+        assert_eq!(report.paths.len(), 4);
+        assert!(report.paths.iter().all(|p| p.valid));
     }
 }

@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -14,6 +14,7 @@ use exposure_core::assets::{load_web_asset, WebApp};
 use exposure_core::config::{
     ControlConfig, ControlRole, DnsProviderAccountConfig, NodeConfig, TopologySpec,
 };
+use exposure_core::protocol::DnsManageOp;
 use exposure_core::crypto::{
     ct_eq_hashed, generate_random_secret_hex, hmac_ip, validate_identifier, verify_password,
 };
@@ -91,6 +92,16 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/passphrases/{tag}/revoke", post(revoke_passphrase))
         .route("/api/discovery/run", post(run_discovery))
         .route("/api/dns/sync", post(sync_dns))
+        .route("/api/dns/domains/{domain}/inspect", get(inspect_dns_domain))
+        .route("/api/dns/domains/{domain}/records", post(create_dns_record))
+        .route(
+            "/api/dns/domains/{domain}/records/{record_id}",
+            put(update_dns_record).delete(delete_dns_record),
+        )
+        .route(
+            "/api/dns/domains/{domain}/records/{record_id}/status",
+            post(set_dns_record_status),
+        )
         .route("/api/telemetry", get(get_telemetry))
         .route("/api/telemetry/pull", post(pull_telemetry))
         .route("/api/fingerprints", get(list_fingerprints))
@@ -1430,6 +1441,181 @@ async fn sync_dns(
             }))
             .into_response()
         }
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct DnsInspectQuery {
+    #[serde(default)]
+    include_lines: Option<bool>,
+    #[serde(default)]
+    maintainer_tag: Option<String>,
+}
+
+async fn inspect_dns_domain(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(domain): Path<String>,
+    Query(q): Query<DnsInspectQuery>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    let op = DnsManageOp::Inspect {
+        domain: domain.clone(),
+        include_lines: q.include_lines.unwrap_or(true),
+    };
+    match state.client.manage_dns(&actor, op, q.maintainer_tag).await {
+        Ok((maintainer_tag, capabilities, lines, records, _)) => Json(serde_json::json!({
+            "ok": true,
+            "domain": domain,
+            "maintainer_tag": maintainer_tag,
+            "capabilities": capabilities,
+            "lines": lines,
+            "records": records,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct DnsRecordMutateReq {
+    record_type: String,
+    value: String,
+    #[serde(default)]
+    line: Option<String>,
+    #[serde(default)]
+    ttl: Option<u32>,
+    #[serde(default)]
+    proxied: Option<bool>,
+    #[serde(default)]
+    maintainer_tag: Option<String>,
+}
+
+async fn create_dns_record(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(domain): Path<String>,
+    Json(req): Json<DnsRecordMutateReq>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let op = DnsManageOp::Create {
+        domain,
+        record_type: req.record_type,
+        value: req.value,
+        line: req.line,
+        ttl: req.ttl,
+        proxied: req.proxied,
+    };
+    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+        Ok((maintainer_tag, _, _, _, record_id)) => Json(serde_json::json!({
+            "ok": true,
+            "maintainer_tag": maintainer_tag,
+            "record_id": record_id,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+async fn update_dns_record(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((domain, record_id)): Path<(String, String)>,
+    Json(req): Json<DnsRecordMutateReq>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let op = DnsManageOp::Update {
+        domain,
+        record_id,
+        record_type: req.record_type,
+        value: req.value,
+        line: req.line,
+        ttl: req.ttl,
+        proxied: req.proxied,
+    };
+    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+        Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
+            "ok": true,
+            "maintainer_tag": maintainer_tag,
+            "record_id": rid,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct DnsRecordStatusReq {
+    enabled: bool,
+    #[serde(default)]
+    maintainer_tag: Option<String>,
+}
+
+async fn set_dns_record_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((domain, record_id)): Path<(String, String)>,
+    Json(req): Json<DnsRecordStatusReq>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let op = DnsManageOp::SetStatus {
+        domain,
+        record_id,
+        enabled: req.enabled,
+    };
+    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+        Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
+            "ok": true,
+            "maintainer_tag": maintainer_tag,
+            "record_id": rid,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+async fn delete_dns_record(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path((domain, record_id)): Path<(String, String)>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let op = DnsManageOp::Delete { domain, record_id };
+    match state.client.manage_dns(&actor, op, None).await {
+        Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
+            "ok": true,
+            "maintainer_tag": maintainer_tag,
+            "record_id": rid,
+        }))
+        .into_response(),
         Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
     }
 }

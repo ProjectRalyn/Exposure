@@ -12,8 +12,9 @@ use exposure_core::config::{
 };
 use exposure_core::crypto::{validate_dns_domain, write_secret_file_atomic, NodeKeyPair};
 use exposure_core::protocol::{
-    cert_bundle_signing_bytes, DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerTelemetrySnapshot,
-    SpecialFrame, SpecialPayload,
+    cert_bundle_signing_bytes, DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities,
+    DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult, DnsSyncRecordSpec,
+    MaintainerTelemetrySnapshot, SpecialFrame, SpecialPayload,
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::SegmentWriter;
@@ -84,6 +85,79 @@ fn validate_aliyun_record_id(val: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_dns_line_code(val: &str) -> Result<String> {
+    let s = val.trim();
+    if s.is_empty() {
+        return Ok("default".to_string());
+    }
+    if s.len() > 64
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ExposureError::Config(format!(
+            "invalid DNS resolution line code: '{val}'"
+        )));
+    }
+    Ok(s.to_string())
+}
+
+fn validate_exposure_dns_record(record_type: &str, value: &str) -> Result<(String, String)> {
+    let rt = record_type.trim().to_ascii_uppercase();
+    let v = value.trim();
+    match rt.as_str() {
+        "A" => {
+            let ip: Ipv4Addr = v.parse().map_err(|_| {
+                ExposureError::Config(format!("invalid IPv4 address '{value}' for A record"))
+            })?;
+            if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+                return Err(ExposureError::Config(format!(
+                    "disallowed IPv4 address '{value}'"
+                )));
+            }
+            Ok(("A".into(), ip.to_string()))
+        }
+        "AAAA" => {
+            let ip: Ipv6Addr = v.parse().map_err(|_| {
+                ExposureError::Config(format!("invalid IPv6 address '{value}' for AAAA record"))
+            })?;
+            if ip.is_unspecified() || ip.is_multicast() {
+                return Err(ExposureError::Config(format!(
+                    "disallowed IPv6 address '{value}'"
+                )));
+            }
+            Ok(("AAAA".into(), ip.to_string()))
+        }
+        "CNAME" => {
+            let clean = v.trim_end_matches('.');
+            if clean.is_empty() || clean.contains('*') {
+                return Err(ExposureError::Config(format!(
+                    "invalid CNAME target '{value}'"
+                )));
+            }
+            validate_dns_domain(clean)?;
+            Ok(("CNAME".into(), clean.to_string()))
+        }
+        _ => Err(ExposureError::AccessDenied(format!(
+            "unsupported DNS record type '{record_type}': Exposure only manages A, AAAA, and CNAME records"
+        ))),
+    }
+}
+
+fn effective_sync_line_entries(spec: &DnsSyncRecordSpec) -> Vec<DnsLineSyncEntry> {
+    if !spec.line_entries.is_empty() {
+        return spec.line_entries.clone();
+    }
+    vec![DnsLineSyncEntry {
+        line: "default".into(),
+        ipv4s: spec.ipv4s.clone(),
+        ipv6s: spec.ipv6s.clone(),
+        cnames: Vec::new(),
+        ttl: spec.ttl,
+        proxied: spec.proxied,
+    }]
 }
 
 fn aliyun_endpoint_host(region_id: Option<&str>) -> Result<String> {
@@ -876,10 +950,10 @@ impl MaintainerService {
             )
             .await?;
 
-        let ttl = spec.ttl.unwrap_or(600).max(1);
-        let ttl_str = ttl.to_string();
+        let default_ttl = spec.ttl.unwrap_or(600).max(1);
+        let line_entries = effective_sync_line_entries(spec);
 
-        // Paginate DescribeDomainRecords to capture all existing A / AAAA records for this RR
+        // Paginate DescribeDomainRecords to capture all existing Exposure-managed (A / AAAA / CNAME) records for this RR
         let mut existing: Vec<serde_json::Value> = Vec::new();
         let mut page = 1u32;
         loop {
@@ -907,7 +981,9 @@ impl MaintainerService {
             for rec in batch {
                 let rec_rr = rec["RR"].as_str().unwrap_or("");
                 let rec_type = rec["Type"].as_str().unwrap_or("");
-                if rec_rr.eq_ignore_ascii_case(&rr) && (rec_type == "A" || rec_type == "AAAA") {
+                if rec_rr.eq_ignore_ascii_case(&rr)
+                    && matches!(rec_type, "A" | "AAAA" | "CNAME")
+                {
                     existing.push(rec);
                 }
             }
@@ -923,64 +999,120 @@ impl MaintainerService {
         let mut unchanged = 0usize;
         let mut to_delete: Vec<String> = Vec::new();
 
-        for (rtype, desired_list) in [("A", &spec.ipv4s), ("AAAA", &spec.ipv6s)] {
-            let desired: BTreeSet<&str> = desired_list.iter().map(|s| s.as_str()).collect();
-            let mut matched_ips: HashSet<String> = HashSet::new();
+        // Group reconciliation strictly per managed Line so unmanaged lines & TXT/MX records are never touched.
+        for entry in &line_entries {
+            let line = validate_dns_line_code(&entry.line)?;
+            let ttl = entry.ttl.unwrap_or(default_ttl).max(1);
+            let ttl_str = ttl.to_string();
 
-            for rec in existing.iter().filter(|r| r["Type"].as_str() == Some(rtype)) {
-                let val = rec["Value"].as_str().unwrap_or("");
-                let Some(rec_id) = rec["RecordId"]
-                    .as_str()
-                    .map(str::to_string)
-                    .or_else(|| rec["RecordId"].as_u64().map(|n| n.to_string()))
-                else {
-                    continue;
-                };
-                validate_aliyun_record_id(&rec_id)?;
+            let line_records: Vec<&serde_json::Value> = existing
+                .iter()
+                .filter(|r| {
+                    r["Line"]
+                        .as_str()
+                        .unwrap_or("default")
+                        .eq_ignore_ascii_case(&line)
+                })
+                .collect();
 
-                if desired.contains(val) && matched_ips.insert(val.to_string()) {
-                    if rec["TTL"].as_u64() != Some(ttl as u64) {
+            for (rtype, desired_list) in [
+                ("A", &entry.ipv4s),
+                ("AAAA", &entry.ipv6s),
+                ("CNAME", &entry.cnames),
+            ] {
+                let desired: BTreeSet<String> = desired_list
+                    .iter()
+                    .map(|s| {
+                        if rtype == "CNAME" {
+                            s.trim().trim_end_matches('.').to_string()
+                        } else {
+                            s.trim().to_string()
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let mut matched_vals: HashSet<String> = HashSet::new();
+
+                for rec in line_records
+                    .iter()
+                    .copied()
+                    .filter(|r| r["Type"].as_str() == Some(rtype))
+                {
+                    let raw_val = rec["Value"].as_str().unwrap_or("");
+                    let norm_val = if rtype == "CNAME" {
+                        raw_val.trim().trim_end_matches('.')
+                    } else {
+                        raw_val.trim()
+                    };
+                    let Some(rec_id) = rec["RecordId"]
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| rec["RecordId"].as_u64().map(|n| n.to_string()))
+                    else {
+                        continue;
+                    };
+                    validate_aliyun_record_id(&rec_id)?;
+
+                    if desired.contains(norm_val) && matched_vals.insert(norm_val.to_string()) {
+                        let rec_disabled = rec["Status"]
+                            .as_str()
+                            .map(|s| s.eq_ignore_ascii_case("DISABLE"))
+                            .unwrap_or(false);
+                        if rec["TTL"].as_u64() != Some(ttl as u64) {
+                            self.call_alidns_api(
+                                base_url,
+                                access_key_id,
+                                access_key_secret,
+                                "UpdateDomainRecord",
+                                &[
+                                    ("RecordId", &rec_id),
+                                    ("RR", &rr),
+                                    ("Type", rtype),
+                                    ("Value", norm_val),
+                                    ("Line", &line),
+                                    ("TTL", &ttl_str),
+                                ],
+                            )
+                            .await?;
+                            updated += 1;
+                        } else if rec_disabled {
+                            self.call_alidns_api(
+                                base_url,
+                                access_key_id,
+                                access_key_secret,
+                                "SetDomainRecordStatus",
+                                &[("RecordId", &rec_id), ("Status", "Enable")],
+                            )
+                            .await?;
+                            updated += 1;
+                        } else {
+                            unchanged += 1;
+                        }
+                    } else {
+                        to_delete.push(rec_id);
+                    }
+                }
+
+                // Create missing records before deleting stale ones to avoid resolution gaps
+                for val in &desired {
+                    if !matched_vals.contains(val) {
                         self.call_alidns_api(
                             base_url,
                             access_key_id,
                             access_key_secret,
-                            "UpdateDomainRecord",
+                            "AddDomainRecord",
                             &[
-                                ("RecordId", &rec_id),
+                                ("DomainName", &root_domain),
                                 ("RR", &rr),
                                 ("Type", rtype),
                                 ("Value", val),
+                                ("Line", &line),
                                 ("TTL", &ttl_str),
                             ],
                         )
                         .await?;
-                        updated += 1;
-                    } else {
-                        unchanged += 1;
+                        created += 1;
                     }
-                } else {
-                    to_delete.push(rec_id);
-                }
-            }
-
-            // Create missing records before deleting stale ones to avoid resolution gaps
-            for ip in &desired {
-                if !matched_ips.contains(*ip) {
-                    self.call_alidns_api(
-                        base_url,
-                        access_key_id,
-                        access_key_secret,
-                        "AddDomainRecord",
-                        &[
-                            ("DomainName", &root_domain),
-                            ("RR", &rr),
-                            ("Type", rtype),
-                            ("Value", ip),
-                            ("TTL", &ttl_str),
-                        ],
-                    )
-                    .await?;
-                    created += 1;
                 }
             }
         }
@@ -1006,6 +1138,308 @@ impl MaintainerService {
             unchanged,
             error: None,
         })
+    }
+
+    async fn aliyun_manage_with_base(
+        &self,
+        base_url: &str,
+        access_key_id: &str,
+        access_key_secret: &str,
+        root_domain_override: Option<&str>,
+        op: &DnsManageOp,
+    ) -> Result<(
+        DnsProviderCapabilities,
+        Vec<DnsSupportLine>,
+        Vec<DnsRemoteRecord>,
+        Option<String>,
+    )> {
+        let caps = DnsProviderCapabilities {
+            supports_lines: true,
+            supports_proxied: false,
+            supports_status_toggle: true,
+            supports_remote_edit: true,
+        };
+        let domain = match op {
+            DnsManageOp::Inspect { domain, .. }
+            | DnsManageOp::Create { domain, .. }
+            | DnsManageOp::Update { domain, .. }
+            | DnsManageOp::SetStatus { domain, .. }
+            | DnsManageOp::Delete { domain, .. } => domain.as_str(),
+        };
+        let (root_domain, rr) = self
+            .resolve_aliyun_domain_and_rr(
+                base_url,
+                access_key_id,
+                access_key_secret,
+                root_domain_override,
+                domain,
+                false,
+            )
+            .await?;
+        let fqdn = domain.trim().trim_end_matches('.').to_string();
+
+        match op {
+            DnsManageOp::Inspect { include_lines, .. } => {
+                let mut records = Vec::new();
+                let mut page = 1u32;
+                loop {
+                    let page_str = page.to_string();
+                    let body = self
+                        .call_alidns_api(
+                            base_url,
+                            access_key_id,
+                            access_key_secret,
+                            "DescribeDomainRecords",
+                            &[
+                                ("DomainName", &root_domain),
+                                ("RRKeyWord", &rr),
+                                ("PageNumber", &page_str),
+                                ("PageSize", "100"),
+                            ],
+                        )
+                        .await?;
+                    let batch = body["DomainRecords"]["Record"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let total_count = body["TotalCount"].as_u64().unwrap_or(0);
+                    let fetched = batch.len();
+                    for rec in batch {
+                        let rec_rr = rec["RR"].as_str().unwrap_or("");
+                        let rec_type = rec["Type"].as_str().unwrap_or("");
+                        if !rec_rr.eq_ignore_ascii_case(&rr)
+                            || !matches!(rec_type, "A" | "AAAA" | "CNAME")
+                        {
+                            continue;
+                        }
+                        let Some(rec_id) = rec["RecordId"]
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| rec["RecordId"].as_u64().map(|n| n.to_string()))
+                        else {
+                            continue;
+                        };
+                        records.push(DnsRemoteRecord {
+                            record_id: rec_id,
+                            rr: rec_rr.to_string(),
+                            fqdn: fqdn.clone(),
+                            record_type: rec_type.to_string(),
+                            value: rec["Value"].as_str().unwrap_or("").to_string(),
+                            line: rec["Line"].as_str().unwrap_or("default").to_string(),
+                            ttl: rec["TTL"].as_u64().unwrap_or(600) as u32,
+                            enabled: !rec["Status"]
+                                .as_str()
+                                .map(|s| s.eq_ignore_ascii_case("DISABLE"))
+                                .unwrap_or(false),
+                            proxied: None,
+                        });
+                    }
+                    if fetched < 100 || (page as u64) * 100 >= total_count {
+                        break;
+                    }
+                    page += 1;
+                }
+
+                let mut lines = Vec::new();
+                if *include_lines {
+                    if let Ok(body) = self
+                        .call_alidns_api(
+                            base_url,
+                            access_key_id,
+                            access_key_secret,
+                            "DescribeSupportLines",
+                            &[("DomainName", &root_domain), ("Lang", "zh")],
+                        )
+                        .await
+                    {
+                        if let Some(arr) = body["RecordLines"]["RecordLine"].as_array() {
+                            for item in arr {
+                                let code = item["LineCode"].as_str().unwrap_or("").trim();
+                                if code.is_empty() {
+                                    continue;
+                                }
+                                let name = item["LineDisplayName"]
+                                    .as_str()
+                                    .or_else(|| item["LineName"].as_str())
+                                    .unwrap_or(code)
+                                    .to_string();
+                                let parent = item["FatherCode"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
+                                lines.push(DnsSupportLine {
+                                    code: code.to_string(),
+                                    name,
+                                    parent_code: parent,
+                                });
+                            }
+                        }
+                    }
+                    if !lines.iter().any(|l| l.code == "default") {
+                        lines.insert(
+                            0,
+                            DnsSupportLine {
+                                code: "default".into(),
+                                name: "默认 (Default)".into(),
+                                parent_code: None,
+                            },
+                        );
+                    }
+                }
+                Ok((caps, lines, records, None))
+            }
+            DnsManageOp::Create {
+                record_type,
+                value,
+                line,
+                ttl,
+                ..
+            } => {
+                let (rtype, norm_val) = validate_exposure_dns_record(record_type, value)?;
+                let line_code = validate_dns_line_code(line.as_deref().unwrap_or("default"))?;
+                let ttl_str = ttl.unwrap_or(600).max(1).to_string();
+                let body = self
+                    .call_alidns_api(
+                        base_url,
+                        access_key_id,
+                        access_key_secret,
+                        "AddDomainRecord",
+                        &[
+                            ("DomainName", &root_domain),
+                            ("RR", &rr),
+                            ("Type", &rtype),
+                            ("Value", &norm_val),
+                            ("Line", &line_code),
+                            ("TTL", &ttl_str),
+                        ],
+                    )
+                    .await?;
+                let rec_id = body["RecordId"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| body["RecordId"].as_u64().map(|n| n.to_string()));
+                Ok((caps, Vec::new(), Vec::new(), rec_id))
+            }
+            DnsManageOp::Update {
+                record_id,
+                record_type,
+                value,
+                line,
+                ttl,
+                ..
+            } => {
+                validate_aliyun_record_id(record_id)?;
+                let (rtype, norm_val) = validate_exposure_dns_record(record_type, value)?;
+                let line_code = validate_dns_line_code(line.as_deref().unwrap_or("default"))?;
+                let ttl_str = ttl.unwrap_or(600).max(1).to_string();
+                // Verify target record belongs to this domain/RR and is Exposure-managed (A/AAAA/CNAME)
+                self.aliyun_verify_record_scope(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    &root_domain,
+                    &rr,
+                    record_id,
+                )
+                .await?;
+                self.call_alidns_api(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    "UpdateDomainRecord",
+                    &[
+                        ("RecordId", record_id),
+                        ("RR", &rr),
+                        ("Type", &rtype),
+                        ("Value", &norm_val),
+                        ("Line", &line_code),
+                        ("TTL", &ttl_str),
+                    ],
+                )
+                .await?;
+                Ok((caps, Vec::new(), Vec::new(), Some(record_id.clone())))
+            }
+            DnsManageOp::SetStatus {
+                record_id, enabled, ..
+            } => {
+                validate_aliyun_record_id(record_id)?;
+                self.aliyun_verify_record_scope(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    &root_domain,
+                    &rr,
+                    record_id,
+                )
+                .await?;
+                let status = if *enabled { "Enable" } else { "Disable" };
+                self.call_alidns_api(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    "SetDomainRecordStatus",
+                    &[("RecordId", record_id), ("Status", status)],
+                )
+                .await?;
+                Ok((caps, Vec::new(), Vec::new(), Some(record_id.clone())))
+            }
+            DnsManageOp::Delete { record_id, .. } => {
+                validate_aliyun_record_id(record_id)?;
+                self.aliyun_verify_record_scope(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    &root_domain,
+                    &rr,
+                    record_id,
+                )
+                .await?;
+                self.call_alidns_api(
+                    base_url,
+                    access_key_id,
+                    access_key_secret,
+                    "DeleteDomainRecord",
+                    &[("RecordId", record_id)],
+                )
+                .await?;
+                Ok((caps, Vec::new(), Vec::new(), Some(record_id.clone())))
+            }
+        }
+    }
+
+    async fn aliyun_verify_record_scope(
+        &self,
+        base_url: &str,
+        access_key_id: &str,
+        access_key_secret: &str,
+        expected_root: &str,
+        expected_rr: &str,
+        record_id: &str,
+    ) -> Result<()> {
+        let info = self
+            .call_alidns_api(
+                base_url,
+                access_key_id,
+                access_key_secret,
+                "DescribeDomainRecordInfo",
+                &[("RecordId", record_id)],
+            )
+            .await?;
+        let dom = info["DomainName"].as_str().unwrap_or("");
+        let rr = info["RR"].as_str().unwrap_or("");
+        let rt = info["Type"].as_str().unwrap_or("");
+        if !dom.eq_ignore_ascii_case(expected_root) || !rr.eq_ignore_ascii_case(expected_rr) {
+            return Err(ExposureError::AccessDenied(format!(
+                "record '{record_id}' belongs to '{rr}.{dom}', not '{expected_rr}.{expected_root}'"
+            )));
+        }
+        if !matches!(rt, "A" | "AAAA" | "CNAME") {
+            return Err(ExposureError::AccessDenied(format!(
+                "refusing to modify non-Exposure record type '{rt}'"
+            )));
+        }
+        Ok(())
     }
 
     async fn cloudflare_resolve_zone_id_with_base(
@@ -1156,15 +1590,48 @@ impl MaintainerService {
             .await?;
         let base = cf_base.trim_end_matches('/');
         let rec_name = spec.domain.trim().trim_end_matches('.');
-        let ttl = spec.ttl.unwrap_or(600).max(1);
-        let proxied = spec.proxied.unwrap_or(false);
+        let default_ttl = spec.ttl.unwrap_or(600).max(1);
+        let default_proxied = spec.proxied.unwrap_or(false);
+
+        // Cloudflare standard DNS has no ISP lines: aggregate all line entries (preferring default when present)
+        let entries = effective_sync_line_entries(spec);
+        let mut merged_v4: BTreeSet<String> = BTreeSet::new();
+        let mut merged_v6: BTreeSet<String> = BTreeSet::new();
+        let mut merged_cname: BTreeSet<String> = BTreeSet::new();
+        let mut eff_ttl = default_ttl;
+        let mut eff_proxied = default_proxied;
+        for e in &entries {
+            for ip in &e.ipv4s {
+                merged_v4.insert(ip.trim().to_string());
+            }
+            for ip in &e.ipv6s {
+                merged_v6.insert(ip.trim().to_string());
+            }
+            for cn in &e.cnames {
+                merged_cname.insert(cn.trim().trim_end_matches('.').to_string());
+            }
+            if e.line.eq_ignore_ascii_case("default") {
+                if let Some(t) = e.ttl {
+                    eff_ttl = t.max(1);
+                }
+                if let Some(p) = e.proxied {
+                    eff_proxied = p;
+                }
+            }
+        }
+        let ttl = eff_ttl;
+        let proxied = eff_proxied;
 
         let mut created = 0usize;
         let mut updated = 0usize;
         let mut deleted = 0usize;
         let mut unchanged = 0usize;
 
-        for (rtype, desired_list) in [("A", &spec.ipv4s), ("AAAA", &spec.ipv6s)] {
+        let v4_vec: Vec<String> = merged_v4.into_iter().collect();
+        let v6_vec: Vec<String> = merged_v6.into_iter().collect();
+        let cn_vec: Vec<String> = merged_cname.into_iter().collect();
+
+        for (rtype, desired_list) in [("A", &v4_vec), ("AAAA", &v6_vec), ("CNAME", &cn_vec)] {
             let mut existing = Vec::new();
             let mut page = 1u64;
             loop {
@@ -1309,6 +1776,324 @@ impl MaintainerService {
         })
     }
 
+    async fn cloudflare_manage_with_base(
+        &self,
+        cf_base: &str,
+        api_token: &str,
+        explicit_zone_id: Option<&str>,
+        root_domain: Option<&str>,
+        op: &DnsManageOp,
+    ) -> Result<(
+        DnsProviderCapabilities,
+        Vec<DnsSupportLine>,
+        Vec<DnsRemoteRecord>,
+        Option<String>,
+    )> {
+        let caps = DnsProviderCapabilities {
+            supports_lines: false,
+            supports_proxied: true,
+            supports_status_toggle: false,
+            supports_remote_edit: true,
+        };
+        let domain = match op {
+            DnsManageOp::Inspect { domain, .. }
+            | DnsManageOp::Create { domain, .. }
+            | DnsManageOp::Update { domain, .. }
+            | DnsManageOp::SetStatus { domain, .. }
+            | DnsManageOp::Delete { domain, .. } => domain.as_str(),
+        };
+        let zone_id = self
+            .cloudflare_resolve_zone_id_with_base(
+                cf_base,
+                api_token,
+                explicit_zone_id,
+                root_domain,
+                domain,
+            )
+            .await?;
+        let base = cf_base.trim_end_matches('/');
+        let rec_name = domain.trim().trim_end_matches('.');
+
+        match op {
+            DnsManageOp::Inspect { .. } => {
+                let mut records = Vec::new();
+                for rtype in ["A", "AAAA", "CNAME"] {
+                    let mut page = 1u64;
+                    loop {
+                        let list_url = format!(
+                            "{base}/zones/{zone_id}/dns_records?type={rtype}&name={}&per_page=100&page={page}",
+                            aliyun_percent_encode(rec_name)
+                        );
+                        let resp = self
+                            .http_client
+                            .get(&list_url)
+                            .bearer_auth(api_token)
+                            .send()
+                            .await
+                            .map_err(|e| ExposureError::Link(format!("cloudflare list records: {e}")))?;
+                        let body: serde_json::Value = resp
+                            .json()
+                            .await
+                            .map_err(|e| ExposureError::Protocol(format!("cloudflare list json: {e}")))?;
+                        if body["success"].as_bool() != Some(true) {
+                            return Err(ExposureError::Protocol(format!(
+                                "cloudflare list dns_records failed: {body}"
+                            )));
+                        }
+                        let batch = body["result"].as_array().cloned().unwrap_or_default();
+                        let batch_len = batch.len();
+                        for rec in batch {
+                            let Some(id) = rec["id"].as_str() else {
+                                continue;
+                            };
+                            let name = rec["name"].as_str().unwrap_or(rec_name);
+                            records.push(DnsRemoteRecord {
+                                record_id: id.to_string(),
+                                rr: name.to_string(),
+                                fqdn: name.to_string(),
+                                record_type: rtype.to_string(),
+                                value: rec["content"].as_str().unwrap_or("").to_string(),
+                                line: "default".to_string(),
+                                ttl: rec["ttl"].as_u64().unwrap_or(1) as u32,
+                                enabled: true,
+                                proxied: Some(rec["proxied"].as_bool().unwrap_or(false)),
+                            });
+                        }
+                        let total_pages = body["result_info"]["total_pages"].as_u64().unwrap_or(1);
+                        if page >= total_pages || batch_len == 0 {
+                            break;
+                        }
+                        page += 1;
+                    }
+                }
+                Ok((caps, Vec::new(), records, None))
+            }
+            DnsManageOp::Create {
+                record_type,
+                value,
+                ttl,
+                proxied,
+                ..
+            } => {
+                let (rtype, norm_val) = validate_exposure_dns_record(record_type, value)?;
+                let post_url = format!("{base}/zones/{zone_id}/dns_records");
+                let resp = self
+                    .http_client
+                    .post(&post_url)
+                    .bearer_auth(api_token)
+                    .json(&serde_json::json!({
+                        "type": rtype,
+                        "name": rec_name,
+                        "content": norm_val,
+                        "ttl": ttl.unwrap_or(1).max(1),
+                        "proxied": proxied.unwrap_or(false),
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| ExposureError::Link(format!("cloudflare create record: {e}")))?;
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ExposureError::Protocol(format!("cloudflare create json: {e}")))?;
+                if body["success"].as_bool() != Some(true) {
+                    return Err(ExposureError::Protocol(format!(
+                        "cloudflare create dns_record failed: {body}"
+                    )));
+                }
+                let rec_id = body["result"]["id"].as_str().map(str::to_string);
+                Ok((caps, Vec::new(), Vec::new(), rec_id))
+            }
+            DnsManageOp::Update {
+                record_id,
+                record_type,
+                value,
+                ttl,
+                proxied,
+                ..
+            } => {
+                validate_cloudflare_id(record_id, "record_id")?;
+                let (rtype, norm_val) = validate_exposure_dns_record(record_type, value)?;
+                self.cloudflare_verify_record_scope(base, api_token, &zone_id, rec_name, record_id)
+                    .await?;
+                let patch_url = format!("{base}/zones/{zone_id}/dns_records/{record_id}");
+                let resp = self
+                    .http_client
+                    .patch(&patch_url)
+                    .bearer_auth(api_token)
+                    .json(&serde_json::json!({
+                        "type": rtype,
+                        "name": rec_name,
+                        "content": norm_val,
+                        "ttl": ttl.unwrap_or(1).max(1),
+                        "proxied": proxied.unwrap_or(false),
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| ExposureError::Link(format!("cloudflare patch record: {e}")))?;
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ExposureError::Protocol(format!("cloudflare patch json: {e}")))?;
+                if body["success"].as_bool() != Some(true) {
+                    return Err(ExposureError::Protocol(format!(
+                        "cloudflare patch dns_record failed: {body}"
+                    )));
+                }
+                Ok((caps, Vec::new(), Vec::new(), Some(record_id.clone())))
+            }
+            DnsManageOp::SetStatus { .. } => Err(ExposureError::Config(
+                "Cloudflare DNS does not support pausing/disabling individual records".into(),
+            )),
+            DnsManageOp::Delete { record_id, .. } => {
+                validate_cloudflare_id(record_id, "record_id")?;
+                self.cloudflare_verify_record_scope(base, api_token, &zone_id, rec_name, record_id)
+                    .await?;
+                let del_url = format!("{base}/zones/{zone_id}/dns_records/{record_id}");
+                let resp = self
+                    .http_client
+                    .delete(&del_url)
+                    .bearer_auth(api_token)
+                    .send()
+                    .await
+                    .map_err(|e| ExposureError::Link(format!("cloudflare delete record: {e}")))?;
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ExposureError::Protocol(format!("cloudflare delete json: {e}")))?;
+                if body["success"].as_bool() != Some(true) {
+                    return Err(ExposureError::Protocol(format!(
+                        "cloudflare delete dns_record failed: {body}"
+                    )));
+                }
+                Ok((caps, Vec::new(), Vec::new(), Some(record_id.clone())))
+            }
+        }
+    }
+
+    async fn cloudflare_verify_record_scope(
+        &self,
+        base: &str,
+        api_token: &str,
+        zone_id: &str,
+        expected_name: &str,
+        record_id: &str,
+    ) -> Result<()> {
+        let url = format!("{base}/zones/{zone_id}/dns_records/{record_id}");
+        let resp = self
+            .http_client
+            .get(&url)
+            .bearer_auth(api_token)
+            .send()
+            .await
+            .map_err(|e| ExposureError::Link(format!("cloudflare get record: {e}")))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ExposureError::Protocol(format!("cloudflare get json: {e}")))?;
+        if body["success"].as_bool() != Some(true) {
+            return Err(ExposureError::Protocol(format!(
+                "cloudflare get dns_record failed: {body}"
+            )));
+        }
+        let name = body["result"]["name"].as_str().unwrap_or("");
+        let rt = body["result"]["type"].as_str().unwrap_or("");
+        if !name.eq_ignore_ascii_case(expected_name) {
+            return Err(ExposureError::AccessDenied(format!(
+                "record '{record_id}' belongs to '{name}', not '{expected_name}'"
+            )));
+        }
+        if !matches!(rt, "A" | "AAAA" | "CNAME") {
+            return Err(ExposureError::AccessDenied(format!(
+                "refusing to modify non-Exposure record type '{rt}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Execute Control-authorized remote DNS inspection or single-record mutation
+    /// strictly scoped to Exposure's configured domains and A/AAAA/CNAME records.
+    pub async fn manage_dns(
+        &self,
+        op: &DnsManageOp,
+    ) -> Result<(
+        DnsProviderCapabilities,
+        Vec<DnsSupportLine>,
+        Vec<DnsRemoteRecord>,
+        Option<String>,
+    )> {
+        let cfg = self.cfg.read().await.clone();
+        let domain = match op {
+            DnsManageOp::Inspect { domain, .. }
+            | DnsManageOp::Create { domain, .. }
+            | DnsManageOp::Update { domain, .. }
+            | DnsManageOp::SetStatus { domain, .. }
+            | DnsManageOp::Delete { domain, .. } => domain.as_str(),
+        };
+        validate_dns_domain(domain)?;
+        let clean_dom = domain.trim().trim_end_matches('.');
+        if clean_dom == "*" || clean_dom.to_ascii_lowercase().starts_with("_acme-challenge.") {
+            return Err(ExposureError::AccessDenied(format!(
+                "domain '{domain}' cannot be managed via Exposure DNS record editor"
+            )));
+        }
+        let binding = resolve_domain_binding(&cfg.domains, domain)
+            .map(|(_, b)| b)
+            .ok_or_else(|| {
+                ExposureError::Config(format!(
+                    "domain '{domain}' is not bound in Maintainer domains config"
+                ))
+            })?;
+        let provider_name = binding.provider.trim();
+        let provider = cfg.dns_providers.get(provider_name).ok_or_else(|| {
+            ExposureError::Config(format!(
+                "maintainer missing DNS provider credentials for '{provider_name}'"
+            ))
+        })?;
+
+        match provider {
+            DnsProviderAccountConfig::Aliyun {
+                access_key_id,
+                access_key_secret,
+                region_id,
+            } => {
+                let host = aliyun_endpoint_host(region_id.as_deref())?;
+                let base_url = format!("https://{host}");
+                self.aliyun_manage_with_base(
+                    &base_url,
+                    access_key_id,
+                    access_key_secret,
+                    binding.root_domain.as_deref(),
+                    op,
+                )
+                .await
+            }
+            DnsProviderAccountConfig::Cloudflare { api_token } => {
+                if api_token.trim().is_empty() {
+                    return Err(ExposureError::Config(format!(
+                        "cloudflare provider '{provider_name}' missing api_token on maintainer"
+                    )));
+                }
+                self.cloudflare_manage_with_base(
+                    "https://api.cloudflare.com/client/v4",
+                    api_token,
+                    binding.zone_id.as_deref(),
+                    binding.root_domain.as_deref(),
+                    op,
+                )
+                .await
+            }
+            DnsProviderAccountConfig::Webhook { .. } | DnsProviderAccountConfig::Exec { .. } => {
+                let caps = DnsProviderCapabilities::default();
+                match op {
+                    DnsManageOp::Inspect { .. } => Ok((caps, Vec::new(), Vec::new(), None)),
+                    _ => Err(ExposureError::Config(format!(
+                        "DNS provider '{provider_name}' does not support direct remote record editing"
+                    ))),
+                }
+            }
+        }
+    }
+
     /// Execute Control-authorized declarative DNS A/AAAA sync for one or more domains
     /// using this Maintainer's local `dns_providers` credentials.
     pub async fn sync_dns_records(&self, records: &[DnsSyncRecordSpec]) -> Vec<DnsSyncDomainResult> {
@@ -1350,29 +2135,26 @@ impl MaintainerService {
                 "cannot sync DNS records for bare wildcard '*'".into(),
             ));
         }
-        for raw in &spec.ipv4s {
-            let ip: Ipv4Addr = raw.trim().parse().map_err(|_| {
-                ExposureError::Config(format!("invalid IPv4 address '{raw}' in DnsSyncReq"))
-            })?;
-            if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
-                return Err(ExposureError::Config(format!(
-                    "disallowed IPv4 address '{raw}' in DnsSyncReq"
-                )));
+        let entries = effective_sync_line_entries(spec);
+        let mut total_targets = 0usize;
+        for entry in &entries {
+            validate_dns_line_code(&entry.line)?;
+            for raw in &entry.ipv4s {
+                validate_exposure_dns_record("A", raw)?;
+                total_targets += 1;
+            }
+            for raw in &entry.ipv6s {
+                validate_exposure_dns_record("AAAA", raw)?;
+                total_targets += 1;
+            }
+            for raw in &entry.cnames {
+                validate_exposure_dns_record("CNAME", raw)?;
+                total_targets += 1;
             }
         }
-        for raw in &spec.ipv6s {
-            let ip: Ipv6Addr = raw.trim().parse().map_err(|_| {
-                ExposureError::Config(format!("invalid IPv6 address '{raw}' in DnsSyncReq"))
-            })?;
-            if ip.is_unspecified() || ip.is_multicast() {
-                return Err(ExposureError::Config(format!(
-                    "disallowed IPv6 address '{raw}' in DnsSyncReq"
-                )));
-            }
-        }
-        if spec.ipv4s.is_empty() && spec.ipv6s.is_empty() {
+        if total_targets == 0 {
             return Err(ExposureError::Config(format!(
-                "refusing to sync '{}' with zero target IPs",
+                "refusing to sync '{}' with zero target records",
                 spec.domain
             )));
         }
@@ -1415,6 +2197,7 @@ impl MaintainerService {
             domain: spec.domain.clone(),
             ipv4s: spec.ipv4s.clone(),
             ipv6s: spec.ipv6s.clone(),
+            line_entries: spec.line_entries.clone(),
             provider: Some(provider_name.to_string()),
             zone_id: eff_zone_id.map(str::to_string),
             root_domain: eff_root.map(str::to_string),
@@ -2373,6 +3156,7 @@ mod tests {
             domain: "edge.example.com".into(),
             ipv4s: vec!["1.1.1.1".into(), "2.2.2.2".into(), "3.3.3.3".into()],
             ipv6s: vec!["2001:db8::1".into()],
+            line_entries: vec![],
             provider: Some("ali-1".into()),
             zone_id: None,
             root_domain: None,
@@ -2479,6 +3263,11 @@ mod tests {
                 200,
                 r#"{"success":true,"result_info":{"total_pages":1},"result":[]}"#.to_string(),
             ),
+            // 8. GET CNAME records (empty)
+            (
+                200,
+                r#"{"success":true,"result_info":{"total_pages":1},"result":[]}"#.to_string(),
+            ),
         ])
         .await;
 
@@ -2486,6 +3275,7 @@ mod tests {
             domain: "app.example.com".into(),
             ipv4s: vec!["1.2.3.4".into(), "5.6.7.8".into()],
             ipv6s: vec![],
+            line_entries: vec![],
             provider: Some("cf-1".into()),
             zone_id: None,
             root_domain: None,
@@ -2527,6 +3317,7 @@ mod tests {
                     domain: "empty.example.com".into(),
                     ipv4s: vec![],
                     ipv6s: vec![],
+                    line_entries: vec![],
                     provider: Some("cf".into()),
                     zone_id: None,
                     root_domain: None,
@@ -2537,6 +3328,7 @@ mod tests {
                     domain: "noprov.example.com".into(),
                     ipv4s: vec!["1.1.1.1".into()],
                     ipv6s: vec![],
+                    line_entries: vec![],
                     provider: None,
                     zone_id: None,
                     root_domain: None,
@@ -2548,13 +3340,126 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(!results[0].ok);
-        assert!(results[0].error.as_deref().unwrap().contains("zero target IPs"));
+        assert!(results[0].error.as_deref().unwrap().contains("zero target"));
         assert!(!results[1].ok);
         assert!(results[1]
             .error
             .as_deref()
             .unwrap()
             .contains("no DNS provider"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn aliyun_split_horizon_lines_and_remote_inspect() {
+        let dir = std::env::temp_dir().join(format!("exp-ali-split-{}", Uuid::new_v4()));
+        let mut cfg = MaintainerConfig::default();
+        cfg.logger.segment.dir = dir.to_string_lossy().to_string();
+        let svc = MaintainerService::new("maint-ali-split", cfg).unwrap();
+
+        let (base_url, reqs) = spawn_mock_alidns_server(vec![
+            // DescribeDomainRecords: telecom has old IP, oversea is unmanaged and MUST remain untouched!
+            (
+                200,
+                r#"{"TotalCount":3,"DomainRecords":{"Record":[
+                    {"RecordId":"r-def","RR":"app","Type":"A","Value":"1.1.1.1","Line":"default","TTL":600,"Status":"ENABLE"},
+                    {"RecordId":"r-ct-old","RR":"app","Type":"A","Value":"9.9.9.9","Line":"telecom","TTL":600,"Status":"ENABLE"},
+                    {"RecordId":"r-os","RR":"app","Type":"A","Value":"8.8.8.8","Line":"oversea","TTL":600,"Status":"ENABLE"}
+                ]}}"#
+                    .to_string(),
+            ),
+            // AddDomainRecord for telecom 2.2.2.2
+            (200, r#"{"RequestId":"2","RecordId":"r-ct-new"}"#.to_string()),
+            // DeleteDomainRecord for r-ct-old (r-os untouched!)
+            (200, r#"{"RequestId":"3","RecordId":"r-ct-old"}"#.to_string()),
+        ])
+        .await;
+
+        let spec = DnsSyncRecordSpec {
+            domain: "app.example.com".into(),
+            ipv4s: vec![],
+            ipv6s: vec![],
+            line_entries: vec![
+                DnsLineSyncEntry {
+                    line: "default".into(),
+                    ipv4s: vec!["1.1.1.1".into()],
+                    ipv6s: vec![],
+                    cnames: vec![],
+                    ttl: Some(600),
+                    proxied: None,
+                },
+                DnsLineSyncEntry {
+                    line: "telecom".into(),
+                    ipv4s: vec!["2.2.2.2".into()],
+                    ipv6s: vec![],
+                    cnames: vec![],
+                    ttl: Some(600),
+                    proxied: None,
+                },
+            ],
+            provider: Some("ali-1".into()),
+            zone_id: None,
+            root_domain: Some("example.com".into()),
+            ttl: Some(600),
+            proxied: None,
+        };
+        let res = svc
+            .aliyun_sync_records_with_base(&base_url, "LTAI5tKey", "Secret", Some("example.com"), &spec)
+            .await
+            .expect("split sync ok");
+        assert!(res.ok);
+        assert_eq!(res.unchanged, 1);
+        assert_eq!(res.created, 1);
+        assert_eq!(res.deleted, 1);
+
+        let captured = reqs.lock().await;
+        assert_eq!(captured[1].action, "AddDomainRecord");
+        assert!(captured[1].query.contains("Line=telecom"));
+        assert!(captured[1].query.contains("Value=2.2.2.2"));
+        assert_eq!(captured[2].action, "DeleteDomainRecord");
+        assert_eq!(captured[2].query, "RecordId=r-ct-old");
+
+        // Now test Inspect with DescribeSupportLines
+        let (base_url2, _) = spawn_mock_alidns_server(vec![
+            (
+                200,
+                r#"{"TotalCount":2,"DomainRecords":{"Record":[
+                    {"RecordId":"r-1","RR":"app","Type":"A","Value":"1.1.1.1","Line":"default","TTL":600,"Status":"ENABLE"},
+                    {"RecordId":"r-txt","RR":"app","Type":"TXT","Value":"v=spf1","Line":"default","TTL":600,"Status":"ENABLE"}
+                ]}}"#
+                    .to_string(),
+            ),
+            (
+                200,
+                r#"{"RecordLines":{"RecordLine":[
+                    {"LineCode":"default","LineDisplayName":"默认"},
+                    {"LineCode":"telecom","LineDisplayName":"中国电信","FatherCode":"isp"}
+                ]}}"#
+                    .to_string(),
+            ),
+        ])
+        .await;
+
+        let (caps, lines, recs, _) = svc
+            .aliyun_manage_with_base(
+                &base_url2,
+                "LTAI5tKey",
+                "Secret",
+                Some("example.com"),
+                &DnsManageOp::Inspect {
+                    domain: "app.example.com".into(),
+                    include_lines: true,
+                },
+            )
+            .await
+            .expect("inspect ok");
+        assert!(caps.supports_lines);
+        assert!(caps.supports_status_toggle);
+        assert_eq!(lines.len(), 2);
+        // TXT record MUST be filtered out — Exposure only exposes A/AAAA/CNAME
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].record_id, "r-1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -399,6 +399,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             listeners: vec![IngressListener {
                 listen_addr: "127.0.0.1:0".into(),
                 tls: false,
+                redirect_https: false,
             }],
             rules: vec![
                 IngressRule {
@@ -1133,6 +1134,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                 domain: "app.example.com".into(),
                 ipv4s: vec!["203.0.113.10".into()],
                 ipv6s: vec![],
+                line_entries: vec![],
                 provider: Some("missing-prov".into()),
                 zone_id: None,
                 root_domain: None,

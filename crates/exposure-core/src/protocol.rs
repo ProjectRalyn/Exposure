@@ -326,6 +326,26 @@ pub struct PreflightReport {
     pub checks: Vec<PreflightCheckItem>,
 }
 
+fn default_dns_sync_line() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsLineSyncEntry {
+    #[serde(default = "default_dns_sync_line")]
+    pub line: String,
+    #[serde(default)]
+    pub ipv4s: Vec<String>,
+    #[serde(default)]
+    pub ipv6s: Vec<String>,
+    #[serde(default)]
+    pub cnames: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsSyncRecordSpec {
     pub domain: String,
@@ -333,6 +353,9 @@ pub struct DnsSyncRecordSpec {
     pub ipv4s: Vec<String>,
     #[serde(default)]
     pub ipv6s: Vec<String>,
+    /// Optional per-line split-horizon sync entries (when non-empty, supersedes flat `ipv4s`/`ipv6s`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_entries: Vec<DnsLineSyncEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +382,80 @@ pub struct DnsSyncDomainResult {
     pub unchanged: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSupportLine {
+    pub code: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsRemoteRecord {
+    pub record_id: String,
+    pub rr: String,
+    pub fqdn: String,
+    /// Strictly Exposure-managed types: "A" | "AAAA" | "CNAME"
+    pub record_type: String,
+    pub value: String,
+    pub line: String,
+    pub ttl: u32,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnsProviderCapabilities {
+    pub supports_lines: bool,
+    pub supports_proxied: bool,
+    pub supports_status_toggle: bool,
+    pub supports_remote_edit: bool,
+}
+
+/// Control-authorized remote DNS management operation scoped strictly to Exposure-managed records (A / AAAA / CNAME).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum DnsManageOp {
+    Inspect {
+        domain: String,
+        #[serde(default)]
+        include_lines: bool,
+    },
+    Create {
+        domain: String,
+        record_type: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxied: Option<bool>,
+    },
+    Update {
+        domain: String,
+        record_id: String,
+        record_type: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxied: Option<bool>,
+    },
+    SetStatus {
+        domain: String,
+        record_id: String,
+        enabled: bool,
+    },
+    Delete {
+        domain: String,
+        record_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +577,30 @@ pub enum SpecialPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Control-signed remote DNS inspection / single-record mutation scoped to Exposure's A/AAAA/CNAME records.
+    DnsManageReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
+        op: DnsManageOp,
+        control_signature: String,
+    },
+    DnsManageResp {
+        request_id: String,
+        maintainer_tag: String,
+        ok: bool,
+        #[serde(default)]
+        capabilities: DnsProviderCapabilities,
+        #[serde(default)]
+        lines: Vec<DnsSupportLine>,
+        #[serde(default)]
+        records: Vec<DnsRemoteRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     ErrorReply {
         message: String,
     },
@@ -568,6 +689,24 @@ pub fn dns_sync_req_signing_bytes(
     out.extend_from_slice(&expires_at.to_be_bytes());
     push_len_prefixed(&mut out, maintainer_tag.as_bytes());
     push_len_prefixed(&mut out, &rec_json);
+    out
+}
+
+pub fn dns_manage_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    maintainer_tag: &str,
+    op: &DnsManageOp,
+) -> Vec<u8> {
+    let op_json = serde_json::to_vec(op).unwrap_or_default();
+    let mut out = Vec::with_capacity(192 + op_json.len());
+    out.extend_from_slice(b"exposure-dns-manage-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, maintainer_tag.as_bytes());
+    push_len_prefixed(&mut out, &op_json);
     out
 }
 

@@ -16,8 +16,9 @@ use exposure_core::crypto::{
 };
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
-    dns_sync_req_signing_bytes, DiscoveryNeighbor, DnsSyncRecordSpec, NodeStatusSnapshot,
-    PreflightCheckItem, PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
+    dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, DiscoveryNeighbor, DnsManageOp,
+    DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem,
+    PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -648,6 +649,30 @@ impl NodeRuntime {
                     )
                 }
             }
+            SpecialPayload::DnsManageReq {
+                request_id,
+                issued_at,
+                expires_at,
+                maintainer_tag,
+                op,
+                control_signature,
+            } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    Some(
+                        self.handle_dns_manage_req(
+                            request_id,
+                            issued_at,
+                            expires_at,
+                            maintainer_tag,
+                            op,
+                            control_signature,
+                        )
+                        .await,
+                    )
+                }
+            }
             SpecialPayload::BootstrapReply {
                 accepted: true,
                 control_public_key: Some(pk),
@@ -981,6 +1006,88 @@ impl NodeRuntime {
             ok: all_ok,
             results,
             error: None,
+        }
+    }
+
+    async fn handle_dns_manage_req(
+        &self,
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
+        op: DnsManageOp,
+        control_signature: String,
+    ) -> SpecialPayload {
+        let reject = |msg: String| SpecialPayload::DnsManageResp {
+            request_id: request_id.clone(),
+            maintainer_tag: self.node_tag(),
+            ok: false,
+            capabilities: DnsProviderCapabilities::default(),
+            lines: Vec::new(),
+            records: Vec::new(),
+            record_id: None,
+            error: Some(msg),
+        };
+
+        if maintainer_tag != self.node_tag() {
+            return reject(format!(
+                "DnsManageReq target '{maintainer_tag}' != local node '{}'",
+                self.node_tag()
+            ));
+        }
+
+        let local_ctrl_pk = self.config.read().await.control_public_key.clone();
+        let Some(local_ctrl_pk) = local_ctrl_pk else {
+            return reject("node has no Control public key configured".into());
+        };
+
+        let now = Utc::now().timestamp();
+        if now > expires_at || issued_at > now + 60 {
+            return reject("DnsManageReq expired or invalid timestamp".into());
+        }
+
+        let signing = dns_manage_req_signing_bytes(
+            &request_id,
+            issued_at,
+            expires_at,
+            &maintainer_tag,
+            &op,
+        );
+        if let Err(e) = verify_signature_b64(&local_ctrl_pk, &signing, &control_signature) {
+            return reject(format!("DnsManageReq signature invalid: {e}"));
+        }
+
+        if self.used_dns_sync_ids.len() > 4096 {
+            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
+        }
+        let mut is_new = false;
+        self.used_dns_sync_ids
+            .entry(request_id.clone())
+            .or_insert_with(|| {
+                is_new = true;
+                expires_at
+            });
+        if !is_new {
+            return reject("DnsManageReq replay rejected".into());
+        }
+
+        let maint = self.maintainer.read().await.clone();
+        let Some(maint) = maint else {
+            return reject("node is not running maintainer mode".into());
+        };
+
+        match maint.manage_dns(&op).await {
+            Ok((capabilities, lines, records, record_id)) => SpecialPayload::DnsManageResp {
+                request_id,
+                maintainer_tag: self.node_tag(),
+                ok: true,
+                capabilities,
+                lines,
+                records,
+                record_id,
+                error: None,
+            },
+            Err(e) => reject(e.to_string()),
         }
     }
 

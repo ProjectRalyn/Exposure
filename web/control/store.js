@@ -1,0 +1,762 @@
+// Unified Cluster Configuration Store (Draft, Undo/Redo, Diff, Path Solver, Validation & Deploy)
+
+export function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+export function isReservedKey(k) {
+  return k === "__proto__" || k === "prototype" || k === "constructor";
+}
+
+export function normalizeTri(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  return null;
+}
+
+export function sanitizeRecord(obj) {
+  const out = {};
+  if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+    for (const [k, v] of Object.entries(obj)) {
+      if (!isReservedKey(k)) out[k] = v;
+    }
+  }
+  return out;
+}
+
+export function defaultTopologyDefaults() {
+  return {
+    ingress: {
+      server_header: "nginx",
+      clearance_secret: "",
+      cert_store_dir: null,
+      default_guard: null,
+      intercept_errors: false,
+      js_fp_beacon: true,
+      js_fp_ttl_secs: 3600,
+    },
+    guard: {
+      antibot: "challenge",
+      rate_limit_bucket: null,
+      challenge_threshold: 50,
+      reject_threshold: 85,
+      pow_difficulty: 16,
+      clearance_ttl_secs: 600,
+      bind_ua: true,
+      bind_ip_prefix: true,
+      block_bots: false,
+      block_headless: true,
+      require_client_fp: false,
+      js_fp_beacon: true,
+      js_fp_ttl_secs: 3600,
+    },
+    egress: {
+      protocol: "auto",
+      timeout_ms: 30000,
+      tls: false,
+      ca_cert_path: null,
+      insecure_skip_verify: false,
+      allow_any_origin: false,
+      intercept_errors: false,
+    },
+    link_listener: {
+      allow_on_demand: true,
+      allow_tunnel: true,
+      allow_bootstrap: false,
+    },
+    pages: {
+      error_html: null,
+      challenge_html: null,
+      challenge_css: null,
+    },
+  };
+}
+
+export function defaultGuardProfile(defs = null) {
+  const gd = defs || defaultTopologyDefaults().guard;
+  return {
+    antibot: gd.antibot || "challenge",
+    rate_limit_bucket: null,
+    allow_cidrs: [],
+    deny_cidrs: [],
+    challenge_threshold: gd.challenge_threshold ?? 50,
+    reject_threshold: gd.reject_threshold ?? 85,
+    pow_difficulty: gd.pow_difficulty ?? 16,
+    clearance_ttl_secs: gd.clearance_ttl_secs ?? 1800,
+    bind_ua: null,
+    bind_ip_prefix: null,
+    api_bypass_headers: [],
+    block_bots: null,
+    block_headless: null,
+    require_client_fp: null,
+    js_fp_beacon: null,
+    js_fp_ttl_secs: null,
+  };
+}
+
+export function normalizeGuardProfile(g) {
+  const src = g && typeof g === "object" ? g : {};
+  return {
+    antibot: src.antibot || "off",
+    rate_limit_bucket: src.rate_limit_bucket || null,
+    allow_cidrs: Array.isArray(src.allow_cidrs) ? src.allow_cidrs : [],
+    deny_cidrs: Array.isArray(src.deny_cidrs) ? src.deny_cidrs : [],
+    challenge_threshold: src.challenge_threshold ?? 50,
+    reject_threshold: src.reject_threshold ?? 85,
+    pow_difficulty: src.pow_difficulty ?? 16,
+    clearance_ttl_secs: src.clearance_ttl_secs ?? 1800,
+    bind_ua: normalizeTri(src.bind_ua),
+    bind_ip_prefix: normalizeTri(src.bind_ip_prefix),
+    api_bypass_headers: Array.isArray(src.api_bypass_headers) ? src.api_bypass_headers : [],
+    block_bots: normalizeTri(src.block_bots),
+    block_headless: normalizeTri(src.block_headless),
+    require_client_fp: normalizeTri(src.require_client_fp),
+    js_fp_beacon: normalizeTri(src.js_fp_beacon),
+    js_fp_ttl_secs: src.js_fp_ttl_secs != null && src.js_fp_ttl_secs !== "" ? Number(src.js_fp_ttl_secs) : null,
+  };
+}
+
+export function normalizeBucket(b) {
+  const src = b && typeof b === "object" ? b : {};
+  return {
+    capacity: src.capacity ?? 60,
+    refill_per_sec: src.refill_per_sec ?? 10,
+    per_ip: normalizeTri(src.per_ip),
+  };
+}
+
+export function normalizeEgressService(svc) {
+  const src = svc && typeof svc === "object" ? svc : {};
+  return {
+    backend: src.backend || "",
+    protocol: src.protocol || "auto",
+    tls: normalizeTri(src.tls),
+    ca_cert_path: src.ca_cert_path || null,
+    insecure_skip_verify: normalizeTri(src.insecure_skip_verify),
+    allow_from: Array.isArray(src.allow_from) ? src.allow_from : [],
+    allow_any_origin: normalizeTri(src.allow_any_origin),
+    timeout_ms: src.timeout_ms ?? 30000,
+    intercept_errors: normalizeTri(src.intercept_errors),
+    local_health_check: src.local_health_check || null,
+  };
+}
+
+export function defaultServiceSpec(egressNode = "") {
+  return {
+    hosts: [],
+    url_prefix: null,
+    sni: null,
+    source_cidrs: [],
+    ingress: { mode: "all", nodes: [], overrides: {} },
+    guard: null,
+    intercept_errors: null,
+    js_fp_beacon: null,
+    egress: {
+      node: egressNode,
+      backend: "127.0.0.1:8080",
+      protocol: "auto",
+      tls: null,
+      ca_cert_path: null,
+      insecure_skip_verify: null,
+      timeout_ms: 0,
+      intercept_errors: null,
+      local_health_check: null,
+    },
+    routing: { mode: "auto", pinned_paths: {} },
+    auto_tls: false,
+    enabled: true,
+  };
+}
+
+export function normalizeServiceSpec(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const rawOverrides = sanitizeRecord(src.ingress?.overrides);
+  const overrides = {};
+  for (const [k, ov] of Object.entries(rawOverrides)) {
+    overrides[k] = {
+      guard: ov?.guard || null,
+      source_cidrs: Array.isArray(ov?.source_cidrs) ? ov.source_cidrs.map(String).filter(Boolean) : [],
+      intercept_errors: normalizeTri(ov?.intercept_errors),
+      js_fp_beacon: normalizeTri(ov?.js_fp_beacon),
+    };
+  }
+  const rawPinned = sanitizeRecord(src.routing?.pinned_paths);
+  const pinned_paths = {};
+  for (const [k, arr] of Object.entries(rawPinned)) {
+    if (Array.isArray(arr)) pinned_paths[k] = arr.map(String).filter(Boolean);
+  }
+  return {
+    hosts: Array.isArray(src.hosts) ? src.hosts.map((s) => String(s).trim()).filter(Boolean) : [],
+    url_prefix: src.url_prefix || null,
+    sni: src.sni || null,
+    source_cidrs: Array.isArray(src.source_cidrs) ? src.source_cidrs.map(String).filter(Boolean) : [],
+    ingress: {
+      mode: src.ingress?.mode || "all",
+      nodes: Array.isArray(src.ingress?.nodes) ? src.ingress.nodes.map(String).filter(Boolean) : [],
+      overrides,
+    },
+    guard: src.guard || null,
+    intercept_errors: normalizeTri(src.intercept_errors),
+    js_fp_beacon: normalizeTri(src.js_fp_beacon),
+    egress: {
+      node: src.egress?.node || "",
+      backend: src.egress?.backend || "",
+      protocol: src.egress?.protocol || "auto",
+      tls: normalizeTri(src.egress?.tls),
+      ca_cert_path: src.egress?.ca_cert_path || null,
+      insecure_skip_verify: normalizeTri(src.egress?.insecure_skip_verify),
+      timeout_ms: Number(src.egress?.timeout_ms ?? 0) || 0,
+      intercept_errors: normalizeTri(src.egress?.intercept_errors),
+      local_health_check: src.egress?.local_health_check || null,
+    },
+    routing: {
+      mode: src.routing?.mode || "auto",
+      pinned_paths,
+    },
+    auto_tls: Boolean(src.auto_tls),
+    enabled: src.enabled !== false,
+  };
+}
+
+export function defaultNodeSpec() {
+  return {
+    roles: { ingress: false, egress: false, relay: false, maintainer: false },
+    external_ips: [],
+    link_listener: {
+      listen_addr: "0.0.0.0:10802",
+      allow_on_demand: null,
+      allow_tunnel: null,
+      allow_bootstrap: null,
+    },
+    maintainer_template: null,
+    maintainer_hops: [],
+    ingress: {
+      listeners: [],
+      rules: [],
+      guards: {},
+      rate_limit_buckets: {},
+      tls_certs: [],
+      clearance_secret: "",
+      cert_store_dir: null,
+      server_header: "",
+      js_fp_beacon: null,
+      js_fp_ttl_secs: null,
+      pages: { error_html: null, challenge_html: null, challenge_css: null },
+    },
+    egress: { services: {}, pages: { error_html: null, challenge_html: null, challenge_css: null } },
+    relay: { rules: [] },
+  };
+}
+
+export function rolesFromAny(rawRoles) {
+  const base = { ingress: false, egress: false, relay: false, maintainer: false };
+  if (Array.isArray(rawRoles)) {
+    for (const r of rawRoles) {
+      if (Object.hasOwn(base, r)) base[r] = true;
+    }
+    return base;
+  }
+  if (rawRoles && typeof rawRoles === "object") {
+    return {
+      ingress: Boolean(rawRoles.ingress),
+      egress: Boolean(rawRoles.egress),
+      relay: Boolean(rawRoles.relay),
+      maintainer: Boolean(rawRoles.maintainer),
+    };
+  }
+  return base;
+}
+
+export function normalizeNode(n) {
+  const base = defaultNodeSpec();
+  const out = { ...base, ...(n || {}) };
+  out.roles = rolesFromAny(n?.roles);
+  out.external_ips = Array.isArray(n?.external_ips) ? n.external_ips.map((s) => String(s).trim()).filter(Boolean) : [];
+  if (n && n.link_listener === null) {
+    out.link_listener = null;
+  } else if (n?.link_listener && typeof n.link_listener === "object") {
+    out.link_listener = {
+      listen_addr: n.link_listener.listen_addr || "",
+      allow_on_demand: normalizeTri(n.link_listener.allow_on_demand),
+      allow_tunnel: normalizeTri(n.link_listener.allow_tunnel),
+      allow_bootstrap: normalizeTri(n.link_listener.allow_bootstrap),
+    };
+  }
+  out.ingress = { ...base.ingress, ...(n?.ingress || {}) };
+  out.ingress.clearance_secret = n?.ingress?.clearance_secret || "";
+  out.ingress.server_header = n?.ingress?.server_header ?? "";
+  out.ingress.js_fp_beacon = normalizeTri(n?.ingress?.js_fp_beacon);
+  out.ingress.js_fp_ttl_secs =
+    n?.ingress?.js_fp_ttl_secs != null && n?.ingress?.js_fp_ttl_secs !== ""
+      ? Number(n.ingress.js_fp_ttl_secs)
+      : null;
+  out.ingress.listeners = Array.isArray(out.ingress.listeners)
+    ? out.ingress.listeners.map((l) => ({
+        listen_addr: l.listen_addr || "",
+        tls: Boolean(l.tls),
+        redirect_https: Boolean(l.redirect_https),
+      }))
+    : [];
+  out.ingress.rules = Array.isArray(out.ingress.rules)
+    ? out.ingress.rules.map((r) => ({
+        name: r.name || null,
+        match: r.match || {},
+        service_tag: r.service_tag || "",
+        next_peer: r.next_peer || "",
+        guard: r.guard || null,
+        intercept_errors: normalizeTri(r.intercept_errors),
+        js_fp_beacon: normalizeTri(r.js_fp_beacon),
+      }))
+    : [];
+  const rawGuards = sanitizeRecord(out.ingress.guards);
+  out.ingress.guards = {};
+  for (const [k, v] of Object.entries(rawGuards)) out.ingress.guards[k] = normalizeGuardProfile(v);
+  const rawBuckets = sanitizeRecord(out.ingress.rate_limit_buckets);
+  out.ingress.rate_limit_buckets = {};
+  for (const [k, v] of Object.entries(rawBuckets)) out.ingress.rate_limit_buckets[k] = normalizeBucket(v);
+  out.ingress.tls_certs = Array.isArray(out.ingress.tls_certs) ? out.ingress.tls_certs : [];
+  out.ingress.pages = {
+    error_html: n?.ingress?.pages?.error_html || null,
+    challenge_html: n?.ingress?.pages?.challenge_html || null,
+    challenge_css: n?.ingress?.pages?.challenge_css || null,
+  };
+  out.egress = { ...base.egress, ...(n?.egress || {}) };
+  out.egress.pages = {
+    error_html: n?.egress?.pages?.error_html || null,
+    challenge_html: null,
+    challenge_css: null,
+  };
+  const rawSvcs = sanitizeRecord(out.egress.services);
+  out.egress.services = {};
+  for (const [k, v] of Object.entries(rawSvcs)) out.egress.services[k] = normalizeEgressService(v);
+  out.relay = { ...base.relay, ...(n?.relay || {}) };
+  out.relay.rules = Array.isArray(out.relay.rules) ? out.relay.rules : [];
+  out.maintainer_hops = Array.isArray(n?.maintainer_hops) ? n.maintainer_hops : [];
+  return out;
+}
+
+export function defaultMaintainerTemplate() {
+  return {
+    is_primary_cert_manager: true,
+    acme: {
+      directory_url: "self-signed",
+      contact_email: "",
+      storage_dir: "./data/certs",
+      orders: [],
+    },
+  };
+}
+
+export function normalizeDefaults(raw) {
+  const base = defaultTopologyDefaults();
+  const src = raw && typeof raw === "object" ? raw : {};
+  return {
+    ingress: {
+      ...base.ingress,
+      ...(src.ingress || {}),
+      cert_store_dir: src.ingress?.cert_store_dir || null,
+      default_guard: src.ingress?.default_guard || null,
+      intercept_errors: Boolean(src.ingress?.intercept_errors ?? base.ingress.intercept_errors),
+      js_fp_beacon: Boolean(src.ingress?.js_fp_beacon ?? base.ingress.js_fp_beacon),
+      js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
+    },
+    guard: {
+      ...base.guard,
+      ...(src.guard || {}),
+      rate_limit_bucket: src.guard?.rate_limit_bucket || null,
+      bind_ua: Boolean(src.guard?.bind_ua ?? base.guard.bind_ua),
+      bind_ip_prefix: Boolean(src.guard?.bind_ip_prefix ?? base.guard.bind_ip_prefix),
+      block_bots: Boolean(src.guard?.block_bots ?? base.guard.block_bots),
+      block_headless: Boolean(src.guard?.block_headless ?? base.guard.block_headless),
+      require_client_fp: Boolean(src.guard?.require_client_fp ?? base.guard.require_client_fp),
+      js_fp_beacon: Boolean(src.guard?.js_fp_beacon ?? base.guard.js_fp_beacon),
+      js_fp_ttl_secs: Number(src.guard?.js_fp_ttl_secs ?? base.guard.js_fp_ttl_secs) || 3600,
+    },
+    egress: {
+      ...base.egress,
+      ...(src.egress || {}),
+      ca_cert_path: src.egress?.ca_cert_path || null,
+      tls: Boolean(src.egress?.tls ?? base.egress.tls),
+      insecure_skip_verify: Boolean(src.egress?.insecure_skip_verify ?? base.egress.insecure_skip_verify),
+      allow_any_origin: Boolean(src.egress?.allow_any_origin ?? base.egress.allow_any_origin),
+      intercept_errors: Boolean(src.egress?.intercept_errors ?? base.egress.intercept_errors),
+      timeout_ms: Number(src.egress?.timeout_ms ?? base.egress.timeout_ms) || 30000,
+    },
+    link_listener: {
+      ...base.link_listener,
+      ...(src.link_listener || {}),
+      allow_on_demand: Boolean(src.link_listener?.allow_on_demand ?? base.link_listener.allow_on_demand),
+      allow_tunnel: Boolean(src.link_listener?.allow_tunnel ?? base.link_listener.allow_tunnel),
+      allow_bootstrap: Boolean(src.link_listener?.allow_bootstrap ?? base.link_listener.allow_bootstrap),
+    },
+    pages: {
+      error_html: src.pages?.error_html || null,
+      challenge_html: src.pages?.challenge_html || null,
+      challenge_css: src.pages?.challenge_css || null,
+    },
+  };
+}
+
+export function normalizeSpec(raw) {
+  const defaults = normalizeDefaults(raw?.defaults);
+  const rawGuardTpls = sanitizeRecord(raw?.guard_templates);
+  const guard_templates = {};
+  for (const [k, v] of Object.entries(rawGuardTpls)) {
+    guard_templates[k] = normalizeGuardProfile(v);
+  }
+  const rawBucketTpls = sanitizeRecord(raw?.bucket_templates);
+  const bucket_templates = {};
+  for (const [k, v] of Object.entries(rawBucketTpls)) {
+    bucket_templates[k] = normalizeBucket(v);
+  }
+  const nodes = {};
+  if (raw && raw.nodes && typeof raw.nodes === "object") {
+    for (const [tag, n] of Object.entries(raw.nodes)) {
+      if (isReservedKey(tag)) continue;
+      nodes[tag] = normalizeNode(n);
+    }
+  }
+  const services = {};
+  const rawSvcs = sanitizeRecord(raw?.services);
+  for (const [sName, sVal] of Object.entries(rawSvcs)) {
+    services[sName] = normalizeServiceSpec(sVal);
+  }
+  const links = Array.isArray(raw?.links)
+    ? raw.links.map((l) => ({
+        from: l.from || "",
+        to: l.to || "",
+        peer_tag: l.peer_tag || null,
+        mode: l.mode || "on-demand",
+        tunnel_direction: l.tunnel_direction || (l.mode === "tunnel" ? "outbound" : null),
+        bidirectional: l.bidirectional ?? true,
+        expected_client_addr: l.expected_client_addr || null,
+        endpoints: Array.isArray(l.endpoints) ? l.endpoints : [],
+        reverse_endpoints: Array.isArray(l.reverse_endpoints) ? l.reverse_endpoints : [],
+      }))
+    : [];
+  const dns_providers = sanitizeRecord(
+    raw?.dns_providers && typeof raw.dns_providers === "object" ? deepClone(raw.dns_providers) : {}
+  );
+  const domains = {};
+  const rawDomains = sanitizeRecord(raw?.domains);
+  for (const [dKey, dVal] of Object.entries(rawDomains)) {
+    const rawLines = Array.isArray(dVal?.line_routes) ? dVal.line_routes : [];
+    domains[dKey] = {
+      provider: dVal?.provider || "",
+      zone_id: dVal?.zone_id || null,
+      root_domain: dVal?.root_domain || null,
+      target_nodes: Array.isArray(dVal?.target_nodes) ? dVal.target_nodes.map(String).filter(Boolean) : [],
+      line_routes: rawLines.map((lr) => ({
+        line: lr?.line || "default",
+        target_nodes: Array.isArray(lr?.target_nodes) ? lr.target_nodes.map(String).filter(Boolean) : [],
+        values: Array.isArray(lr?.values) ? lr.values.map(String).filter(Boolean) : [],
+        record_type: lr?.record_type === "cname" ? "cname" : "auto",
+        ttl: lr?.ttl != null && lr.ttl !== "" ? Number(lr.ttl) : null,
+        proxied: normalizeTri(lr?.proxied),
+        enabled: lr?.enabled !== false,
+      })),
+      ttl: dVal?.ttl != null ? Number(dVal.ttl) : 600,
+      proxied: Boolean(dVal?.proxied),
+    };
+  }
+  const maintainer_templates = sanitizeRecord(
+    raw?.maintainer_templates && typeof raw.maintainer_templates === "object"
+      ? deepClone(raw.maintainer_templates)
+      : {}
+  );
+  const global_logger = raw?.global_logger ? deepClone(raw.global_logger) : null;
+  return {
+    defaults,
+    guard_templates,
+    bucket_templates,
+    dns_providers,
+    domains,
+    services,
+    nodes,
+    links,
+    maintainer_templates,
+    global_logger,
+  };
+}
+
+export function resolveDomainBindingJS(domains, targetDomain) {
+  const raw = String(targetDomain || "").trim().replace(/\.+$/, "").toLowerCase();
+  if (!raw || !domains) return null;
+  const norm = raw.startsWith("*.") ? raw.slice(2) : raw;
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (kr === raw) return [k, v];
+  }
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (!kr.startsWith("*.") && kr === norm) return [k, v];
+  }
+  let best = null;
+  for (const [k, v] of Object.entries(domains)) {
+    const kr = k.trim().replace(/\.+$/, "").toLowerCase();
+    if (!kr || kr.startsWith("*.")) continue;
+    if (norm.endsWith("." + kr)) {
+      if (!best || kr.length > best[2]) best = [k, v, kr.length];
+    }
+  }
+  return best ? [best[0], best[1]] : null;
+}
+
+export function shortestPathBFS(links, start, goal, { nodes = null, requireRelay = false } = {}) {
+  if (!start || !goal) return null;
+  if (start === goal) return [start];
+  const adj = new Map();
+  const add = (a, b) => {
+    if (!adj.has(a)) adj.set(a, new Set());
+    adj.get(a).add(b);
+  };
+  for (const l of links || []) {
+    if (!l.from || !l.to) continue;
+    if (l.mode === "tunnel" && l.tunnel_direction === "inbound") continue;
+    add(l.from, l.to);
+    if (l.mode === "tunnel") {
+      add(l.to, l.from);
+    } else if (l.mode === "on-demand" && l.bidirectional !== false && (l.reverse_endpoints || []).length > 0) {
+      add(l.to, l.from);
+    }
+  }
+  const visited = new Set([start]);
+  const q = [[start]];
+  while (q.length) {
+    const path = q.shift();
+    const last = path[path.length - 1];
+    const nbs = [...(adj.get(last) || [])].sort();
+    for (const nb of nbs) {
+      if (visited.has(nb)) continue;
+      if (nb !== goal && requireRelay && nodes && !nodes[nb]?.roles?.relay) continue;
+      const next = [...path, nb];
+      if (nb === goal) return next;
+      visited.add(nb);
+      q.push(next);
+    }
+  }
+  return null;
+}
+
+export function resolveServiceTargetIngresses(spec, svc) {
+  const allIng = Object.entries(spec?.nodes || {})
+    .filter(([, n]) => n.roles?.ingress)
+    .map(([tag]) => tag)
+    .sort();
+  const mode = svc?.ingress?.mode || "all";
+  if (mode === "all") return allIng;
+  if (mode === "selected") {
+    return (svc.ingress?.nodes || []).filter((t) => spec?.nodes?.[t]?.roles?.ingress);
+  }
+  if (mode === "exclude") {
+    const excl = new Set(svc.ingress?.nodes || []);
+    return allIng.filter((t) => !excl.has(t));
+  }
+  return allIng;
+}
+
+export function certCoversHost(certDomain, host) {
+  const cert = String(certDomain || "").trim().replace(/\.+$/, "").toLowerCase();
+  const h = String(host || "").trim().replace(/\.+$/, "").toLowerCase();
+  if (!cert || !h) return false;
+  if (cert === h) return true;
+  if (cert.startsWith("*.")) {
+    const suf = cert.slice(1);
+    if (h.endsWith(suf)) {
+      const pref = h.slice(0, h.length - suf.length);
+      return pref.length > 0 && !pref.includes(".");
+    }
+  }
+  return false;
+}
+
+export function createControlStore({ api }) {
+  const listeners = new Set();
+  const store = {
+    loaded: false,
+    spec: normalizeSpec({}),
+    savedSpec: normalizeSpec({}),
+    yaml: "",
+    compiledPaths: [],
+    errors: [],
+    warnings: [],
+    liveNodes: [],
+    liveLinks: [],
+    overview: null,
+    telemetry: null,
+    versions: [],
+    audit: [],
+    dnsRemoteCache: {}, // domain -> { capabilities, lines, records, fetchedAt, maintainer_tag }
+    undoStack: [],
+    redoStack: [],
+    dirty: false,
+
+    subscribe(fn) {
+      listeners.add(fn);
+      return () => listeners.delete(fn);
+    },
+
+    notify(reason = "update") {
+      for (const fn of listeners) fn(reason);
+    },
+
+    setFromServer(data, force = false) {
+      if (store.dirty && !force) {
+        // Only update live runtime overlays without clobbering unsaved draft
+        if (Array.isArray(data.live_nodes)) store.liveNodes = data.live_nodes;
+        if (Array.isArray(data.live_links)) store.liveLinks = data.live_links;
+        store.notify("live");
+        return;
+      }
+      store.spec = normalizeSpec(data.spec || {});
+      store.savedSpec = deepClone(store.spec);
+      store.yaml = data.yaml || "";
+      store.compiledPaths = data.paths || [];
+      store.errors = data.errors || [];
+      store.warnings = data.warnings || [];
+      if (Array.isArray(data.live_nodes)) store.liveNodes = data.live_nodes;
+      if (Array.isArray(data.live_links)) store.liveLinks = data.live_links;
+      store.undoStack = [];
+      store.redoStack = [];
+      store.dirty = false;
+      store.loaded = true;
+      store.notify("server");
+    },
+
+    async loadTopology(force = false) {
+      const data = await api("/api/topology");
+      store.setFromServer(data, force);
+      return data;
+    },
+
+    mutate(mutator, recordHistory = true) {
+      if (recordHistory) {
+        store.undoStack.push(deepClone(store.spec));
+        if (store.undoStack.length > 50) store.undoStack.shift();
+        store.redoStack = [];
+      }
+      mutator(store.spec);
+      store.dirty = JSON.stringify(store.spec) !== JSON.stringify(store.savedSpec);
+      store.notify("mutate");
+    },
+
+    undo() {
+      if (!store.undoStack.length) return false;
+      store.redoStack.push(deepClone(store.spec));
+      store.spec = store.undoStack.pop();
+      store.dirty = JSON.stringify(store.spec) !== JSON.stringify(store.savedSpec);
+      store.notify("undo");
+      return true;
+    },
+
+    redo() {
+      if (!store.redoStack.length) return false;
+      store.undoStack.push(deepClone(store.spec));
+      store.spec = store.redoStack.pop();
+      store.dirty = JSON.stringify(store.spec) !== JSON.stringify(store.savedSpec);
+      store.notify("redo");
+      return true;
+    },
+
+    discardDraft() {
+      store.spec = deepClone(store.savedSpec);
+      store.undoStack = [];
+      store.redoStack = [];
+      store.dirty = false;
+      store.notify("discard");
+    },
+
+    computeDiff() {
+      const changes = [];
+      const compareMap = (section, label, prevMap, nextMap) => {
+        const prev = prevMap || {};
+        const next = nextMap || {};
+        const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+        for (const k of keys) {
+          const hasP = Object.hasOwn(prev, k);
+          const hasN = Object.hasOwn(next, k);
+          if (!hasP && hasN) changes.push({ section, kind: "add", label, name: k });
+          else if (hasP && !hasN) changes.push({ section, kind: "remove", label, name: k });
+          else if (JSON.stringify(prev[k]) !== JSON.stringify(next[k])) {
+            changes.push({ section, kind: "modify", label, name: k });
+          }
+        }
+      };
+      compareMap("hosts", "Host", store.savedSpec.nodes, store.spec.nodes);
+      compareMap("services", "Service", store.savedSpec.services, store.spec.services);
+      compareMap("domains", "Domain", store.savedSpec.domains, store.spec.domains);
+      compareMap("dns_providers", "DNS Provider", store.savedSpec.dns_providers, store.spec.dns_providers);
+      compareMap("guards", "Guard", store.savedSpec.guard_templates, store.spec.guard_templates);
+      compareMap("buckets", "Bucket", store.savedSpec.bucket_templates, store.spec.bucket_templates);
+      compareMap("maintainers", "Maintainer Template", store.savedSpec.maintainer_templates, store.spec.maintainer_templates);
+      if (JSON.stringify(store.savedSpec.links) !== JSON.stringify(store.spec.links)) {
+        changes.push({
+          section: "topology",
+          kind: "modify",
+          label: "Mesh Links",
+          name: `${(store.savedSpec.links || []).length} → ${(store.spec.links || []).length}`,
+        });
+      }
+      if (JSON.stringify(store.savedSpec.defaults) !== JSON.stringify(store.spec.defaults)) {
+        changes.push({ section: "system", kind: "modify", label: "Cluster Defaults", name: "defaults" });
+      }
+      if (JSON.stringify(store.savedSpec.global_logger) !== JSON.stringify(store.spec.global_logger)) {
+        changes.push({ section: "system", kind: "modify", label: "Global Logger", name: "global_logger" });
+      }
+      return changes;
+    },
+
+    async validate(yamlOverride = null) {
+      const payload = yamlOverride != null ? { yaml: yamlOverride, push: false } : { spec: store.spec, push: false };
+      const res = await api("/api/topology/validate", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      store.errors = res.errors || [];
+      store.warnings = res.warnings || [];
+      store.compiledPaths = res.paths || [];
+      if (res.yaml) store.yaml = res.yaml;
+      if (yamlOverride != null && res.spec) {
+        store.mutate(() => {
+          store.spec = normalizeSpec(res.spec);
+        });
+      } else {
+        store.notify("validate");
+      }
+      return res;
+    },
+
+    async preflight() {
+      return await api("/api/topology/preflight", {
+        method: "POST",
+        body: JSON.stringify({ spec: store.spec, push: false }),
+      });
+    },
+
+    async deploy({ push = true, syncDns = false } = {}) {
+      const res = await api("/api/topology", {
+        method: "PUT",
+        body: JSON.stringify({ spec: store.spec, push, sync_dns: syncDns }),
+      });
+      store.setFromServer(
+        {
+          yaml: res.yaml,
+          spec: res.spec,
+          paths: res.paths || [],
+          errors: res.push_errors || [],
+          warnings: res.warnings || [],
+        },
+        true
+      );
+      return res;
+    },
+
+    liveNodeMap() {
+      const m = new Map();
+      for (const n of store.liveNodes || []) m.set(n.node_tag, n);
+      return m;
+    },
+  };
+
+  return store;
+}

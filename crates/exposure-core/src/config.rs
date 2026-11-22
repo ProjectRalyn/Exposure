@@ -661,8 +661,57 @@ fn default_dns_ttl() -> u32 {
     600
 }
 
+fn default_dns_line() -> String {
+    "default".into()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DomainLineRecordType {
+    /// Automatically expands `target_nodes` `external_ips` (or manual IP `values`) into A/AAAA records.
+    #[default]
+    Auto,
+    /// Syncs CNAME record(s) from `values`.
+    Cname,
+}
+
+/// Per-line split-horizon DNS routing entry (e.g. Aliyun ISP / geo lines such as `default`, `telecom`, `unicom`, `mobile`, `oversea`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainLineRoute {
+    #[serde(default = "default_dns_line")]
+    pub line: String,
+    /// Target node tags whose configured `external_ips` are synced for this line.
+    #[serde(default)]
+    pub target_nodes: Vec<String>,
+    /// Optional explicit IP addresses (for `auto`) or target hostname (for `cname`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default)]
+    pub record_type: DomainLineRecordType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<bool>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for DomainLineRoute {
+    fn default() -> Self {
+        Self {
+            line: default_dns_line(),
+            target_nodes: Vec::new(),
+            values: Vec::new(),
+            record_type: DomainLineRecordType::Auto,
+            ttl: None,
+            proxied: None,
+            enabled: true,
+        }
+    }
+}
+
 /// Binding between a domain (apex, subdomain, or wildcard) and a named DNS provider account,
-/// optionally carrying zone metadata and target nodes for declarative A/AAAA DNS sync.
+/// optionally carrying zone metadata, flat `target_nodes`, or split-horizon `line_routes` for declarative DNS sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainBindingConfig {
     /// Named account key in `dns_providers`.
@@ -673,9 +722,12 @@ pub struct DomainBindingConfig {
     /// Optional hosted root/apex domain name (auto-detected when omitted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_domain: Option<String>,
-    /// Target node tags whose configured `external_ips` are synced as A/AAAA records for this domain.
+    /// Legacy flat target node tags (treated as `default` line when `line_routes` is empty).
     #[serde(default)]
     pub target_nodes: Vec<String>,
+    /// Split-horizon per-line routing rules (e.g. Aliyun ISP/geo lines). Takes precedence over `target_nodes` when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub line_routes: Vec<DomainLineRoute>,
     /// DNS record TTL in seconds (default 600).
     #[serde(default = "default_dns_ttl")]
     pub ttl: u32,
@@ -691,6 +743,7 @@ impl Default for DomainBindingConfig {
             zone_id: None,
             root_domain: None,
             target_nodes: Vec::new(),
+            line_routes: Vec::new(),
             ttl: default_dns_ttl(),
             proxied: false,
         }
@@ -1159,12 +1212,133 @@ pub struct TopologyDefaults {
     pub pages: CustomPagesConfig,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceIngressMode {
+    /// Automatically expose on every Ingress node in the topology.
+    #[default]
+    All,
+    /// Expose only on the Ingress nodes listed in `nodes`.
+    Selected,
+    /// Expose on every Ingress node EXCEPT those listed in `nodes`.
+    Exclude,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceIngressOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceIngressScope {
+    #[serde(default)]
+    pub mode: ServiceIngressMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, ServiceIngressOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceEgressTarget {
+    pub node: String,
+    pub backend: String,
+    #[serde(default)]
+    pub protocol: BackendProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_skip_verify: Option<bool>,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_health_check: Option<LocalHealthCheckConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceRoutingMode {
+    /// Shortest reachable path through Relay nodes (or `"local"` for co-located Ingress+Egress).
+    #[default]
+    Auto,
+    /// Use explicit `pinned_paths[ingress_node]`, falling back to shortest path if omitted.
+    Pinned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServiceRoutingSpec {
+    #[serde(default)]
+    pub mode: ServiceRoutingMode,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pinned_paths: BTreeMap<String, Vec<String>>,
+}
+
+/// Service-centric declarative specification: define once, compile to all selected Ingress/Relay/Egress nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceSpec {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    #[serde(default)]
+    pub ingress: ServiceIngressScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept_errors: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+    pub egress: ServiceEgressTarget,
+    #[serde(default)]
+    pub routing: ServiceRoutingSpec,
+    /// When true, compiler ensures ACME cert coverage on Primary Maintainer for this service's hosts.
+    #[serde(default)]
+    pub auto_tls: bool,
+    /// Disabled services remain saved in topology but are skipped during compilation.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for ServiceSpec {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            url_prefix: None,
+            sni: None,
+            source_cidrs: Vec::new(),
+            ingress: ServiceIngressScope::default(),
+            guard: None,
+            intercept_errors: None,
+            js_fp_beacon: None,
+            egress: ServiceEgressTarget::default(),
+            routing: ServiceRoutingSpec::default(),
+            auto_tls: false,
+            enabled: true,
+        }
+    }
+}
+
 /// High-level topology table edited in Control and compiled into per-node configs.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TopologySpec {
     #[serde(default)]
     pub defaults: TopologyDefaults,
-    /// Globally reusable Guard profile templates selectable on any Ingress node/rule.
+    /// Globally reusable Guard profile templates selectable on any Ingress node/rule or Service.
     #[serde(default)]
     pub guard_templates: BTreeMap<String, GuardProfile>,
     /// Globally reusable Rate-Limit bucket templates selectable by any Guard template or Ingress node.
@@ -1173,9 +1347,12 @@ pub struct TopologySpec {
     /// Separated DNS provider credentials (supports multiple accounts per provider).
     #[serde(default)]
     pub dns_providers: BTreeMap<String, DnsProviderAccountConfig>,
-    /// Separated domain bindings (1st/multi-level domains -> DNS provider account, zone metadata, & target nodes).
+    /// Separated domain bindings (1st/multi-level domains -> DNS provider account, zone metadata, & target nodes / split-horizon line routes).
     #[serde(default)]
     pub domains: BTreeMap<String, DomainBindingConfig>,
+    /// Service-centric declarative exposure specs (automatically compiled to Ingress rules, Relay rules, Egress services & ACLs).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub services: BTreeMap<String, ServiceSpec>,
     #[serde(default)]
     pub nodes: BTreeMap<String, TopologyNodeSpec>,
     #[serde(default)]
