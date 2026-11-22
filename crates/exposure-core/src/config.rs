@@ -68,6 +68,100 @@ fn default_retention_hours() -> u64 {
 fn default_renew_before_days() -> u32 {
     30
 }
+fn default_cache_max_memory_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_cache_max_object_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+fn default_cache_max_entries() -> usize {
+    10_000
+}
+fn default_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_cache_stale_if_error_secs() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeCacheConfig {
+    /// Master switch for Ingress edge HTTP response caching (default false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Total in-memory cache byte budget (default 64 MiB).
+    #[serde(default = "default_cache_max_memory_bytes")]
+    pub max_memory_bytes: u64,
+    /// Maximum size of a single cacheable response body (default 4 MiB).
+    #[serde(default = "default_cache_max_object_bytes")]
+    pub max_object_bytes: u64,
+    /// Maximum number of cached objects (default 10,000).
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+    /// Fallback TTL in seconds when upstream omits Cache-Control max-age/s-maxage (default 60s).
+    #[serde(default = "default_cache_ttl_secs")]
+    pub default_ttl_secs: u64,
+    /// Serve stale cached content for up to N seconds if upstream fails with 5xx / timeout (default 300s).
+    #[serde(default = "default_cache_stale_if_error_secs")]
+    pub stale_if_error_secs: u64,
+    /// Respect upstream Cache-Control directives (`no-store`, `private`, `no-cache`, `s-maxage`, `max-age`).
+    #[serde(default = "default_true")]
+    pub respect_cache_control: bool,
+    /// Ignore URL query string when computing cache keys (default false).
+    #[serde(default)]
+    pub ignore_query_string: bool,
+    /// Cacheable HTTP status codes (empty = [200, 203, 204, 206, 301, 308, 404, 410]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cacheable_statuses: Vec<u16>,
+    /// Bypass cache when request Cookie header contains a cookie starting with any of these prefixes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bypass_cookie_prefixes: Vec<String>,
+}
+
+impl Default for NodeCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_memory_bytes: default_cache_max_memory_bytes(),
+            max_object_bytes: default_cache_max_object_bytes(),
+            max_entries: default_cache_max_entries(),
+            default_ttl_secs: default_cache_ttl_secs(),
+            stale_if_error_secs: default_cache_stale_if_error_secs(),
+            respect_cache_control: true,
+            ignore_query_string: false,
+            cacheable_statuses: Vec::new(),
+            bypass_cookie_prefixes: Vec::new(),
+        }
+    }
+}
+
+/// Per-rule / per-service edge cache override (inherits from `IngressConfig.cache` when fields are None/empty).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuleCacheConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_if_error_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub respect_cache_control: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_query_string: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bypass_cookie_prefixes: Vec<String>,
+}
+
+impl RuleCacheConfig {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.default_ttl_secs.is_none()
+            && self.stale_if_error_secs.is_none()
+            && self.respect_cache_control.is_none()
+            && self.ignore_query_string.is_none()
+            && self.bypass_cookie_prefixes.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeRoles {
@@ -349,6 +443,9 @@ pub struct IngressRule {
     pub intercept_errors: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_beacon: Option<bool>,
+    /// Optional per-rule edge HTTP cache policy override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<RuleCacheConfig>,
 }
 
 impl IngressRule {
@@ -436,6 +533,9 @@ pub struct IngressConfig {
     /// Optional custom HTML/CSS pages provisioned from Control (`error_html`, `challenge_html`, `challenge_css`).
     #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
     pub pages: CustomPagesConfig,
+    /// Node-level HTTP edge cache defaults & memory limits.
+    #[serde(default)]
+    pub cache: NodeCacheConfig,
 }
 
 impl IngressConfig {
@@ -461,6 +561,7 @@ impl Default for IngressConfig {
             js_fp_beacon: None,
             js_fp_ttl_secs: None,
             pages: CustomPagesConfig::default(),
+            cache: NodeCacheConfig::default(),
         }
     }
 }
@@ -1080,6 +1181,8 @@ pub struct IngressDefaults {
     pub js_fp_beacon: bool,
     #[serde(default = "default_js_fp_ttl_secs")]
     pub js_fp_ttl_secs: u64,
+    #[serde(default)]
+    pub cache: NodeCacheConfig,
 }
 
 impl Default for IngressDefaults {
@@ -1092,6 +1195,7 @@ impl Default for IngressDefaults {
             intercept_errors: false,
             js_fp_beacon: true,
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
+            cache: NodeCacheConfig::default(),
         }
     }
 }
@@ -1234,6 +1338,9 @@ pub struct ServiceIngressOverride {
     pub intercept_errors: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_beacon: Option<bool>,
+    /// Optional per-rule edge HTTP cache policy override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<RuleCacheConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1303,6 +1410,9 @@ pub struct ServiceSpec {
     pub intercept_errors: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_beacon: Option<bool>,
+    /// Optional per-service edge HTTP response caching override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<RuleCacheConfig>,
     pub egress: ServiceEgressTarget,
     #[serde(default)]
     pub routing: ServiceRoutingSpec,
@@ -1325,6 +1435,7 @@ impl Default for ServiceSpec {
             guard: None,
             intercept_errors: None,
             js_fp_beacon: None,
+            cache: None,
             egress: ServiceEgressTarget::default(),
             routing: ServiceRoutingSpec::default(),
             auto_tls: false,

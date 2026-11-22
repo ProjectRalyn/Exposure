@@ -413,6 +413,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     guard: None,
                     intercept_errors: Some(false),
                     js_fp_beacon: Some(true),
+                    cache: None,
                 },
                 IngressRule {
                     name: Some("local-self-tag".into()),
@@ -425,6 +426,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     guard: None,
                     intercept_errors: Some(false),
                     js_fp_beacon: Some(true),
+                    cache: None,
                 },
                 IngressRule {
                     name: Some("rate-limited".into()),
@@ -437,6 +439,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     guard: Some("rl".into()),
                     intercept_errors: Some(true),
                     js_fp_beacon: Some(false),
+                    cache: None,
                 },
                 IngressRule {
                     name: Some("pow-protected".into()),
@@ -449,6 +452,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                     guard: Some("pow".into()),
                     intercept_errors: Some(false),
                     js_fp_beacon: Some(true),
+                    cache: None,
                 },
             ],
             guards,
@@ -460,6 +464,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             js_fp_beacon: Some(true),
             js_fp_ttl_secs: Some(3600),
             pages: Default::default(),
+            cache: Default::default(),
         },
         egress: EgressConfig {
             services: local_services,

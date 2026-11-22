@@ -1,7 +1,7 @@
 // System View — Cluster Defaults, Config Versions & Rollback, Audit Log, Raw YAML Source
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
-import { defaultTopologyDefaults } from "../store.js";
+import { defaultNodeCacheConfig, defaultTopologyDefaults } from "../store.js";
 import {
   el,
   esc,
@@ -55,6 +55,8 @@ export function createSystemView({ api, store }) {
   function renderDefaults(container) {
     const defs = store.spec.defaults || defaultTopologyDefaults();
     const ig = defs.ingress;
+    if (!ig.cache) ig.cache = defaultNodeCacheConfig();
+    const ca = ig.cache;
     const gd = defs.guard;
     const eg = defs.egress;
     const ll = defs.link_listener;
@@ -161,6 +163,24 @@ export function createSystemView({ api, store }) {
             <label><span>Retention (hours)</span><input id="sd-log-ret" type="number" min="1" value="${gl.segment?.retention_hours ?? 72}" /></label>
           </div>
         </div>
+
+        <div class="panel" style="margin-bottom:0;">
+          <div class="panel-header"><h3>Edge HTTP Response Cache Defaults</h3></div>
+          <div class="tri-stack" style="margin-bottom:8px;">
+            ${renderBinSlider({ attrName: "data-sd-ca-bin", attrVal: "enabled", label: "Enable Edge Cache by Default", sub: "In-memory LRU cache on Ingress hosts (RFC 9111 Vary + ETag 304 + Stale-if-Error)", val: ca.enabled })}
+            ${renderBinSlider({ attrName: "data-sd-ca-bin", attrVal: "respect_cache_control", label: "Respect Cache-Control Headers", sub: "Honor s-maxage / max-age / no-store / private (Set-Cookie is never cached)", val: ca.respect_cache_control })}
+            ${renderBinSlider({ attrName: "data-sd-ca-bin", attrVal: "ignore_query_string", label: "Ignore Query String in Cache Key", val: ca.ignore_query_string })}
+          </div>
+          <div class="inspector-row">
+            <label><span>Memory Budget (MiB)</span><input id="sd-ca-mem" type="number" min="1" value="${Math.round((ca.max_memory_bytes || 67108864) / 1048576)}" /></label>
+            <label><span>Max Object (MiB)</span><input id="sd-ca-obj" type="number" min="1" value="${Math.max(1, Math.round((ca.max_object_bytes || 4194304) / 1048576))}" /></label>
+            <label><span>Default TTL (s)</span><input id="sd-ca-ttl" type="number" min="0" value="${ca.default_ttl_secs ?? 60}" /></label>
+            <label><span>Stale-if-Error (s)</span><input id="sd-ca-stale" type="number" min="0" value="${ca.stale_if_error_secs ?? 300}" /></label>
+          </div>
+          <label style="margin-top:8px;"><span>Bypass Cookie Prefixes (CSV)</span>
+            <input id="sd-ca-ck" value="${esc((ca.bypass_cookie_prefixes || []).join(", "))}" placeholder="session=, auth_" />
+          </label>
+        </div>
       </div>
     `;
 
@@ -197,6 +217,17 @@ export function createSystemView({ api, store }) {
     wireBinSliders(container, "data-sd-log-bin", (f, v) => store.mutate((s) => { ensureGl(s)[f] = v; }, false));
     el("sd-log-sr")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).sample_rate = parseNum(ev.target.value, 1.0, 0.01, 1.0); }, false));
     el("sd-log-ret")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.retention_hours = parseNum(ev.target.value, 72, 1); }, false));
+
+    const ensureCa = (s) => {
+      if (!s.defaults.ingress.cache) s.defaults.ingress.cache = defaultNodeCacheConfig();
+      return s.defaults.ingress.cache;
+    };
+    wireBinSliders(container, "data-sd-ca-bin", (f, v) => store.mutate((s) => { ensureCa(s)[f] = v; }, false));
+    el("sd-ca-mem")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).max_memory_bytes = parseNum(ev.target.value, 64, 1, 16384) * 1048576; }, false));
+    el("sd-ca-obj")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).max_object_bytes = parseNum(ev.target.value, 4, 1, 512) * 1048576; }, false));
+    el("sd-ca-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).default_ttl_secs = parseNum(ev.target.value, 60, 0); }, false));
+    el("sd-ca-stale")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).stale_if_error_secs = parseNum(ev.target.value, 300, 0); }, false));
+    el("sd-ca-ck")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).bypass_cookie_prefixes = ev.target.value.split(",").map((x) => x.trim()).filter(Boolean); }, false));
   }
 
   async function loadVersions() {

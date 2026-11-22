@@ -24,6 +24,61 @@ export function sanitizeRecord(obj) {
   return out;
 }
 
+export function defaultNodeCacheConfig() {
+  return {
+    enabled: false,
+    max_memory_bytes: 64 * 1024 * 1024,
+    max_object_bytes: 4 * 1024 * 1024,
+    max_entries: 10000,
+    default_ttl_secs: 60,
+    stale_if_error_secs: 300,
+    respect_cache_control: true,
+    ignore_query_string: false,
+    cacheable_statuses: [],
+    bypass_cookie_prefixes: [],
+  };
+}
+
+export function normalizeNodeCacheConfig(raw) {
+  const b = defaultNodeCacheConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    max_memory_bytes: Number(s.max_memory_bytes ?? b.max_memory_bytes) || b.max_memory_bytes,
+    max_object_bytes: Number(s.max_object_bytes ?? b.max_object_bytes) || b.max_object_bytes,
+    max_entries: Number(s.max_entries ?? b.max_entries) || b.max_entries,
+    default_ttl_secs: Number(s.default_ttl_secs ?? b.default_ttl_secs) || b.default_ttl_secs,
+    stale_if_error_secs: Number(s.stale_if_error_secs ?? b.stale_if_error_secs) || 0,
+    respect_cache_control: Boolean(s.respect_cache_control ?? b.respect_cache_control),
+    ignore_query_string: Boolean(s.ignore_query_string ?? b.ignore_query_string),
+    cacheable_statuses: Array.isArray(s.cacheable_statuses) ? s.cacheable_statuses.map(Number).filter(Boolean) : [],
+    bypass_cookie_prefixes: Array.isArray(s.bypass_cookie_prefixes) ? s.bypass_cookie_prefixes.map(String).filter(Boolean) : [],
+  };
+}
+
+export function normalizeRuleCacheConfig(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const out = {
+    enabled: normalizeTri(raw.enabled),
+    default_ttl_secs: raw.default_ttl_secs != null && raw.default_ttl_secs !== "" ? Number(raw.default_ttl_secs) : null,
+    stale_if_error_secs: raw.stale_if_error_secs != null && raw.stale_if_error_secs !== "" ? Number(raw.stale_if_error_secs) : null,
+    respect_cache_control: normalizeTri(raw.respect_cache_control),
+    ignore_query_string: normalizeTri(raw.ignore_query_string),
+    bypass_cookie_prefixes: Array.isArray(raw.bypass_cookie_prefixes) ? raw.bypass_cookie_prefixes.map(String).filter(Boolean) : [],
+  };
+  if (
+    out.enabled == null &&
+    out.default_ttl_secs == null &&
+    out.stale_if_error_secs == null &&
+    out.respect_cache_control == null &&
+    out.ignore_query_string == null &&
+    !out.bypass_cookie_prefixes.length
+  ) {
+    return null;
+  }
+  return out;
+}
+
 export function defaultTopologyDefaults() {
   return {
     ingress: {
@@ -34,6 +89,7 @@ export function defaultTopologyDefaults() {
       intercept_errors: false,
       js_fp_beacon: true,
       js_fp_ttl_secs: 3600,
+      cache: defaultNodeCacheConfig(),
     },
     guard: {
       antibot: "challenge",
@@ -151,6 +207,7 @@ export function defaultServiceSpec(egressNode = "") {
     guard: null,
     intercept_errors: null,
     js_fp_beacon: null,
+    cache: null,
     egress: {
       node: egressNode,
       backend: "127.0.0.1:8080",
@@ -198,6 +255,7 @@ export function normalizeServiceSpec(raw) {
     guard: src.guard || null,
     intercept_errors: normalizeTri(src.intercept_errors),
     js_fp_beacon: normalizeTri(src.js_fp_beacon),
+    cache: normalizeRuleCacheConfig(src.cache),
     egress: {
       node: src.egress?.node || "",
       backend: src.egress?.backend || "",
@@ -359,6 +417,7 @@ export function normalizeDefaults(raw) {
       intercept_errors: Boolean(src.ingress?.intercept_errors ?? base.ingress.intercept_errors),
       js_fp_beacon: Boolean(src.ingress?.js_fp_beacon ?? base.ingress.js_fp_beacon),
       js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
+      cache: normalizeNodeCacheConfig(src.ingress?.cache),
     },
     guard: {
       ...base.guard,

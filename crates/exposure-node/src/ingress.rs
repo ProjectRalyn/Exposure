@@ -29,6 +29,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
 use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
 use crate::guard::{compute_suspicion_score, sanitize_redirect, GuardDecision, GuardEngine};
@@ -113,6 +114,7 @@ pub struct IngressServer {
     default_ttl: u8,
     forwarder: Arc<Forwarder>,
     guard: Arc<GuardEngine>,
+    cache: Arc<EdgeCache>,
     cert_resolver: Arc<DynamicCertResolver>,
     logger: Arc<NodeLogger>,
     started_listeners: DashMap<String, JoinHandle<()>>,
@@ -132,6 +134,10 @@ impl IngressServer {
     ) -> Arc<Self> {
         let tag = node_tag.into();
         let cfg = ensure_strong_clearance_secret(cfg, &tag);
+        let cache = Arc::new(EdgeCache::new(
+            cfg.cache.max_memory_bytes,
+            cfg.cache.max_entries,
+        ));
         Arc::new(Self {
             node_tag: tag,
             keypair,
@@ -139,12 +145,17 @@ impl IngressServer {
             default_ttl,
             forwarder,
             guard: Arc::new(GuardEngine::new()),
+            cache,
             cert_resolver,
             logger,
             started_listeners: DashMap::new(),
             conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_CONNS)),
             per_ip_conns: Arc::new(DashMap::new()),
         })
+    }
+
+    pub fn edge_cache(&self) -> &Arc<EdgeCache> {
+        &self.cache
     }
 
     pub async fn update_config(
@@ -154,6 +165,17 @@ impl IngressServer {
     ) -> Result<()> {
         self.cert_resolver.load_from_files(&cfg.tls_certs)?;
         let cfg = ensure_strong_clearance_secret(cfg, &self.node_tag);
+        let any_cache_enabled = ingress_enabled
+            && (cfg.cache.enabled
+                || cfg
+                    .rules
+                    .iter()
+                    .any(|r| r.cache.as_ref().and_then(|c| c.enabled) == Some(true)));
+        self.cache.reconfigure(
+            cfg.cache.max_memory_bytes,
+            cfg.cache.max_entries,
+            !any_cache_enabled,
+        );
         let desired_listeners = if ingress_enabled {
             cfg.listeners.clone()
         } else {
@@ -882,10 +904,6 @@ impl IngressServer {
             cfg.effective_js_fp_beacon(),
             rule.js_fp_beacon,
         ) {
-            // Request fresh uncompressed HTML from upstream for this single probe request only (once per TTL per browser)
-            req.headers_mut().remove(header::ACCEPT_ENCODING);
-            req.headers_mut().remove(header::IF_NONE_MATCH);
-            req.headers_mut().remove(header::IF_MODIFIED_SINCE);
             Some(self.guard.mint_fp_token(
                 &cfg.clearance_secret,
                 &host,
@@ -896,6 +914,145 @@ impl IngressServer {
         } else {
             None
         };
+
+        // Evaluate Edge HTTP Cache AFTER Entry Guard (so ACL/RateLimit/PoW/WAF are never bypassed)
+        let cache_policy = EffectiveCachePolicy::resolve(&cfg.cache, rule.cache.as_ref());
+        let orig_method = req.method().clone();
+        let orig_req_headers = if cache_policy.enabled {
+            Some(req.headers().clone())
+        } else {
+            None
+        };
+        let mut cache_store_key: Option<String> = None;
+        let mut stale_fallback: Option<(String, Arc<CachedEntry>)> = None;
+        let mut sent_cache_revalidation = false;
+
+        if cache_policy.enabled {
+            let lookup_headers = orig_req_headers.as_ref().unwrap();
+            match self.cache.lookup(
+                &cache_policy,
+                &rule.service_tag,
+                &orig_method,
+                &host,
+                &path_and_query,
+                lookup_headers,
+            ) {
+                CacheLookup::Hit { entry, .. } => {
+                    // If this single probe needs passive FP beacon injection and the cached HTML is compressed,
+                    // bypass cache once so upstream serves uncompressed HTML; otherwise serve straight from RAM!
+                    let is_compressed_html = entry
+                        .headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.to_ascii_lowercase().starts_with("text/html"))
+                        .unwrap_or(false)
+                        && entry
+                            .headers
+                            .get(header::CONTENT_ENCODING)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|ce| !ce.trim().is_empty() && !ce.eq_ignore_ascii_case("identity"))
+                            .unwrap_or(false);
+
+                    if fp_inject_token.is_none() || !is_compressed_html {
+                        self.cache.record_hit();
+                        let mut resp =
+                            build_response_from_cache(&entry, &orig_method, lookup_headers, "HIT");
+                        if let Some(ref fp_token) = fp_inject_token {
+                            resp = maybe_inject_fp_beacon(resp, fp_token).await;
+                        }
+                        let resp_bytes_out = resp
+                            .headers()
+                            .get(header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        self.logger
+                            .record_session_with_fp(
+                                "ingress",
+                                &rule.service_tag,
+                                &client_ip.to_string(),
+                                resp.status().as_u16(),
+                                latency_ms,
+                                0,
+                                resp_bytes_out,
+                                false,
+                                false,
+                                false,
+                                None,
+                                Some(client_fp.device_type.to_string()),
+                                Some(client_fp.browser_family.to_string()),
+                                Some(client_fp.os_family.to_string()),
+                                fp_verified,
+                            )
+                            .await;
+                        self.logger
+                            .record_fingerprint(
+                                &rule.service_tag,
+                                &host,
+                                &client_ip.to_string(),
+                                &obs_fp_hash,
+                                fp_verified,
+                                obs_fp_source,
+                                &ua_str,
+                                &al_str,
+                                client_fp.device_type,
+                                client_fp.browser_family,
+                                client_fp.os_family,
+                                client_fp.is_bot,
+                                obs_is_headless,
+                                suspicion_score,
+                                tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                None,
+                                1,
+                                0,
+                                0,
+                            )
+                            .await;
+                        return resp;
+                    }
+                    self.cache.record_bypass();
+                }
+                CacheLookup::Stale { base_key, entry } => {
+                    // Attach conditional revalidation headers if client didn't send its own
+                    if fp_inject_token.is_none()
+                        && !req.headers().contains_key(header::IF_NONE_MATCH)
+                        && !req.headers().contains_key(header::IF_MODIFIED_SINCE)
+                    {
+                        if let Some(ref etag) = entry.etag {
+                            if let Ok(hv) = HeaderValue::from_str(etag) {
+                                req.headers_mut().insert(header::IF_NONE_MATCH, hv);
+                                sent_cache_revalidation = true;
+                            }
+                        }
+                        if let Some(ref lm) = entry.last_modified {
+                            if let Ok(hv) = HeaderValue::from_str(lm) {
+                                req.headers_mut().insert(header::IF_MODIFIED_SINCE, hv);
+                                sent_cache_revalidation = true;
+                            }
+                        }
+                    }
+                    cache_store_key = Some(base_key.clone());
+                    stale_fallback = Some((base_key, entry));
+                }
+                CacheLookup::Miss { base_key } => {
+                    self.cache.record_miss();
+                    cache_store_key = Some(base_key);
+                }
+                CacheLookup::Bypass => {
+                    self.cache.record_bypass();
+                }
+            }
+        }
+
+        if fp_inject_token.is_some() {
+            // Request fresh uncompressed HTML from upstream for this single probe request only (once per TTL per browser)
+            req.headers_mut().remove(header::ACCEPT_ENCODING);
+            req.headers_mut().remove(header::IF_NONE_MATCH);
+            req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+            sent_cache_revalidation = false;
+        }
 
         // Strip untrusted client-supplied forwarding headers before injecting authoritative values
         for h in [
@@ -968,6 +1125,13 @@ impl IngressServer {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
+                if let Some((_, ref stale_entry)) = stale_fallback {
+                    if stale_entry.is_usable_stale(Instant::now()) {
+                        self.cache.record_stale();
+                        let lookup_h = orig_req_headers.as_ref().unwrap();
+                        return build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
+                    }
+                }
                 let msg = format!(
                     "ingress forward to peer={} service={} failed: {}",
                     rule.next_peer, rule.service_tag, e
@@ -994,6 +1158,13 @@ impl IngressServer {
                     .unwrap();
             }
             Err(_) => {
+                if let Some((_, ref stale_entry)) = stale_fallback {
+                    if stale_entry.is_usable_stale(Instant::now()) {
+                        self.cache.record_stale();
+                        let lookup_h = orig_req_headers.as_ref().unwrap();
+                        return build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
+                    }
+                }
                 return Response::builder()
                     .status(StatusCode::GATEWAY_TIMEOUT)
                     .body(full_body("504 Gateway Time-out"))
@@ -1103,6 +1274,63 @@ impl IngressServer {
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         match proxy_res {
             Ok(mut resp) => {
+                if cache_policy.enabled {
+                    let lookup_h = orig_req_headers.as_ref().unwrap();
+                    if sent_cache_revalidation && resp.status() == StatusCode::NOT_MODIFIED {
+                        if let Some((ref base_key, ref stale_entry)) = stale_fallback {
+                            let refreshed = self.cache.revalidate_304(
+                                &cache_policy,
+                                base_key,
+                                stale_entry,
+                                resp.headers(),
+                            );
+                            self.cache.record_revalidated();
+                            resp = build_response_from_cache(
+                                &refreshed,
+                                &orig_method,
+                                lookup_h,
+                                "REVALIDATED",
+                            );
+                        }
+                    } else if resp.status().is_server_error() {
+                        if let Some((_, ref stale_entry)) = stale_fallback {
+                            if stale_entry.is_usable_stale(Instant::now()) {
+                                self.cache.record_stale();
+                                resp = build_response_from_cache(
+                                    stale_entry,
+                                    &orig_method,
+                                    lookup_h,
+                                    "STALE",
+                                );
+                            }
+                        }
+                    } else if orig_method == http::Method::GET
+                        && cache_store_key.is_some()
+                        && EdgeCache::response_headers_cacheable(
+                            &cache_policy,
+                            resp.status(),
+                            resp.headers(),
+                        )
+                    {
+                        let base_key = cache_store_key.as_ref().unwrap();
+                        resp = maybe_store_in_cache(
+                            &self.cache,
+                            &cache_policy,
+                            base_key,
+                            lookup_h,
+                            resp,
+                        )
+                        .await;
+                    } else {
+                        let status_hdr = if cache_store_key.is_some() {
+                            "MISS"
+                        } else {
+                            "BYPASS"
+                        };
+                        resp.headers_mut()
+                            .insert("x-exposure-cache", HeaderValue::from_static(status_hdr));
+                    }
+                }
                 if let Some(ref fp_token) = fp_inject_token {
                     resp = maybe_inject_fp_beacon(resp, fp_token).await;
                 }
@@ -1158,6 +1386,13 @@ impl IngressServer {
                 resp
             }
             Err((err_status, err)) => {
+                if let Some((_, ref stale_entry)) = stale_fallback {
+                    if stale_entry.is_usable_stale(Instant::now()) {
+                        self.cache.record_stale();
+                        let lookup_h = orig_req_headers.as_ref().unwrap();
+                        return build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
+                    }
+                }
                 warn!(ray_id = %ray_id, service = %rule.service_tag, error = %err, "ingress proxy error");
                 self.logger
                     .record_session(
@@ -1225,6 +1460,72 @@ impl Body for PrefixBody {
         }
         Pin::new(&mut self.rest).poll_frame(cx)
     }
+}
+
+/// Collect up to `policy.max_object_bytes` from an eligible upstream response to store in `EdgeCache`.
+/// If the response exceeds the single-object limit mid-stream, transparently falls back to streaming via `PrefixBody`.
+async fn maybe_store_in_cache(
+    cache: &EdgeCache,
+    policy: &EffectiveCachePolicy,
+    base_key: &str,
+    req_headers: &http::HeaderMap,
+    resp: Response<ProxyBody>,
+) -> Response<ProxyBody> {
+    let limit = policy.max_object_bytes as usize;
+    let (mut parts, mut body) = resp.into_parts();
+    let mut collected = Vec::new();
+    let mut exceeded = false;
+    let mut stream_err = false;
+
+    while let Some(frame_res) = body.frame().await {
+        match frame_res {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    if collected.len().saturating_add(data.len()) > limit {
+                        collected.extend_from_slice(data);
+                        exceeded = true;
+                        break;
+                    }
+                    collected.extend_from_slice(data);
+                }
+            }
+            Err(_) => {
+                stream_err = true;
+                break;
+            }
+        }
+    }
+
+    if exceeded {
+        parts
+            .headers
+            .insert("x-exposure-cache", HeaderValue::from_static("BYPASS"));
+        let chained = PrefixBody {
+            prefix: Some(Bytes::from(collected)),
+            rest: body,
+        };
+        return Response::from_parts(parts, chained.boxed());
+    }
+
+    let bytes = Bytes::from(collected);
+    if !stream_err {
+        let _ = cache.store(
+            policy,
+            base_key,
+            req_headers,
+            parts.status,
+            &parts.headers,
+            bytes.clone(),
+        );
+    }
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    if let Ok(hv) = HeaderValue::from_str(&bytes.len().to_string()) {
+        parts.headers.insert(header::CONTENT_LENGTH, hv);
+    }
+    parts
+        .headers
+        .insert("x-exposure-cache", HeaderValue::from_static("MISS"));
+    Response::from_parts(parts, full_body(bytes))
 }
 
 /// Inject `<script defer src="/cdn-cgi/fp.js" data-t="..."></script>` into eligible uncompressed 2xx HTML responses.

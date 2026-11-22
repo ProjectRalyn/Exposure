@@ -5,9 +5,9 @@ use exposure_core::config::{
     resolve_domain_binding, CertOrderConfig, CustomPagesConfig, DomainLineRecordType,
     EgressConfig, EgressDefaults, EgressServiceConfig, GuardDefaults, GuardProfile, IngressConfig,
     IngressDefaults, IngressRule, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
-    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
-    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
-    TunnelDirection,
+    NodeCacheConfig, NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule,
+    RuleMatch, ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer,
+    TrustedOrigin, TunnelDirection,
 };
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::routing::canonical_ip;
@@ -207,6 +207,9 @@ fn resolve_ingress_config(
     inherit_opt_page(&mut out.pages.error_html, &page_defs.error_html);
     inherit_opt_page(&mut out.pages.challenge_html, &page_defs.challenge_html);
     inherit_opt_page(&mut out.pages.challenge_css, &page_defs.challenge_css);
+    if out.cache == NodeCacheConfig::default() {
+        out.cache = ingress_defs.cache.clone();
+    }
     out
 }
 
@@ -624,6 +627,9 @@ fn expand_declarative_services(
                 .and_then(|o| o.intercept_errors)
                 .or(svc.intercept_errors);
             let eff_beacon = ov.and_then(|o| o.js_fp_beacon).or(svc.js_fp_beacon);
+            let eff_cache = ov
+                .and_then(|o| o.cache.clone())
+                .or_else(|| svc.cache.clone());
 
             if let Some(ig_spec) = out.nodes.get_mut(ig_tag) {
                 for (hi, host) in hosts.iter().enumerate() {
@@ -645,6 +651,7 @@ fn expand_declarative_services(
                         guard: eff_guard.clone(),
                         intercept_errors: eff_intercept,
                         js_fp_beacon: eff_beacon,
+                        cache: eff_cache.clone(),
                     });
                 }
             }
@@ -1831,6 +1838,7 @@ mod tests {
                         guard: Some("global-web".into()),
                         intercept_errors: None,
                         js_fp_beacon: None,
+                        cache: None,
                     }],
                     ..Default::default()
                 },

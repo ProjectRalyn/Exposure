@@ -1,4 +1,5 @@
 pub mod acme;
+pub mod cache;
 pub mod egress;
 pub mod forwarder;
 pub mod guard;

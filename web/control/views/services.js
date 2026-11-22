@@ -293,6 +293,7 @@ export function createServicesView({ store, navigate }) {
                           <div class="tag-list">
                             <span class="pill">${esc(effGuard)}</span>
                             ${svc.auto_tls ? `<span class="pill ok">Auto-TLS</span>` : ""}
+                            ${(svc.cache?.enabled ?? igDefs.cache?.enabled) ? `<span class="pill info">Cache</span>` : ""}
                           </div>
                         </td>
                         <td>
@@ -600,7 +601,20 @@ export function createServicesView({ store, navigate }) {
             ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "auto_tls", label: t("svc.field.auto_tls"), sub: t("svc.field.auto_tls_sub"), val: draft.auto_tls })}
             ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "intercept_errors", label: "Ingress Intercept Errors (429/5xx)", val: draft.intercept_errors, inherited: defs.ingress.intercept_errors })}
             ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: draft.js_fp_beacon, inherited: defs.ingress.js_fp_beacon })}
+            ${renderTriSlider({ attrName: "data-sd-ca-tri", attrVal: "enabled", label: "Edge HTTP Cache", sub: "Cache GET/HEAD responses in RAM on Ingress hosts", val: draft.cache?.enabled ?? null, inherited: Boolean(defs.ingress.cache?.enabled) })}
           </div>
+          ${
+            (draft.cache?.enabled ?? defs.ingress.cache?.enabled)
+              ? `<div class="inspector-row">
+                  <label><span>Cache TTL Override (s)</span><input id="sd-ca-ttl" type="number" min="0" value="${draft.cache?.default_ttl_secs ?? ""}" placeholder="Default (${defs.ingress.cache?.default_ttl_secs ?? 60}s)" /></label>
+                  <label><span>Stale-if-Error (s)</span><input id="sd-ca-stale" type="number" min="0" value="${draft.cache?.stale_if_error_secs ?? ""}" placeholder="Default (${defs.ingress.cache?.stale_if_error_secs ?? 300}s)" /></label>
+                </div>
+                <div class="tri-stack">
+                  ${renderTriSlider({ attrName: "data-sd-ca-tri", attrVal: "respect_cache_control", label: "Respect Cache-Control", val: draft.cache?.respect_cache_control ?? null, inherited: defs.ingress.cache?.respect_cache_control !== false })}
+                  ${renderTriSlider({ attrName: "data-sd-ca-tri", attrVal: "ignore_query_string", label: "Ignore Query String", val: draft.cache?.ignore_query_string ?? null, inherited: Boolean(defs.ingress.cache?.ignore_query_string) })}
+                </div>`
+              : ""
+          }
           <div>
             <div class="muted-sm" style="margin-bottom:6px;font-weight:700;">${esc(t("svc.route_preview"))}</div>
             <div class="diff-list">${routePreviewHtml || '<div class="muted-sm">Select an Egress host and at least one Ingress host.</div>'}</div>
@@ -682,6 +696,20 @@ export function createServicesView({ store, navigate }) {
       });
       wireBinSliders(drawer.body, "data-sd-bin", (f, val) => { draft[f] = val; });
       wireTriSliders(drawer.body, "data-sd-tri", (f, val) => { draft[f] = val; });
+      const ensureDraftCache = () => {
+        if (!draft.cache) draft.cache = { enabled: null, default_ttl_secs: null, stale_if_error_secs: null, respect_cache_control: null, ignore_query_string: null, bypass_cookie_prefixes: [] };
+        return draft.cache;
+      };
+      wireTriSliders(drawer.body, "data-sd-ca-tri", (f, val) => {
+        ensureDraftCache()[f] = val;
+        if (f === "enabled") renderDrawerContent();
+      });
+      el("sd-ca-ttl")?.addEventListener("input", (ev) => {
+        ensureDraftCache().default_ttl_secs = ev.target.value.trim() ? parseNum(ev.target.value, 60, 0) : null;
+      });
+      el("sd-ca-stale")?.addEventListener("input", (ev) => {
+        ensureDraftCache().stale_if_error_secs = ev.target.value.trim() ? parseNum(ev.target.value, 300, 0) : null;
+      });
 
       el("sd-cancel")?.addEventListener("click", closeDrawer);
       el("sd-save")?.addEventListener("click", () => {
