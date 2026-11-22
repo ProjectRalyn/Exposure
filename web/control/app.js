@@ -985,6 +985,8 @@ async function refreshFingerprints() {
         const js = obs.js_fp;
         const jsSummary = js
           ? `${js.screen || "-"} · ${js.webgl ? js.webgl.slice(0, 32) : js.platform || "-"} · ${js.tz || "-"}`
+          : obs.js_verified
+          ? `JS verified (${obs.fp_source || "beacon"})`
           : "Pending passive JS beacon";
         const riskCls = obs.is_headless || obs.is_bot || obs.suspicion_score >= 60 ? "err" : obs.suspicion_score >= 30 ? "warn" : "ok";
         const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `Score ${Number(obs.suspicion_score) || 0}`;
@@ -1041,12 +1043,23 @@ function openFingerprintDetailModal(obs) {
       </div>`
     : `<div class="muted-sm" style="margin-bottom:12px;">No client JS report captured yet for this visitor (only server-side HTTP/TLS headers observed).</div>`;
 
+  const score = Number(obs.suspicion_score) || 0;
+  const riskStatusLabel = obs.is_bot
+    ? "Bot"
+    : obs.is_headless
+    ? "Headless"
+    : score >= 60
+    ? "High Risk"
+    : score >= 30
+    ? "Elevated"
+    : "Normal";
+
   const bodyHtml = `
     <div class="fp-detail-grid">
       <div class="fp-kv"><div class="fp-kv-lbl">Client IP / Subnet</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")}<br/><small class="muted">HMAC: <code>${esc(obs.ip_hmac)}</code></small></div></div>
       <div class="fp-kv"><div class="fp-kv-lbl">Fingerprint Hash</div><div class="fp-kv-val"><code>${esc(obs.fp_hash)}</code><br/><small class="muted">${obs.js_verified ? `JS Verified (${esc(obs.fp_source)})` : "Server UA Fallback"}</small></div></div>
       <div class="fp-kv"><div class="fp-kv-lbl">Classification</div><div class="fp-kv-val">${esc(obs.device_type)} · ${esc(obs.browser_family)} · ${esc(obs.os_family)}</div></div>
-      <div class="fp-kv"><div class="fp-kv-lbl">Risk &amp; TLS Signals</div><div class="fp-kv-val">Score ${Number(obs.suspicion_score) || 0}/100 · ${obs.is_bot ? "Bot" : obs.is_headless ? "Headless" : "Normal"}<br/><small class="muted">TLS ciphers: ${Number(obs.tls_cipher_count) || 0} · ALPN: ${obs.tls_alpn ? "Yes" : "No"}</small></div></div>
+      <div class="fp-kv"><div class="fp-kv-lbl">Risk &amp; TLS Signals</div><div class="fp-kv-val">Score ${score}/100 · ${riskStatusLabel}<br/><small class="muted">TLS ciphers: ${Number(obs.tls_cipher_count) || 0} · ALPN: ${obs.tls_alpn ? "Yes" : "No"}</small></div></div>
       <div class="fp-kv"><div class="fp-kv-lbl">Route Context</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}<br/><small class="muted">Host: ${esc(obs.host || "-")}</small></div></div>
       <div class="fp-kv"><div class="fp-kv-lbl">Activity Window</div><div class="fp-kv-val">${formatCompact(obs.request_count)} req · ${obs.challenge_count || 0} ch · ${obs.rate_limited_count || 0} 429<br/><small class="muted">${esc(formatDateTime(obs.first_seen_ts))} → ${esc(formatDateTime(obs.last_seen_ts))}</small></div></div>
     </div>

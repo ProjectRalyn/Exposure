@@ -1766,10 +1766,45 @@ impl MaintainerService {
             }
             generate_self_signed_pem(&order.domain)?
         } else {
-            return Err(ExposureError::Config(format!(
-                "ACME directory '{}' requires a full ACME client implementation; use directory_url: \"self-signed\" for dev/self-signed issuance",
-                cfg.acme.directory_url
-            )));
+            let pname = resolved_provider_name.ok_or_else(|| {
+                ExposureError::Config(format!(
+                    "ACME order '{}' requires a DNS-01 provider (configure `provider` or `domains` binding)",
+                    order.domain
+                ))
+            })?;
+            let provider = cfg.dns_providers.get(pname).ok_or_else(|| {
+                ExposureError::Config(format!(
+                    "cert order '{}' references unknown dns_provider '{pname}'",
+                    order.domain
+                ))
+            })?;
+            let acme_http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|e| ExposureError::Link(format!("ACME HTTP client: {e}")))?;
+            crate::acme::issue_acme_dns01_cert(
+                acme_http,
+                &cfg.acme.directory_url,
+                &cfg.acme.contact_email,
+                &cfg.acme.storage_dir,
+                &order.domain,
+                |txt_val| {
+                    let domain = order.domain.clone();
+                    async move {
+                        self.dns01_present(provider, binding, &domain, &txt_val)
+                            .await
+                    }
+                },
+                |txt_val, rec_id| {
+                    let domain = order.domain.clone();
+                    async move {
+                        let _ = self
+                            .dns01_cleanup(provider, binding, &domain, &txt_val, rec_id.as_deref())
+                            .await;
+                    }
+                },
+            )
+            .await?
         };
 
         // Persist certificate locally on Maintainer (strict domain validation + atomic 0600 private key!)

@@ -164,7 +164,7 @@ impl IngressServer {
         // Stop listeners that were removed or when ingress role is disabled
         let desired_keys: HashSet<String> = desired_listeners
             .iter()
-            .map(|l| format!("{}|{}", l.listen_addr, l.tls))
+            .map(|l| format!("{}|{}|{}", l.listen_addr, l.tls, l.redirect_https))
             .collect();
         let existing_keys: Vec<String> = self
             .started_listeners
@@ -182,7 +182,7 @@ impl IngressServer {
 
         // Start newly added listeners
         for l in desired_listeners {
-            let key = format!("{}|{}", l.listen_addr, l.tls);
+            let key = format!("{}|{}|{}", l.listen_addr, l.tls, l.redirect_https);
             if !self.started_listeners.contains_key(&key) {
                 if let Err(e) = self.start_listener(l.clone()).await {
                     warn!(addr = %l.listen_addr, error = %e, "failed to start newly added ingress listener on hot reload");
@@ -193,7 +193,10 @@ impl IngressServer {
     }
 
     pub async fn start_listener(self: &Arc<Self>, listener_cfg: IngressListener) -> Result<SocketAddr> {
-        let key = format!("{}|{}", listener_cfg.listen_addr, listener_cfg.tls);
+        let key = format!(
+            "{}|{}|{}",
+            listener_cfg.listen_addr, listener_cfg.tls, listener_cfg.redirect_https
+        );
         let tcp_listener = TcpListener::bind(&listener_cfg.listen_addr).await?;
         let bound = tcp_listener.local_addr()?;
         info!(
@@ -240,6 +243,7 @@ impl IngressServer {
                 let canon_addr = SocketAddr::new(canon_ip, peer_addr.port());
                 let this2 = Arc::clone(&this);
                 let acceptor2 = tls_acceptor.clone();
+                let redirect_https = !listener_cfg.tls && listener_cfg.redirect_https;
 
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -261,6 +265,7 @@ impl IngressServer {
                                         tls_stream,
                                         canon_addr,
                                         true,
+                                        false,
                                         auth_sni,
                                         Some(hello_sig),
                                     )
@@ -274,7 +279,9 @@ impl IngressServer {
                             }
                         }
                     } else {
-                        this2.serve_conn(tcp, canon_addr, false, None, None).await;
+                        this2
+                            .serve_conn(tcp, canon_addr, false, redirect_https, None, None)
+                            .await;
                     }
                 });
             }
@@ -289,6 +296,7 @@ impl IngressServer {
         io_stream: S,
         peer_addr: SocketAddr,
         is_tls: bool,
+        redirect_https: bool,
         auth_sni: Option<String>,
         tls_signal: Option<ClientHelloSignal>,
     ) where
@@ -307,6 +315,7 @@ impl IngressServer {
                             req,
                             peer_addr,
                             is_tls,
+                            redirect_https,
                             sni2.as_deref(),
                             sig2.as_ref().as_ref(),
                         )
@@ -340,12 +349,21 @@ impl IngressServer {
         req: Request<Incoming>,
         peer_addr: SocketAddr,
         is_tls: bool,
+        redirect_https: bool,
         auth_sni: Option<&str>,
         tls_signal: Option<&ClientHelloSignal>,
     ) -> Response<ProxyBody> {
         let cfg = Arc::clone(&*self.cfg.read().await);
         let mut resp = self
-            .handle_http_request_inner(req, peer_addr, is_tls, auth_sni, tls_signal, &cfg)
+            .handle_http_request_inner(
+                req,
+                peer_addr,
+                is_tls,
+                redirect_https,
+                auth_sni,
+                tls_signal,
+                &cfg,
+            )
             .await;
         if !cfg.server_header.trim().is_empty() {
             if let Ok(hv) = HeaderValue::from_str(cfg.server_header.trim()) {
@@ -360,6 +378,7 @@ impl IngressServer {
         mut req: Request<Incoming>,
         peer_addr: SocketAddr,
         is_tls: bool,
+        redirect_https: bool,
         auth_sni: Option<&str>,
         tls_signal: Option<&ClientHelloSignal>,
         cfg: &IngressConfig,
@@ -384,6 +403,18 @@ impl IngressServer {
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".into());
+
+        if redirect_https && !is_tls && !host.is_empty() {
+            let clean_host = host.strip_suffix(":80").unwrap_or(&host);
+            let location = format!("https://{clean_host}{path_and_query}");
+            if let Ok(hv) = HeaderValue::from_str(&location) {
+                return Response::builder()
+                    .status(StatusCode::PERMANENT_REDIRECT)
+                    .header(header::LOCATION, hv)
+                    .body(full_body(""))
+                    .unwrap();
+            }
+        }
         let client_ip = canonical_ip(peer_addr.ip());
 
         // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`)
@@ -1005,6 +1036,7 @@ impl IngressServer {
                 }
             } else {
                 *req.version_mut() = Version::HTTP_11;
+                crate::egress::normalize_request_for_http1(&mut req);
                 let client_upg = if is_upgrade {
                     Some(hyper::upgrade::on(&mut req))
                 } else {

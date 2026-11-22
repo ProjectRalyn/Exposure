@@ -680,6 +680,8 @@ impl FingerprintObservation {
             if other.js_fp.is_some() {
                 self.js_fp = other.js_fp.clone();
             }
+        } else if self.js_fp.is_none() && other.js_fp.is_some() {
+            self.js_fp = other.js_fp.clone();
         }
     }
 }

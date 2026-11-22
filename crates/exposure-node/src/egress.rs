@@ -563,6 +563,45 @@ impl EgressHandler {
     }
 }
 
+/// Normalize an HTTP/2 or absolute-form request for HTTP/1.1 origin servers:
+/// - Merge multiple `cookie` header fields into a single `Cookie` header joined by `"; "` (RFC 9113 §8.2.3).
+/// - Ensure `Host` header is populated from URI authority if absent, and rewrite URI to origin-form (`/path?query`).
+pub(crate) fn normalize_request_for_http1<B>(req: &mut Request<B>) {
+    let cookie_vals: Vec<String> = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if cookie_vals.len() > 1 {
+        let merged = cookie_vals.join("; ");
+        if let Ok(hv) = header::HeaderValue::from_str(&merged) {
+            req.headers_mut().insert(header::COOKIE, hv);
+        }
+    }
+
+    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+        if !req.headers().contains_key(header::HOST) {
+            if let Some(auth) = req.uri().authority() {
+                if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+                    req.headers_mut().insert(header::HOST, hv);
+                }
+            }
+        }
+        let pq = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/");
+        if let Ok(origin_uri) = pq.parse() {
+            *req.uri_mut() = origin_uri;
+        }
+    }
+}
+
 async fn forward_http_stream<S>(
     stream: S,
     mut req: Request<Incoming>,
@@ -618,6 +657,7 @@ where
         }
     } else {
         *req.version_mut() = http::Version::HTTP_11;
+        normalize_request_for_http1(&mut req);
         strip_hop_by_hop_headers(req.headers_mut(), false, is_upgrade);
         let client_upgrade = if is_upgrade {
             Some(hyper::upgrade::on(&mut req))

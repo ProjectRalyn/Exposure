@@ -369,6 +369,8 @@ pub struct IngressListener {
     pub listen_addr: String,
     #[serde(default)]
     pub tls: bool,
+    #[serde(default)]
+    pub redirect_https: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
