@@ -296,6 +296,81 @@ impl LinkListenConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+pub enum WafMode {
+    /// WAF inspection disabled (default).
+    #[default]
+    Off,
+    /// Inspect and log matched attack signatures without blocking traffic.
+    Monitor,
+    /// Block matched attack payloads with HTTP 403 Forbidden.
+    Block,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum WafCategory {
+    SqlInjection,
+    Xss,
+    PathTraversal,
+    CommandInjection,
+    NoSqlInjection,
+    Ssrf,
+    Ssti,
+    Xxe,
+    LdapInjection,
+    CrlfInjection,
+    Deserialization,
+    BufferOverflow,
+}
+
+pub fn default_waf_min_confidence() -> f32 {
+    0.65
+}
+
+pub fn default_waf_max_body_bytes() -> usize {
+    32 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WafConfig {
+    #[serde(default)]
+    pub mode: WafMode,
+    /// Minimum `sigil-filter` confidence score in `[0.1, 1.0]` to trigger an alert/block.
+    #[serde(default = "default_waf_min_confidence")]
+    pub min_confidence: f32,
+    /// Enabled attack categories; empty means all 12 built-in `sigil-filter` categories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<WafCategory>,
+    /// Inspect HTTP headers (`User-Agent`, `Referer`, `Cookie`, `X-Original-URL`, `X-Rewrite-URL`, `Forwarded`, `X-Forwarded-*`).
+    #[serde(default = "default_true")]
+    pub inspect_headers: bool,
+    /// Inspect small text/JSON/form/XML request bodies (`POST`/`PUT`/`PATCH`) up to `max_body_bytes`.
+    #[serde(default = "default_true")]
+    pub inspect_body: bool,
+    /// Maximum request body bytes buffered for WAF inspection (default 32 KiB, hard cap 256 KiB).
+    #[serde(default = "default_waf_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// URL path prefixes exempt from WAF inspection (e.g. `"/api/webhooks/"`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_paths: Vec<String>,
+}
+
+impl Default for WafConfig {
+    fn default() -> Self {
+        Self {
+            mode: WafMode::Off,
+            min_confidence: default_waf_min_confidence(),
+            categories: Vec::new(),
+            inspect_headers: true,
+            inspect_body: true,
+            max_body_bytes: default_waf_max_body_bytes(),
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum AntibotMode {
     #[default]
     Off,
@@ -361,6 +436,9 @@ pub struct GuardProfile {
     /// Cooldown TTL in seconds before re-collecting passive JS fingerprint from the same browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_ttl_secs: Option<u64>,
+    /// Optional lightweight WAF powered by `sigil-filter` (`None` inherits `GuardDefaults.waf`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf: Option<WafConfig>,
 }
 
 impl GuardProfile {
@@ -385,6 +463,9 @@ impl GuardProfile {
     pub fn effective_js_fp_ttl_secs(&self) -> u64 {
         self.js_fp_ttl_secs.unwrap_or_else(default_js_fp_ttl_secs).max(60)
     }
+    pub fn effective_waf(&self) -> Option<&WafConfig> {
+        self.waf.as_ref().filter(|w| w.mode != WafMode::Off)
+    }
 }
 
 impl Default for GuardProfile {
@@ -406,6 +487,7 @@ impl Default for GuardProfile {
             require_client_fp: None,
             js_fp_beacon: None,
             js_fp_ttl_secs: None,
+            waf: None,
         }
     }
 }
@@ -1228,6 +1310,8 @@ pub struct GuardDefaults {
     pub js_fp_beacon: bool,
     #[serde(default = "default_js_fp_ttl_secs")]
     pub js_fp_ttl_secs: u64,
+    #[serde(default)]
+    pub waf: WafConfig,
 }
 
 impl Default for GuardDefaults {
@@ -1246,6 +1330,7 @@ impl Default for GuardDefaults {
             require_client_fp: false,
             js_fp_beacon: true,
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
+            waf: WafConfig::default(),
         }
     }
 }

@@ -54,6 +54,12 @@ guard_templates:
     reject_threshold: 85
     pow_difficulty: 16
     clearance_ttl_secs: 1800
+    waf:
+      mode: monitor
+      min_confidence: 0.65
+      inspect_headers: true
+      inspect_body: true
+      max_body_bytes: 32768
   under-attack:
     antibot: always
     rate_limit_bucket: strict-api
@@ -61,6 +67,12 @@ guard_templates:
     block_bots: true
     block_headless: true
     require_client_fp: true
+    waf:
+      mode: block
+      min_confidence: 0.60
+      inspect_headers: true
+      inspect_body: true
+      max_body_bytes: 32768
 
 dns_providers:
   cf-prod:

@@ -111,6 +111,10 @@ fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile
     out.require_client_fp = Some(out.require_client_fp.unwrap_or(defs.require_client_fp));
     out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(defs.js_fp_beacon));
     out.js_fp_ttl_secs = Some(out.js_fp_ttl_secs.unwrap_or(defs.js_fp_ttl_secs).max(60));
+    let mut waf = out.waf.unwrap_or_else(|| defs.waf.clone());
+    waf.min_confidence = waf.min_confidence.clamp(0.1, 1.0);
+    waf.max_body_bytes = waf.max_body_bytes.min(256 * 1024);
+    out.waf = Some(waf);
     out
 }
 
@@ -2245,5 +2249,38 @@ mod tests {
         // 4 valid service route traces (2 ingresses x 2 hosts)
         assert_eq!(report.paths.len(), 4);
         assert!(report.paths.iter().all(|p| p.valid));
+    }
+
+    #[test]
+    fn resolve_guard_profile_inherits_and_clamps_waf_config() {
+        use exposure_core::config::{WafConfig, WafMode};
+
+        let mut defs = GuardDefaults::default();
+        defs.waf = WafConfig {
+            mode: WafMode::Monitor,
+            min_confidence: 0.7,
+            max_body_bytes: 512 * 1024, // exceeds 256 KiB hard ceiling
+            ..Default::default()
+        };
+        let inherited = resolve_guard_profile(&GuardProfile::default(), &defs);
+        let iw = inherited.waf.expect("inherited waf");
+        assert_eq!(iw.mode, WafMode::Monitor);
+        assert_eq!(iw.min_confidence, 0.7);
+        assert_eq!(iw.max_body_bytes, 256 * 1024);
+
+        let custom = GuardProfile {
+            waf: Some(WafConfig {
+                mode: WafMode::Block,
+                min_confidence: 0.01, // clamped to 0.1
+                max_body_bytes: 16 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_guard_profile(&custom, &defs);
+        let rw = resolved.waf.expect("custom waf");
+        assert_eq!(rw.mode, WafMode::Block);
+        assert!((rw.min_confidence - 0.1).abs() < 1e-6);
+        assert_eq!(rw.max_body_bytes, 16 * 1024);
     }
 }

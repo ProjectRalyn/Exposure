@@ -78,6 +78,26 @@ pub struct GuardHttpResponse {
     pub extra_headers: Vec<(String, String)>,
 }
 
+/// Constant-time check for authenticated API bypass headers (`"Header-Name: expected-secret"`).
+pub fn matches_api_bypass(profile: &GuardProfile, headers: &HeaderMap) -> bool {
+    for bypass_rule in &profile.api_bypass_headers {
+        if let Some((h_name, expected_val)) = bypass_rule.split_once(':') {
+            let h_name = h_name.trim();
+            let expected_val = expected_val.trim();
+            if !h_name.is_empty() && !expected_val.is_empty() {
+                for hv in headers.get_all(h_name) {
+                    if let Ok(actual) = hv.to_str() {
+                        if ct_eq_hashed(actual.trim().as_bytes(), expected_val.as_bytes()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Ingress Entry Guard Engine (DESIGN.md §11):
 /// - CIDR allow/deny (canonicalized IPv4/IPv6)
 /// - Bounded named token-bucket rate limiting (429 + Retry-After)
@@ -385,20 +405,8 @@ impl GuardEngine {
         }
 
         // 4. Authenticated API bypass headers (`Header-Name: secret-value`, constant-time compare)
-        for bypass_rule in &profile.api_bypass_headers {
-            if let Some((h_name, expected_val)) = bypass_rule.split_once(':') {
-                let h_name = h_name.trim();
-                let expected_val = expected_val.trim();
-                if !h_name.is_empty() && !expected_val.is_empty() {
-                    for hv in headers.get_all(h_name) {
-                        if let Ok(actual) = hv.to_str() {
-                            if ct_eq_hashed(actual.trim().as_bytes(), expected_val.as_bytes()) {
-                                return GuardDecision::Allow;
-                            }
-                        }
-                    }
-                }
-            }
+        if matches_api_bypass(profile, headers) {
+            return GuardDecision::Allow;
         }
 
         // 4b. Block known bot/scraper UAs if enabled

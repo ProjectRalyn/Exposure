@@ -32,9 +32,15 @@ use uuid::Uuid;
 use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
 use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
-use crate::guard::{compute_suspicion_score, sanitize_redirect, GuardDecision, GuardEngine};
+use crate::guard::{
+    compute_suspicion_score, matches_api_bypass, sanitize_redirect, GuardDecision, GuardEngine,
+};
 use crate::logger::NodeLogger;
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
+use crate::waf::{
+    inspect_request_body, inspect_request_head, is_path_exempt, should_inspect_body, WafFinding,
+    WafVerdict,
+};
 
 const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
 const MAX_CONNS_PER_IP: usize = 128;
@@ -397,7 +403,7 @@ impl IngressServer {
 
     async fn handle_http_request_inner(
         &self,
-        mut req: Request<Incoming>,
+        req: Request<Incoming>,
         peer_addr: SocketAddr,
         is_tls: bool,
         redirect_https: bool,
@@ -878,6 +884,131 @@ impl IngressServer {
             }
         }
 
+        let is_upgrade = req.headers().contains_key(header::UPGRADE);
+        let mut req: Request<ProxyBody> = req.map(|b| b.boxed());
+
+        // Evaluate lightweight WAF (sigil-filter) AFTER Entry Guard and BEFORE Edge Cache / upstream
+        if let Some(profile) = active_profile {
+            if let Some(waf_cfg) = profile.effective_waf() {
+                if !matches_api_bypass(profile, req.headers()) {
+                    let mut verdict = inspect_request_head(
+                        waf_cfg,
+                        &path,
+                        req.uri().query(),
+                        req.headers(),
+                    );
+                    if matches!(verdict, WafVerdict::Allow)
+                        && !is_path_exempt(&path, &waf_cfg.exempt_paths)
+                    {
+                        if let Some(body_limit) =
+                            should_inspect_body(waf_cfg, req.method(), req.headers(), is_upgrade)
+                        {
+                            let ct = req
+                                .headers()
+                                .get(header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            let (rebuilt_req, inspected_bytes) =
+                                buffer_prefix_for_waf(req, body_limit).await;
+                            req = rebuilt_req;
+                            if !inspected_bytes.is_empty() {
+                                verdict = inspect_request_body(
+                                    waf_cfg,
+                                    ct.as_deref(),
+                                    &inspected_bytes,
+                                );
+                            }
+                        }
+                    }
+
+                    match verdict {
+                        WafVerdict::Allow => {}
+                        WafVerdict::Monitor(finding) => {
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "monitor",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                reasons = ?finding.reasons,
+                                "waf matched suspicious payload (monitor mode)"
+                            );
+                        }
+                        WafVerdict::Block(finding) => {
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "block",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                reasons = ?finding.reasons,
+                                "waf blocked malicious request"
+                            );
+                            let reason = finding.telemetry_reason();
+                            self.logger
+                                .record_session_with_fp(
+                                    "ingress",
+                                    &rule.service_tag,
+                                    &client_ip.to_string(),
+                                    403,
+                                    start.elapsed().as_secs_f64() * 1000.0,
+                                    0,
+                                    0,
+                                    false,
+                                    true,
+                                    false,
+                                    Some(reason),
+                                    Some(client_fp.device_type.to_string()),
+                                    Some(client_fp.browser_family.to_string()),
+                                    Some(client_fp.os_family.to_string()),
+                                    false,
+                                )
+                                .await;
+                            self.logger
+                                .record_fingerprint(
+                                    &rule.service_tag,
+                                    &host,
+                                    &client_ip.to_string(),
+                                    &fallback_fp_hash,
+                                    false,
+                                    "none",
+                                    &ua_str,
+                                    &al_str,
+                                    client_fp.device_type,
+                                    client_fp.browser_family,
+                                    client_fp.os_family,
+                                    client_fp.is_bot,
+                                    false,
+                                    suspicion_score,
+                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                    None,
+                                    1,
+                                    1,
+                                    0,
+                                )
+                                .await;
+                            return build_waf_block_response(
+                                &finding,
+                                rule.effective_intercept_errors(),
+                                is_browser_navigation(req.method(), req.headers()),
+                                &ray_id,
+                                cfg.pages.error_html.as_deref(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let verified_info = self.guard.verified_fp_info(
             active_profile,
             &cfg.clearance_secret,
@@ -891,7 +1022,6 @@ impl IngressServer {
             None => (fallback_fp_hash, "none", false),
         };
 
-        let is_upgrade = req.headers().contains_key(header::UPGRADE);
         // Decide BEFORE upstream forwarding whether this single HTML navigation needs passive JS FP beacon injection
         let fp_inject_token = if self.guard.should_inject_fp_beacon(
             req.method(),
@@ -1711,6 +1841,85 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+async fn buffer_prefix_for_waf(
+    req: Request<ProxyBody>,
+    limit: usize,
+) -> (Request<ProxyBody>, Bytes) {
+    let (parts, mut body) = req.into_parts();
+    let mut collected = Vec::new();
+    let mut exceeded = false;
+    while let Some(frame_res) = body.frame().await {
+        match frame_res {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    collected.extend_from_slice(data);
+                    if collected.len() >= limit {
+                        exceeded = true;
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+    let inspected_len = collected.len().min(limit);
+    let prefix = Bytes::from(collected);
+    let inspected = prefix.slice(..inspected_len);
+    let rebuilt_body = if exceeded {
+        PrefixBody {
+            prefix: Some(prefix),
+            rest: body,
+        }
+        .boxed()
+    } else {
+        full_body(prefix)
+    };
+    (Request::from_parts(parts, rebuilt_body), inspected)
+}
+
+fn build_waf_block_response(
+    finding: &WafFinding,
+    intercept_errors: bool,
+    browser_nav: bool,
+    ray_id: &str,
+    error_html_template: Option<&str>,
+) -> Response<ProxyBody> {
+    if intercept_errors && browser_nav {
+        let html = exposure_core::assets::render_exposure_error_html_with_template(
+            error_html_template,
+            403,
+            "Request Blocked",
+            "Your request was blocked by the edge web application firewall.",
+            ray_id,
+            None,
+        );
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("x-exposure-waf", "BLOCK")
+            .header("x-exposure-ray", ray_id)
+            .body(full_body(html))
+            .unwrap();
+    }
+    let body = serde_json::json!({
+        "error": "waf_blocked",
+        "category": finding.category,
+        "ray_id": ray_id,
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-exposure-waf", "BLOCK")
+        .header("x-exposure-ray", ray_id)
+        .body(full_body(body))
+        .unwrap()
+}
+
 fn build_rate_limit_response(
     retry_after_secs: u64,
     show_error_page: bool,
@@ -1817,5 +2026,65 @@ mod tests {
         );
         let degraded_bytes = degraded_resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&degraded_bytes[..], b"429");
+    }
+
+    #[tokio::test]
+    async fn waf_block_response_renders_json_or_custom_html() {
+        let finding = WafFinding {
+            category: "sql-injection",
+            location: "query",
+            confidence: 0.96,
+            reasons: vec!["SQL boolean tautology"],
+        };
+        let api_resp = build_waf_block_response(&finding, true, false, "raywaf1", None);
+        assert_eq!(api_resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(api_resp.headers().get("x-exposure-waf").unwrap(), "BLOCK");
+        assert_eq!(
+            api_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+        let api_bytes = api_resp.into_body().collect().await.unwrap().to_bytes();
+        let api_str = String::from_utf8(api_bytes.to_vec()).unwrap();
+        assert!(api_str.contains("\"waf_blocked\""));
+        assert!(api_str.contains("\"sql-injection\""));
+        assert!(api_str.contains("\"raywaf1\""));
+
+        let html_resp = build_waf_block_response(
+            &finding,
+            true,
+            true,
+            "raywaf2",
+            Some("<html>blocked {{status}} {{ray_id}}</html>"),
+        );
+        assert_eq!(html_resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            html_resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let html_bytes = html_resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8(html_bytes.to_vec()).unwrap(),
+            "<html>blocked 403 raywaf2</html>"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffer_prefix_for_waf_preserves_full_streaming_body() {
+        use futures::stream::iter;
+        use http_body_util::StreamBody;
+
+        let chunks = vec![
+            Ok::<_, hyper::Error>(Frame::data(Bytes::from_static(b"hello-"))),
+            Ok(Frame::data(Bytes::from_static(b"world-"))),
+            Ok(Frame::data(Bytes::from_static(b"1234567890"))),
+        ];
+        let body: ProxyBody = StreamBody::new(iter(chunks)).boxed();
+        let req = Request::builder().method("POST").uri("/submit").body(body).unwrap();
+
+        // Limit smaller than total body -> inspects first 10 bytes, preserves entire 22 bytes on rebuilt req
+        let (rebuilt, inspected) = buffer_prefix_for_waf(req, 10).await;
+        assert_eq!(&inspected[..], b"hello-worl");
+        let full = rebuilt.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&full[..], b"hello-world-1234567890");
     }
 }

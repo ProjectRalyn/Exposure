@@ -3,14 +3,18 @@ import { t } from "../i18n.js";
 import {
   defaultGuardProfile,
   defaultTopologyDefaults,
+  defaultWafConfig,
   isReservedKey,
+  WAF_CATEGORIES,
 } from "../store.js";
 import {
   el,
   esc,
   parseNum,
+  renderBinSlider,
   renderTriSlider,
   showToast,
+  wireBinSliders,
   wireTriSliders,
 } from "../ui.js";
 
@@ -88,6 +92,11 @@ export function createSecurityView({ store }) {
         const used = usage[gName] || 0;
         const isDefault = defGuardName === gName;
         const isUnderAttack = g.antibot === "always";
+        const defWaf = gDefs.waf || defaultWafConfig();
+        const waf = g.waf;
+        const effWafMode = waf ? waf.mode : defWaf.mode;
+        const wafSelectVal = waf ? waf.mode : "inherit";
+        const activeCats = waf?.categories || [];
         return `
           <div class="subcard">
             <div class="subcard-head">
@@ -96,6 +105,7 @@ export function createSecurityView({ store }) {
                 <span class="pill ${used > 0 ? "ok" : ""}">Used: ${used}</span>
                 ${isDefault ? `<span class="pill info">Default Guard</span>` : ""}
                 ${isUnderAttack ? `<span class="pill err">UNDER ATTACK</span>` : ""}
+                ${effWafMode === "block" ? `<span class="pill err">WAF: BLOCK</span>` : effWafMode === "monitor" ? `<span class="pill warn">WAF: MONITOR</span>` : ""}
               </div>
               <div class="btn-row">
                 <button type="button" class="btn sm ${isUnderAttack ? "danger" : ""}" data-gd-ua="${esc(gName)}" title="${esc(t("sec.under_attack"))}">⚡ ${isUnderAttack ? "Exit Attack" : "Under Attack"}</button>
@@ -138,6 +148,43 @@ export function createSecurityView({ store }) {
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "block_headless", label: "Block Headless Browsers", val: g.block_headless, inherited: gDefs.block_headless })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "require_client_fp", label: "Require Verified JS FP", val: g.require_client_fp, inherited: gDefs.require_client_fp })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: g.js_fp_beacon, inherited: gDefs.js_fp_beacon })}
+            </div>
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+                <strong style="font-size:12px;letter-spacing:.03em;">${esc(t("waf.title"))}</strong>
+                <select style="width:auto;min-width:170px;" data-gd-waf-mode="${esc(gName)}">
+                  <option value="inherit" ${wafSelectVal === "inherit" ? "selected" : ""}>${esc(t("waf.mode.inherit", { mode: defWaf.mode }))}</option>
+                  <option value="off" ${wafSelectVal === "off" ? "selected" : ""}>${esc(t("waf.mode.off"))}</option>
+                  <option value="monitor" ${wafSelectVal === "monitor" ? "selected" : ""}>${esc(t("waf.mode.monitor"))}</option>
+                  <option value="block" ${wafSelectVal === "block" ? "selected" : ""}>${esc(t("waf.mode.block"))}</option>
+                </select>
+              </div>
+              ${
+                waf && waf.mode !== "off"
+                  ? `
+                <div class="inspector-row">
+                  <label><span>${esc(t("waf.min_conf"))}</span><input type="number" step="0.05" min="0.1" max="1" data-gd-waf-conf="${esc(gName)}" value="${waf.min_confidence ?? 0.65}" /></label>
+                  <label><span>${esc(t("waf.max_body_kb"))}</span><input type="number" min="0" max="256" data-gd-waf-bodykb="${esc(gName)}" value="${Math.round((waf.max_body_bytes ?? 32768) / 1024)}" /></label>
+                </div>
+                <div class="tri-stack" style="margin-top:6px;">
+                  ${renderBinSlider({ attrName: `data-gd-waf-bin-${gName}`, attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: waf.inspect_headers !== false })}
+                  ${renderBinSlider({ attrName: `data-gd-waf-bin-${gName}`, attrVal: "inspect_body", label: t("waf.inspect_body"), val: waf.inspect_body !== false })}
+                </div>
+                <label style="margin-top:6px;"><span>${esc(t("waf.exempt_paths"))}</span>
+                  <input data-gd-waf-exempt="${esc(gName)}" value="${esc((waf.exempt_paths || []).join(", "))}" placeholder="/api/webhooks/, /cms/" />
+                </label>
+                <div style="margin-top:6px;">
+                  <div class="muted" style="font-size:11px;margin-bottom:5px;">${esc(activeCats.length ? t("waf.categories") : t("waf.categories.all"))}</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                    <button type="button" class="btn sm ${activeCats.length === 0 ? "primary" : "ghost"}" data-gd-waf-cat-all="${esc(gName)}">${esc(t("common.all"))}</button>
+                    ${WAF_CATEGORIES.map((c) => {
+                      const on = activeCats.includes(c);
+                      return `<button type="button" class="btn sm ${on ? "primary" : "ghost"}" data-gd-waf-cat="${esc(gName)}" data-waf-c="${esc(c)}">${esc(t(`waf.cat.${c}`))}</button>`;
+                    }).join("")}
+                  </div>
+                </div>`
+                  : ""
+              }
             </div>
           </div>`;
       })
@@ -235,7 +282,93 @@ export function createSecurityView({ store }) {
       wireTriSliders(container, `data-gd-tri-${gName}`, (field, val) => {
         store.mutate((s) => { s.guard_templates[gName][field] = val; }, false);
       });
+      wireBinSliders(container, `data-gd-waf-bin-${gName}`, (field, val) => {
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf[field] = val;
+        }, false);
+      });
     }
+
+    container.querySelectorAll("[data-gd-waf-mode]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const gName = sel.dataset.gdWafMode;
+        const val = sel.value;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (val === "inherit") {
+            g.waf = null;
+          } else {
+            if (!g.waf) g.waf = { ...(s.defaults?.guard?.waf || defaultWafConfig()) };
+            g.waf.mode = val;
+          }
+        });
+        render();
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-conf]").forEach((inp) => {
+      inp.addEventListener("input", () => {
+        const gName = inp.dataset.gdWafConf;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf.min_confidence = parseNum(inp.value, 0.65, 0.1, 1.0);
+        }, false);
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-bodykb]").forEach((inp) => {
+      inp.addEventListener("input", () => {
+        const gName = inp.dataset.gdWafBodykb;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf.max_body_bytes = parseNum(inp.value, 32, 0, 256) * 1024;
+        }, false);
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-exempt]").forEach((inp) => {
+      inp.addEventListener("input", () => {
+        const gName = inp.dataset.gdWafExempt;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf.exempt_paths = inp.value.split(",").map((x) => x.trim()).filter(Boolean);
+        }, false);
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-cat-all]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const gName = btn.dataset.gdWafCatAll;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf.categories = [];
+        });
+        render();
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-cat]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const gName = btn.dataset.gdWafCat;
+        const cat = btn.dataset.wafC;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          const list = Array.isArray(g.waf.categories) ? [...g.waf.categories] : [];
+          const idx = list.indexOf(cat);
+          if (idx >= 0) list.splice(idx, 1);
+          else list.push(cat);
+          g.waf.categories = list;
+        });
+        render();
+      });
+    });
   }
 
   function renderBucketsSubTab(container, bucketKeys) {

@@ -1,7 +1,7 @@
 // System View — Cluster Defaults, Config Versions & Rollback, Audit Log, Raw YAML Source
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
-import { defaultNodeCacheConfig, defaultTopologyDefaults } from "../store.js";
+import { defaultNodeCacheConfig, defaultTopologyDefaults, defaultWafConfig } from "../store.js";
 import {
   el,
   esc,
@@ -58,6 +58,8 @@ export function createSystemView({ api, store }) {
     if (!ig.cache) ig.cache = defaultNodeCacheConfig();
     const ca = ig.cache;
     const gd = defs.guard;
+    if (!gd.waf) gd.waf = defaultWafConfig();
+    const dwaf = gd.waf;
     const eg = defs.egress;
     const ll = defs.link_listener;
     const gl = store.spec.global_logger || { store_raw_ip: false, sample_rate: 1.0, segment: { retention_hours: 72 } };
@@ -127,6 +129,23 @@ export function createSystemView({ api, store }) {
             ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "bind_ip_prefix", label: "Bind Client IP", val: gd.bind_ip_prefix })}
             ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "block_bots", label: "Block Known Bots", val: gd.block_bots })}
             ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "block_headless", label: "Block Headless Browsers", val: gd.block_headless })}
+          </div>
+          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
+            <div class="inspector-row">
+              <label><span>${esc(t("waf.mode"))}</span>
+                <select id="sd-waf-mode">
+                  <option value="off" ${dwaf.mode === "off" ? "selected" : ""}>${esc(t("waf.mode.off"))}</option>
+                  <option value="monitor" ${dwaf.mode === "monitor" ? "selected" : ""}>${esc(t("waf.mode.monitor"))}</option>
+                  <option value="block" ${dwaf.mode === "block" ? "selected" : ""}>${esc(t("waf.mode.block"))}</option>
+                </select>
+              </label>
+              <label><span>${esc(t("waf.min_conf"))}</span><input id="sd-waf-conf" type="number" step="0.05" min="0.1" max="1" value="${dwaf.min_confidence ?? 0.65}" /></label>
+              <label><span>${esc(t("waf.max_body_kb"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
+            </div>
+            <div class="tri-stack" style="margin-top:6px;">
+              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: dwaf.inspect_headers !== false })}
+              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("waf.inspect_body"), val: dwaf.inspect_body !== false })}
+            </div>
           </div>
         </div>
 
@@ -203,6 +222,14 @@ export function createSystemView({ api, store }) {
     el("sd-gd-pow")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.pow_difficulty = parseNum(ev.target.value, 16, 4, 28); }, false));
     el("sd-gd-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.clearance_ttl_secs = parseNum(ev.target.value, 600, 10); }, false));
     wireBinSliders(container, "data-sd-gd-bin", (f, v) => store.mutate((s) => { s.defaults.guard[f] = v; }, false));
+    const ensureWaf = (s) => {
+      if (!s.defaults.guard.waf) s.defaults.guard.waf = defaultWafConfig();
+      return s.defaults.guard.waf;
+    };
+    el("sd-waf-mode")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).mode = ev.target.value; }, false));
+    el("sd-waf-conf")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).min_confidence = parseNum(ev.target.value, 0.65, 0.1, 1.0); }, false));
+    el("sd-waf-bodykb")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).max_body_bytes = parseNum(ev.target.value, 32, 0, 256) * 1024; }, false));
+    wireBinSliders(container, "data-sd-waf-bin", (f, v) => store.mutate((s) => { ensureWaf(s)[f] = v; }, false));
 
     el("sd-eg-proto")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.egress.protocol = ev.target.value; }, false));
     el("sd-eg-to")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.egress.timeout_ms = parseNum(ev.target.value, 30000, 100); }, false));

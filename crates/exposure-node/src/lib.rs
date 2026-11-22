@@ -8,5 +8,6 @@ pub mod logger;
 pub mod maintainer;
 pub mod runtime;
 pub mod tls;
+pub mod waf;
 
 pub use runtime::NodeRuntime;

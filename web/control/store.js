@@ -24,6 +24,51 @@ export function sanitizeRecord(obj) {
   return out;
 }
 
+export const WAF_CATEGORIES = [
+  "sql-injection",
+  "xss",
+  "path-traversal",
+  "command-injection",
+  "nosql-injection",
+  "ssrf",
+  "ssti",
+  "xxe",
+  "ldap-injection",
+  "crlf-injection",
+  "deserialization",
+  "buffer-overflow",
+];
+
+export function defaultWafConfig() {
+  return {
+    mode: "off",
+    min_confidence: 0.65,
+    categories: [],
+    inspect_headers: true,
+    inspect_body: true,
+    max_body_bytes: 32 * 1024,
+    exempt_paths: [],
+  };
+}
+
+export function normalizeWafConfig(raw) {
+  const b = defaultWafConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const mode = s.mode === "block" || s.mode === "monitor" || s.mode === "off" ? s.mode : b.mode;
+  const conf = Number(s.min_confidence ?? b.min_confidence);
+  return {
+    mode,
+    min_confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0.1, Math.round(conf * 100) / 100)) : b.min_confidence,
+    categories: Array.isArray(s.categories)
+      ? s.categories.map(String).filter((c) => WAF_CATEGORIES.includes(c))
+      : [],
+    inspect_headers: Boolean(s.inspect_headers ?? b.inspect_headers),
+    inspect_body: Boolean(s.inspect_body ?? b.inspect_body),
+    max_body_bytes: Math.min(256 * 1024, Math.max(0, Number(s.max_body_bytes ?? b.max_body_bytes) || b.max_body_bytes)),
+    exempt_paths: Array.isArray(s.exempt_paths) ? s.exempt_paths.map((x) => String(x).trim()).filter(Boolean) : [],
+  };
+}
+
 export function defaultNodeCacheConfig() {
   return {
     enabled: false,
@@ -105,6 +150,7 @@ export function defaultTopologyDefaults() {
       require_client_fp: false,
       js_fp_beacon: true,
       js_fp_ttl_secs: 3600,
+      waf: defaultWafConfig(),
     },
     egress: {
       protocol: "auto",
@@ -147,6 +193,7 @@ export function defaultGuardProfile(defs = null) {
     require_client_fp: null,
     js_fp_beacon: null,
     js_fp_ttl_secs: null,
+    waf: null,
   };
 }
 
@@ -169,6 +216,7 @@ export function normalizeGuardProfile(g) {
     require_client_fp: normalizeTri(src.require_client_fp),
     js_fp_beacon: normalizeTri(src.js_fp_beacon),
     js_fp_ttl_secs: src.js_fp_ttl_secs != null && src.js_fp_ttl_secs !== "" ? Number(src.js_fp_ttl_secs) : null,
+    waf: src.waf && typeof src.waf === "object" ? normalizeWafConfig(src.waf) : null,
   };
 }
 
@@ -430,6 +478,7 @@ export function normalizeDefaults(raw) {
       require_client_fp: Boolean(src.guard?.require_client_fp ?? base.guard.require_client_fp),
       js_fp_beacon: Boolean(src.guard?.js_fp_beacon ?? base.guard.js_fp_beacon),
       js_fp_ttl_secs: Number(src.guard?.js_fp_ttl_secs ?? base.guard.js_fp_ttl_secs) || 3600,
+      waf: normalizeWafConfig(src.guard?.waf),
     },
     egress: {
       ...base.egress,
