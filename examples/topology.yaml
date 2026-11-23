@@ -55,6 +55,7 @@ guard_templates:
     pow_difficulty: 16
     clearance_ttl_secs: 1800
     waf:
+      # Supported modes: off | monitor | block | evilpot (divert attacks to embedded honeypot & behavior analysis)
       mode: monitor
       min_confidence: 0.65
       inspect_headers: true
@@ -68,7 +69,7 @@ guard_templates:
     block_headless: true
     require_client_fp: true
     waf:
-      mode: block
+      mode: evilpot
       min_confidence: 0.60
       inspect_headers: true
       inspect_body: true

@@ -27,9 +27,24 @@ export function createServicesView({ store, navigate }) {
   let searchQ = "";
 
   function countLegacyRules() {
+    const egressTags = new Set();
+    for (const node of Object.values(store.spec.nodes || {})) {
+      if (!node.roles?.egress) continue;
+      for (const sTag of Object.keys(node.egress?.services || {})) {
+        egressTags.add(sTag);
+      }
+    }
+    const existingServices = store.spec.services || {};
     let n = 0;
     for (const node of Object.values(store.spec.nodes || {})) {
-      n += (node.ingress?.rules || []).length;
+      if (!node.roles?.ingress) continue;
+      for (const rule of node.ingress?.rules || []) {
+        const sTag = rule.service_tag;
+        if (!sTag) continue;
+        if (!existingServices[sTag] && egressTags.has(sTag)) {
+          n++;
+        }
+      }
     }
     return n;
   }

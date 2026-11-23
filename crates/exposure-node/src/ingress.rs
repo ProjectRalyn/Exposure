@@ -9,12 +9,14 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
-use exposure_core::config::{IngressConfig, IngressListener};
+use evilpot::ExploitVerificationStatus;
+use exposure_core::config::{IngressConfig, IngressListener, WafMode};
 use exposure_core::crypto::{
     generate_random_secret_hex, is_weak_secret, short_sha256_hex, NodeKeyPair,
 };
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
 use exposure_core::routing::{any_rule_matches_host, canonical_ip, match_ingress_rule, normalize_host};
+use exposure_core::telemetry::EvilpotNodeReport;
 use exposure_core::Result;
 use http::{header, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Limited};
@@ -35,6 +37,10 @@ use crate::forwarder::Forwarder;
 use crate::guard::{
     compute_suspicion_score, matches_api_bypass, sanitize_redirect, GuardDecision, GuardEngine,
 };
+use crate::honeypot::{
+    build_attack_signal, clamp_input_slice, into_proxy_response, verification_status_label,
+    EvilpotManager, EvilpotStealthMarker, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
+};
 use crate::logger::NodeLogger;
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
 use crate::waf::{
@@ -52,6 +58,7 @@ const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+const WAF_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
 const MAX_HTML_INJECT_BYTES: usize = 2 * 1024 * 1024;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -121,6 +128,7 @@ pub struct IngressServer {
     forwarder: Arc<Forwarder>,
     guard: Arc<GuardEngine>,
     cache: Arc<EdgeCache>,
+    evilpot: Arc<EvilpotManager>,
     cert_resolver: Arc<DynamicCertResolver>,
     logger: Arc<NodeLogger>,
     started_listeners: DashMap<String, JoinHandle<()>>,
@@ -144,6 +152,7 @@ impl IngressServer {
             cfg.cache.max_memory_bytes,
             cfg.cache.max_entries,
         ));
+        let evilpot = Arc::new(EvilpotManager::new(tag.clone()));
         Arc::new(Self {
             node_tag: tag,
             keypair,
@@ -152,6 +161,7 @@ impl IngressServer {
             forwarder,
             guard: Arc::new(GuardEngine::new()),
             cache,
+            evilpot,
             cert_resolver,
             logger,
             started_listeners: DashMap::new(),
@@ -162,6 +172,10 @@ impl IngressServer {
 
     pub fn edge_cache(&self) -> &Arc<EdgeCache> {
         &self.cache
+    }
+
+    pub async fn evilpot_report(&self) -> Option<EvilpotNodeReport> {
+        self.evilpot.build_report().await
     }
 
     pub async fn update_config(
@@ -182,6 +196,14 @@ impl IngressServer {
             cfg.cache.max_entries,
             !any_cache_enabled,
         );
+        let any_evilpot_enabled = ingress_enabled
+            && cfg
+                .guards
+                .values()
+                .any(|g| g.waf.as_ref().map(|w| w.mode == WafMode::Evilpot).unwrap_or(false));
+        self.evilpot
+            .reconfigure(&cfg.evilpot, any_evilpot_enabled)
+            .await;
         let desired_listeners = if ingress_enabled {
             cfg.listeners.clone()
         } else {
@@ -393,7 +415,9 @@ impl IngressServer {
                 &cfg,
             )
             .await;
-        if !cfg.server_header.trim().is_empty() {
+        if resp.extensions().get::<EvilpotStealthMarker>().is_none()
+            && !cfg.server_header.trim().is_empty()
+        {
             if let Ok(hv) = HeaderValue::from_str(cfg.server_header.trim()) {
                 resp.headers_mut().insert(header::SERVER, hv);
             }
@@ -887,10 +911,122 @@ impl IngressServer {
         let is_upgrade = req.headers().contains_key(header::UPGRADE);
         let mut req: Request<ProxyBody> = req.map(|b| b.boxed());
 
-        // Evaluate lightweight WAF (sigil-filter) AFTER Entry Guard and BEFORE Edge Cache / upstream
+        // Evaluate lightweight WAF (sigil-filter) + optional Evilpot deception/analysis AFTER Entry Guard and BEFORE Edge Cache / upstream
         if let Some(profile) = active_profile {
             if let Some(waf_cfg) = profile.effective_waf() {
                 if !matches_api_bypass(profile, req.headers()) {
+                    // When WAF action is `evilpot`, check first whether a follow-up request replays
+                    // any implanted canary token, cookie, API key, or secret vault path.
+                    // Fast O(1) skip when no trap has ever fired yet (0-ns overhead on benign traffic).
+                    if waf_cfg.mode == WafMode::Evilpot
+                        && !is_path_exempt(&path, &waf_cfg.exempt_paths)
+                    {
+                        if let Some(ep_engine) = self.evilpot.engine().await {
+                            if EvilpotManager::has_triggered_traps(&ep_engine) {
+                                let ep_path = clamp_input_slice(&path, MAX_EVILPOT_PATH_CHARS);
+                                let ep_query = req
+                                    .uri()
+                                    .query()
+                                    .map(|q| clamp_input_slice(q, MAX_EVILPOT_QUERY_CHARS));
+                                if ep_engine
+                                    .check_canary_trigger(client_ip, ep_path, ep_query, req.headers())
+                                    .is_some()
+                                {
+                                    let Some(permit) = self.evilpot.try_admit(client_ip) else {
+                                        return Response::builder()
+                                            .status(StatusCode::FORBIDDEN)
+                                            .header(header::CACHE_CONTROL, "no-store")
+                                            .body(full_body("Forbidden"))
+                                            .unwrap();
+                                    };
+                                    if let Some(outcome) = ep_engine
+                                        .handle_canary_if_present(
+                                            client_ip,
+                                            req.method().as_str(),
+                                            ep_path,
+                                            ep_query,
+                                            req.headers(),
+                                        )
+                                        .await
+                                    {
+                                        let status_lbl =
+                                            verification_status_label(outcome.session.status);
+                                        warn!(
+                                            node = %self.node_tag,
+                                            service = %rule.service_tag,
+                                            host = %host,
+                                            client = %client_ip,
+                                            ray_id = %ray_id,
+                                            status = status_lbl,
+                                            canary_triggers = outcome.session.canary_triggers,
+                                            persona = %outcome.session.persona_hostname,
+                                            "evilpot canary triggered — verified active exploit"
+                                        );
+                                        if self
+                                            .evilpot
+                                            .should_emit_alert(client_ip, outcome.session.status)
+                                        {
+                                            self.logger
+                                                .emit_alert(
+                                                    "critical",
+                                                    format!(
+                                                        "Evilpot VerifiedExploit (canary replay) from {} on {} [service={}, triggers={}]",
+                                                        client_ip, host, rule.service_tag, outcome.session.canary_triggers
+                                                    ),
+                                                )
+                                                .await;
+                                        }
+                                        let resp_status = outcome.response.status().as_u16();
+                                        self.logger
+                                            .record_session_with_fp(
+                                                "ingress",
+                                                &rule.service_tag,
+                                                &client_ip.to_string(),
+                                                resp_status,
+                                                start.elapsed().as_secs_f64() * 1000.0,
+                                                0,
+                                                0,
+                                                false,
+                                                true,
+                                                false,
+                                                Some(format!("evilpot:{status_lbl}:canary")),
+                                                Some(client_fp.device_type.to_string()),
+                                                Some(client_fp.browser_family.to_string()),
+                                                Some(client_fp.os_family.to_string()),
+                                                false,
+                                            )
+                                            .await;
+                                        self.logger
+                                            .record_fingerprint(
+                                                &rule.service_tag,
+                                                &host,
+                                                &client_ip.to_string(),
+                                                &fallback_fp_hash,
+                                                false,
+                                                "none",
+                                                &ua_str,
+                                                &al_str,
+                                                client_fp.device_type,
+                                                client_fp.browser_family,
+                                                client_fp.os_family,
+                                                client_fp.is_bot,
+                                                false,
+                                                suspicion_score,
+                                                tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                                tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                                None,
+                                                1,
+                                                1,
+                                                0,
+                                            )
+                                            .await;
+                                        return into_proxy_response(outcome.response, Some(permit));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let mut verdict = inspect_request_head(
                         waf_cfg,
                         &path,
@@ -908,15 +1044,25 @@ impl IngressServer {
                                 .get(header::CONTENT_TYPE)
                                 .and_then(|v| v.to_str().ok())
                                 .map(str::to_string);
-                            let (rebuilt_req, inspected_bytes) =
-                                buffer_prefix_for_waf(req, body_limit).await;
-                            req = rebuilt_req;
-                            if !inspected_bytes.is_empty() {
-                                verdict = inspect_request_body(
-                                    waf_cfg,
-                                    ct.as_deref(),
-                                    &inspected_bytes,
-                                );
+                            match buffer_prefix_for_waf(req, body_limit).await {
+                                Ok((rebuilt_req, inspected_bytes)) => {
+                                    req = rebuilt_req;
+                                    if !inspected_bytes.is_empty() {
+                                        verdict = inspect_request_body(
+                                            waf_cfg,
+                                            ct.as_deref(),
+                                            &inspected_bytes,
+                                        );
+                                    }
+                                }
+                                Err(()) => {
+                                    // Slow-POST / R.U.D.Y. timeout while reading request body prefix
+                                    return Response::builder()
+                                        .status(StatusCode::REQUEST_TIMEOUT)
+                                        .header(header::CACHE_CONTROL, "no-store")
+                                        .body(full_body("408 Request Timeout"))
+                                        .unwrap();
+                                }
                             }
                         }
                     }
@@ -1003,6 +1149,143 @@ impl IngressServer {
                                 &ray_id,
                                 cfg.pages.error_html.as_deref(),
                             );
+                        }
+                        WafVerdict::Evilpot(finding) => {
+                            // Enforce per-IP & global Evilpot concurrency/rate caps so CC floods
+                            // cannot starve Ingress slots or inflate honeypot session memory.
+                            let Some(permit) = self.evilpot.try_admit(client_ip) else {
+                                return build_waf_block_response(
+                                    &finding,
+                                    false,
+                                    false,
+                                    &ray_id,
+                                    None,
+                                );
+                            };
+                            let ep_engine = self.evilpot.get_or_init(&cfg.evilpot).await;
+                            let ep_path = clamp_input_slice(&path, MAX_EVILPOT_PATH_CHARS);
+                            let ep_query = req
+                                .uri()
+                                .query()
+                                .map(|q| clamp_input_slice(q, MAX_EVILPOT_QUERY_CHARS));
+                            let signal = build_attack_signal(
+                                &finding,
+                                ep_query.or(Some(ep_path)),
+                            );
+                            let outcome = ep_engine
+                                .handle_attack(
+                                    client_ip,
+                                    req.method().as_str(),
+                                    ep_path,
+                                    ep_query,
+                                    req.headers(),
+                                    signal,
+                                )
+                                .await;
+                            let status_lbl = verification_status_label(outcome.session.status);
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "evilpot",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                verification_status = status_lbl,
+                                persona = %outcome.session.persona_hostname,
+                                trapped_reqs = outcome.session.total_trapped_requests,
+                                sqli_probes = outcome.session.sqli_probes,
+                                rce_cmds = outcome.session.rce_commands_executed.len(),
+                                iocs = ?outcome.session.captured_iocs,
+                                "waf diverted attack into evilpot honeypot"
+                            );
+                            if self
+                                .evilpot
+                                .should_emit_alert(client_ip, outcome.session.status)
+                            {
+                                match outcome.session.status {
+                                    ExploitVerificationStatus::VerifiedExploit => {
+                                        self.logger
+                                            .emit_alert(
+                                                "critical",
+                                                format!(
+                                                    "Evilpot VerifiedExploit ({}) from {} on {} [service={}, reqs={}, iocs={}]",
+                                                    finding.category,
+                                                    client_ip,
+                                                    host,
+                                                    rule.service_tag,
+                                                    outcome.session.total_trapped_requests,
+                                                    outcome.session.captured_iocs.len(),
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    ExploitVerificationStatus::MultiStepExploitation => {
+                                        self.logger
+                                            .emit_alert(
+                                                "warning",
+                                                format!(
+                                                    "Evilpot MultiStepExploitation ({}) from {} on {} [service={}, reqs={}, sqli_pos={}]",
+                                                    finding.category,
+                                                    client_ip,
+                                                    host,
+                                                    rule.service_tag,
+                                                    outcome.session.total_trapped_requests,
+                                                    outcome.session.sqli_distinct_positions,
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    ExploitVerificationStatus::Probing => {}
+                                }
+                            }
+                            let resp_status = outcome.response.status().as_u16();
+                            self.logger
+                                .record_session_with_fp(
+                                    "ingress",
+                                    &rule.service_tag,
+                                    &client_ip.to_string(),
+                                    resp_status,
+                                    start.elapsed().as_secs_f64() * 1000.0,
+                                    0,
+                                    0,
+                                    false,
+                                    true,
+                                    false,
+                                    Some(format!("evilpot:{status_lbl}:{}", finding.category)),
+                                    Some(client_fp.device_type.to_string()),
+                                    Some(client_fp.browser_family.to_string()),
+                                    Some(client_fp.os_family.to_string()),
+                                    false,
+                                )
+                                .await;
+                            self.logger
+                                .record_fingerprint(
+                                    &rule.service_tag,
+                                    &host,
+                                    &client_ip.to_string(),
+                                    &fallback_fp_hash,
+                                    false,
+                                    "none",
+                                    &ua_str,
+                                    &al_str,
+                                    client_fp.device_type,
+                                    client_fp.browser_family,
+                                    client_fp.os_family,
+                                    client_fp.is_bot,
+                                    false,
+                                    suspicion_score,
+                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                    None,
+                                    1,
+                                    1,
+                                    0,
+                                )
+                                .await;
+                            return into_proxy_response(outcome.response, Some(permit));
                         }
                     }
                 }
@@ -1844,25 +2127,31 @@ fn hex_nibble(b: u8) -> Option<u8> {
 async fn buffer_prefix_for_waf(
     req: Request<ProxyBody>,
     limit: usize,
-) -> (Request<ProxyBody>, Bytes) {
+) -> std::result::Result<(Request<ProxyBody>, Bytes), ()> {
     let (parts, mut body) = req.into_parts();
     let mut collected = Vec::new();
     let mut exceeded = false;
-    while let Some(frame_res) = body.frame().await {
-        match frame_res {
-            Ok(frame) => {
-                if let Some(data) = frame.data_ref() {
-                    collected.extend_from_slice(data);
-                    if collected.len() >= limit {
-                        exceeded = true;
-                        break;
+    let read_res = tokio::time::timeout(WAF_BODY_READ_TIMEOUT, async {
+        while let Some(frame_res) = body.frame().await {
+            match frame_res {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref() {
+                        collected.extend_from_slice(data);
+                        if collected.len() >= limit {
+                            exceeded = true;
+                            break;
+                        }
                     }
                 }
-            }
-            Err(_) => {
-                break;
+                Err(_) => {
+                    break;
+                }
             }
         }
+    })
+    .await;
+    if read_res.is_err() {
+        return Err(());
     }
     let inspected_len = collected.len().min(limit);
     let prefix = Bytes::from(collected);
@@ -1876,7 +2165,7 @@ async fn buffer_prefix_for_waf(
     } else {
         full_body(prefix)
     };
-    (Request::from_parts(parts, rebuilt_body), inspected)
+    Ok((Request::from_parts(parts, rebuilt_body), inspected))
 }
 
 fn build_waf_block_response(
@@ -2035,6 +2324,7 @@ mod tests {
             location: "query",
             confidence: 0.96,
             reasons: vec!["SQL boolean tautology"],
+            matched_payload: None,
         };
         let api_resp = build_waf_block_response(&finding, true, false, "raywaf1", None);
         assert_eq!(api_resp.status(), StatusCode::FORBIDDEN);
@@ -2082,9 +2372,177 @@ mod tests {
         let req = Request::builder().method("POST").uri("/submit").body(body).unwrap();
 
         // Limit smaller than total body -> inspects first 10 bytes, preserves entire 22 bytes on rebuilt req
-        let (rebuilt, inspected) = buffer_prefix_for_waf(req, 10).await;
+        let (rebuilt, inspected) = buffer_prefix_for_waf(req, 10).await.unwrap();
         assert_eq!(&inspected[..], b"hello-worl");
         let full = rebuilt.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&full[..], b"hello-world-1234567890");
+    }
+
+    #[tokio::test]
+    async fn live_ingress_waf_evilpot_diverts_verifies_canary_and_caps_cc_flood() {
+        use exposure_core::config::{
+            EgressConfig, GuardProfile, IngressRule, LoggerConfig, NodeRoles, RelayConfig,
+            RuleMatch, SegmentConfig, WafConfig,
+        };
+        use exposure_link::LinkManager;
+        use std::collections::BTreeMap;
+
+        let tmp_dir = std::env::temp_dir().join(format!("exp-ep-test-{}", Uuid::new_v4()));
+        let logger = NodeLogger::new(
+            "ing-ep",
+            LoggerConfig {
+                hmac_key: generate_random_secret_hex(32),
+                store_raw_ip: false,
+                sample_rate: 1.0,
+                hll_precision: 10,
+                segment: SegmentConfig {
+                    dir: tmp_dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let kp = NodeKeyPair::generate();
+        let lm = LinkManager::new("ing-ep", kp.clone(), false, vec![], Default::default());
+        let egress = crate::egress::EgressHandler::new(
+            "ing-ep",
+            EgressConfig::default(),
+            vec![],
+            Arc::clone(&logger),
+        );
+        let (fwd, _rx) = Forwarder::new(
+            "ing-ep",
+            NodeRoles {
+                ingress: true,
+                egress: false,
+                relay: false,
+                maintainer: false,
+            },
+            RelayConfig::default(),
+            lm,
+            egress,
+            Arc::clone(&logger),
+        );
+
+        let mut guards = BTreeMap::new();
+        guards.insert(
+            "ep-guard".to_string(),
+            GuardProfile {
+                waf: Some(WafConfig {
+                    mode: WafMode::Evilpot,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let cfg = IngressConfig {
+            rules: vec![IngressRule {
+                name: Some("main".into()),
+                r#match: RuleMatch {
+                    host: Some("victim.test".into()),
+                    ..Default::default()
+                },
+                service_tag: "svc-web".into(),
+                next_peer: "missing-peer".into(),
+                guard: Some("ep-guard".into()),
+                intercept_errors: Some(false),
+                js_fp_beacon: Some(false),
+                cache: None,
+            }],
+            guards,
+            server_header: "exposure-custom-sentinel".into(),
+            ..Default::default()
+        };
+
+        let server = IngressServer::new(
+            "ing-ep",
+            kp,
+            cfg.clone(),
+            8,
+            fwd,
+            DynamicCertResolver::new(),
+            Arc::clone(&logger),
+        );
+        let bound = server
+            .start_listener(IngressListener {
+                listen_addr: "127.0.0.1:0".into(),
+                tls: false,
+                redirect_https: false,
+            })
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{bound}");
+
+        // 1. Attack triggers WAF -> diverted to Evilpot (stealthy, no X-Exposure-Waf, persona Server preserved)
+        let r1 = client
+            .get(format!("{base}/download?file=../../../../.env"))
+            .header("Host", "victim.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), 200);
+        assert!(r1.headers().get("x-exposure-waf").is_none());
+        assert_ne!(
+            r1.headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "exposure-custom-sentinel",
+            "evilpot persona Server header must not be clobbered"
+        );
+        let env_body = r1.text().await.unwrap();
+        let canary_key = env_body
+            .lines()
+            .find_map(|l| l.strip_prefix("ADMIN_BYPASS_TOKEN="))
+            .expect("decoy .env must embed canary token")
+            .trim()
+            .to_string();
+        assert!(canary_key.starts_with("epk_"));
+
+        // 2. Follow-up benign-looking request replaying stolen canary token -> caught & VerifiedExploit!
+        let r2 = client
+            .get(format!("{base}/api/v1/users"))
+            .header("Host", "victim.test")
+            .header("Authorization", format!("Bearer {canary_key}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), 200);
+
+        let report = server.evilpot_report().await.expect("evilpot report active");
+        assert_eq!(report.canary_verifications, 1);
+        assert_eq!(report.verified_attack_sessions, 1);
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].status, "verified_exploit");
+
+        let alerts = logger.recent_alerts().await;
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.severity == "critical" && a.message.contains("VerifiedExploit")),
+            "expected critical alert for VerifiedExploit, got: {alerts:?}"
+        );
+
+        // 3. CC flood (>45 requests/min from same IP) degrades cleanly to fast 403
+        let mut saw_403 = false;
+        for i in 0..50 {
+            let r = client
+                .get(format!("{base}/search?q=admin'+OR+'1'='1'+--&i={i}"))
+                .header("Host", "victim.test")
+                .send()
+                .await
+                .unwrap();
+            if r.status() == 403 {
+                saw_403 = true;
+                break;
+            }
+        }
+        assert!(saw_403, "CC flood against evilpot must degrade to fast 403");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

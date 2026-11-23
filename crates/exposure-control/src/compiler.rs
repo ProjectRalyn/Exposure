@@ -3,11 +3,11 @@ use std::net::IpAddr;
 
 use exposure_core::config::{
     resolve_domain_binding, CertOrderConfig, CustomPagesConfig, DomainLineRecordType,
-    EgressConfig, EgressDefaults, EgressServiceConfig, GuardDefaults, GuardProfile, IngressConfig,
-    IngressDefaults, IngressRule, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
-    NodeCacheConfig, NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule,
-    RuleMatch, ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer,
-    TrustedOrigin, TunnelDirection,
+    EgressConfig, EgressDefaults, EgressServiceConfig, EvilpotNodeConfig, GuardDefaults,
+    GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
+    LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig, PeerConfig,
+    ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode,
+    ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection,
 };
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::routing::canonical_ip;
@@ -213,6 +213,9 @@ fn resolve_ingress_config(
     inherit_opt_page(&mut out.pages.challenge_css, &page_defs.challenge_css);
     if out.cache == NodeCacheConfig::default() {
         out.cache = ingress_defs.cache.clone();
+    }
+    if out.evilpot == EvilpotNodeConfig::default() {
+        out.evilpot = ingress_defs.evilpot.clone();
     }
     out
 }

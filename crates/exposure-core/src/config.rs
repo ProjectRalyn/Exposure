@@ -304,6 +304,71 @@ pub enum WafMode {
     Monitor,
     /// Block matched attack payloads with HTTP 403 Forbidden.
     Block,
+    /// Divert matched attacks into the embedded `evilpot` honeypot, tarpit & exploit behavior analysis engine.
+    Evilpot,
+}
+
+fn default_evilpot_rotation_secs() -> u64 {
+    300
+}
+fn default_evilpot_persona_slots() -> usize {
+    16
+}
+fn default_evilpot_max_tarpit_conns() -> usize {
+    256
+}
+fn default_evilpot_drip_bps() -> usize {
+    256
+}
+fn default_evilpot_sqli_delay_ms() -> u64 {
+    2500
+}
+fn default_evilpot_canary_url() -> String {
+    "https://canary.internal.example.com/t".to_string()
+}
+fn default_evilpot_max_sessions() -> usize {
+    2048
+}
+
+/// Node-level configuration for the embedded `evilpot` deception, tarpit & exploit verification engine.
+/// Instantiated lazily only when at least one Ingress GuardProfile selects `waf.mode = evilpot`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvilpotNodeConfig {
+    /// Persona snapshot rotation interval in seconds (default 300).
+    #[serde(default = "default_evilpot_rotation_secs")]
+    pub rotation_interval_secs: u64,
+    /// Number of distinct pre-baked server personas per rotation epoch (default 16).
+    #[serde(default = "default_evilpot_persona_slots")]
+    pub persona_slots: usize,
+    /// Maximum concurrent slow-drip tarpit streams per Ingress node (default 256).
+    #[serde(default = "default_evilpot_max_tarpit_conns")]
+    pub max_tarpit_connections: usize,
+    /// Drip speed in bytes/sec for fake archive tarpit streams (default 256).
+    #[serde(default = "default_evilpot_drip_bps")]
+    pub tarpit_drip_bytes_per_sec: usize,
+    /// Default delay in ms for time-blind SQL injection traps (default 2500).
+    #[serde(default = "default_evilpot_sqli_delay_ms")]
+    pub sqli_time_delay_ms: u64,
+    /// Canary webhook base URL embedded into fake `.env`, Git configs, and debug leaks.
+    #[serde(default = "default_evilpot_canary_url")]
+    pub canary_webhook_url: String,
+    /// Maximum attacker verification sessions retained in RAM (LRU-bounded, default 2048).
+    #[serde(default = "default_evilpot_max_sessions")]
+    pub max_tracked_sessions: usize,
+}
+
+impl Default for EvilpotNodeConfig {
+    fn default() -> Self {
+        Self {
+            rotation_interval_secs: default_evilpot_rotation_secs(),
+            persona_slots: default_evilpot_persona_slots(),
+            max_tarpit_connections: default_evilpot_max_tarpit_conns(),
+            tarpit_drip_bytes_per_sec: default_evilpot_drip_bps(),
+            sqli_time_delay_ms: default_evilpot_sqli_delay_ms(),
+            canary_webhook_url: default_evilpot_canary_url(),
+            max_tracked_sessions: default_evilpot_max_sessions(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -618,6 +683,9 @@ pub struct IngressConfig {
     /// Node-level HTTP edge cache defaults & memory limits.
     #[serde(default)]
     pub cache: NodeCacheConfig,
+    /// Node-level embedded `evilpot` honeypot engine settings (used when a Guard enables `waf.mode = evilpot`).
+    #[serde(default)]
+    pub evilpot: EvilpotNodeConfig,
 }
 
 impl IngressConfig {
@@ -644,6 +712,7 @@ impl Default for IngressConfig {
             js_fp_ttl_secs: None,
             pages: CustomPagesConfig::default(),
             cache: NodeCacheConfig::default(),
+            evilpot: EvilpotNodeConfig::default(),
         }
     }
 }
@@ -1265,6 +1334,8 @@ pub struct IngressDefaults {
     pub js_fp_ttl_secs: u64,
     #[serde(default)]
     pub cache: NodeCacheConfig,
+    #[serde(default)]
+    pub evilpot: EvilpotNodeConfig,
 }
 
 impl Default for IngressDefaults {
@@ -1278,6 +1349,7 @@ impl Default for IngressDefaults {
             js_fp_beacon: true,
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
             cache: NodeCacheConfig::default(),
+            evilpot: EvilpotNodeConfig::default(),
         }
     }
 }

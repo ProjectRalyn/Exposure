@@ -465,6 +465,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             js_fp_ttl_secs: Some(3600),
             pages: Default::default(),
             cache: Default::default(),
+            evilpot: Default::default(),
         },
         egress: EgressConfig {
             services: local_services,

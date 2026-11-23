@@ -504,6 +504,7 @@ impl NodeRuntime {
                     let links = self.link_manager.link_snapshots().await;
                     let (ok, err) = self.last_reload_status.read().await.clone();
                     let alerts = self.logger.recent_alerts().await;
+                    let evilpot = self.ingress.evilpot_report().await;
                     Some(SpecialPayload::StatusResp(NodeStatusSnapshot {
                         node_tag: cfg.node_tag,
                         roles: cfg.roles,
@@ -513,6 +514,7 @@ impl NodeRuntime {
                         uptime_secs: self.started_at.elapsed().as_secs(),
                         links,
                         alerts,
+                        evilpot,
                     }))
                 }
             }

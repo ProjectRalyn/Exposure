@@ -51,10 +51,39 @@ export function defaultWafConfig() {
   };
 }
 
+export function defaultEvilpotConfig() {
+  return {
+    rotation_interval_secs: 300,
+    persona_slots: 16,
+    max_tarpit_connections: 256,
+    tarpit_drip_bytes_per_sec: 256,
+    sqli_time_delay_ms: 2500,
+    canary_webhook_url: "https://canary.internal.example.com/t",
+    max_tracked_sessions: 2048,
+  };
+}
+
+export function normalizeEvilpotConfig(raw) {
+  const b = defaultEvilpotConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  return {
+    rotation_interval_secs: Math.max(60, Number(s.rotation_interval_secs ?? b.rotation_interval_secs) || b.rotation_interval_secs),
+    persona_slots: Math.min(32, Math.max(1, Number(s.persona_slots ?? b.persona_slots) || b.persona_slots)),
+    max_tarpit_connections: Math.min(256, Math.max(1, Number(s.max_tarpit_connections ?? b.max_tarpit_connections) || b.max_tarpit_connections)),
+    tarpit_drip_bytes_per_sec: Math.min(16384, Math.max(16, Number(s.tarpit_drip_bytes_per_sec ?? b.tarpit_drip_bytes_per_sec) || b.tarpit_drip_bytes_per_sec)),
+    sqli_time_delay_ms: Math.min(5000, Math.max(100, Number(s.sqli_time_delay_ms ?? b.sqli_time_delay_ms) || b.sqli_time_delay_ms)),
+    canary_webhook_url: String(s.canary_webhook_url ?? b.canary_webhook_url).trim().slice(0, 256) || b.canary_webhook_url,
+    max_tracked_sessions: Math.min(4096, Math.max(16, Number(s.max_tracked_sessions ?? b.max_tracked_sessions) || b.max_tracked_sessions)),
+  };
+}
+
 export function normalizeWafConfig(raw) {
   const b = defaultWafConfig();
   const s = raw && typeof raw === "object" ? raw : {};
-  const mode = s.mode === "block" || s.mode === "monitor" || s.mode === "off" ? s.mode : b.mode;
+  const mode =
+    s.mode === "block" || s.mode === "monitor" || s.mode === "evilpot" || s.mode === "off"
+      ? s.mode
+      : b.mode;
   const conf = Number(s.min_confidence ?? b.min_confidence);
   return {
     mode,
@@ -135,6 +164,7 @@ export function defaultTopologyDefaults() {
       js_fp_beacon: true,
       js_fp_ttl_secs: 3600,
       cache: defaultNodeCacheConfig(),
+      evilpot: defaultEvilpotConfig(),
     },
     guard: {
       antibot: "challenge",
@@ -466,6 +496,7 @@ export function normalizeDefaults(raw) {
       js_fp_beacon: Boolean(src.ingress?.js_fp_beacon ?? base.ingress.js_fp_beacon),
       js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
       cache: normalizeNodeCacheConfig(src.ingress?.cache),
+      evilpot: normalizeEvilpotConfig(src.ingress?.evilpot),
     },
     guard: {
       ...base.guard,

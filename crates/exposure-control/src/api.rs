@@ -104,6 +104,7 @@ pub fn build_router(state: ApiState) -> Router {
         )
         .route("/api/telemetry", get(get_telemetry))
         .route("/api/telemetry/pull", post(pull_telemetry))
+        .route("/api/evilpot", get(get_evilpot))
         .route("/api/fingerprints", get(list_fingerprints))
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
@@ -1651,6 +1652,118 @@ struct TelemetryQuery {
     service: Option<String>,
     #[serde(default)]
     window_secs: Option<i64>,
+}
+
+fn evilpot_status_rank(s: &str) -> u8 {
+    match s {
+        "verified_exploit" => 3,
+        "multi_step_exploitation" => 2,
+        "probing" => 1,
+        _ => 0,
+    }
+}
+
+async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let tel = state.client.cached_telemetry().await;
+    let mut requests_handled = 0u64;
+    let mut traps_triggered = 0u64;
+    let mut canary_verifications = 0u64;
+    let mut verified_attack_sessions = 0u64;
+    let mut tarpit_bytes_dripped = 0u64;
+    let mut active_tarpit_connections = 0usize;
+
+    let mut nodes = Vec::new();
+    let mut sessions: Vec<serde_json::Value> = Vec::new();
+    let mut recent_events: Vec<serde_json::Value> = Vec::new();
+
+    for rep in &tel.evilpot_reports {
+        requests_handled = requests_handled.saturating_add(rep.requests_handled);
+        traps_triggered = traps_triggered.saturating_add(rep.traps_triggered);
+        canary_verifications = canary_verifications.saturating_add(rep.canary_verifications);
+        verified_attack_sessions =
+            verified_attack_sessions.saturating_add(rep.verified_attack_sessions);
+        tarpit_bytes_dripped = tarpit_bytes_dripped.saturating_add(rep.tarpit_bytes_dripped);
+        active_tarpit_connections =
+            active_tarpit_connections.saturating_add(rep.active_tarpit_connections);
+
+        nodes.push(serde_json::json!({
+            "node_tag": rep.node_tag,
+            "current_epoch": rep.current_epoch,
+            "rotations_completed": rep.rotations_completed,
+            "requests_handled": rep.requests_handled,
+            "traps_triggered": rep.traps_triggered,
+            "canary_verifications": rep.canary_verifications,
+            "verified_attack_sessions": rep.verified_attack_sessions,
+            "tarpit_bytes_dripped": rep.tarpit_bytes_dripped,
+            "active_tarpit_connections": rep.active_tarpit_connections,
+            "tracked_sessions": rep.sessions.len(),
+        }));
+
+        for s in &rep.sessions {
+            let mut val = serde_json::to_value(s).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
+            }
+            sessions.push(val);
+        }
+
+        for ev in &rep.recent_events {
+            let mut val = serde_json::to_value(ev).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
+            }
+            recent_events.push(val);
+        }
+    }
+
+    sessions.sort_by(|a, b| {
+        let ra = evilpot_status_rank(a.get("status").and_then(|v| v.as_str()).unwrap_or(""));
+        let rb = evilpot_status_rank(b.get("status").and_then(|v| v.as_str()).unwrap_or(""));
+        let ta = a.get("last_seen_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("last_seen_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+        rb.cmp(&ra).then_with(|| tb.cmp(&ta))
+    });
+    sessions.truncate(200);
+
+    recent_events.sort_by(|a, b| {
+        let ta = a
+            .get("timestamp_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let tb = b
+            .get("timestamp_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    recent_events.truncate(200);
+
+    Json(serde_json::json!({
+        "last_pulled_at": tel.last_pulled_at,
+        "summary": {
+            "active_nodes": nodes.len(),
+            "requests_handled": requests_handled,
+            "traps_triggered": traps_triggered,
+            "canary_verifications": canary_verifications,
+            "verified_attack_sessions": verified_attack_sessions,
+            "tracked_sessions": sessions.len(),
+            "tarpit_bytes_dripped": tarpit_bytes_dripped,
+            "active_tarpit_connections": active_tarpit_connections,
+        },
+        "nodes": nodes,
+        "sessions": sessions,
+        "recent_events": recent_events,
+    }))
+    .into_response()
 }
 
 async fn get_telemetry(

@@ -5,8 +5,8 @@ use crate::config::{NodeRoles, SignedConfigBundle};
 use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
 use crate::telemetry::{
-    AlertRecord, CertStatusInfo, FingerprintObservation, LinkStatusSnapshot, MinuteSummary,
-    SessionSummary,
+    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
+    MinuteSummary, SessionSummary,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -298,6 +298,8 @@ pub struct NodeStatusSnapshot {
     pub links: Vec<LinkStatusSnapshot>,
     #[serde(default)]
     pub alerts: Vec<AlertRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evilpot: Option<EvilpotNodeReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

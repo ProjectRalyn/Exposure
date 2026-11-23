@@ -1,7 +1,12 @@
 // System View — Cluster Defaults, Config Versions & Rollback, Audit Log, Raw YAML Source
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
-import { defaultNodeCacheConfig, defaultTopologyDefaults, defaultWafConfig } from "../store.js";
+import {
+  defaultEvilpotConfig,
+  defaultNodeCacheConfig,
+  defaultTopologyDefaults,
+  defaultWafConfig,
+} from "../store.js";
 import {
   el,
   esc,
@@ -56,7 +61,9 @@ export function createSystemView({ api, store }) {
     const defs = store.spec.defaults || defaultTopologyDefaults();
     const ig = defs.ingress;
     if (!ig.cache) ig.cache = defaultNodeCacheConfig();
+    if (!ig.evilpot) ig.evilpot = defaultEvilpotConfig();
     const ca = ig.cache;
+    const ep = ig.evilpot;
     const gd = defs.guard;
     if (!gd.waf) gd.waf = defaultWafConfig();
     const dwaf = gd.waf;
@@ -137,6 +144,7 @@ export function createSystemView({ api, store }) {
                   <option value="off" ${dwaf.mode === "off" ? "selected" : ""}>${esc(t("waf.mode.off"))}</option>
                   <option value="monitor" ${dwaf.mode === "monitor" ? "selected" : ""}>${esc(t("waf.mode.monitor"))}</option>
                   <option value="block" ${dwaf.mode === "block" ? "selected" : ""}>${esc(t("waf.mode.block"))}</option>
+                  <option value="evilpot" ${dwaf.mode === "evilpot" ? "selected" : ""}>${esc(t("waf.mode.evilpot"))}</option>
                 </select>
               </label>
               <label><span>${esc(t("waf.min_conf"))}</span><input id="sd-waf-conf" type="number" step="0.05" min="0.1" max="1" value="${dwaf.min_confidence ?? 0.65}" /></label>
@@ -200,6 +208,23 @@ export function createSystemView({ api, store }) {
             <input id="sd-ca-ck" value="${esc((ca.bypass_cookie_prefixes || []).join(", "))}" placeholder="session=, auth_" />
           </label>
         </div>
+
+        <div class="panel" style="margin-bottom:0;">
+          <div class="panel-header"><h3>${esc(t("ep.defaults.title"))}</h3></div>
+          <div class="inspector-row">
+            <label><span>${esc(t("ep.defaults.rotation"))}</span><input id="sd-ep-rot" type="number" min="60" value="${ep.rotation_interval_secs ?? 300}" /></label>
+            <label><span>${esc(t("ep.defaults.slots"))}</span><input id="sd-ep-slots" type="number" min="1" max="32" value="${ep.persona_slots ?? 16}" /></label>
+            <label><span>${esc(t("ep.defaults.tarpit_conns"))}</span><input id="sd-ep-tconns" type="number" min="1" max="256" value="${ep.max_tarpit_connections ?? 256}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("ep.defaults.drip_bps"))}</span><input id="sd-ep-drip" type="number" min="16" max="16384" value="${ep.tarpit_drip_bytes_per_sec ?? 256}" /></label>
+            <label><span>${esc(t("ep.defaults.sqli_delay"))}</span><input id="sd-ep-sqli" type="number" min="100" max="5000" value="${ep.sqli_time_delay_ms ?? 2500}" /></label>
+            <label><span>${esc(t("ep.defaults.max_sessions"))}</span><input id="sd-ep-maxs" type="number" min="16" max="4096" value="${ep.max_tracked_sessions ?? 2048}" /></label>
+          </div>
+          <label style="margin-top:8px;"><span>${esc(t("ep.defaults.canary_url"))}</span>
+            <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
+          </label>
+        </div>
       </div>
     `;
 
@@ -255,6 +280,18 @@ export function createSystemView({ api, store }) {
     el("sd-ca-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).default_ttl_secs = parseNum(ev.target.value, 60, 0); }, false));
     el("sd-ca-stale")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).stale_if_error_secs = parseNum(ev.target.value, 300, 0); }, false));
     el("sd-ca-ck")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).bypass_cookie_prefixes = ev.target.value.split(",").map((x) => x.trim()).filter(Boolean); }, false));
+
+    const ensureEp = (s) => {
+      if (!s.defaults.ingress.evilpot) s.defaults.ingress.evilpot = defaultEvilpotConfig();
+      return s.defaults.ingress.evilpot;
+    };
+    el("sd-ep-rot")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).rotation_interval_secs = parseNum(ev.target.value, 300, 60); }, false));
+    el("sd-ep-slots")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).persona_slots = parseNum(ev.target.value, 16, 1, 32); }, false));
+    el("sd-ep-tconns")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tarpit_connections = parseNum(ev.target.value, 256, 1, 256); }, false));
+    el("sd-ep-drip")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).tarpit_drip_bytes_per_sec = parseNum(ev.target.value, 256, 16, 16384); }, false));
+    el("sd-ep-sqli")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).sqli_time_delay_ms = parseNum(ev.target.value, 2500, 100, 5000); }, false));
+    el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
+    el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
   }
 
   async function loadVersions() {

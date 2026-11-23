@@ -3,6 +3,7 @@ pub mod cache;
 pub mod egress;
 pub mod forwarder;
 pub mod guard;
+pub mod honeypot;
 pub mod ingress;
 pub mod logger;
 pub mod maintainer;

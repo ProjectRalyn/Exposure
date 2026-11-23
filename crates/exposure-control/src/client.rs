@@ -21,7 +21,8 @@ use exposure_core::protocol::{
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
-    AlertRecord, CertStatusInfo, FingerprintObservation, LinkStatusSnapshot, MinuteSummary,
+    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
+    MinuteSummary,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -55,6 +56,7 @@ pub struct CachedTelemetry {
     pub alerts: Vec<AlertRecord>,
     pub maintainers: Vec<MaintainerHealthInfo>,
     pub node_uptimes: HashMap<String, u64>,
+    pub evilpot_reports: Vec<EvilpotNodeReport>,
     pub last_pulled_at: Option<String>,
 }
 
@@ -1004,11 +1006,15 @@ impl ControlClient {
                     uptime_secs,
                     links,
                     alerts,
+                    evilpot,
                     ..
                 } = snap;
                 cache.node_uptimes.insert(node_tag, uptime_secs);
                 cache.links.extend(links);
                 cache.alerts.extend(alerts);
+                if let Some(ep) = evilpot {
+                    cache.evilpot_reports.push(ep);
+                }
                 pulled += 1;
 
                 if let Some(MaintainerTelemetrySnapshot {

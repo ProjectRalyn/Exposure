@@ -10,6 +10,10 @@ pub const WAF_HARD_MAX_BODY_BYTES: usize = 256 * 1024;
 /// while still catching NOP sleds, format strings, repeated padding, and oversized floods).
 const HEAD_OVERFLOW_WARN_LEN: usize = 4096;
 const HEAD_OVERFLOW_CRIT_LEN: usize = 8192;
+/// Iteration caps preventing CPU-amplification DoS via thousands of tiny query/cookie/form items.
+const MAX_WAF_QUERY_PARAMS: usize = 128;
+const MAX_WAF_COOKIE_ITEMS: usize = 64;
+const MAX_WAF_FORM_PARAMS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct WafFinding {
@@ -17,6 +21,8 @@ pub struct WafFinding {
     pub location: &'static str,
     pub confidence: f32,
     pub reasons: Vec<&'static str>,
+    /// Bounded snippet (<= 512 chars) of the matched input, used by `evilpot` deception/analysis.
+    pub matched_payload: Option<String>,
 }
 
 impl WafFinding {
@@ -30,11 +36,16 @@ pub enum WafVerdict {
     Allow,
     Monitor(WafFinding),
     Block(WafFinding),
+    Evilpot(WafFinding),
 }
 
 impl WafVerdict {
     pub fn is_block(&self) -> bool {
         matches!(self, WafVerdict::Block(_))
+    }
+
+    pub fn is_evilpot(&self) -> bool {
+        matches!(self, WafVerdict::Evilpot(_))
     }
 }
 
@@ -162,10 +173,13 @@ fn is_text_inspectable_content_type(ct: &str) -> bool {
         || media == "application/ecmascript"
 }
 
+const MAX_CAPTURED_PAYLOAD_CHARS: usize = 512;
+
 #[inline]
 fn verdict_from_result(
     mode: WafMode,
     location: &'static str,
+    sample: &str,
     res: DetectionResult,
 ) -> Option<WafVerdict> {
     let cat = res.violation?;
@@ -174,16 +188,23 @@ fn verdict_from_result(
         .first()
         .map(|v| v.reasons.clone())
         .unwrap_or_default();
+    let matched_payload = if sample.is_empty() {
+        None
+    } else {
+        Some(sample.chars().take(MAX_CAPTURED_PAYLOAD_CHARS).collect())
+    };
     let finding = WafFinding {
         category: sigil_category_label(cat),
         location,
         confidence: res.confidence,
         reasons,
+        matched_payload,
     };
     Some(match mode {
         WafMode::Off => WafVerdict::Allow,
         WafMode::Monitor => WafVerdict::Monitor(finding),
         WafMode::Block => WafVerdict::Block(finding),
+        WafMode::Evilpot => WafVerdict::Evilpot(finding),
     })
 }
 
@@ -216,14 +237,14 @@ pub fn inspect_request_head(
     // 1. URI path
     if !path.is_empty() && path != "/" {
         let res = detector.detect(ScanInput::new(path).with_mask(mask));
-        if let Some(v) = verdict_from_result(cfg.mode, "path", res) {
+        if let Some(v) = verdict_from_result(cfg.mode, "path", path, res) {
             return v;
         }
     }
 
-    // 2. Query string (scan individual key/value pairs + raw query)
+    // 2. Query string (scan bounded individual key/value pairs + raw query)
     if let Some(q) = query.filter(|q| !q.is_empty()) {
-        for pair in q.split('&') {
+        for pair in q.split('&').take(MAX_WAF_QUERY_PARAMS) {
             if pair.is_empty() {
                 continue;
             }
@@ -233,27 +254,27 @@ pub fn inspect_request_head(
             };
             let k_norm = replace_plus_with_space(k);
             let res = detector.detect(ScanInput::new(k_norm.as_ref()).with_mask(mask));
-            if let Some(verdict) = verdict_from_result(cfg.mode, "query", res) {
+            if let Some(verdict) = verdict_from_result(cfg.mode, "query", k_norm.as_ref(), res) {
                 return verdict;
             }
             if let Some(v) = v_opt.filter(|v| !v.is_empty()) {
                 let v_norm = replace_plus_with_space(v);
                 let res = detector.detect(ScanInput::new(v_norm.as_ref()).with_mask(mask));
-                if let Some(verdict) = verdict_from_result(cfg.mode, "query", res) {
+                if let Some(verdict) = verdict_from_result(cfg.mode, "query", v_norm.as_ref(), res) {
                     return verdict;
                 }
             }
             // Also scan the full `key=value` pair (catches MongoDB `user[$ne]=admin`, etc.)
             let pair_norm = replace_plus_with_space(pair);
             let res = detector.detect(ScanInput::new(pair_norm.as_ref()).with_mask(mask));
-            if let Some(verdict) = verdict_from_result(cfg.mode, "query", res) {
+            if let Some(verdict) = verdict_from_result(cfg.mode, "query", pair_norm.as_ref(), res) {
                 return verdict;
             }
         }
         // Catch cross-param/oversized query payloads
         let q_norm = replace_plus_with_space(q);
         let res = detector.detect(ScanInput::new(q_norm.as_ref()).with_mask(mask));
-        if let Some(verdict) = verdict_from_result(cfg.mode, "query", res) {
+        if let Some(verdict) = verdict_from_result(cfg.mode, "query", q_norm.as_ref(), res) {
             return verdict;
         }
     }
@@ -265,7 +286,7 @@ pub fn inspect_request_head(
         for hv in headers.get_all(header::USER_AGENT) {
             if let Ok(s) = hv.to_str() {
                 let res = detector.detect(ScanInput::new(s).with_mask(ua_mask));
-                if let Some(v) = verdict_from_result(cfg.mode, "header:user-agent", res) {
+                if let Some(v) = verdict_from_result(cfg.mode, "header:user-agent", s, res) {
                     return v;
                 }
             }
@@ -276,16 +297,16 @@ pub fn inspect_request_head(
         for hv in headers.get_all(header::REFERER) {
             if let Ok(s) = hv.to_str() {
                 let res = detector.detect(ScanInput::new(s).with_mask(referer_mask));
-                if let Some(v) = verdict_from_result(cfg.mode, "header:referer", res) {
+                if let Some(v) = verdict_from_result(cfg.mode, "header:referer", s, res) {
                     return v;
                 }
             }
         }
 
-        // Cookie: split on `;` so standard `a=1; id=2` cookie delimiters don't look like shell `; id` chains
+        // Cookie: split on `;` (capped) so standard `a=1; id=2` cookie delimiters don't look like shell `; id` chains
         for hv in headers.get_all(header::COOKIE) {
             if let Ok(raw_cookie) = hv.to_str() {
-                for item in raw_cookie.split(';') {
+                for item in raw_cookie.split(';').take(MAX_WAF_COOKIE_ITEMS) {
                     let trimmed = item.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -298,7 +319,7 @@ pub fn inspect_request_head(
                         continue;
                     }
                     let res = detector.detect(ScanInput::new(val).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, "header:cookie", res) {
+                    if let Some(v) = verdict_from_result(cfg.mode, "header:cookie", val, res) {
                         return v;
                     }
                 }
@@ -316,7 +337,7 @@ pub fn inspect_request_head(
             for hv in headers.get_all(h_name) {
                 if let Ok(s) = hv.to_str() {
                     let res = detector.detect(ScanInput::new(s).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, loc, res) {
+                    if let Some(v) = verdict_from_result(cfg.mode, loc, s, res) {
                         return v;
                     }
                 }
@@ -379,20 +400,20 @@ pub fn inspect_request_body(
         .unwrap_or(false);
 
     if is_form {
-        for pair in text.split('&') {
+        for pair in text.split('&').take(MAX_WAF_FORM_PARAMS) {
             if pair.is_empty() {
                 continue;
             }
             let pair_norm = replace_plus_with_space(pair);
             let res = detector.detect(ScanInput::new(pair_norm.as_ref()).with_mask(mask));
-            if let Some(v) = verdict_from_result(cfg.mode, "body", res) {
+            if let Some(v) = verdict_from_result(cfg.mode, "body", pair_norm.as_ref(), res) {
                 return v;
             }
             if let Some((_, val)) = pair.split_once('=') {
                 if !val.is_empty() {
                     let val_norm = replace_plus_with_space(val);
                     let res = detector.detect(ScanInput::new(val_norm.as_ref()).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, "body", res) {
+                    if let Some(v) = verdict_from_result(cfg.mode, "body", val_norm.as_ref(), res) {
                         return v;
                     }
                 }
@@ -402,7 +423,7 @@ pub fn inspect_request_body(
     }
 
     let res = detector.detect(ScanInput::new(text).with_mask(mask));
-    verdict_from_result(cfg.mode, "body", res).unwrap_or(WafVerdict::Allow)
+    verdict_from_result(cfg.mode, "body", text, res).unwrap_or(WafVerdict::Allow)
 }
 
 #[cfg(test)]

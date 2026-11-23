@@ -713,6 +713,64 @@ pub struct AlertRecord {
     pub message: String,
 }
 
+/// Attacker deception & exploit-verification session report collected by `evilpot` on an Ingress node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvilpotSessionInfo {
+    pub client_ip: String,
+    pub epoch_id: u64,
+    pub persona_hostname: String,
+    pub first_seen_unix: u64,
+    pub last_seen_unix: u64,
+    pub total_trapped_requests: u64,
+    /// `"probing"` | `"multi_step_exploitation"` | `"verified_exploit"`
+    pub status: String,
+    pub canary_triggers: u32,
+    pub sqli_probes: u32,
+    pub sqli_distinct_positions: usize,
+    #[serde(default)]
+    pub rce_commands_executed: Vec<String>,
+    #[serde(default)]
+    pub captured_iocs: Vec<String>,
+    #[serde(default)]
+    pub distinct_paths: Vec<String>,
+    pub tarpit_bytes_consumed: u64,
+    pub tarpit_max_duration_ms: u64,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+/// Individual deception / exploit-verification threat event recorded by `evilpot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvilpotEventInfo {
+    pub timestamp_unix: u64,
+    pub epoch_id: u64,
+    pub persona_hostname: String,
+    pub client_ip: String,
+    pub verification_status: String,
+    pub trap_kind: String,
+    pub detail: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+/// Per-node `evilpot` honeypot metrics, tracked attacker sessions, and recent deception events.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvilpotNodeReport {
+    pub node_tag: String,
+    pub current_epoch: u64,
+    pub rotations_completed: u64,
+    pub requests_handled: u64,
+    pub traps_triggered: u64,
+    pub canary_verifications: u64,
+    pub verified_attack_sessions: u64,
+    pub tarpit_bytes_dripped: u64,
+    pub active_tarpit_connections: usize,
+    #[serde(default)]
+    pub sessions: Vec<EvilpotSessionInfo>,
+    #[serde(default)]
+    pub recent_events: Vec<EvilpotEventInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
