@@ -186,13 +186,38 @@ impl EvilpotManager {
         cfg: &EvilpotNodeConfig,
         server_header: &str,
     ) -> Arc<EvilpotEngine> {
-        if let Some(eng) = self.engine().await {
-            return eng;
+        // Fast path: clone the engine under a read lock.
+        {
+            let guard = self.active.read().await;
+            if let Some(active) = guard.as_ref() {
+                return Arc::clone(&active.engine);
+            }
         }
-        self.reconfigure(cfg, server_header, true).await;
-        self.engine()
-            .await
-            .expect("evilpot engine initialized after reconfigure(true)")
+        // Initialize while holding the write lock so a concurrent `reconfigure(enabled=false)`
+        // cannot slip in between initialization and the read. Previously the two separate lock
+        // acquisitions allowed `engine()` to observe `None` and panic on the request path.
+        let mut guard = self.active.write().await;
+        if let Some(active) = guard.as_ref() {
+            return Arc::clone(&active.engine);
+        }
+        let ep_cfg = to_evilpot_config(cfg, server_header);
+        let engine = EvilpotEngine::new(ep_cfg);
+        let rotation_task = engine.spawn_rotation_task();
+        info!(
+            node = %self.node_tag,
+            rotation_secs = cfg.rotation_interval_secs,
+            persona_slots = cfg.persona_slots,
+            max_tarpit_conns = cfg.max_tarpit_connections,
+            "initialized embedded evilpot honeypot engine"
+        );
+        let engine_arc = Arc::clone(&engine);
+        *guard = Some(ActiveEvilpot {
+            cfg: cfg.clone(),
+            server_header: server_header.to_string(),
+            engine,
+            rotation_task,
+        });
+        engine_arc
     }
 
     /// Fast O(1) check used to skip canary scanning on benign traffic before any trap has fired.

@@ -443,20 +443,19 @@ struct LoginReq {
 }
 
 async fn login(State(state): State<ApiState>, Json(req): Json<LoginReq>) -> Response {
-    // Global brute-force throttle for admin login
+    // Brute-force throttle for admin login.
+    //
+    // SECURITY: credentials are ALWAYS verified before the lockout is enforced. Rejecting early
+    // while locked would let any unauthenticated client permanently lock out the only admin
+    // account (trivial DoS). Wrong credentials are still throttled with 429 while locked, but a
+    // correct login always succeeds.
     let now = Instant::now();
-    {
-        if let Some(st) = state.login_limiter.get("global") {
-            if let Some(until) = st.locked_until {
-                if now < until {
-                    return json_err(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "too many failed login attempts; please try again shortly",
-                    );
-                }
-            }
-        }
-    }
+    let locked = state
+        .login_limiter
+        .get("global")
+        .and_then(|st| st.locked_until)
+        .map(|until| now < until)
+        .unwrap_or(false);
 
     let user_ok = ct_eq_hashed(req.username.as_bytes(), state.cfg.admin.username.as_bytes());
     let pass_ok = verify_password(&req.password, &state.cfg.admin.password_hash);
@@ -481,6 +480,12 @@ async fn login(State(state): State<ApiState>, Json(req): Json<LoginReq>) -> Resp
                 .db()
                 .append_audit(&safe_user, "login", "control", false, "bad credentials")
                 .await;
+        }
+        if locked {
+            return json_err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed login attempts; please try again shortly",
+            );
         }
         return json_err(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
@@ -1378,6 +1383,10 @@ async fn register_passphrase(
                 )
                 .await
             {
+                // The enroll helper can fail before it reaches its own revoke paths (e.g. no
+                // connected bootstrap node, or the RPC send fails). Revoke here so the
+                // one-time passphrase can never remain usable after we report it as revoked.
+                let _ = state.client.db().revoke_passphrase(&req.node_tag).await;
                 return json_err(
                     StatusCode::BAD_GATEWAY,
                     format!("dial enroll failed (passphrase revoked): {e}"),

@@ -2367,19 +2367,29 @@ impl MaintainerService {
             )));
         }
 
-        let binding = resolve_domain_binding(&cfg.domains, &spec.domain).map(|(_, b)| b);
+        // Scope enforcement: only domains explicitly configured in `maintainer.domains` may be
+        // mutated. Without this, a signed `DnsSyncReq` could create/update/delete records in any
+        // zone reachable by the configured provider credentials (see `manage_dns`, which enforces
+        // the same binding check).
+        let binding = resolve_domain_binding(&cfg.domains, &spec.domain).ok_or_else(|| {
+            ExposureError::Config(format!(
+                "domain '{}' is not authorized in maintainer domains (no DNS provider configured for this zone)",
+                spec.domain
+            ))
+        })?;
+        let binding = binding.1;
         let provider_name = spec
             .provider
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| binding.map(|b| b.provider.trim()))
-            .ok_or_else(|| {
-                ExposureError::Config(format!(
-                    "domain '{}' has no DNS provider configured",
-                    spec.domain
-                ))
-            })?;
+            .unwrap_or_else(|| binding.provider.trim());
+        if provider_name.is_empty() {
+            return Err(ExposureError::Config(format!(
+                "domain '{}' has no DNS provider configured",
+                spec.domain
+            )));
+        }
         let provider = cfg.dns_providers.get(provider_name).ok_or_else(|| {
             ExposureError::Config(format!(
                 "maintainer missing DNS provider credentials for '{provider_name}'"
@@ -2391,15 +2401,15 @@ impl MaintainerService {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| binding.and_then(|b| b.zone_id.as_deref()));
+            .or(binding.zone_id.as_deref());
         let eff_root = spec
             .root_domain
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .or_else(|| binding.and_then(|b| b.root_domain.as_deref()));
-        let eff_ttl = spec.ttl.or_else(|| binding.map(|b| b.ttl));
-        let eff_proxied = spec.proxied.or_else(|| binding.map(|b| b.proxied));
+            .or(binding.root_domain.as_deref());
+        let eff_ttl = spec.ttl.or(Some(binding.ttl));
+        let eff_proxied = spec.proxied.or(Some(binding.proxied));
 
         let eff_spec = DnsSyncRecordSpec {
             domain: spec.domain.clone(),

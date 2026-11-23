@@ -1875,7 +1875,9 @@ impl IngressServer {
             sent_cache_revalidation = false;
         }
 
-        // Strip untrusted client-supplied forwarding headers before injecting authoritative values
+        let use_h2_mesh = req.version() == Version::HTTP_2 && !is_upgrade;
+
+        // Strip untrusted client-supplied forwarding headers BEFORE injecting authoritative values.
         for h in [
             "x-real-ip",
             "forwarded",
@@ -1886,6 +1888,11 @@ impl IngressServer {
         ] {
             req.headers_mut().remove(h);
         }
+        // Strip hop-by-hop (incl. dynamic `Connection` tokens) BEFORE injecting authoritative
+        // headers, so a client `Connection: host, x-forwarded-for` can never delete the
+        // proxy-injected Host / X-Forwarded-* headers (gateway integrity bypass).
+        strip_hop_by_hop_headers(req.headers_mut(), use_h2_mesh, is_upgrade);
+
         if let Ok(hv) = HeaderValue::from_str(&client_ip.to_string()) {
             req.headers_mut().insert("x-forwarded-for", hv);
         }
@@ -1905,9 +1912,6 @@ impl IngressServer {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| req.body().size_hint().lower());
-
-        let use_h2_mesh = req.version() == Version::HTTP_2 && !is_upgrade;
-        strip_hop_by_hop_headers(req.headers_mut(), use_h2_mesh, is_upgrade);
 
         let request_id = Uuid::new_v4().to_string();
         let now_ts = Utc::now().timestamp();

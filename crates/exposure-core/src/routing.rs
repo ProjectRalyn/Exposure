@@ -228,10 +228,12 @@ pub fn select_endpoint<'a>(
             .unwrap_or(LinkHealthState::Up)
     };
 
+    // Health-first ordering: a healthy backup must be preferred over a degraded primary,
+    // otherwise failover to backups never happens while a primary is merely degraded.
     let phases: [(bool, LinkHealthState); 4] = [
         (true, LinkHealthState::Up),
-        (true, LinkHealthState::Degraded),
         (false, LinkHealthState::Up),
+        (true, LinkHealthState::Degraded),
         (false, LinkHealthState::Degraded),
     ];
 

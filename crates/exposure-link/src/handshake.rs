@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use dashmap::DashMap;
@@ -21,6 +22,9 @@ const MIN_NONCE_LEN: usize = 16;
 const MAX_NONCE_LEN: usize = 64;
 const MAX_NONCE_CACHE: usize = 16_384;
 const MAX_BOOTSTRAP_FAILURES: u32 = 5;
+/// After `MAX_BOOTSTRAP_FAILURES`, temporarily reject attempts for this window instead of
+/// destroying the passphrase (avoids a remote-triggerable onboarding DoS).
+const BOOTSTRAP_LOCKOUT_SECS: u64 = 60;
 
 /// Bounded TTL replay cache for Hello nonces.
 #[derive(Default)]
@@ -55,6 +59,7 @@ impl NonceReplayCache {
 struct BootstrapPassphraseEntry {
     phrase: String,
     failed_attempts: u32,
+    locked_until: Option<Instant>,
 }
 
 /// Atomic single-use bootstrap passphrase verifier with brute-force lockout.
@@ -75,6 +80,7 @@ impl BootstrapAuthState {
         *guard = phrase.filter(|p| !p.trim().is_empty()).map(|p| {
             BootstrapPassphraseEntry {
                 phrase: p,
+                locked_until: None,
                 failed_attempts: 0,
             }
         });
@@ -93,18 +99,30 @@ impl BootstrapAuthState {
         nonce: &[u8],
         proof_hex: &str,
     ) -> std::result::Result<bool, &'static str> {
+        let now = Instant::now();
         let mut guard = self.inner.lock().await;
         let Some(ref mut entry) = *guard else {
             return Ok(false);
         };
+        // Enforce a temporary lockout window without destroying the passphrase.
+        if let Some(until) = entry.locked_until {
+            if now < until {
+                return Err("bootstrap passphrase temporarily locked out after repeated failures");
+            }
+            entry.locked_until = None;
+            entry.failed_attempts = 0;
+        }
         if verify_passphrase_proof(&entry.phrase, node_tag, pubkey_b64, nonce, proof_hex) {
             *guard = None; // One-time atomic consumption!
             return Ok(true);
         }
         entry.failed_attempts += 1;
         if entry.failed_attempts >= MAX_BOOTSTRAP_FAILURES {
-            *guard = None;
-            return Err("bootstrap passphrase locked out after repeated failures");
+            // Keep the passphrase alive; just throttle for a window. Destroying it here would let
+            // any reachable unauthenticated client DoS a freshly generated onboarding passphrase.
+            entry.failed_attempts = 0;
+            entry.locked_until = Some(now + Duration::from_secs(BOOTSTRAP_LOCKOUT_SECS));
+            return Err("bootstrap passphrase temporarily locked out after repeated failures");
         }
         Err("invalid bootstrap passphrase proof")
     }
@@ -333,21 +351,6 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(ExposureError::Auth("invalid hello nonce length".into()));
     }
 
-    if !nonce_cache.check_and_insert(&hello.nonce, now) {
-        let ack = build_signed_ack(
-            keypair,
-            noise_handshake_hash,
-            &hello.nonce,
-            local_tag,
-            false,
-            false,
-            false,
-            Some("hello nonce replay detected".into()),
-        );
-        let _ = write_json_frame(stream, &ack).await;
-        return Err(ExposureError::Auth("hello nonce replay detected".into()));
-    }
-
     let signing = HelloFrame::signing_bytes(
         noise_handshake_hash,
         &hello.node_tag,
@@ -369,6 +372,23 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         );
         let _ = write_json_frame(stream, &ack).await;
         return Err(e);
+    }
+
+    // Only consume a replay-cache slot AFTER the peer proves possession of its key, so an
+    // unauthenticated client cannot pollute the bounded nonce cache.
+    if !nonce_cache.check_and_insert(&hello.nonce, now) {
+        let ack = build_signed_ack(
+            keypair,
+            noise_handshake_hash,
+            &hello.nonce,
+            local_tag,
+            false,
+            false,
+            false,
+            Some("hello nonce replay detected".into()),
+        );
+        let _ = write_json_frame(stream, &ack).await;
+        return Err(ExposureError::Auth("hello nonce replay detected".into()));
     }
 
     let mut authenticated = false;

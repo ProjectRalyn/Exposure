@@ -40,6 +40,21 @@ pub fn full_body(data: impl Into<Bytes>) -> ProxyBody {
         .boxed()
 }
 
+/// Headers the proxy authoritatively sets; these must never be removed via `Connection` tokens,
+/// otherwise a client could strip `Host`/`X-Forwarded-*` and bypass origin IP policies or vhost routing.
+fn is_protected_proxy_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-length"
+            | "x-forwarded-for"
+            | "x-forwarded-proto"
+            | "x-forwarded-host"
+            | "x-forwarded-port"
+            | "x-real-ip"
+    )
+}
+
 /// Strip RFC 9110 static + dynamic `Connection`-listed hop-by-hop headers (and invalid `TE` for H2).
 pub fn strip_hop_by_hop_headers(headers: &mut HeaderMap, for_h2: bool, preserve_upgrade: bool) {
     let mut dynamic_names: Vec<HeaderName> = Vec::new();
@@ -51,7 +66,9 @@ pub fn strip_hop_by_hop_headers(headers: &mut HeaderMap, for_h2: bool, preserve_
                     continue;
                 }
                 if let Ok(name) = HeaderName::from_bytes(t.as_bytes()) {
-                    dynamic_names.push(name);
+                    if !is_protected_proxy_header(&name) {
+                        dynamic_names.push(name);
+                    }
                 }
             }
         }

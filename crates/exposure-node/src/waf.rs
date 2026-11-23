@@ -162,11 +162,12 @@ pub fn is_path_exempt(path: &str, exempt_paths: &[String]) -> bool {
 }
 
 /// Returns `Some(max_body_bytes)` when the request body should be buffered & inspected by WAF.
-/// Binary/multipart uploads and WebSocket upgrades are intentionally skipped to preserve streaming.
+/// WebSocket upgrades are skipped; all other bodies are bounded-inspected regardless of the
+/// client-supplied `Content-Type` (see security note below).
 pub fn should_inspect_body(
     cfg: &WafConfig,
     method: &Method,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     is_upgrade: bool,
 ) -> Option<usize> {
     if cfg.mode == WafMode::Off || !cfg.inspect_body || is_upgrade {
@@ -179,37 +180,11 @@ pub fn should_inspect_body(
     if limit == 0 {
         return None;
     }
-    // Skip clearly non-textual binary/multipart payloads (images, files, gRPC, octet-stream)
-    if let Some(ct) = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-    {
-        if !is_text_inspectable_content_type(ct) {
-            return None;
-        }
-    }
+    // SECURITY: Do NOT skip inspection based on the client-controlled `Content-Type`. A client
+    // could otherwise set `application/octet-stream` / `multipart/form-data` to bypass body
+    // inspection entirely. `inspect_request_body` is UTF-8-safe (falls back to the valid prefix)
+    // and bounded by `limit`, so binary bodies are safe to scan.
     Some(limit)
-}
-
-fn is_text_inspectable_content_type(ct: &str) -> bool {
-    let media = ct
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if media.is_empty() {
-        return true;
-    }
-    media.starts_with("text/")
-        || media == "application/json"
-        || media.ends_with("+json")
-        || media == "application/x-www-form-urlencoded"
-        || media == "application/xml"
-        || media.ends_with("+xml")
-        || media == "application/graphql"
-        || media == "application/javascript"
-        || media == "application/ecmascript"
 }
 
 const MAX_CAPTURED_PAYLOAD_CHARS: usize = 512;
@@ -1175,14 +1150,28 @@ mod tests {
     }
 
     #[test]
-    fn skips_binary_and_multipart_body_inspection() {
+    fn inspects_bodies_regardless_of_spoofable_content_type() {
         let cfg = block_cfg();
+        // A client-controlled Content-Type must not disable body inspection (WAF bypass).
         let mut h_multi = HeaderMap::new();
         h_multi.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("multipart/form-data; boundary=----abc"),
         );
-        assert!(should_inspect_body(&cfg, &Method::POST, &h_multi, false).is_none());
+        assert_eq!(
+            should_inspect_body(&cfg, &Method::POST, &h_multi, false),
+            Some(32 * 1024)
+        );
+
+        let mut h_octet = HeaderMap::new();
+        h_octet.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert_eq!(
+            should_inspect_body(&cfg, &Method::POST, &h_octet, false),
+            Some(32 * 1024)
+        );
 
         let mut h_json = HeaderMap::new();
         h_json.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));

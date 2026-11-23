@@ -312,7 +312,17 @@ impl MuxSession {
     }
 
     pub async fn close(&self) {
-        let _ = self.cmd_tx.try_send(MuxCommand::Close);
+        // Mark the session closed immediately so callers stop scheduling new streams.
+        self.closed.store(true, Ordering::SeqCst);
+        // `try_send` can fail when the bounded command channel is momentarily full (e.g. many
+        // concurrent `open_stream` calls). Dropping `Close` here would leave revoked/evicted
+        // peers' authenticated streams alive, so fall back to a blocking send on a task.
+        if self.cmd_tx.try_send(MuxCommand::Close).is_err() {
+            let tx = self.cmd_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(MuxCommand::Close).await;
+            });
+        }
     }
 }
 

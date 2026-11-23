@@ -1184,7 +1184,29 @@ pub fn resolve_domain_binding<'a>(
         }
     }
 
-    // 3. Longest-suffix parent domain match (e.g. `a.b.example.com` -> `b.example.com` -> `example.com`)
+    // 3. Wildcard-key match: a configured `*.example.com` binding matches concrete subdomains
+    //    such as `api.example.com` / `a.b.example.com` (longest suffix wins).
+    let mut best_wild: Option<(&'a str, &'a DomainBindingConfig, usize)> = None;
+    for (k, v) in domains {
+        let k_raw = k.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some(suffix) = k_raw.strip_prefix("*.") else {
+            continue;
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        if norm.len() > suffix.len() && norm.ends_with(&format!(".{suffix}")) {
+            let len = suffix.len();
+            if best_wild.map(|(_, _, blen)| len > blen).unwrap_or(true) {
+                best_wild = Some((k.as_str(), v, len));
+            }
+        }
+    }
+    if let Some((k, v, _)) = best_wild {
+        return Some((k, v));
+    }
+
+    // 4. Longest-suffix parent domain match (e.g. `a.b.example.com` -> `b.example.com` -> `example.com`)
     let mut best: Option<(&'a str, &'a DomainBindingConfig, usize)> = None;
     for (k, v) in domains {
         let k_raw = k.trim().trim_end_matches('.').to_ascii_lowercase();

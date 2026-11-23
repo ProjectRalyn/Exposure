@@ -120,14 +120,19 @@ impl Forwarder {
     async fn send_special_with_kind(&self, mut frame: SpecialFrame, kind: StreamKind) -> Result<()> {
         frame.validate_hops()?;
         if frame.is_final_hop(&self.node_tag) {
-            self.deliver_local_special(IncomingSpecialFrame {
-                frame,
-                authenticated: true,
-                is_control: false,
-                remote_node_tag: self.node_tag.clone(),
-                remote_public_key: self.link_manager.keypair().public_key_b64(),
-                stream_kind: kind,
-            })
+            // Locally-originated request terminating here: enqueue as an *incoming request*
+            // (never match our own pending RPC waiter, whose id equals this request's id).
+            self.deliver_local_special(
+                IncomingSpecialFrame {
+                    frame,
+                    authenticated: true,
+                    is_control: false,
+                    remote_node_tag: self.node_tag.clone(),
+                    remote_public_key: self.link_manager.keypair().public_key_b64(),
+                    stream_kind: kind,
+                },
+                false,
+            )
             .await;
             return Ok(());
         }
@@ -197,10 +202,17 @@ impl Forwarder {
         }
     }
 
-    async fn deliver_local_special(&self, incoming: IncomingSpecialFrame) {
-        if let Some((_, waiter)) = self.pending_replies.remove(&incoming.frame.id) {
-            let _ = waiter.send(incoming.frame);
-            return;
+    /// Deliver a locally-terminated special frame.
+    ///
+    /// `match_pending` must be `false` for frames **originated by this node** (e.g. a request whose
+    /// final hop is this node). Otherwise the request id collides with our own pending RPC waiter
+    /// (replies reuse the request id) and the waiter would receive the request as its "reply".
+    async fn deliver_local_special(&self, incoming: IncomingSpecialFrame, match_pending: bool) {
+        if match_pending {
+            if let Some((_, waiter)) = self.pending_replies.remove(&incoming.frame.id) {
+                let _ = waiter.send(incoming.frame);
+                return;
+            }
         }
         if let Err(e) = self.special_tx.send(incoming).await {
             warn!(error = %e, "dropped incoming special frame (local receiver closed)");
@@ -364,14 +376,17 @@ impl Forwarder {
             ));
         }
 
-        self.deliver_local_special(IncomingSpecialFrame {
-            frame,
-            authenticated: incoming.authenticated,
-            is_control: incoming.is_control,
-            remote_node_tag: incoming.remote_node_tag,
-            remote_public_key: incoming.remote_public_key,
-            stream_kind: StreamKind::Bootstrap,
-        })
+        self.deliver_local_special(
+            IncomingSpecialFrame {
+                frame,
+                authenticated: incoming.authenticated,
+                is_control: incoming.is_control,
+                remote_node_tag: incoming.remote_node_tag,
+                remote_public_key: incoming.remote_public_key,
+                stream_kind: StreamKind::Bootstrap,
+            },
+            true,
+        )
         .await;
         Ok(())
     }
@@ -403,14 +418,17 @@ impl Forwarder {
         }
 
         if frame.is_final_hop(&self.node_tag) {
-            self.deliver_local_special(IncomingSpecialFrame {
-                frame,
-                authenticated: incoming.authenticated,
-                is_control: incoming.is_control,
-                remote_node_tag: incoming.remote_node_tag,
-                remote_public_key: incoming.remote_public_key,
-                stream_kind: StreamKind::Special,
-            })
+            self.deliver_local_special(
+                IncomingSpecialFrame {
+                    frame,
+                    authenticated: incoming.authenticated,
+                    is_control: incoming.is_control,
+                    remote_node_tag: incoming.remote_node_tag,
+                    remote_public_key: incoming.remote_public_key,
+                    stream_kind: StreamKind::Special,
+                },
+                true,
+            )
             .await;
             return Ok(());
         }
