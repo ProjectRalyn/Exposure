@@ -711,7 +711,9 @@ impl NodeRuntime {
                             &nonce,
                             rp,
                         ),
-                        // If Control already matched trusted_control_pubkeys on reconnect, allow only matching key
+                        // If Control already matched trusted_control_pubkeys on reconnect, allow only
+                        // the already-pinned signing key. When no signing key is pinned yet, fail
+                        // closed (the passphrase-proof arm above is the only way to install one).
                         _ => self
                             .config
                             .read()
@@ -719,7 +721,7 @@ impl NodeRuntime {
                             .control_public_key
                             .as_deref()
                             .map(|existing| existing == pk)
-                            .unwrap_or(true),
+                            .unwrap_or(false),
                     }
                 } else {
                     let cur_pass = self.passphrase.read().await.clone();

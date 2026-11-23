@@ -421,6 +421,22 @@ impl EdgeCache {
         let Some(vary_headers) = parse_vary_headers(resp_headers) else {
             return false;
         };
+        // Cache-poisoning guard: if the client content-negotiated (compression / language) or
+        // sent cookies, but the upstream did NOT declare the matching `Vary` dimension, storing
+        // this response would serve one client's variant to another. Refuse to store instead.
+        if !vary_includes(&vary_headers, "accept-encoding")
+            && request_has_nonidentity_accept_encoding(req_headers)
+        {
+            return false;
+        }
+        if !vary_includes(&vary_headers, "cookie") && req_headers.contains_key(header::COOKIE) {
+            return false;
+        }
+        if !vary_includes(&vary_headers, "accept-language")
+            && req_headers.contains_key(header::ACCEPT_LANGUAGE)
+        {
+            return false;
+        }
         let Some(ttl_secs) = resolve_ttl_secs(policy, resp_headers) else {
             return false;
         };
@@ -740,6 +756,25 @@ fn resolve_ttl_secs(policy: &EffectiveCachePolicy, resp_headers: &HeaderMap) -> 
     } else {
         None
     }
+}
+
+fn vary_includes(vary_headers: &[String], name: &str) -> bool {
+    vary_headers.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+/// True if the request accepts any content coding other than `identity`
+/// (gzip/br/deflate/zstd/...), i.e. a compressed response body must be variant-keyed.
+fn request_has_nonidentity_accept_encoding(req_headers: &HeaderMap) -> bool {
+    for hv in req_headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(raw) = hv.to_str() else { continue };
+        for token in raw.split(',') {
+            let codec = token.split(';').next().unwrap_or("").trim();
+            if !codec.is_empty() && !codec.eq_ignore_ascii_case("identity") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Returns `None` if `Vary: *` (uncacheable); otherwise returns sorted lowercase Vary header names.

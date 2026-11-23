@@ -112,6 +112,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn(csrf_origin_guard))
         .with_state(state)
 }
 
@@ -135,6 +136,105 @@ async fn security_headers_middleware(req: axum::extract::Request, next: Next) ->
         HeaderValue::from_static(PANEL_CSP),
     );
     resp
+}
+
+/// Lowercased host (sans port/brackets) from an authority such as `example.com:8090` or `[::1]:8090`.
+fn host_from_authority(v: &str) -> Option<String> {
+    let uri: axum::http::Uri = format!("http://{}", v.trim()).parse().ok()?;
+    uri.host()
+        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())
+}
+
+/// Lowercased host from an absolute URI such as an `Origin`/`Referer` value.
+fn host_from_absolute_uri(v: &str) -> Option<String> {
+    let uri: axum::http::Uri = v.trim().parse().ok()?;
+    if uri.scheme().is_none() {
+        return None;
+    }
+    uri.host()
+        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())
+}
+
+/// CSRF defense for state-changing requests.
+///
+/// `SameSite=Strict` alone does not protect against a same-site sibling subdomain
+/// (`evil.example.com` -> `control.example.com`) because the cookie is still sent. For
+/// browser-originated mutations we require any `Origin` (or `Referer`) host to match the
+/// request's own host (incl. `X-Forwarded-Host` behind a trusted proxy). Non-browser clients
+/// that send neither header are still allowed, and a present opaque/unparseable origin is rejected.
+async fn csrf_origin_guard(req: axum::extract::Request, next: Next) -> Response {
+    let state_changing = matches!(req.method().as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+    if state_changing {
+        let mut expected: Vec<String> = Vec::new();
+        if let Some(a) = req.uri().authority() {
+            expected.push(a.host().trim_matches(['[', ']']).to_ascii_lowercase());
+        }
+        let headers = req.headers();
+        if let Some(h) = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .and_then(host_from_authority)
+        {
+            expected.push(h);
+        }
+        for hv in headers.get_all("x-forwarded-host") {
+            if let Ok(s) = hv.to_str() {
+                if let Some(h) = s
+                    .split(',')
+                    .next()
+                    .map(str::trim)
+                    .and_then(host_from_authority)
+                {
+                    expected.push(h);
+                }
+            }
+        }
+        expected.sort();
+        expected.dedup();
+
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(host_from_absolute_uri);
+        let referer = headers
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(host_from_absolute_uri);
+
+        if let Some(candidate) = origin.or(referer) {
+            let allowed = match candidate {
+                Some(src) => expected.iter().any(|h| h == &src),
+                // Origin: null / unparseable → treat as hostile for mutations.
+                None => false,
+            };
+            if !allowed {
+                return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// `Secure` cookie suffix when the panel is served over TLS, including TLS terminated at a
+/// trusted reverse proxy (`X-Forwarded-Proto: https`).
+fn cookie_secure_suffix(state: &ApiState, headers: &HeaderMap) -> &'static str {
+    let tls = state.cfg.tls.is_some();
+    let forwarded_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("https")
+        })
+        .unwrap_or(false);
+    if tls || forwarded_https {
+        "; Secure"
+    } else {
+        ""
+    }
 }
 
 fn extract_raw_session_token(headers: &HeaderMap) -> Option<String> {
@@ -442,7 +542,11 @@ struct LoginReq {
     password: String,
 }
 
-async fn login(State(state): State<ApiState>, Json(req): Json<LoginReq>) -> Response {
+async fn login(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Response {
     // Brute-force throttle for admin login.
     //
     // SECURITY: credentials are ALWAYS verified before the lockout is enforced. Rejecting early
@@ -498,7 +602,7 @@ async fn login(State(state): State<ApiState>, Json(req): Json<LoginReq>) -> Resp
         .append_audit(&state.cfg.admin.username, "login", "control", true, "admin login")
         .await;
 
-    let secure_flag = if state.cfg.tls.is_some() { "; Secure" } else { "" };
+    let secure_flag = cookie_secure_suffix(&state, &headers);
     let cookie = format!(
         "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict{secure_flag}; Max-Age={SESSION_TTL_SECS}"
     );
@@ -529,7 +633,7 @@ async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
                 .await;
         }
     }
-    let secure_flag = if state.cfg.tls.is_some() { "; Secure" } else { "" };
+    let secure_flag = cookie_secure_suffix(&state, &headers);
     let clear_cookie = format!(
         "{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict{secure_flag}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
     );

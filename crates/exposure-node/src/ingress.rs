@@ -63,6 +63,10 @@ const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 const WAF_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
 const MAX_HTML_INJECT_BYTES: usize = 2 * 1024 * 1024;
+/// Global cap on concurrently buffered cacheable responses. Each buffer may hold up to
+/// `cache.max_object_bytes` (default 4 MiB), so this bounds worst-case transient memory
+/// instead of letting it scale with `MAX_CONCURRENT_INGRESS_CONNS`.
+const MAX_CONCURRENT_RESPONSE_BUFFERS: usize = 256;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 struct PerIpConnGuard {
@@ -137,6 +141,7 @@ pub struct IngressServer {
     logger: Arc<NodeLogger>,
     started_listeners: DashMap<String, JoinHandle<()>>,
     conn_sem: Arc<Semaphore>,
+    buffer_sem: Arc<Semaphore>,
     per_ip_conns: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
 }
 
@@ -201,6 +206,7 @@ impl IngressServer {
             logger,
             started_listeners: DashMap::new(),
             conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_CONNS)),
+            buffer_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONSE_BUFFERS)),
             per_ip_conns: Arc::new(DashMap::new()),
         })
     }
@@ -2143,6 +2149,7 @@ impl IngressServer {
                             &cache_policy,
                             base_key,
                             lookup_h,
+                            Arc::clone(&self.buffer_sem),
                             resp,
                         )
                         .await;
@@ -2295,9 +2302,13 @@ async fn maybe_store_in_cache(
     policy: &EffectiveCachePolicy,
     base_key: &str,
     req_headers: &http::HeaderMap,
+    buffer_sem: Arc<Semaphore>,
     resp: Response<ProxyBody>,
 ) -> Response<ProxyBody> {
     let limit = policy.max_object_bytes as usize;
+    // Bound concurrent in-flight buffering globally (memory-amplification DoS protection).
+    // Waiting here applies backpressure instead of letting many multi-MiB buffers coexist.
+    let _buffer_permit = buffer_sem.acquire_owned().await.ok();
     let (mut parts, mut body) = resp.into_parts();
     let mut collected = Vec::new();
     let mut exceeded = false;

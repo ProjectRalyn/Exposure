@@ -38,6 +38,30 @@ const MAX_RATE_LIMIT_HTML_RESPONSES: u32 = 3;
 const CHALLENGE_CSP: &str =
     "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
 
+/// Evict roughly half of a bounded state map instead of wiping it entirely.
+///
+/// `DashMap::clear()` resets *all* rate-limit / replay state at once (fail-open) and, for
+/// spent-token caches, re-enables replay within the token TTL. Evicting a subset keeps the
+/// structure bounded while preserving most state.
+fn evict_half<K, V>(map: &DashMap<K, V>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let to_remove = map.len() / 2;
+    if to_remove == 0 {
+        return;
+    }
+    let mut removed = 0usize;
+    map.retain(|_, _| {
+        if removed < to_remove {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifiedFpSubmission {
     pub service_tag: Option<String>,
@@ -239,7 +263,7 @@ impl GuardEngine {
         if map.len() >= max_entries {
             map.retain(|_, v| now.duration_since(v.last_refill) < BUCKET_IDLE_TTL);
             if map.len() >= max_entries {
-                map.clear();
+                evict_half(map);
             }
         }
         let key = canonical_ip(client_ip).to_string();
@@ -296,7 +320,7 @@ impl GuardEngine {
                     || now.duration_since(v.failure_window_start) < VERIFY_FAILURE_WINDOW
             });
             if self.challenge_activity.len() >= MAX_SPENT_CHALLENGES {
-                self.challenge_activity.clear();
+                evict_half(&self.challenge_activity);
             }
         }
         let ip_key = client_ip_binding_key(client_ip);
@@ -521,8 +545,8 @@ impl GuardEngine {
             self.buckets
                 .retain(|_, v| now.duration_since(v.last_refill) < BUCKET_IDLE_TTL);
             if self.buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
-                // Shed oldest/idle state rather than OOMing
-                self.buckets.clear();
+                // Shed a bounded subset rather than wiping all limiter state (fail-open)
+                evict_half(&self.buckets);
             }
         }
 
@@ -742,7 +766,7 @@ impl GuardEngine {
         if self.spent_fp_tokens.len() >= MAX_SPENT_FP_TOKENS {
             self.spent_fp_tokens.retain(|_, exp| *exp >= now);
             if self.spent_fp_tokens.len() >= MAX_SPENT_FP_TOKENS {
-                self.spent_fp_tokens.clear();
+                evict_half(&self.spent_fp_tokens);
             }
         }
         let mut inserted = false;
@@ -794,7 +818,7 @@ impl GuardEngine {
         if self.spent_challenges.len() >= MAX_SPENT_CHALLENGES {
             self.spent_challenges.retain(|_, exp| *exp >= now);
             if self.spent_challenges.len() >= MAX_SPENT_CHALLENGES {
-                self.spent_challenges.clear();
+                evict_half(&self.spent_challenges);
             }
         }
         let mut inserted = false;
