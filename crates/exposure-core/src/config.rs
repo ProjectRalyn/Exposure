@@ -335,7 +335,7 @@ fn default_evilpot_sqli_delay_ms() -> u64 {
     2500
 }
 fn default_evilpot_canary_url() -> String {
-    "https://canary.internal.example.com/t".to_string()
+    "https://sso-auth.internal.corp/v1/introspect".to_string()
 }
 fn default_evilpot_max_sessions() -> usize {
     2048

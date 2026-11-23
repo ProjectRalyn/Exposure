@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["ProjectRalyn <ralyn@d2lib.com>"]
 license = "MIT"
@@ -53,7 +53,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 sigil-filter = "0.1"
-evilpot = { version = "0.1", default-features = false }
+evilpot = { version = "0.1.1", default-features = false }
 snow = "0.9"
 subtle = "2"
 thiserror = "2"

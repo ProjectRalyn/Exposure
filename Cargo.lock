@@ -632,9 +632,9 @@ dependencies = [
 
 [[package]]
 name = "evilpot"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54fb32601252d4973a0a5612b3afa5fe7a9a2e8e7dafda72bb225fee3e18f519"
+checksum = "077d5a6d4fe31930f225019d1c8f3f2ed385742eef3b704237af16bf27b8013b"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-link"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "exposure-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

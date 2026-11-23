@@ -104,6 +104,7 @@ impl Body for BoundedEvilpotBody {
 
 struct ActiveEvilpot {
     cfg: EvilpotNodeConfig,
+    server_header: String,
     engine: Arc<EvilpotEngine>,
     rotation_task: JoinHandle<()>,
 }
@@ -135,7 +136,7 @@ impl EvilpotManager {
         }
     }
 
-    pub async fn reconfigure(&self, cfg: &EvilpotNodeConfig, enabled: bool) {
+    pub async fn reconfigure(&self, cfg: &EvilpotNodeConfig, server_header: &str, enabled: bool) {
         let mut guard = self.active.write().await;
         if !enabled {
             if let Some(old) = guard.take() {
@@ -147,14 +148,14 @@ impl EvilpotManager {
             return;
         }
         if let Some(ref existing) = *guard {
-            if &existing.cfg == cfg {
+            if &existing.cfg == cfg && existing.server_header == server_header {
                 return;
             }
         }
         if let Some(old) = guard.take() {
             old.rotation_task.abort();
         }
-        let ep_cfg = to_evilpot_config(cfg);
+        let ep_cfg = to_evilpot_config(cfg, server_header);
         let engine = EvilpotEngine::new(ep_cfg);
         let rotation_task = engine.spawn_rotation_task();
         info!(
@@ -166,6 +167,7 @@ impl EvilpotManager {
         );
         *guard = Some(ActiveEvilpot {
             cfg: cfg.clone(),
+            server_header: server_header.to_string(),
             engine,
             rotation_task,
         });
@@ -179,11 +181,15 @@ impl EvilpotManager {
             .map(|a| Arc::clone(&a.engine))
     }
 
-    pub async fn get_or_init(&self, cfg: &EvilpotNodeConfig) -> Arc<EvilpotEngine> {
+    pub async fn get_or_init(
+        &self,
+        cfg: &EvilpotNodeConfig,
+        server_header: &str,
+    ) -> Arc<EvilpotEngine> {
         if let Some(eng) = self.engine().await {
             return eng;
         }
-        self.reconfigure(cfg, true).await;
+        self.reconfigure(cfg, server_header, true).await;
         self.engine()
             .await
             .expect("evilpot engine initialized after reconfigure(true)")
@@ -392,7 +398,7 @@ pub fn clamp_input_slice(raw: &str, max_chars: usize) -> &str {
     }
 }
 
-fn to_evilpot_config(cfg: &EvilpotNodeConfig) -> EvilpotConfig {
+fn to_evilpot_config(cfg: &EvilpotNodeConfig, server_header: &str) -> EvilpotConfig {
     let mut seed = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut seed);
     let mut ep = EvilpotConfig::default();
@@ -402,6 +408,8 @@ fn to_evilpot_config(cfg: &EvilpotNodeConfig) -> EvilpotConfig {
     ep.max_tarpit_connections = cfg.max_tarpit_connections.clamp(1, 256);
     ep.tarpit_drip_bytes_per_sec = cfg.tarpit_drip_bytes_per_sec.clamp(16, 16_384);
     ep.sqli_time_delay_ms = cfg.sqli_time_delay_ms.clamp(100, 5_000);
+    ep.server_header = Some(server_header.trim().to_string());
+    ep.emit_persona_headers = false;
     let sanitized_url: String = cfg
         .canary_webhook_url
         .trim()
@@ -512,7 +520,7 @@ mod tests {
         let mgr = EvilpotManager::new("ingress-test");
         assert!(mgr.build_report().await.is_none());
 
-        mgr.reconfigure(&EvilpotNodeConfig::default(), true).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true).await;
         let engine = mgr.engine().await.expect("evilpot engine active");
         assert!(!EvilpotManager::has_triggered_traps(&engine));
 
@@ -596,14 +604,14 @@ mod tests {
         assert!(!report.recent_events.is_empty());
 
         // 4. Disabling tears down engine cleanly
-        mgr.reconfigure(&EvilpotNodeConfig::default(), false).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", false).await;
         assert!(mgr.build_report().await.is_none());
     }
 
     #[tokio::test]
     async fn waf_evilpot_captures_rce_malware_ioc_in_report() {
         let mgr = EvilpotManager::new("ingress-rce");
-        mgr.reconfigure(&EvilpotNodeConfig::default(), true).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true).await;
         let engine = mgr.engine().await.unwrap();
 
         let waf_cfg = WafConfig {
