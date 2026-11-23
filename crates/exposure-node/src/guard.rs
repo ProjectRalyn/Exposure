@@ -388,6 +388,32 @@ impl GuardEngine {
         headers: &HeaderMap,
         tls_signal: Option<&ClientHelloSignal>,
     ) -> GuardDecision {
+        self.evaluate_with_reputation(
+            profile,
+            bucket_defs,
+            clearance_secret,
+            client_ip,
+            host,
+            path_and_query,
+            headers,
+            tls_signal,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_reputation(
+        &self,
+        profile: &GuardProfile,
+        bucket_defs: &BTreeMap<String, RateLimitBucket>,
+        clearance_secret: &str,
+        client_ip: IpAddr,
+        host: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        tls_signal: Option<&ClientHelloSignal>,
+        abuse_score: Option<u8>,
+    ) -> GuardDecision {
         let client_ip = canonical_ip(client_ip);
 
         // 1 & 2. Source CIDR restrictions + Named token bucket rate limiting
@@ -451,8 +477,10 @@ impl GuardEngine {
             return GuardDecision::Allow;
         }
 
-        // 6. Browser fingerprint suspicion scoring (0..=100)
-        let score = compute_suspicion_score(headers, tls_signal);
+        // 6. Authoritative server-side suspicion scoring (TLS JA3/GREASE/ALPN + HTTP wire headers + AbuseIPDB).
+        // Client JS fingerprints are strictly auxiliary (used only for headless/tamper detection in step 4c)
+        // and NEVER reduce this server-side score.
+        let score = compute_server_suspicion_score(headers, tls_signal, abuse_score);
 
         if profile.reject_threshold > 0 && score >= profile.reject_threshold {
             return GuardDecision::Reject {
@@ -1361,8 +1389,19 @@ impl GuardEngine {
     }
 }
 
-/// Heuristic browser fingerprint suspicion score (0 = clean browser, 100 = clearly automated bot).
+/// Server-side suspicion score (0 = clean browser, 100 = clearly automated/abusive).
+/// Derived exclusively from unforgeable server-observed signals (TLS ClientHello JA3/GREASE/ALPN,
+/// HTTP header structure/consistency, and optional AbuseIPDB IP reputation).
 pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSignal>) -> u8 {
+    compute_server_suspicion_score(headers, tls, None)
+}
+
+/// Full server-side suspicion score combining TLS ClientHello, HTTP wire headers, and AbuseIPDB score.
+pub fn compute_server_suspicion_score(
+    headers: &HeaderMap,
+    tls: Option<&ClientHelloSignal>,
+    abuse_score: Option<u8>,
+) -> u8 {
     let mut score: u32 = 0;
 
     let ua = headers
@@ -1432,12 +1471,64 @@ pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSign
         score += 25;
     }
 
+    // Server-side Sec-Ch-Ua-Platform vs User-Agent OS contradiction check (unforgeable by JS beacon)
+    if let Some(ch_plat) = headers
+        .get("sec-ch-ua-platform")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        let contradiction = (ua_l.contains("windows nt")
+            && (ch_plat.contains("linux") || ch_plat.contains("mac")))
+            || ((ua_l.contains("macintosh") || ua_l.contains("mac os x"))
+                && !ua_l.contains("iphone")
+                && !ua_l.contains("ipad")
+                && (ch_plat.contains("win") || ch_plat.contains("linux")))
+            || (ua_l.contains("linux")
+                && !ua_l.contains("android")
+                && (ch_plat.contains("win") || ch_plat.contains("mac")));
+        if contradiction {
+            score += 25;
+        }
+    }
+
+    // Unforgeable TLS ClientHello signals (cipher suite count, ALPN h2, GREASE, UA-CH consistency)
     if let Some(sig) = tls {
         if sig.cipher_count > 0 && sig.cipher_count < 4 {
             score += 20;
         }
         if !sig.has_alpn {
             score += 15;
+        }
+        let claims_chromium = ua_l.contains("chrome/1") || ua_l.contains("edg/1");
+        if claims_chromium {
+            if sig.extension_count > 0 && !sig.has_grease && sig.extension_count < 8 {
+                score += 15;
+            }
+            if sig.has_alpn && !sig.alpn_h2 {
+                score += 10;
+            }
+            let has_sec_ch_ua = headers
+                .get("sec-ch-ua")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !has_sec_ch_ua {
+                score += 15;
+            }
+        }
+    }
+
+    // Server-side AbuseIPDB IP reputation contribution
+    if let Some(ab) = abuse_score {
+        if ab >= 75 {
+            score += 55;
+        } else if ab >= 50 {
+            score += 40;
+        } else if ab >= 25 {
+            score += 25;
+        } else if ab >= 10 {
+            score += 10;
         }
     }
 
@@ -2213,5 +2304,52 @@ mod tests {
             engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &real_http_browser, None),
             GuardDecision::Allow
         ));
+    }
+
+    #[test]
+    fn server_first_scoring_weighs_tls_grease_sec_ch_ua_and_abuseipdb() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        h.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+        h.insert(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+        h.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        h.insert("sec-ch-ua", "\"Chromium\";v=\"130\"".parse().unwrap());
+        h.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
+
+        let genuine_tls = crate::tls::ClientHelloSignal {
+            sni: Some("app.example.com".into()),
+            tls_version: 0x0303,
+            cipher_count: 16,
+            extension_count: 14,
+            has_alpn: true,
+            alpn_h2: true,
+            has_grease: true,
+            supported_groups_count: 4,
+            fingerprint: Some("deadbeef".into()),
+        };
+        let clean_score = compute_server_suspicion_score(&h, Some(&genuine_tls), Some(0));
+        assert!(clean_score < 20, "genuine browser TLS + clean IP scored {clean_score}");
+
+        // Impersonated TLS without GREASE/ALPN h2 + contradictory Sec-Ch-Ua-Platform + high AbuseIPDB score
+        let fake_tls = crate::tls::ClientHelloSignal {
+            sni: Some("app.example.com".into()),
+            tls_version: 0x0303,
+            cipher_count: 3,
+            extension_count: 4,
+            has_alpn: false,
+            alpn_h2: false,
+            has_grease: false,
+            supported_groups_count: 1,
+            fingerprint: Some("cafebabe".into()),
+        };
+        let mut spoof_h = h.clone();
+        spoof_h.insert("sec-ch-ua-platform", "\"Linux\"".parse().unwrap());
+        let high_score = compute_server_suspicion_score(&spoof_h, Some(&fake_tls), Some(85));
+        assert!(high_score >= 70, "spoofed TLS + AbuseIPDB 85 scored only {high_score}");
     }
 }

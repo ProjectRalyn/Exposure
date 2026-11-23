@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, CertOrderConfig, CustomPagesConfig, DomainLineRecordType,
-    EgressConfig, EgressDefaults, EgressServiceConfig, EvilpotNodeConfig, GuardDefaults,
-    GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
+    resolve_domain_binding, AbuseIpDbConfig, CertOrderConfig, CrsUpdateConfig, CustomPagesConfig,
+    DomainLineRecordType, EgressConfig, EgressDefaults, EgressServiceConfig, EvilpotNodeConfig,
+    GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
     LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig, PeerConfig,
     ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode,
     ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection,
 };
+use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::routing::canonical_ip;
 use ipnet::IpNet;
@@ -114,6 +115,7 @@ fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile
     let mut waf = out.waf.unwrap_or_else(|| defs.waf.clone());
     waf.min_confidence = waf.min_confidence.clamp(0.1, 1.0);
     waf.max_body_bytes = waf.max_body_bytes.min(256 * 1024);
+    waf.crs_paranoia_level = waf.crs_paranoia_level.clamp(1, 4);
     out.waf = Some(waf);
     out
 }
@@ -217,7 +219,42 @@ fn resolve_ingress_config(
     if out.evilpot == EvilpotNodeConfig::default() {
         out.evilpot = ingress_defs.evilpot.clone();
     }
+    if out.abuseipdb == AbuseIpDbConfig::default() {
+        out.abuseipdb = ingress_defs.abuseipdb.clone();
+    }
+    if out.crs == CrsUpdateConfig::default() {
+        out.crs = ingress_defs.crs.clone();
+    }
+    out.crs.paranoia_level = out.crs.paranoia_level.clamp(1, 4);
+    out.crs.update_interval_hours = out.crs.update_interval_hours.clamp(1, 720);
+    // Merge cluster-wide disabled rule IDs into every guard's WAF config so both
+    // `sigil-filter` (100001..100012) and OWASP CRS rules honor global toggles.
+    if !out.crs.disabled_rule_ids.is_empty() {
+        for g in out.guards.values_mut() {
+            if let Some(ref mut waf) = g.waf {
+                for &id in &out.crs.disabled_rule_ids {
+                    if !waf.disabled_rule_ids.contains(&id) {
+                        waf.disabled_rule_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
     out
+}
+
+/// Inject active OWASP CRS ruleset descriptors into every compiled Ingress node config.
+pub fn inject_crs_rules(
+    compiled: &mut BTreeMap<String, NodeConfig>,
+    rules: &[WafRuleDescriptor],
+) {
+    for cfg in compiled.values_mut() {
+        if cfg.roles.ingress {
+            cfg.ingress.crs_rules = rules.to_vec();
+        } else {
+            cfg.ingress.crs_rules.clear();
+        }
+    }
 }
 
 fn resolve_egress_config(

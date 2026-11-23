@@ -1,7 +1,12 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use exposure_core::config::{WafCategory, WafConfig, WafMode};
+use exposure_core::crs::{
+    builtin_crs_snapshot, WafRuleDescriptor, CRS_REGEX_SIZE_LIMIT, MAX_CRS_RULES,
+};
 use http::{header, HeaderMap, Method};
+use regex::{Regex, RegexBuilder};
 use sigil_filter::{AttackDetector, CategoryMask, DetectionResult, ScanInput, ViolationCategory};
 
 /// Hard ceiling on request body bytes buffered for WAF inspection (prevents OOM DoS).
@@ -23,11 +28,19 @@ pub struct WafFinding {
     pub reasons: Vec<&'static str>,
     /// Bounded snippet (<= 512 chars) of the matched input, used by `evilpot` deception/analysis.
     pub matched_payload: Option<String>,
+    /// Optional matched OWASP CRS rule ID (e.g. `942140`), `None` for `sigil-filter` heuristic hits.
+    pub rule_id: Option<u32>,
+    /// Optional human-readable OWASP CRS rule message.
+    pub rule_msg: Option<String>,
 }
 
 impl WafFinding {
     pub fn telemetry_reason(&self) -> String {
-        format!("waf:{}:{}", self.category, self.location)
+        if let Some(id) = self.rule_id {
+            format!("waf:crs:{}:{}:{}", id, self.category, self.location)
+        } else {
+            format!("waf:{}:{}", self.category, self.location)
+        }
     }
 }
 
@@ -84,13 +97,38 @@ pub fn sigil_category_label(cat: ViolationCategory) -> &'static str {
     }
 }
 
-fn build_category_mask(categories: &[WafCategory]) -> CategoryMask {
-    if categories.is_empty() {
-        return CategoryMask::ALL;
+fn sigil_rule_id_to_category(id: u32) -> Option<ViolationCategory> {
+    match id {
+        100001 => Some(ViolationCategory::SqlInjection),
+        100002 => Some(ViolationCategory::Xss),
+        100003 => Some(ViolationCategory::PathTraversal),
+        100004 => Some(ViolationCategory::CommandInjection),
+        100005 => Some(ViolationCategory::NoSqlInjection),
+        100006 => Some(ViolationCategory::Ssrf),
+        100007 => Some(ViolationCategory::SstiAndCodeInjection),
+        100008 => Some(ViolationCategory::XxeAndXmlInjection),
+        100009 => Some(ViolationCategory::LdapInjection),
+        100010 => Some(ViolationCategory::CrlfAndHeaderInjection),
+        100011 => Some(ViolationCategory::DeserializationAndPrototypePollution),
+        100012 => Some(ViolationCategory::BufferOverflow),
+        _ => None,
     }
-    let mut mask = 0u16;
-    for &c in categories {
-        mask |= category_to_sigil(c).bit();
+}
+
+fn build_category_mask(categories: &[WafCategory], disabled_rule_ids: &[u32]) -> CategoryMask {
+    let mut mask = if categories.is_empty() {
+        CategoryMask::ALL.0
+    } else {
+        let mut m = 0u16;
+        for &c in categories {
+            m |= category_to_sigil(c).bit();
+        }
+        m
+    };
+    for &id in disabled_rule_ids {
+        if let Some(cat) = sigil_rule_id_to_category(id) {
+            mask &= !cat.bit();
+        }
     }
     CategoryMask(mask)
 }
@@ -199,6 +237,8 @@ fn verdict_from_result(
         confidence: res.confidence,
         reasons,
         matched_payload,
+        rule_id: None,
+        rule_msg: None,
     };
     Some(match mode {
         WafMode::Off => WafVerdict::Allow,
@@ -232,7 +272,10 @@ pub fn inspect_request_head(
     let detector = AttackDetector::new()
         .with_min_confidence(min_c)
         .with_buffer_limits(HEAD_OVERFLOW_WARN_LEN, HEAD_OVERFLOW_CRIT_LEN);
-    let mask = build_category_mask(&cfg.categories);
+    let mask = build_category_mask(&cfg.categories, &cfg.disabled_rule_ids);
+    if mask.0 == 0 {
+        return WafVerdict::Allow;
+    }
 
     // 1. URI path
     if !path.is_empty() && path != "/" {
@@ -387,7 +430,10 @@ pub fn inspect_request_body(
     let detector = AttackDetector::new()
         .with_min_confidence(min_c)
         .with_buffer_limits(body_warn, body_crit);
-    let mask = build_category_mask(&cfg.categories);
+    let mask = build_category_mask(&cfg.categories, &cfg.disabled_rule_ids);
+    if mask.0 == 0 {
+        return WafVerdict::Allow;
+    }
 
     let is_form = content_type
         .map(|ct| {
@@ -424,6 +470,333 @@ pub fn inspect_request_body(
 
     let res = detector.detect(ScanInput::new(text).with_mask(mask));
     verdict_from_result(cfg.mode, "body", text, res).unwrap_or(WafVerdict::Allow)
+}
+
+/* ==================== Compiled OWASP CRS Runtime Engine ==================== */
+
+const MAX_CRS_SCAN_BYTES: usize = 8192;
+
+#[derive(Debug, Clone, Copy)]
+struct CrsTargetFlags {
+    uri: bool,
+    args: bool,
+    body: bool,
+    cookies: bool,
+    all_headers: bool,
+    user_agent: bool,
+    referer: bool,
+}
+
+impl CrsTargetFlags {
+    fn from_targets(targets: &[String]) -> Self {
+        let mut f = Self {
+            uri: false,
+            args: false,
+            body: false,
+            cookies: false,
+            all_headers: false,
+            user_agent: false,
+            referer: false,
+        };
+        for t in targets {
+            let u = t.to_ascii_uppercase();
+            match u.as_str() {
+                "REQUEST_URI" | "REQUEST_URI_RAW" | "REQUEST_FILENAME" | "REQUEST_BASENAME" | "REQUEST_LINE" => {
+                    f.uri = true;
+                }
+                "ARGS" | "ARGS_NAMES" | "ARGS_GET" | "ARGS_POST" | "QUERY_STRING" => {
+                    f.args = true;
+                }
+                "REQUEST_BODY" => {
+                    f.body = true;
+                }
+                "REQUEST_COOKIES" | "REQUEST_COOKIES_NAMES" => {
+                    f.cookies = true;
+                }
+                "REQUEST_HEADERS" => {
+                    f.all_headers = true;
+                }
+                "REQUEST_HEADERS:USER-AGENT" => {
+                    f.user_agent = true;
+                }
+                "REQUEST_HEADERS:REFERER" => {
+                    f.referer = true;
+                }
+                _ if u.starts_with("REQUEST_HEADERS:") => {
+                    f.all_headers = true;
+                }
+                _ => {}
+            }
+        }
+        f
+    }
+}
+
+enum CompiledCrsMatcher {
+    Regex(Regex),
+    PhraseMatch(Vec<String>),
+    Contains(String),
+    BeginsWith(String),
+    EndsWith(String),
+}
+
+impl CompiledCrsMatcher {
+    fn is_match(&self, text: &str) -> bool {
+        let slice = clamp_utf8_bytes(text, MAX_CRS_SCAN_BYTES);
+        match self {
+            Self::Regex(re) => re.is_match(slice),
+            Self::PhraseMatch(phrases) => {
+                let lower = slice.to_ascii_lowercase();
+                phrases.iter().any(|p| lower.contains(p.as_str()))
+            }
+            Self::Contains(needle) => slice.to_ascii_lowercase().contains(needle.as_str()),
+            Self::BeginsWith(prefix) => slice.to_ascii_lowercase().starts_with(prefix.as_str()),
+            Self::EndsWith(suffix) => slice.to_ascii_lowercase().ends_with(suffix.as_str()),
+        }
+    }
+}
+
+fn clamp_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn crs_category_static(cat: &str) -> &'static str {
+    match cat {
+        "sql-injection" => "sql-injection",
+        "xss" => "xss",
+        "path-traversal" => "path-traversal",
+        "command-injection" => "command-injection",
+        "nosql-injection" => "nosql-injection",
+        "ssrf" => "ssrf",
+        "ssti" => "ssti",
+        "xxe" => "xxe",
+        "ldap-injection" => "ldap-injection",
+        "crlf-injection" => "crlf-injection",
+        "deserialization" => "deserialization",
+        "buffer-overflow" => "buffer-overflow",
+        "scanner-detection" => "scanner",
+        "php-attack" => "php-attack",
+        "protocol-attack" | "protocol-enforcement" => "protocol-attack",
+        _ => "crs-rule",
+    }
+}
+
+struct CompiledCrsRule {
+    id: u32,
+    paranoia_level: u8,
+    category: &'static str,
+    msg: String,
+    targets: CrsTargetFlags,
+    matcher: CompiledCrsMatcher,
+}
+
+/// Linear-time, ReDoS-safe compiled OWASP CRS rule engine shared across Ingress workers.
+pub struct CompiledCrsEngine {
+    rules: Vec<CompiledCrsRule>,
+}
+
+impl CompiledCrsEngine {
+    /// Compile rules from `descriptors` (falls back to built-in CRS baseline if empty).
+    pub fn compile(descriptors: &[WafRuleDescriptor], global_disabled: &[u32]) -> Self {
+        let fallback;
+        let list = if descriptors.is_empty() {
+            fallback = builtin_crs_snapshot().rules;
+            &fallback[..]
+        } else {
+            descriptors
+        };
+        let disabled: HashSet<u32> = global_disabled.iter().copied().collect();
+        let mut compiled = Vec::new();
+        for d in list.iter().take(MAX_CRS_RULES) {
+            if !d.enabled || disabled.contains(&d.id) || d.source == "sigil-filter" {
+                continue;
+            }
+            let matcher = match d.operator.as_str() {
+                "rx" => match RegexBuilder::new(&d.pattern)
+                    .size_limit(CRS_REGEX_SIZE_LIMIT)
+                    .dfa_size_limit(CRS_REGEX_SIZE_LIMIT)
+                    .build()
+                {
+                    Ok(re) => CompiledCrsMatcher::Regex(re),
+                    Err(_) => continue,
+                },
+                "pm" => {
+                    let phrases: Vec<String> = d
+                        .pattern
+                        .split_whitespace()
+                        .map(|s| s.to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if phrases.is_empty() {
+                        continue;
+                    }
+                    CompiledCrsMatcher::PhraseMatch(phrases)
+                }
+                "contains" => {
+                    let n = d.pattern.to_ascii_lowercase();
+                    if n.is_empty() {
+                        continue;
+                    }
+                    CompiledCrsMatcher::Contains(n)
+                }
+                "beginsWith" => {
+                    let n = d.pattern.to_ascii_lowercase();
+                    if n.is_empty() {
+                        continue;
+                    }
+                    CompiledCrsMatcher::BeginsWith(n)
+                }
+                "endsWith" => {
+                    let n = d.pattern.to_ascii_lowercase();
+                    if n.is_empty() {
+                        continue;
+                    }
+                    CompiledCrsMatcher::EndsWith(n)
+                }
+                _ => continue,
+            };
+            compiled.push(CompiledCrsRule {
+                id: d.id,
+                paranoia_level: d.paranoia_level.clamp(1, 4),
+                category: crs_category_static(&d.category),
+                msg: d.msg.clone(),
+                targets: CrsTargetFlags::from_targets(&d.targets),
+                matcher,
+            });
+        }
+        Self { rules: compiled }
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    fn make_verdict(
+        mode: WafMode,
+        rule: &CompiledCrsRule,
+        location: &'static str,
+        sample: &str,
+    ) -> WafVerdict {
+        let finding = WafFinding {
+            category: rule.category,
+            location,
+            confidence: 0.95,
+            reasons: vec!["owasp-crs-rule"],
+            matched_payload: if sample.is_empty() {
+                None
+            } else {
+                Some(sample.chars().take(MAX_CAPTURED_PAYLOAD_CHARS).collect())
+            },
+            rule_id: Some(rule.id),
+            rule_msg: Some(rule.msg.clone()),
+        };
+        match mode {
+            WafMode::Off => WafVerdict::Allow,
+            WafMode::Monitor => WafVerdict::Monitor(finding),
+            WafMode::Block => WafVerdict::Block(finding),
+            WafMode::Evilpot => WafVerdict::Evilpot(finding),
+        }
+    }
+
+    pub fn inspect_head(
+        &self,
+        cfg: &WafConfig,
+        path: &str,
+        query: Option<&str>,
+        headers: &HeaderMap,
+    ) -> WafVerdict {
+        if cfg.mode == WafMode::Off
+            || !cfg.crs_enabled
+            || is_path_exempt(path, &cfg.exempt_paths)
+            || self.rules.is_empty()
+        {
+            return WafVerdict::Allow;
+        }
+        let max_pl = cfg.crs_paranoia_level.clamp(1, 4);
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let referer = headers
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let cookie = headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        for rule in &self.rules {
+            if rule.paranoia_level > max_pl || cfg.disabled_rule_ids.contains(&rule.id) {
+                continue;
+            }
+            if rule.targets.uri && !path.is_empty() && path != "/" && rule.matcher.is_match(path) {
+                return Self::make_verdict(cfg.mode, rule, "path", path);
+            }
+            if rule.targets.args {
+                if let Some(q) = query.filter(|q| !q.is_empty()) {
+                    let q_norm = replace_plus_with_space(q);
+                    if rule.matcher.is_match(q_norm.as_ref()) {
+                        return Self::make_verdict(cfg.mode, rule, "query", q_norm.as_ref());
+                    }
+                }
+            }
+            if cfg.inspect_headers {
+                if (rule.targets.user_agent || rule.targets.all_headers)
+                    && !ua.is_empty()
+                    && rule.matcher.is_match(ua)
+                {
+                    return Self::make_verdict(cfg.mode, rule, "header:user-agent", ua);
+                }
+                if (rule.targets.referer || rule.targets.all_headers)
+                    && !referer.is_empty()
+                    && rule.matcher.is_match(referer)
+                {
+                    return Self::make_verdict(cfg.mode, rule, "header:referer", referer);
+                }
+                if rule.targets.cookies && !cookie.is_empty() && rule.matcher.is_match(cookie) {
+                    return Self::make_verdict(cfg.mode, rule, "header:cookie", cookie);
+                }
+            }
+        }
+        WafVerdict::Allow
+    }
+
+    pub fn inspect_body(&self, cfg: &WafConfig, body: &[u8]) -> WafVerdict {
+        if cfg.mode == WafMode::Off
+            || !cfg.crs_enabled
+            || !cfg.inspect_body
+            || body.is_empty()
+            || self.rules.is_empty()
+        {
+            return WafVerdict::Allow;
+        }
+        let slice = &body[..body.len().min(MAX_CRS_SCAN_BYTES)];
+        let text = match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(e) => match std::str::from_utf8(&slice[..e.valid_up_to()]) {
+                Ok(s) if !s.is_empty() => s,
+                _ => return WafVerdict::Allow,
+            },
+        };
+        let max_pl = cfg.crs_paranoia_level.clamp(1, 4);
+        for rule in &self.rules {
+            if rule.paranoia_level > max_pl || cfg.disabled_rule_ids.contains(&rule.id) {
+                continue;
+            }
+            if (rule.targets.body || rule.targets.args) && rule.matcher.is_match(text) {
+                return Self::make_verdict(cfg.mode, rule, "body", text);
+            }
+        }
+        WafVerdict::Allow
+    }
 }
 
 #[cfg(test)]
@@ -621,5 +994,30 @@ mod tests {
         );
         assert!(should_inspect_body(&cfg, &Method::GET, &h_json, false).is_none());
         assert!(should_inspect_body(&cfg, &Method::POST, &h_json, true).is_none());
+    }
+
+    #[test]
+    fn compiled_crs_engine_matches_and_respects_disabled_ids() {
+        let engine = CompiledCrsEngine::compile(&[], &[]);
+        assert!(engine.rule_count() >= 8);
+
+        let cfg = block_cfg();
+        let mut h_scan = HeaderMap::new();
+        h_scan.insert(header::USER_AGENT, HeaderValue::from_static("sqlmap/1.8.2#stable"));
+        match engine.inspect_head(&cfg, "/", None, &h_scan) {
+            WafVerdict::Block(f) => {
+                assert_eq!(f.rule_id, Some(913100));
+                assert_eq!(f.category, "scanner");
+            }
+            other => panic!("expected CRS 913100 block, got {other:?}"),
+        }
+
+        // Disabling rule 913100 allows that User-Agent through
+        let mut cfg_dis = block_cfg();
+        cfg_dis.disabled_rule_ids = vec![913100];
+        assert!(matches!(
+            engine.inspect_head(&cfg_dis, "/", None, &h_scan),
+            WafVerdict::Allow
+        ));
     }
 }

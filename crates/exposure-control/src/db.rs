@@ -202,6 +202,46 @@ impl ControlDb {
         .await
     }
 
+    pub async fn get_kv_json<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let key = key.to_string();
+        let raw: Option<String> = self
+            .run(move |conn| {
+                let v: Option<String> = conn
+                    .query_row("SELECT v FROM kv_store WHERE k = ?1", params![key], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .map_err(|e| ExposureError::Storage(e.to_string()))?;
+                Ok(v)
+            })
+            .await?;
+        let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let parsed = serde_json::from_str::<T>(&raw)
+            .map_err(|e| ExposureError::Storage(format!("decode kv_store json: {e}")))?;
+        Ok(Some(parsed))
+    }
+
+    pub async fn set_kv_json<T: Serialize>(&self, key: &str, val: &T) -> Result<()> {
+        let key = key.to_string();
+        let raw = serde_json::to_string(val)
+            .map_err(|e| ExposureError::Storage(format!("encode kv_store json: {e}")))?;
+        self.run(move |conn| {
+            conn.execute(
+                "INSERT INTO kv_store (k, v) VALUES (?1, ?2)
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                params![key, raw],
+            )
+            .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Read cluster-wide logger IP HMAC key if already provisioned (read-only).
     pub async fn get_cluster_hmac_key(&self) -> Result<Option<String>> {
         self.run(|conn| {

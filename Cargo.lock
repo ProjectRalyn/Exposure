@@ -698,6 +698,8 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "rand 0.8.8",
+ "regex",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
@@ -726,6 +728,7 @@ dependencies = [
  "hmac",
  "ipnet",
  "rand 0.8.8",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -780,6 +783,7 @@ dependencies = [
  "hyper-util",
  "rand 0.8.8",
  "rcgen",
+ "regex",
  "reqwest",
  "ring",
  "rustls",
@@ -1818,6 +1822,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9807af0e638c12e753aa1b4e601791bf2a8f71274023c8bbeec12fc149950857"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

@@ -466,6 +466,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             pages: Default::default(),
             cache: Default::default(),
             evilpot: Default::default(),
+            abuseipdb: Default::default(),
+            crs: Default::default(),
+            crs_rules: vec![],
         },
         egress: EgressConfig {
             services: local_services,

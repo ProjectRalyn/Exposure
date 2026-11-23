@@ -1,5 +1,6 @@
 pub mod assets;
 pub mod config;
+pub mod crs;
 pub mod crypto;
 pub mod error;
 pub mod protocol;

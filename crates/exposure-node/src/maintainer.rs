@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -17,12 +17,16 @@ use exposure_core::protocol::{
     MaintainerTelemetrySnapshot, SpecialFrame, SpecialPayload,
 };
 use exposure_core::routing::canonical_ip;
-use exposure_core::segment::SegmentWriter;
+use exposure_core::segment::{
+    list_recent_segment_files, read_json_snapshot, read_segment_file, write_json_snapshot_atomic,
+    SegmentWriter,
+};
 use exposure_core::telemetry::{
     AlertRecord, CertStatusInfo, FingerprintObservation, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -421,10 +425,173 @@ pub struct MaintainerService {
     shutdown_tx: watch::Sender<bool>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MaintainerPersistedState {
+    #[serde(default)]
+    summaries: Vec<MinuteSummary>,
+    #[serde(default)]
+    fingerprints: Vec<FingerprintObservation>,
+    #[serde(default)]
+    alerts: Vec<AlertRecord>,
+}
+
+fn maintainer_state_path(dir: &str, node_tag: &str) -> PathBuf {
+    let safe: String = node_tag
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .take(64)
+        .collect();
+    let name = if safe.is_empty() || safe.contains("..") {
+        "maintainer".to_string()
+    } else {
+        safe
+    };
+    PathBuf::from(dir).join(format!("maintainer-state-{name}.json"))
+}
+
+fn prune_summaries_map(
+    map: &mut HashMap<(i64, String, String, String), MinuteSummary>,
+    min_cutoff: i64,
+    max_allowed: i64,
+    max_entries: usize,
+) {
+    map.retain(|(min, _, _, _), _| *min >= min_cutoff && *min <= max_allowed);
+    if map.len() > max_entries {
+        let mut keys: Vec<_> = map.keys().cloned().collect();
+        keys.sort_by_key(|(min, _, _, _)| *min);
+        let to_drop = map.len().saturating_sub(max_entries);
+        for k in keys.into_iter().take(to_drop) {
+            map.remove(&k);
+        }
+    }
+}
+
+fn prune_fingerprints_map(
+    map: &mut HashMap<String, FingerprintObservation>,
+    min_cutoff: i64,
+    max_allowed: i64,
+    max_entries: usize,
+) {
+    map.retain(|_, v| v.last_seen_ts >= min_cutoff && v.last_seen_ts <= max_allowed);
+    if map.len() > max_entries {
+        let mut entries: Vec<(String, i64)> =
+            map.iter().map(|(k, v)| (k.clone(), v.last_seen_ts)).collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        let to_drop = map.len().saturating_sub(max_entries);
+        for (k, _) in entries.into_iter().take(to_drop) {
+            map.remove(&k);
+        }
+    }
+}
+
 impl MaintainerService {
     pub fn new(node_tag: impl Into<String>, cfg: MaintainerConfig) -> Result<Arc<Self>> {
         let tag = node_tag.into();
         let writer = SegmentWriter::new(cfg.logger.segment.clone(), format!("maintainer-{tag}"))?;
+
+        // Restore persisted aggregated summaries, fingerprints, and alerts across restarts
+        let now_ts = Utc::now().timestamp();
+        let retention_hours = cfg.logger.segment.retention_hours.max(1);
+        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
+        let max_allowed = now_ts.saturating_add(300);
+        let max_summaries = cfg.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES);
+        let max_fps = cfg
+            .logger
+            .segment
+            .max_fingerprints
+            .clamp(100, MAX_MERGED_FINGERPRINTS);
+
+        let mut init_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
+            HashMap::new();
+        let mut init_fps: HashMap<String, FingerprintObservation> = HashMap::new();
+        let mut init_alerts: Vec<AlertRecord> = Vec::new();
+
+        let state_path = maintainer_state_path(&cfg.logger.segment.dir, &tag);
+        match read_json_snapshot::<MaintainerPersistedState>(&state_path) {
+            Ok(Some(st)) => {
+                for s in st.summaries {
+                    if s.minute_epoch >= min_cutoff
+                        && s.minute_epoch <= max_allowed
+                        && s.uv_hll.is_valid()
+                    {
+                        let key = (
+                            s.minute_epoch,
+                            s.node_tag.clone(),
+                            s.role.clone(),
+                            s.service_tag.clone(),
+                        );
+                        init_summaries
+                            .entry(key)
+                            .and_modify(|e| e.merge_from(&s))
+                            .or_insert(s);
+                    }
+                }
+                for mut fp in st.fingerprints {
+                    if fp.last_seen_ts >= min_cutoff && fp.last_seen_ts <= max_allowed {
+                        if !cfg.logger.store_raw_ip {
+                            fp.client_ip = None;
+                        }
+                        fp.sanitize();
+                        if !fp.id.is_empty() {
+                            init_fps
+                                .entry(fp.id.clone())
+                                .and_modify(|e| e.merge_from(&fp))
+                                .or_insert(fp);
+                        }
+                    }
+                }
+                init_alerts = st.alerts.into_iter().take(200).collect();
+                prune_summaries_map(&mut init_summaries, min_cutoff, max_allowed, max_summaries);
+                prune_fingerprints_map(&mut init_fps, min_cutoff, max_allowed, max_fps);
+                info!(
+                    node = %tag,
+                    summaries = init_summaries.len(),
+                    fingerprints = init_fps.len(),
+                    "restored persisted maintainer telemetry state from disk"
+                );
+            }
+            Ok(None) => {
+                // Fallback: replay recent `.seg.jsonl` segment files if no state checkpoint exists yet
+                let seg_files = list_recent_segment_files(
+                    Path::new(&cfg.logger.segment.dir),
+                    &format!("maintainer-{tag}"),
+                    retention_hours,
+                );
+                for path in seg_files.into_iter().take(64) {
+                    if let Ok(rows) = read_segment_file::<SessionSummary>(&path) {
+                        for rec in rows {
+                            let min_epoch = ((rec.timestamp_ms / 1000) / 60) * 60;
+                            if min_epoch < min_cutoff || min_epoch > max_allowed {
+                                continue;
+                            }
+                            let key = (
+                                min_epoch,
+                                rec.node_tag.clone(),
+                                rec.role.clone(),
+                                rec.service_tag.clone(),
+                            );
+                            let entry = init_summaries.entry(key).or_insert_with(|| {
+                                MinuteSummary::new(
+                                    min_epoch,
+                                    &rec.node_tag,
+                                    &rec.role,
+                                    &rec.service_tag,
+                                    cfg.logger.hll_precision,
+                                    cfg.logger.hll_seed,
+                                    cfg.logger.histogram_buckets_ms.clone(),
+                                )
+                            });
+                            entry.record(&rec);
+                        }
+                    }
+                }
+                prune_summaries_map(&mut init_summaries, min_cutoff, max_allowed, max_summaries);
+            }
+            Err(e) => {
+                warn!(path = %state_path.display(), error = %e, "failed to load persisted maintainer state; starting fresh");
+            }
+        }
+
         let mut cert_map = HashMap::new();
         for order in &cfg.acme.orders {
             cert_map.insert(
@@ -448,11 +615,11 @@ impl MaintainerService {
         Ok(Arc::new(Self {
             node_tag: tag,
             cfg: Arc::new(RwLock::new(cfg)),
-            merged_summaries: Arc::new(Mutex::new(HashMap::new())),
-            merged_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            merged_summaries: Arc::new(Mutex::new(init_summaries)),
+            merged_fingerprints: Arc::new(Mutex::new(init_fps)),
             segment_writer: Arc::new(StdMutex::new(writer)),
             cert_statuses: Arc::new(Mutex::new(cert_map)),
-            alerts: Arc::new(Mutex::new(Vec::new())),
+            alerts: Arc::new(Mutex::new(init_alerts)),
             last_merge_latency_ms: Arc::new(Mutex::new(0.0)),
             http_client,
             shutdown_tx,
@@ -492,7 +659,7 @@ impl MaintainerService {
         Ok(())
     }
 
-    /// Merge incoming LogBatch from an authenticated Node (bounded timestamps, bounded maps, respects `store_raw_ip`).
+    /// Merge incoming LogBatch from an authenticated Node (bounded timestamps, bounded maps, respects `store_raw_ip` & retention).
     pub async fn ingest_log_batch(
         &self,
         from_node: &str,
@@ -501,13 +668,24 @@ impl MaintainerService {
         fingerprints: Vec<FingerprintObservation>,
     ) -> usize {
         let start = Instant::now();
-        let store_raw_ip = self.cfg.read().await.logger.store_raw_ip;
+        let (store_raw_ip, retention_hours, max_summaries, max_fps) = {
+            let c = self.cfg.read().await;
+            (
+                c.logger.store_raw_ip,
+                c.logger.segment.retention_hours.max(1),
+                c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
+                c.logger
+                    .segment
+                    .max_fingerprints
+                    .clamp(100, MAX_MERGED_FINGERPRINTS),
+            )
+        };
         let now_ts = Utc::now().timestamp();
-        let min_cutoff = now_ts.saturating_sub(86_400);
+        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
         let max_allowed = now_ts.saturating_add(300);
 
         // Enforce Maintainer's `store_raw_ip` privacy policy and cap batch size
-        records.truncate(2048);
+        records.truncate(4096);
         if !store_raw_ip {
             for r in &mut records {
                 r.raw_ip = None;
@@ -545,15 +723,12 @@ impl MaintainerService {
                     s.role.clone(),
                     s.service_tag.clone(),
                 );
-                if map.len() >= MAX_MERGED_SUMMARIES && !map.contains_key(&key) {
-                    continue;
-                }
                 map.entry(key)
                     .and_modify(|existing| existing.merge_from(&s))
                     .or_insert(s);
                 accepted_summaries += 1;
             }
-            map.retain(|(min, _, _, _), _| *min >= min_cutoff && *min <= max_allowed);
+            prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
         }
 
         let mut accepted_fps = 0usize;
@@ -570,16 +745,13 @@ impl MaintainerService {
                 if fp.id.is_empty() {
                     continue;
                 }
-                if fp_map.len() >= MAX_MERGED_FINGERPRINTS && !fp_map.contains_key(&fp.id) {
-                    continue;
-                }
                 fp_map
                     .entry(fp.id.clone())
                     .and_modify(|existing| existing.merge_from(&fp))
                     .or_insert(fp);
                 accepted_fps += 1;
             }
-            fp_map.retain(|_, v| v.last_seen_ts >= min_cutoff && v.last_seen_ts <= max_allowed);
+            prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
         }
 
         *self.last_merge_latency_ms.lock().await = start.elapsed().as_secs_f64() * 1000.0;
@@ -587,10 +759,46 @@ impl MaintainerService {
     }
 
     pub async fn flush_segments(&self) -> Result<()> {
+        let (dir, retention_hours, max_summaries, max_fps) = {
+            let c = self.cfg.read().await;
+            (
+                c.logger.segment.dir.clone(),
+                c.logger.segment.retention_hours.max(1),
+                c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
+                c.logger
+                    .segment
+                    .max_fingerprints
+                    .clamp(100, MAX_MERGED_FINGERPRINTS),
+            )
+        };
+        let now_ts = Utc::now().timestamp();
+        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
+        let max_allowed = now_ts.saturating_add(300);
+
+        let summaries: Vec<MinuteSummary> = {
+            let mut map = self.merged_summaries.lock().await;
+            prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
+            map.values().cloned().collect()
+        };
+        let fingerprints: Vec<FingerprintObservation> = {
+            let mut fp_map = self.merged_fingerprints.lock().await;
+            prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
+            fp_map.values().cloned().collect()
+        };
+        let alerts = self.alerts.lock().await.clone();
+        let state_path = maintainer_state_path(&dir, &self.node_tag);
+        let state = MaintainerPersistedState {
+            summaries,
+            fingerprints,
+            alerts,
+        };
+
         let writer = Arc::clone(&self.segment_writer);
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
             let _ = w.flush()?;
+            let _ = w.enforce_limits();
+            write_json_snapshot_atomic(&state_path, &state)?;
             Ok(())
         })
         .await
@@ -3542,6 +3750,59 @@ mod tests {
         // TXT record MUST be filtered out — Exposure only exposes A/AAAA/CNAME
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].record_id, "r-1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn maintainer_persists_state_across_restart_and_prunes_limits() {
+        use std::collections::BTreeMap;
+        use exposure_core::telemetry::{HyperLogLog, LatencyHistogram};
+
+        let dir = std::env::temp_dir().join(format!("exposure-maint-persist-{}", uuid::Uuid::new_v4()));
+        let mut cfg = MaintainerConfig::default();
+        cfg.logger.segment.dir = dir.to_string_lossy().to_string();
+        cfg.logger.segment.retention_hours = 24;
+        cfg.logger.segment.max_summaries = 100;
+        cfg.logger.segment.max_fingerprints = 100;
+
+        let svc = MaintainerService::new("maint-1", cfg.clone()).unwrap();
+        let now_min = (Utc::now().timestamp() / 60) * 60;
+        let fresh_sum = MinuteSummary {
+            minute_epoch: now_min,
+            node_tag: "edge-1".into(),
+            role: "ingress".into(),
+            service_tag: "web".into(),
+            requests: 42,
+            errors: 1,
+            rate_limited: 2,
+            challenges_issued: 3,
+            challenges_passed: 2,
+            bytes_in: 1000,
+            bytes_out: 4000,
+            uv_hll: HyperLogLog::new(12, 0),
+            latency_hist: LatencyHistogram::new(vec![10.0, 50.0, 100.0]),
+            device_counts: BTreeMap::new(),
+            browser_counts: BTreeMap::new(),
+            os_counts: BTreeMap::new(),
+            client_fp_verified: 1,
+        };
+        let expired_sum = MinuteSummary {
+            minute_epoch: now_min - 48 * 3600, // older than 24h retention_hours -> MUST be pruned!
+            ..fresh_sum.clone()
+        };
+        let ingested = svc
+            .ingest_log_batch("edge-1", vec![], vec![fresh_sum, expired_sum], vec![])
+            .await;
+        assert_eq!(ingested, 1, "expired summary older than retention_hours must be dropped");
+
+        svc.flush_segments().await.unwrap();
+
+        // Simulate full Maintainer process restart: new instance loads persisted state from disk!
+        let restored = MaintainerService::new("maint-1", cfg).unwrap();
+        let snap = restored.build_telemetry_snapshot(None).await;
+        assert_eq!(snap.summaries.len(), 1);
+        assert_eq!(snap.summaries[0].requests, 42);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::crs::WafRuleDescriptor;
+
 fn default_ttl() -> u8 {
     16
 }
@@ -55,6 +57,15 @@ fn default_flush_interval_secs() -> u64 {
 }
 fn default_max_batch_records() -> usize {
     512
+}
+fn default_max_batch_bytes() -> usize {
+    1024 * 1024
+}
+fn default_max_summaries() -> usize {
+    50_000
+}
+fn default_max_fingerprints() -> usize {
+    20_000
 }
 fn default_max_segment_bytes() -> u64 {
     16 * 1024 * 1024
@@ -396,6 +407,113 @@ pub fn default_waf_max_body_bytes() -> usize {
     32 * 1024
 }
 
+fn default_waf_paranoia_level() -> u8 {
+    1
+}
+
+fn default_crs_update_interval_hours() -> u64 {
+    24
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AbuseIpDbAction {
+    Off,
+    Monitor,
+    Challenge,
+    #[default]
+    Block,
+    Evilpot,
+}
+
+fn default_abuse_max_age_days() -> u16 {
+    90
+}
+fn default_abuse_challenge_threshold() -> u8 {
+    25
+}
+fn default_abuse_block_threshold() -> u8 {
+    75
+}
+fn default_abuse_cache_ttl_secs() -> u64 {
+    21_600
+}
+fn default_abuse_max_daily_lookups() -> u32 {
+    900
+}
+
+/// Optional AbuseIPDB IP reputation integration (uses the operator's own API key).
+/// AbuseIPDB returns `abuseConfidenceScore` in 0..=100 (higher = more abusive / lower reputation).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AbuseIpDbConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// User's AbuseIPDB v2 API key (redacted in Control GET responses).
+    #[serde(default)]
+    pub api_key: String,
+    /// Lookback window in days (1..=365, default 90).
+    #[serde(default = "default_abuse_max_age_days")]
+    pub max_age_days: u16,
+    /// Abuse confidence score >= this value raises server suspicion score & triggers PoW challenge (default 25).
+    #[serde(default = "default_abuse_challenge_threshold")]
+    pub challenge_threshold: u8,
+    /// Abuse confidence score >= this value triggers `high_risk_action` automatically (default 75).
+    #[serde(default = "default_abuse_block_threshold")]
+    pub block_threshold: u8,
+    /// Automatic action when an IP's abuse score >= `block_threshold` (`monitor` | `challenge` | `block` | `evilpot`).
+    #[serde(default)]
+    pub high_risk_action: AbuseIpDbAction,
+    /// In-memory per-IP cache TTL in seconds (default 21600s = 6h, preserves daily API quota).
+    #[serde(default = "default_abuse_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Hard daily API lookup budget per node (default 900, safe for 1000/day free keys).
+    #[serde(default = "default_abuse_max_daily_lookups")]
+    pub max_daily_lookups: u32,
+}
+
+impl Default for AbuseIpDbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            max_age_days: default_abuse_max_age_days(),
+            challenge_threshold: default_abuse_challenge_threshold(),
+            block_threshold: default_abuse_block_threshold(),
+            high_risk_action: AbuseIpDbAction::Block,
+            cache_ttl_secs: default_abuse_cache_ttl_secs(),
+            max_daily_lookups: default_abuse_max_daily_lookups(),
+        }
+    }
+}
+
+/// Cluster-wide OWASP Core Rule Set (https://coreruleset.org/) automatic sync & rule tuning settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrsUpdateConfig {
+    /// Automatically sync latest OWASP CRS release from GitHub on schedule (default true).
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+    /// Sync check interval in hours (default 24h).
+    #[serde(default = "default_crs_update_interval_hours")]
+    pub update_interval_hours: u64,
+    /// Default OWASP CRS Paranoia Level (1..=4, default 1).
+    #[serde(default = "default_waf_paranoia_level")]
+    pub paranoia_level: u8,
+    /// Globally disabled WAF / CRS rule IDs (applies across all guards).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_rule_ids: Vec<u32>,
+}
+
+impl Default for CrsUpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_update: true,
+            update_interval_hours: default_crs_update_interval_hours(),
+            paranoia_level: default_waf_paranoia_level(),
+            disabled_rule_ids: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WafConfig {
     #[serde(default)]
@@ -418,6 +536,15 @@ pub struct WafConfig {
     /// URL path prefixes exempt from WAF inspection (e.g. `"/api/webhooks/"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exempt_paths: Vec<String>,
+    /// Also evaluate synced OWASP Core Rule Set (CRS) rules alongside `sigil-filter` (default true).
+    #[serde(default = "default_true")]
+    pub crs_enabled: bool,
+    /// OWASP CRS Paranoia Level for this guard (1..=4, default 1).
+    #[serde(default = "default_waf_paranoia_level")]
+    pub crs_paranoia_level: u8,
+    /// Rule IDs disabled for this guard (in addition to global disabled IDs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_rule_ids: Vec<u32>,
 }
 
 impl Default for WafConfig {
@@ -430,6 +557,9 @@ impl Default for WafConfig {
             inspect_body: true,
             max_body_bytes: default_waf_max_body_bytes(),
             exempt_paths: Vec::new(),
+            crs_enabled: true,
+            crs_paranoia_level: default_waf_paranoia_level(),
+            disabled_rule_ids: Vec::new(),
         }
     }
 }
@@ -686,6 +816,15 @@ pub struct IngressConfig {
     /// Node-level embedded `evilpot` honeypot engine settings (used when a Guard enables `waf.mode = evilpot`).
     #[serde(default)]
     pub evilpot: EvilpotNodeConfig,
+    /// Optional AbuseIPDB IP reputation integration.
+    #[serde(default)]
+    pub abuseipdb: AbuseIpDbConfig,
+    /// OWASP CRS global settings (auto-update, paranoia level, globally disabled rule IDs).
+    #[serde(default)]
+    pub crs: CrsUpdateConfig,
+    /// Compiled/synced OWASP CRS rule descriptors distributed from Control (falls back to built-in baseline when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crs_rules: Vec<WafRuleDescriptor>,
 }
 
 impl IngressConfig {
@@ -713,6 +852,9 @@ impl Default for IngressConfig {
             pages: CustomPagesConfig::default(),
             cache: NodeCacheConfig::default(),
             evilpot: EvilpotNodeConfig::default(),
+            abuseipdb: AbuseIpDbConfig::default(),
+            crs: CrsUpdateConfig::default(),
+            crs_rules: Vec::new(),
         }
     }
 }
@@ -823,12 +965,21 @@ pub struct SegmentConfig {
     pub flush_interval_secs: u64,
     #[serde(default = "default_max_batch_records")]
     pub max_batch_records: usize,
+    /// Trigger an immediate flush & Maintainer push when buffered JSONL bytes hit this threshold (default 1 MiB).
+    #[serde(default = "default_max_batch_bytes")]
+    pub max_batch_bytes: usize,
     #[serde(default = "default_max_segment_bytes")]
     pub max_segment_bytes: u64,
     #[serde(default = "default_max_disk_bytes")]
     pub max_disk_bytes: u64,
     #[serde(default = "default_retention_hours")]
     pub retention_hours: u64,
+    /// Maximum aggregated minute summaries retained on Maintainer (prevents unbounded RAM/disk growth, default 50,000).
+    #[serde(default = "default_max_summaries")]
+    pub max_summaries: usize,
+    /// Maximum visitor fingerprint records retained on Maintainer (default 20,000).
+    #[serde(default = "default_max_fingerprints")]
+    pub max_fingerprints: usize,
 }
 
 fn default_segment_dir() -> String {
@@ -841,9 +992,12 @@ impl Default for SegmentConfig {
             dir: default_segment_dir(),
             flush_interval_secs: default_flush_interval_secs(),
             max_batch_records: default_max_batch_records(),
+            max_batch_bytes: default_max_batch_bytes(),
             max_segment_bytes: default_max_segment_bytes(),
             max_disk_bytes: default_max_disk_bytes(),
             retention_hours: default_retention_hours(),
+            max_summaries: default_max_summaries(),
+            max_fingerprints: default_max_fingerprints(),
         }
     }
 }
@@ -1336,6 +1490,10 @@ pub struct IngressDefaults {
     pub cache: NodeCacheConfig,
     #[serde(default)]
     pub evilpot: EvilpotNodeConfig,
+    #[serde(default)]
+    pub abuseipdb: AbuseIpDbConfig,
+    #[serde(default)]
+    pub crs: CrsUpdateConfig,
 }
 
 impl Default for IngressDefaults {
@@ -1350,6 +1508,8 @@ impl Default for IngressDefaults {
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
             cache: NodeCacheConfig::default(),
             evilpot: EvilpotNodeConfig::default(),
+            abuseipdb: AbuseIpDbConfig::default(),
+            crs: CrsUpdateConfig::default(),
         }
     }
 }

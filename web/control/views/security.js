@@ -2,6 +2,7 @@
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
+  defaultCrsUpdateConfig,
   defaultGuardProfile,
   defaultTopologyDefaults,
   defaultWafConfig,
@@ -11,6 +12,7 @@ import {
 import {
   el,
   esc,
+  openModal,
   parseNum,
   renderBinSlider,
   renderTriSlider,
@@ -20,10 +22,17 @@ import {
 } from "../ui.js";
 
 export function createSecurityView({ api, store }) {
-  let subTab = "guards"; // guards | buckets | evilpot | pages
+  let subTab = "guards"; // guards | waf-rules | buckets | evilpot | pages
   let previewMode = "error"; // error | challenge
   let evilpotData = null;
   let evilpotLoading = false;
+  let wafRulesData = null;
+  let wafRulesLoading = false;
+  let wafSyncing = false;
+  let wafSearch = "";
+  let wafSourceFilter = "all"; // all | sigil-filter | owasp-crs
+  let wafPlFilter = "all"; // all | 1 | 2 | 3 | 4
+  let wafStatusFilter = "all"; // all | on | off
 
   function countGuardUsage() {
     const counts = {};
@@ -51,12 +60,18 @@ export function createSecurityView({ api, store }) {
 
     const verifiedCount = evilpotData?.summary?.verified_attack_sessions || 0;
     const trackedCount = evilpotData?.summary?.tracked_sessions || 0;
+    const totalWafRulesCount = wafRulesData
+      ? (wafRulesData.builtin_rules?.length || 0) + (wafRulesData.crs_rules?.length || 0)
+      : 0;
 
     root.innerHTML = `
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "guards" ? "active" : ""}" data-sec-sub="guards">
             ${esc(t("sec.tab.guards"))} <span class="subtab-count">${guardKeys.length}</span>
+          </button>
+          <button type="button" class="subtab-btn ${subTab === "waf-rules" ? "active" : ""}" data-sec-sub="waf-rules">
+            ${esc(t("sec.tab.waf_rules"))} ${totalWafRulesCount > 0 ? `<span class="subtab-count">${totalWafRulesCount}</span>` : ""}
           </button>
           <button type="button" class="subtab-btn ${subTab === "buckets" ? "active" : ""}" data-sec-sub="buckets">
             ${esc(t("sec.tab.buckets"))} <span class="subtab-count">${bucketKeys.length}</span>
@@ -70,6 +85,7 @@ export function createSecurityView({ api, store }) {
         </div>
         <div class="btn-row">
           ${subTab === "guards" ? `<button type="button" id="btn-sec-add-guard" class="btn sm primary">${esc(t("sec.add_guard"))}</button>` : ""}
+          ${subTab === "waf-rules" ? `<button type="button" id="btn-sec-crs-sync" class="btn sm primary" ${wafSyncing ? "disabled" : ""}>${esc(wafSyncing ? t("waf.crs.syncing") : t("waf.crs.sync_now"))}</button>` : ""}
           ${subTab === "buckets" ? `<button type="button" id="btn-sec-add-bucket" class="btn sm primary">${esc(t("sec.add_bucket"))}</button>` : ""}
           ${subTab === "evilpot" ? `<button type="button" id="btn-sec-ep-pull" class="btn sm primary" ${evilpotLoading ? "disabled" : ""}>${esc(t("ep.pull_refresh"))}</button>` : ""}
           ${subTab === "pages" ? `<button type="button" id="btn-sec-reset-pages" class="btn sm">${esc(t("sec.pages.reset"))}</button>` : ""}
@@ -82,12 +98,14 @@ export function createSecurityView({ api, store }) {
       btn.addEventListener("click", () => {
         subTab = btn.dataset.secSub;
         if (subTab === "evilpot") loadEvilpot(false);
+        else if (subTab === "waf-rules") loadWafRules();
         render();
       });
     });
 
     const body = el("sec-sub-body");
     if (subTab === "guards") renderGuardsSubTab(body, guardKeys, bucketKeys);
+    else if (subTab === "waf-rules") renderWafRulesSubTab(body);
     else if (subTab === "buckets") renderBucketsSubTab(body, bucketKeys);
     else if (subTab === "evilpot") renderEvilpotSubTab(body);
     else renderPagesSubTab(body);
@@ -178,10 +196,16 @@ export function createSecurityView({ api, store }) {
                 <div class="inspector-row">
                   <label><span>${esc(t("waf.min_conf"))}</span><input type="number" step="0.05" min="0.1" max="1" data-gd-waf-conf="${esc(gName)}" value="${waf.min_confidence ?? 0.65}" /></label>
                   <label><span>${esc(t("waf.max_body_kb"))}</span><input type="number" min="0" max="256" data-gd-waf-bodykb="${esc(gName)}" value="${Math.round((waf.max_body_bytes ?? 32768) / 1024)}" /></label>
+                  <label><span>${esc(t("waf.crs.paranoia"))}</span>
+                    <select data-gd-waf-pl="${esc(gName)}">
+                      ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(waf.crs_paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
+                    </select>
+                  </label>
                 </div>
                 <div class="tri-stack" style="margin-top:6px;">
                   ${renderBinSlider({ attrName: `data-gd-waf-bin-${gName}`, attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: waf.inspect_headers !== false })}
                   ${renderBinSlider({ attrName: `data-gd-waf-bin-${gName}`, attrVal: "inspect_body", label: t("waf.inspect_body"), val: waf.inspect_body !== false })}
+                  ${renderBinSlider({ attrName: `data-gd-waf-bin-${gName}`, attrVal: "crs_enabled", label: t("waf.crs.enabled"), val: waf.crs_enabled !== false })}
                 </div>
                 <label style="margin-top:6px;"><span>${esc(t("waf.exempt_paths"))}</span>
                   <input data-gd-waf-exempt="${esc(gName)}" value="${esc((waf.exempt_paths || []).join(", "))}" placeholder="/api/webhooks/, /cms/" />
@@ -339,6 +363,17 @@ export function createSecurityView({ api, store }) {
           const g = s.guard_templates[gName];
           if (!g.waf) g.waf = defaultWafConfig();
           g.waf.max_body_bytes = parseNum(inp.value, 32, 0, 256) * 1024;
+        }, false);
+      });
+    });
+
+    container.querySelectorAll("[data-gd-waf-pl]").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const gName = sel.dataset.gdWafPl;
+        store.mutate((s) => {
+          const g = s.guard_templates[gName];
+          if (!g.waf) g.waf = defaultWafConfig();
+          g.waf.crs_paranoia_level = parseNum(sel.value, 1, 1, 4);
         }, false);
       });
     });
@@ -728,11 +763,252 @@ export function createSecurityView({ api, store }) {
     `;
   }
 
+  async function loadWafRules() {
+    if (wafRulesLoading) return;
+    wafRulesLoading = true;
+    try {
+      wafRulesData = await api("/api/waf/rules");
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      wafRulesLoading = false;
+      if (subTab === "waf-rules") render();
+    }
+  }
+
+  async function triggerCrsSync() {
+    if (wafSyncing) return;
+    wafSyncing = true;
+    render();
+    try {
+      const res = await api("/api/waf/crs/sync", { method: "POST" });
+      showToast(t("waf.crs.synced_ok", { version: res.version || "latest", count: res.rules_count ?? 0 }));
+      await loadWafRules();
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      wafSyncing = false;
+      if (subTab === "waf-rules") render();
+    }
+  }
+
+  function renderWafRulesSubTab(container) {
+    el("btn-sec-crs-sync")?.addEventListener("click", triggerCrsSync);
+
+    const ensureCrs = (s) => {
+      if (!s.defaults) s.defaults = defaultTopologyDefaults();
+      if (!s.defaults.ingress) s.defaults.ingress = defaultTopologyDefaults().ingress;
+      if (!s.defaults.ingress.crs) s.defaults.ingress.crs = defaultCrsUpdateConfig();
+      return s.defaults.ingress.crs;
+    };
+    const crsCfg = store.spec.defaults?.ingress?.crs || defaultCrsUpdateConfig();
+    const disabledSet = new Set((crsCfg.disabled_rule_ids || []).map(Number));
+    const meta = wafRulesData?.crs_meta || {};
+    const allRules = [
+      ...(wafRulesData?.builtin_rules || []),
+      ...(wafRulesData?.crs_rules || []),
+    ];
+
+    const q = wafSearch.trim().toLowerCase();
+    const filtered = allRules.filter((r) => {
+      if (wafSourceFilter !== "all" && r.source !== wafSourceFilter) return false;
+      if (wafPlFilter !== "all" && Number(r.paranoia_level || 1) !== Number(wafPlFilter)) return false;
+      const isOff = disabledSet.has(Number(r.id));
+      if (wafStatusFilter === "on" && isOff) return false;
+      if (wafStatusFilter === "off" && !isOff) return false;
+      if (q) {
+        const hay = `${r.id} ${r.category || ""} ${r.msg || ""} ${r.pattern || ""} ${r.file || ""} ${(r.tags || []).join(" ")}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const sevPill = (sev) => {
+      const s = String(sev || "CRITICAL").toUpperCase();
+      const cls = s === "CRITICAL" ? "err" : s === "ERROR" ? "warn" : "info";
+      return `<span class="pill ${cls}">${esc(s)}</span>`;
+    };
+
+    container.innerHTML = `
+      <div class="kpi-grid" style="margin-bottom:14px;">
+        <div class="kpi">
+          <div class="kpi-label">${esc(t("waf.crs.version"))}</div>
+          <div class="kpi-val" style="font-size:18px;">${esc(meta.version || (wafRulesLoading ? "…" : "builtin"))}</div>
+          <div class="kpi-sub"><a href="https://coreruleset.org/" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">coreruleset.org</a></div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">${esc(t("waf.crs.active_count"))}</div>
+          <div class="kpi-val">${allRules.length - disabledSet.size} / ${allRules.length}</div>
+          <div class="kpi-sub">${(wafRulesData?.builtin_rules || []).length} Sigil · ${(wafRulesData?.crs_rules || []).length} CRS</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">${esc(t("waf.crs.skipped_pcre"))}</div>
+          <div class="kpi-val">${meta.skipped_pcre ?? 0}</div>
+          <div class="kpi-sub">Linear-time ReDoS-safe Rust regex</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">${esc(t("waf.crs.updated"))}</div>
+          <div class="kpi-val" style="font-size:15px;">${esc(meta.updated_at ? formatDateTime(meta.updated_at) : "—")}</div>
+          <div class="kpi-sub">${disabledSet.size} disabled</div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:14px;">
+        <div class="inspector-row" style="align-items:end;">
+          <div style="flex:1.4;">
+            ${renderBinSlider({ attrName: "data-crs-bin", attrVal: "auto_update", label: t("waf.crs.auto_update"), val: crsCfg.auto_update !== false })}
+          </div>
+          <label><span>${esc(t("waf.crs.interval_h"))}</span>
+            <input id="crs-interval-h" type="number" min="1" max="720" value="${crsCfg.update_interval_hours ?? 24}" />
+          </label>
+          <label><span>${esc(t("waf.crs.paranoia"))}</span>
+            <select id="crs-default-pl">
+              ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(crsCfg.paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
+            </select>
+          </label>
+        </div>
+        <div class="muted-sm" style="margin-top:8px;">${esc(t("waf.crs.deploy_hint"))}</div>
+      </div>
+
+      <div class="panel">
+        <div class="fp-search-bar" style="margin-bottom:10px;">
+          <label style="flex:2;"><span>${esc(t("common.search"))}</span>
+            <input id="waf-rule-search" type="search" value="${esc(wafSearch)}" placeholder="${esc(t("waf.crs.search_ph"))}" />
+          </label>
+          <label><span>${esc(t("waf.crs.col_source"))}</span>
+            <select id="waf-rule-src">
+              <option value="all" ${wafSourceFilter === "all" ? "selected" : ""}>${esc(t("waf.crs.src_all"))}</option>
+              <option value="sigil-filter" ${wafSourceFilter === "sigil-filter" ? "selected" : ""}>${esc(t("waf.crs.src_sigil"))}</option>
+              <option value="owasp-crs" ${wafSourceFilter === "owasp-crs" ? "selected" : ""}>${esc(t("waf.crs.src_crs"))}</option>
+            </select>
+          </label>
+          <label><span>${esc(t("waf.crs.col_pl"))}</span>
+            <select id="waf-rule-pl">
+              <option value="all" ${wafPlFilter === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
+              ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${String(wafPlFilter) === String(pl) ? "selected" : ""}>PL${pl}</option>`).join("")}
+            </select>
+          </label>
+          <label><span>${esc(t("waf.crs.col_state"))}</span>
+            <select id="waf-rule-status">
+              <option value="all" ${wafStatusFilter === "all" ? "selected" : ""}>${esc(t("waf.crs.status_all"))}</option>
+              <option value="on" ${wafStatusFilter === "on" ? "selected" : ""}>${esc(t("waf.crs.status_on"))}</option>
+              <option value="off" ${wafStatusFilter === "off" ? "selected" : ""}>${esc(t("waf.crs.status_off"))}</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="table-scroll" style="max-height:540px;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>${esc(t("waf.crs.col_id"))}</th>
+                <th>${esc(t("waf.crs.col_source"))}</th>
+                <th>${esc(t("waf.crs.col_pl"))}</th>
+                <th>${esc(t("waf.crs.col_cat"))}</th>
+                <th>${esc(t("waf.crs.col_sev"))}</th>
+                <th>${esc(t("waf.crs.col_desc"))}</th>
+                <th>${esc(t("waf.crs.col_state"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${
+                filtered
+                  .slice(0, 300)
+                  .map((r, idx) => {
+                    const isEnabled = !disabledSet.has(Number(r.id));
+                    const srcPill = r.source === "sigil-filter"
+                      ? `<span class="pill info">sigil-filter</span>`
+                      : `<span class="pill ok">OWASP CRS</span>`;
+                    return `
+                  <tr class="fp-table-row" data-waf-rule-idx="${idx}" style="${isEnabled ? "" : "opacity:0.55;"}">
+                    <td><code>${esc(r.id)}</code></td>
+                    <td>${srcPill}</td>
+                    <td><span class="pill">PL${Number(r.paranoia_level) || 1}</span></td>
+                    <td><code>${esc(r.category || "-")}</code></td>
+                    <td>${sevPill(r.severity)}</td>
+                    <td style="max-width:420px;">
+                      <div><strong>${esc(r.msg || "(unnamed rule)")}</strong></div>
+                      <div class="muted-sm" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><code>${esc((r.pattern || "").slice(0, 120))}</code></div>
+                    </td>
+                    <td data-waf-toggle-cell="1">
+                      <button type="button" class="btn sm ${isEnabled ? "primary" : "ghost"}" data-waf-rule-toggle="${esc(r.id)}">
+                        ${esc(isEnabled ? t("waf.crs.status_on") : t("waf.crs.status_off"))}
+                      </button>
+                    </td>
+                  </tr>`;
+                  })
+                  .join("") || `<tr><td colspan="7" class="muted">${wafRulesLoading ? "Loading…" : "No WAF rules match filter."}</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        ${filtered.length > 300 ? `<div class="muted-sm" style="margin-top:6px;">Showing first 300 of ${filtered.length} matching rules — refine search to inspect others.</div>` : ""}
+      </div>
+    `;
+
+    wireBinSliders(container, "data-crs-bin", (f, v) => {
+      store.mutate((s) => { ensureCrs(s)[f] = v; }, false);
+    });
+    el("crs-interval-h")?.addEventListener("input", (ev) => {
+      store.mutate((s) => { ensureCrs(s).update_interval_hours = parseNum(ev.target.value, 24, 1, 720); }, false);
+    });
+    el("crs-default-pl")?.addEventListener("change", (ev) => {
+      store.mutate((s) => { ensureCrs(s).paranoia_level = parseNum(ev.target.value, 1, 1, 4); }, false);
+    });
+    el("waf-rule-search")?.addEventListener("input", (ev) => { wafSearch = ev.target.value; render(); });
+    el("waf-rule-src")?.addEventListener("change", (ev) => { wafSourceFilter = ev.target.value; render(); });
+    el("waf-rule-pl")?.addEventListener("change", (ev) => { wafPlFilter = ev.target.value; render(); });
+    el("waf-rule-status")?.addEventListener("change", (ev) => { wafStatusFilter = ev.target.value; render(); });
+
+    container.querySelectorAll("[data-waf-rule-toggle]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const id = Number(btn.dataset.wafRuleToggle);
+        store.mutate((s) => {
+          const c = ensureCrs(s);
+          const list = Array.isArray(c.disabled_rule_ids) ? c.disabled_rule_ids.map(Number) : [];
+          const idx = list.indexOf(id);
+          if (idx >= 0) list.splice(idx, 1);
+          else list.push(id);
+          c.disabled_rule_ids = list.sort((a, b) => a - b);
+        });
+        render();
+      });
+    });
+
+    container.querySelectorAll("[data-waf-rule-idx]").forEach((tr) => {
+      tr.addEventListener("click", (ev) => {
+        if (ev.target.closest("[data-waf-toggle-cell]")) return;
+        const r = filtered[Number(tr.dataset.wafRuleIdx)];
+        if (!r) return;
+        openModal({
+          title: `WAF Rule #${r.id} — ${r.source}`,
+          bodyHtml: `
+            <div class="fp-detail-grid">
+              <div class="fp-kv"><div class="fp-kv-lbl">Category / PL / Severity</div><div class="fp-kv-val"><code>${esc(r.category)}</code> · PL${Number(r.paranoia_level) || 1} · ${esc(r.severity)}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Source File</div><div class="fp-kv-val"><code>${esc(r.file || "-")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Operator</div><div class="fp-kv-val"><code>@${esc(r.operator || "rx")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Targets</div><div class="fp-kv-val"><code>${esc((r.targets || []).join(", ") || "-")}</code></div></div>
+            </div>
+            <div style="margin-top:10px;"><strong>${esc(r.msg || "")}</strong></div>
+            <div class="muted-sm" style="margin-top:8px;">Pattern</div>
+            <pre class="output-box" style="max-height:180px;white-space:pre-wrap;word-break:break-all;">${esc(r.pattern || "")}</pre>
+            ${r.tags?.length ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px;">${r.tags.map((tg) => `<span class="pill">${esc(tg)}</span>`).join("")}</div>` : ""}`,
+          actions: [{ label: t("common.close"), cls: "primary" }],
+        });
+      });
+    });
+  }
+
   async function refresh(opts = {}) {
     if (opts.subTab) subTab = opts.subTab;
     if (!store.loaded) await store.loadTopology(false);
     if (subTab === "evilpot") {
       await loadEvilpot(false);
+      return;
+    }
+    if (subTab === "waf-rules") {
+      await loadWafRules();
       return;
     }
     render();

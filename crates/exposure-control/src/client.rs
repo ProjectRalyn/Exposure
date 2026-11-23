@@ -32,31 +32,50 @@ use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::compiler::{compile_topology_full, compute_control_hops, CompileReport};
+use crate::compiler::{compile_topology_full, compute_control_hops, inject_crs_rules, CompileReport};
 use crate::db::ControlDb;
+use exposure_core::crs::{builtin_crs_snapshot, CrsRulesetSnapshot};
+
+const KV_TELEMETRY_CACHE: &str = "telemetry_cache_json";
+pub const KV_CRS_RULESET: &str = "crs_ruleset_json";
+const MAX_PERSISTED_SUMMARIES: usize = 10_000;
+const MAX_PERSISTED_FINGERPRINTS: usize = 5_000;
+const MAX_PERSISTED_ALERTS: usize = 500;
 
 const MAX_INCOMING_DISPATCH_TASKS: usize = 128;
 const INCOMING_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_DEPTH: usize = 16;
 const MAX_DISCOVERY_NODES: usize = 512;
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MaintainerHealthInfo {
+    #[serde(default)]
     pub maintainer_tag: String,
+    #[serde(default)]
     pub segment_backlog: usize,
+    #[serde(default)]
     pub merge_latency_ms: f64,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CachedTelemetry {
+    #[serde(default)]
     pub links: Vec<LinkStatusSnapshot>,
+    #[serde(default)]
     pub summaries: Vec<MinuteSummary>,
+    #[serde(default)]
     pub fingerprints: Vec<FingerprintObservation>,
+    #[serde(default)]
     pub certificates: Vec<CertStatusInfo>,
+    #[serde(default)]
     pub alerts: Vec<AlertRecord>,
+    #[serde(default)]
     pub maintainers: Vec<MaintainerHealthInfo>,
+    #[serde(default)]
     pub node_uptimes: HashMap<String, u64>,
+    #[serde(default)]
     pub evilpot_reports: Vec<EvilpotNodeReport>,
+    #[serde(default)]
     pub last_pulled_at: Option<String>,
 }
 
@@ -141,6 +160,55 @@ impl ControlClient {
 
     pub async fn cached_telemetry(&self) -> CachedTelemetry {
         self.telemetry_cache.read().await.clone()
+    }
+
+    /// Restore previously persisted telemetry cache from SQLite on Control startup so dashboards
+    /// and analytics retain historical data across restarts even before the next mesh pull.
+    pub async fn restore_telemetry_cache(&self) {
+        match self.db.get_kv_json::<CachedTelemetry>(KV_TELEMETRY_CACHE).await {
+            Ok(Some(saved)) => {
+                info!(
+                    summaries = saved.summaries.len(),
+                    fingerprints = saved.fingerprints.len(),
+                    last_pulled_at = ?saved.last_pulled_at,
+                    "restored persisted telemetry cache from SQLite"
+                );
+                *self.telemetry_cache.write().await = saved;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to restore persisted telemetry cache from SQLite");
+            }
+        }
+    }
+
+    /// Return the active OWASP CRS ruleset snapshot (synced from GitHub or built-in baseline).
+    pub async fn active_crs_snapshot(&self) -> CrsRulesetSnapshot {
+        match self.db.get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET).await {
+            Ok(Some(snap)) if !snap.rules.is_empty() => snap,
+            _ => builtin_crs_snapshot(),
+        }
+    }
+
+    /// Sync the latest OWASP Core Rule Set from `coreruleset.org` / GitHub and persist to SQLite.
+    pub async fn sync_owasp_crs(&self, actor: &str) -> Result<CrsRulesetSnapshot> {
+        let snap = crate::crs_sync::sync_owasp_crs_from_github().await?;
+        self.db.set_kv_json(KV_CRS_RULESET, &snap).await?;
+        self.db
+            .append_audit(
+                actor,
+                "crs_sync",
+                "waf",
+                true,
+                &format!(
+                    "synced OWASP CRS {} ({} rules active, {} PCRE-only skipped)",
+                    snap.version,
+                    snap.rules.len(),
+                    snap.skipped_pcre
+                ),
+            )
+            .await;
+        Ok(snap)
     }
 
     pub async fn active_bootstrap_tag(&self) -> Option<String> {
@@ -537,7 +605,8 @@ impl ControlClient {
         }
 
         let cluster_hmac = self.db.get_cluster_hmac_key().await.ok().flatten();
-        let (report, compiled) = compile_topology_full(
+        let crs = self.active_crs_snapshot().await;
+        let (report, mut compiled) = compile_topology_full(
             &topo,
             &self.signing_kp.public_key_b64(),
             &self.link_public_key_b64(),
@@ -546,6 +615,7 @@ impl ControlClient {
             true,
             cluster_hmac.as_deref(),
         );
+        inject_crs_rules(&mut compiled, &crs.rules);
         Ok((topo, report, compiled))
     }
 
@@ -574,7 +644,8 @@ impl ControlClient {
         }
 
         let cluster_hmac = self.db.get_or_create_cluster_hmac_key().await?;
-        let (report, compiled) = compile_topology_full(
+        let crs = self.active_crs_snapshot().await;
+        let (report, mut compiled) = compile_topology_full(
             &topo,
             &self.signing_kp.public_key_b64(),
             &self.link_public_key_b64(),
@@ -583,6 +654,7 @@ impl ControlClient {
             true,
             Some(&cluster_hmac),
         );
+        inject_crs_rules(&mut compiled, &crs.rules);
         Ok((topo, report, compiled))
     }
 
@@ -1070,6 +1142,10 @@ impl ControlClient {
             }
         }
 
+        if pulled == 0 {
+            return Ok(0);
+        }
+
         cache.summaries = dedup_summaries.into_values().collect();
         let mut fps: Vec<FingerprintObservation> = dedup_fingerprints.into_values().collect();
         fps.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
@@ -1077,7 +1153,43 @@ impl ControlClient {
         cache.fingerprints = fps;
         cache.certificates = dedup_certs.into_values().collect();
         cache.last_pulled_at = Some(Utc::now().to_rfc3339());
-        *self.telemetry_cache.write().await = cache;
+
+        // If no Maintainer responded during this cycle, retain previously persisted summaries/fingerprints
+        // so transient Maintainer restarts never blank out Control telemetry.
+        {
+            let mut guard = self.telemetry_cache.write().await;
+            if cache.maintainers.is_empty() {
+                if cache.summaries.is_empty() && !guard.summaries.is_empty() {
+                    cache.summaries = guard.summaries.clone();
+                }
+                if cache.fingerprints.is_empty() && !guard.fingerprints.is_empty() {
+                    cache.fingerprints = guard.fingerprints.clone();
+                }
+                if cache.certificates.is_empty() && !guard.certificates.is_empty() {
+                    cache.certificates = guard.certificates.clone();
+                }
+            }
+            *guard = cache.clone();
+        }
+
+        // Persist bounded telemetry snapshot to SQLite so Control restarts keep recent telemetry.
+        let mut persisted = cache;
+        if persisted.summaries.len() > MAX_PERSISTED_SUMMARIES {
+            persisted
+                .summaries
+                .sort_by(|a, b| b.minute_epoch.cmp(&a.minute_epoch));
+            persisted.summaries.truncate(MAX_PERSISTED_SUMMARIES);
+        }
+        if persisted.fingerprints.len() > MAX_PERSISTED_FINGERPRINTS {
+            persisted.fingerprints.truncate(MAX_PERSISTED_FINGERPRINTS);
+        }
+        if persisted.alerts.len() > MAX_PERSISTED_ALERTS {
+            persisted.alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            persisted.alerts.truncate(MAX_PERSISTED_ALERTS);
+        }
+        if let Err(e) = self.db.set_kv_json(KV_TELEMETRY_CACHE, &persisted).await {
+            warn!(error = %e, "failed to persist telemetry cache to SQLite");
+        }
         Ok(pulled)
     }
 

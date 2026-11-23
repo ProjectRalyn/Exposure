@@ -304,17 +304,31 @@ export function createAnalyticsViews({ api, store, navigate }) {
                     const ipPrimary = obs.client_ip || obs.ip_prefix || "-";
                     const srcBadge = obs.js_verified ? (obs.fp_source === "pow" ? `<span class="pill ok">PoW</span>` : `<span class="pill info">Beacon</span>`) : `<span class="pill">UA</span>`;
                     const js = obs.js_fp;
-                    const jsSum = js ? `${js.screen || "-"} · ${(js.webgl || js.platform || "-").slice(0, 28)}` : "-";
+                    const jsParts = [];
+                    if (js) {
+                      if (js.screen) jsParts.push(js.screen);
+                      if (js.canvas_hash) jsParts.push(`cv:${js.canvas_hash}`);
+                      if (js.audio_hash) jsParts.push(`au:${js.audio_hash}`);
+                      if (js.fonts_count) jsParts.push(`ft:${js.fonts_count}`);
+                      if (js.webgl) jsParts.push(js.webgl.slice(0, 22));
+                    }
+                    const jsSum = jsParts.length ? jsParts.join(" · ") : "-";
                     const riskCls = obs.is_headless || obs.is_bot || obs.suspicion_score >= 60 ? "err" : obs.suspicion_score >= 30 ? "warn" : "ok";
-                    const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `Score ${Number(obs.suspicion_score) || 0}`;
+                    const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `${t("fp.server_score")} ${Number(obs.suspicion_score) || 0}`;
+                    const abuseBadge = obs.abuse_score != null
+                      ? `<span class="pill ${obs.abuse_score >= 75 ? "err" : obs.abuse_score >= 25 ? "warn" : "ok"}">Abuse ${Number(obs.abuse_score)}${obs.abuse_country ? ` · ${esc(obs.abuse_country)}` : ""}${obs.abuse_is_tor ? " · TOR" : ""}</span>`
+                      : "";
+                    const ja3Line = obs.tls_ja3
+                      ? `<div class="muted-sm">JA3: <span class="fp-code">${esc(obs.tls_ja3.slice(0, 12))}</span>${obs.tls_grease ? " · GREASE" : ""}</div>`
+                      : "";
                     return `
                   <tr class="fp-table-row" data-fp-idx="${idx}">
                     <td><div><strong>${esc(ipPrimary)}</strong></div><div class="muted-sm"><span class="fp-code">${esc(obs.ip_hmac)}</span></div></td>
-                    <td><span class="fp-code">${esc(obs.fp_hash)}</span> ${srcBadge}</td>
+                    <td><div><span class="fp-code">${esc(obs.fp_hash)}</span> ${srcBadge}</div>${ja3Line}</td>
                     <td><div><strong>${esc(obs.browser_family || "-")}</strong> · ${esc(obs.os_family || "-")}</div><div class="muted-sm">${esc(obs.device_type || "-")}</div></td>
                     <td><span class="muted-sm">${esc(jsSum)}</span></td>
                     <td><div><code>${esc(obs.service_tag)}</code></div><div class="muted-sm">${esc(obs.node_tag)}</div></td>
-                    <td><span class="pill ${riskCls}">${esc(riskLbl)}</span></td>
+                    <td><div style="display:flex;flex-wrap:wrap;gap:4px;"><span class="pill ${riskCls}">${esc(riskLbl)}</span>${abuseBadge}</div></td>
                     <td><div><strong>${formatCompact(obs.request_count)}</strong></div><div class="muted-sm">${obs.challenge_count || 0} ch · ${obs.rate_limited_count || 0} 429</div></td>
                     <td>${esc(formatDateTime(obs.last_seen_ts))}</td>
                   </tr>`;
@@ -350,16 +364,40 @@ export function createAnalyticsViews({ api, store, navigate }) {
         const obs = items[Number(tr.dataset.fpIdx)];
         if (!obs) return;
         const js = obs.js_fp;
+        const abuseHtml = obs.abuse_score != null
+          ? `<span class="pill ${obs.abuse_score >= 75 ? "err" : obs.abuse_score >= 25 ? "warn" : "ok"}">${Number(obs.abuse_score)}/100</span>
+             ${esc(obs.abuse_country || "-")} · ${esc(obs.abuse_isp || "-")}${obs.abuse_is_tor ? ` <span class="pill warn">TOR</span>` : ""}`
+          : `<span class="muted">—</span>`;
+        const tamperHtml = js?.tamper_flags?.length
+          ? js.tamper_flags.map((f) => `<span class="pill err">${esc(f)}</span>`).join(" ")
+          : `<span class="pill ok">none</span>`;
         openModal({
           title: `Fingerprint — ${obs.fp_hash}`,
           bodyHtml: `
+            <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--accent);">${esc(t("fp.sec.server"))}</div>
             <div class="fp-detail-grid">
               <div class="fp-kv"><div class="fp-kv-lbl">IP / HMAC</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")}<br/><code>${esc(obs.ip_hmac)}</code></div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">Route</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}</div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">Score &amp; TLS</div><div class="fp-kv-val">${Number(obs.suspicion_score) || 0}/100 · ciphers: ${Number(obs.tls_cipher_count) || 0}</div></div>
-              ${js ? `<div class="fp-kv"><div class="fp-kv-lbl">WebGL / Screen</div><div class="fp-kv-val">${esc(js.webgl || "-")} · ${esc(js.screen || "-")}</div></div>` : ""}
+              <div class="fp-kv"><div class="fp-kv-lbl">Route / Host</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}<br/><span class="muted-sm">${esc(obs.host || "-")}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.server_score"))}</div><div class="fp-kv-val"><strong>${Number(obs.suspicion_score) || 0}/100</strong> · bot:${obs.is_bot ? "yes" : "no"} · headless:${obs.is_headless ? "yes" : "no"}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.tls_ja3"))}</div><div class="fp-kv-val"><code>${esc(obs.tls_ja3 || "-")}</code><br/><span class="muted-sm">ciphers: ${Number(obs.tls_cipher_count) || 0} · GREASE: ${obs.tls_grease ? "yes" : "no"}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.abuse_intel"))}</div><div class="fp-kv-val">${abuseHtml}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Traffic</div><div class="fp-kv-val">${formatCompact(obs.request_count)} req · ${obs.challenge_count || 0} PoW · ${obs.rate_limited_count || 0} 429</div></div>
             </div>
-            <div class="fp-ua-box">${esc(obs.user_agent || "(empty)")}</div>`,
+            <div class="fp-ua-box" style="margin-top:8px;">${esc(obs.user_agent || "(empty)")}</div>
+            ${
+              js
+                ? `
+              <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--text-muted);">${esc(t("fp.sec.client"))}</div>
+              <div class="fp-detail-grid">
+                <div class="fp-kv"><div class="fp-kv-lbl">Canvas / Audio / Fonts</div><div class="fp-kv-val">cv: <code>${esc(js.canvas_hash || "-")}</code> · au: <code>${esc(js.audio_hash || "-")}</code><br/>fonts: <code>${esc(js.fonts_hash || "-")}</code> (${Number(js.fonts_count) || 0} detected)</div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">WebGL GPU &amp; Extensions</div><div class="fp-kv-val">${esc(js.webgl || "-")}<br/><span class="muted-sm">vendor: ${esc(js.webgl_vendor || "-")} · ext: <code>${esc(js.webgl_ext_hash || "-")}</code> · maxTex: ${Number(js.webgl_max_tex) || 0}</span></div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">Screen &amp; Media Prefs</div><div class="fp-kv-val">${esc(js.screen || "-")} (avail ${esc(js.avail_screen || "-")}) · DPR ${esc(js.dpr || "1")}<br/><span class="muted-sm">${esc(js.media_prefs || "-")}</span></div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">Timezone &amp; Locale</div><div class="fp-kv-val">${esc(js.tz || "-")} (UTC offset ${Number(js.tz_offset) || 0}m)<br/><span class="muted-sm">intl: ${esc(js.intl_locale || "-")} · langs: ${esc(js.languages || js.lang || "-")}</span></div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">Hardware &amp; UA-CH</div><div class="fp-kv-val">${Number(js.cores) || 0} cores · ${Number(js.mem) || 0} GB · touch:${Number(js.touch) || 0} · plugins:${Number(js.plugins_count) || 0} · voices:${Number(js.speech_voices) || 0}<br/><span class="muted-sm">${esc(js.ua_brands || js.platform || "-")}</span></div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">Storage &amp; APIs / ${esc(t("fp.tamper_flags"))}</div><div class="fp-kv-val"><code>${esc(js.storage_flags || "-")}</code><br/><div style="margin-top:4px;">${tamperHtml}</div></div></div>
+              </div>`
+                : ""
+            }`,
           actions: [{ label: t("common.close"), cls: "primary" }],
         });
       });

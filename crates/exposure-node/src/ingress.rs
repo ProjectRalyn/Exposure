@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
-use evilpot::ExploitVerificationStatus;
-use exposure_core::config::{IngressConfig, IngressListener, WafMode};
+use evilpot::{AttackCategory, AttackSignal, ExploitVerificationStatus};
+use exposure_core::config::{AbuseIpDbAction, IngressConfig, IngressListener, WafMode};
 use exposure_core::crypto::{
     generate_random_secret_hex, is_weak_secret, short_sha256_hex, NodeKeyPair,
 };
@@ -31,21 +31,23 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::abuseipdb::AbuseIpDbClient;
 use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
 use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
 use crate::guard::{
-    compute_suspicion_score, matches_api_bypass, sanitize_redirect, GuardDecision, GuardEngine,
+    compute_server_suspicion_score, compute_suspicion_score, matches_api_bypass, sanitize_redirect,
+    GuardDecision, GuardEngine,
 };
 use crate::honeypot::{
     build_attack_signal, clamp_input_slice, into_proxy_response, verification_status_label,
     EvilpotManager, EvilpotStealthMarker, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
 };
-use crate::logger::NodeLogger;
+use crate::logger::{FpServerExtras, NodeLogger};
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
 use crate::waf::{
-    inspect_request_body, inspect_request_head, is_path_exempt, should_inspect_body, WafFinding,
-    WafVerdict,
+    inspect_request_body, inspect_request_head, is_path_exempt, should_inspect_body,
+    CompiledCrsEngine, WafFinding, WafVerdict,
 };
 
 const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
@@ -129,6 +131,8 @@ pub struct IngressServer {
     guard: Arc<GuardEngine>,
     cache: Arc<EdgeCache>,
     evilpot: Arc<EvilpotManager>,
+    abuseipdb: Arc<AbuseIpDbClient>,
+    crs: Arc<RwLock<Arc<CompiledCrsEngine>>>,
     cert_resolver: Arc<DynamicCertResolver>,
     logger: Arc<NodeLogger>,
     started_listeners: DashMap<String, JoinHandle<()>>,
@@ -153,6 +157,11 @@ impl IngressServer {
             cfg.cache.max_entries,
         ));
         let evilpot = Arc::new(EvilpotManager::new(tag.clone()));
+        let abuseipdb = AbuseIpDbClient::new(cfg.abuseipdb.clone());
+        let crs = Arc::new(CompiledCrsEngine::compile(
+            &cfg.crs_rules,
+            &cfg.crs.disabled_rule_ids,
+        ));
         Arc::new(Self {
             node_tag: tag,
             keypair,
@@ -162,6 +171,8 @@ impl IngressServer {
             guard: Arc::new(GuardEngine::new()),
             cache,
             evilpot,
+            abuseipdb,
+            crs: Arc::new(RwLock::new(crs)),
             cert_resolver,
             logger,
             started_listeners: DashMap::new(),
@@ -197,13 +208,21 @@ impl IngressServer {
             !any_cache_enabled,
         );
         let any_evilpot_enabled = ingress_enabled
-            && cfg
+            && (cfg
                 .guards
                 .values()
-                .any(|g| g.waf.as_ref().map(|w| w.mode == WafMode::Evilpot).unwrap_or(false));
+                .any(|g| g.waf.as_ref().map(|w| w.mode == WafMode::Evilpot).unwrap_or(false))
+                || (cfg.abuseipdb.enabled
+                    && cfg.abuseipdb.high_risk_action == AbuseIpDbAction::Evilpot));
         self.evilpot
             .reconfigure(&cfg.evilpot, any_evilpot_enabled)
             .await;
+        self.abuseipdb.reconfigure(cfg.abuseipdb.clone()).await;
+        let compiled_crs = Arc::new(CompiledCrsEngine::compile(
+            &cfg.crs_rules,
+            &cfg.crs.disabled_rule_ids,
+        ));
+        *self.crs.write().await = compiled_crs;
         let desired_listeners = if ingress_enabled {
             cfg.listeners.clone()
         } else {
@@ -690,7 +709,21 @@ impl IngressServer {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let suspicion_score = compute_suspicion_score(req.headers(), tls_signal);
+        let abuse_rep = if cfg.abuseipdb.enabled && !cfg.abuseipdb.api_key.trim().is_empty() {
+            self.abuseipdb.lookup(client_ip).await
+        } else {
+            None
+        };
+        let abuse_score = abuse_rep.as_ref().map(|r| r.abuse_confidence_score);
+        let fp_extras = FpServerExtras {
+            tls_ja3: tls_signal.and_then(|s| s.fingerprint.as_deref()),
+            tls_grease: tls_signal.map(|s| s.has_grease).unwrap_or(false),
+            abuse_score,
+            abuse_country: abuse_rep.as_ref().and_then(|r| r.country_code.as_deref()),
+            abuse_isp: abuse_rep.as_ref().and_then(|r| r.isp.as_deref()),
+            abuse_is_tor: abuse_rep.as_ref().map(|r| r.is_tor).unwrap_or(false),
+        };
+        let suspicion_score = compute_server_suspicion_score(req.headers(), tls_signal, abuse_score);
         let fallback_fp_hash = short_sha256_hex(&format!("ua|{ua_str}|{al_str}"));
 
         let mut active_profile = None;
@@ -699,7 +732,7 @@ impl IngressServer {
             if !guard_name.trim().is_empty() {
                 if let Some(profile) = cfg.guards.get(guard_name) {
                     active_profile = Some(profile);
-                    match self.guard.evaluate(
+                    match self.guard.evaluate_with_reputation(
                         profile,
                         &cfg.rate_limit_buckets,
                         &cfg.clearance_secret,
@@ -708,6 +741,7 @@ impl IngressServer {
                         &path_and_query,
                         req.headers(),
                         tls_signal,
+                        abuse_score,
                     ) {
                         GuardDecision::Allow => {}
                         GuardDecision::RateLimited {
@@ -908,6 +942,153 @@ impl IngressServer {
             }
         }
 
+        // Enforce AbuseIPDB automatic high-risk IP mitigation (before Edge Cache & upstream)
+        if let Some(ab_score) = abuse_score {
+            let bypassed = active_profile
+                .map(|p| matches_api_bypass(p, req.headers()))
+                .unwrap_or(false);
+            if !bypassed
+                && cfg.abuseipdb.enabled
+                && ab_score >= cfg.abuseipdb.block_threshold
+                && cfg.abuseipdb.high_risk_action != AbuseIpDbAction::Off
+            {
+                match cfg.abuseipdb.high_risk_action {
+                    AbuseIpDbAction::Off => {}
+                    AbuseIpDbAction::Monitor => {
+                        warn!(
+                            node = %self.node_tag,
+                            service = %rule.service_tag,
+                            client = %client_ip,
+                            abuse_score = ab_score,
+                            "abuseipdb high-risk IP detected (monitor mode)"
+                        );
+                    }
+                    AbuseIpDbAction::Challenge => {
+                        if !is_browser_navigation(req.method(), req.headers()) {
+                            return Response::builder()
+                                .status(StatusCode::FORBIDDEN)
+                                .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                                .header(header::CACHE_CONTROL, "no-store")
+                                .body(full_body(
+                                    serde_json::json!({
+                                        "error": "abuseipdb_verification_required",
+                                        "abuse_score": ab_score,
+                                        "ray_id": ray_id,
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap();
+                        }
+                        return Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(header::LOCATION, "/cdn-cgi/?redirect=%2F")
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .body(full_body(""))
+                            .unwrap();
+                    }
+                    AbuseIpDbAction::Evilpot => {
+                        if let Some(permit) = self.evilpot.try_admit(client_ip) {
+                            let ep_engine = self.evilpot.get_or_init(&cfg.evilpot).await;
+                            let ep_path = clamp_input_slice(&path, MAX_EVILPOT_PATH_CHARS);
+                            let ep_query = req
+                                .uri()
+                                .query()
+                                .map(|q| clamp_input_slice(q, MAX_EVILPOT_QUERY_CHARS));
+                            let sig = AttackSignal::new(
+                                AttackCategory::ScannerUserAgent,
+                                "ip-reputation",
+                                (ab_score as f32 / 100.0).clamp(0.5, 1.0),
+                            )
+                            .with_reasons(vec![format!("abuseipdb_score={ab_score}")]);
+                            let outcome = ep_engine
+                                .handle_attack(
+                                    client_ip,
+                                    req.method().as_str(),
+                                    ep_path,
+                                    ep_query,
+                                    req.headers(),
+                                    sig,
+                                )
+                                .await;
+                            return into_proxy_response(outcome.response, Some(permit));
+                        }
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .body(full_body("403 Forbidden"))
+                            .unwrap();
+                    }
+                    AbuseIpDbAction::Block => {
+                        warn!(
+                            node = %self.node_tag,
+                            service = %rule.service_tag,
+                            client = %client_ip,
+                            abuse_score = ab_score,
+                            "abuseipdb blocked high-risk IP"
+                        );
+                        self.logger
+                            .record_session_with_fp(
+                                "ingress",
+                                &rule.service_tag,
+                                &client_ip.to_string(),
+                                403,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                                0,
+                                0,
+                                false,
+                                true,
+                                false,
+                                Some(format!("abuseipdb:score={ab_score}")),
+                                Some(client_fp.device_type.to_string()),
+                                Some(client_fp.browser_family.to_string()),
+                                Some(client_fp.os_family.to_string()),
+                                false,
+                            )
+                            .await;
+                        self.logger
+                            .record_fingerprint_with_extras(
+                                &rule.service_tag,
+                                &host,
+                                &client_ip.to_string(),
+                                &fallback_fp_hash,
+                                false,
+                                "none",
+                                &ua_str,
+                                &al_str,
+                                client_fp.device_type,
+                                client_fp.browser_family,
+                                client_fp.os_family,
+                                client_fp.is_bot,
+                                false,
+                                suspicion_score,
+                                tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                fp_extras.clone(),
+                                None,
+                                1,
+                                1,
+                                0,
+                            )
+                            .await;
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .header("x-exposure-ray", &ray_id)
+                            .body(full_body(
+                                serde_json::json!({
+                                    "error": "abuseipdb_blocked",
+                                    "abuse_score": ab_score,
+                                    "ray_id": ray_id,
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
         let is_upgrade = req.headers().contains_key(header::UPGRADE);
         let mut req: Request<ProxyBody> = req.map(|b| b.boxed());
 
@@ -1027,12 +1208,21 @@ impl IngressServer {
                         }
                     }
 
+                    let crs_engine = Arc::clone(&*self.crs.read().await);
                     let mut verdict = inspect_request_head(
                         waf_cfg,
                         &path,
                         req.uri().query(),
                         req.headers(),
                     );
+                    if matches!(verdict, WafVerdict::Allow) {
+                        verdict = crs_engine.inspect_head(
+                            waf_cfg,
+                            &path,
+                            req.uri().query(),
+                            req.headers(),
+                        );
+                    }
                     if matches!(verdict, WafVerdict::Allow)
                         && !is_path_exempt(&path, &waf_cfg.exempt_paths)
                     {
@@ -1053,6 +1243,10 @@ impl IngressServer {
                                             ct.as_deref(),
                                             &inspected_bytes,
                                         );
+                                        if matches!(verdict, WafVerdict::Allow) {
+                                            verdict =
+                                                crs_engine.inspect_body(waf_cfg, &inspected_bytes);
+                                        }
                                     }
                                 }
                                 Err(()) => {
@@ -1400,7 +1594,7 @@ impl IngressServer {
                             )
                             .await;
                         self.logger
-                            .record_fingerprint(
+                            .record_fingerprint_with_extras(
                                 &rule.service_tag,
                                 &host,
                                 &client_ip.to_string(),
@@ -1417,6 +1611,7 @@ impl IngressServer {
                                 suspicion_score,
                                 tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
                                 tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                fp_extras.clone(),
                                 None,
                                 1,
                                 0,
@@ -1773,7 +1968,7 @@ impl IngressServer {
                     )
                     .await;
                 self.logger
-                    .record_fingerprint(
+                    .record_fingerprint_with_extras(
                         &rule.service_tag,
                         &host,
                         &client_ip.to_string(),
@@ -1790,6 +1985,7 @@ impl IngressServer {
                         suspicion_score,
                         tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
                         tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                        fp_extras.clone(),
                         None,
                         1,
                         0,
@@ -2196,6 +2392,7 @@ fn build_waf_block_response(
     let body = serde_json::json!({
         "error": "waf_blocked",
         "category": finding.category,
+        "rule_id": finding.rule_id,
         "ray_id": ray_id,
     })
     .to_string();
@@ -2325,6 +2522,8 @@ mod tests {
             confidence: 0.96,
             reasons: vec!["SQL boolean tautology"],
             matched_payload: None,
+            rule_id: None,
+            rule_msg: None,
         };
         let api_resp = build_waf_block_response(&finding, true, false, "raywaf1", None);
         assert_eq!(api_resp.status(), StatusCode::FORBIDDEN);

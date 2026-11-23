@@ -2,6 +2,7 @@
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
+  defaultAbuseIpDbConfig,
   defaultEvilpotConfig,
   defaultNodeCacheConfig,
   defaultTopologyDefaults,
@@ -22,6 +23,9 @@ export function createSystemView({ api, store }) {
   let subTab = "defaults"; // defaults | versions | audit | yaml
   let auditSearch = "";
   let auditStatus = "all";
+  let abuseTestIp = "118.25.6.39";
+  let abuseTestResult = null;
+  let abuseTesting = false;
 
   function render() {
     const root = el("tab-system");
@@ -62,14 +66,29 @@ export function createSystemView({ api, store }) {
     const ig = defs.ingress;
     if (!ig.cache) ig.cache = defaultNodeCacheConfig();
     if (!ig.evilpot) ig.evilpot = defaultEvilpotConfig();
+    if (!ig.abuseipdb) ig.abuseipdb = defaultAbuseIpDbConfig();
     const ca = ig.cache;
     const ep = ig.evilpot;
+    const ab = ig.abuseipdb;
     const gd = defs.guard;
     if (!gd.waf) gd.waf = defaultWafConfig();
     const dwaf = gd.waf;
     const eg = defs.egress;
     const ll = defs.link_listener;
-    const gl = store.spec.global_logger || { store_raw_ip: false, sample_rate: 1.0, segment: { retention_hours: 72 } };
+    const gl = store.spec.global_logger || {
+      store_raw_ip: false,
+      sample_rate: 1.0,
+      segment: {
+        flush_interval_secs: 30,
+        max_batch_records: 500,
+        max_batch_bytes: 1024 * 1024,
+        max_disk_bytes: 512 * 1024 * 1024,
+        retention_hours: 72,
+        max_summaries: 50000,
+        max_fingerprints: 20000,
+      },
+    };
+    const seg = gl.segment || {};
     const guardNames = Object.keys(store.spec.guard_templates || {});
     const bucketNames = Object.keys(store.spec.bucket_templates || {});
 
@@ -149,10 +168,16 @@ export function createSystemView({ api, store }) {
               </label>
               <label><span>${esc(t("waf.min_conf"))}</span><input id="sd-waf-conf" type="number" step="0.05" min="0.1" max="1" value="${dwaf.min_confidence ?? 0.65}" /></label>
               <label><span>${esc(t("waf.max_body_kb"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
+              <label><span>${esc(t("waf.crs.paranoia"))}</span>
+                <select id="sd-waf-pl">
+                  ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(dwaf.crs_paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
+                </select>
+              </label>
             </div>
             <div class="tri-stack" style="margin-top:6px;">
               ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: dwaf.inspect_headers !== false })}
               ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("waf.inspect_body"), val: dwaf.inspect_body !== false })}
+              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "crs_enabled", label: t("waf.crs.enabled"), val: dwaf.crs_enabled !== false })}
             </div>
           </div>
         </div>
@@ -187,7 +212,63 @@ export function createSystemView({ api, store }) {
           </div>
           <div class="inspector-row" style="margin-top:8px;">
             <label><span>Sample Rate</span><input id="sd-log-sr" type="number" step="0.05" min="0.01" max="1" value="${gl.sample_rate ?? 1.0}" /></label>
-            <label><span>Retention (hours)</span><input id="sd-log-ret" type="number" min="1" value="${gl.segment?.retention_hours ?? 72}" /></label>
+            <label><span>${esc(t("log.flush_secs"))}</span><input id="sd-log-flush" type="number" min="5" value="${seg.flush_interval_secs ?? 30}" /></label>
+            <label><span>${esc(t("log.max_batch_rec"))}</span><input id="sd-log-brec" type="number" min="50" value="${seg.max_batch_records ?? 500}" /></label>
+            <label><span>${esc(t("log.max_batch_kb"))}</span><input id="sd-log-bkb" type="number" min="16" value="${Math.max(16, Math.round((seg.max_batch_bytes ?? 1048576) / 1024))}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("log.retention_h"))}</span><input id="sd-log-ret" type="number" min="1" value="${seg.retention_hours ?? 72}" /></label>
+            <label><span>${esc(t("log.max_disk_mb"))}</span><input id="sd-log-disk" type="number" min="16" value="${Math.max(16, Math.round((seg.max_disk_bytes ?? 536870912) / 1048576))}" /></label>
+            <label><span>${esc(t("log.max_summaries"))}</span><input id="sd-log-maxsum" type="number" min="500" value="${seg.max_summaries ?? 50000}" /></label>
+            <label><span>${esc(t("log.max_fps"))}</span><input id="sd-log-maxfp" type="number" min="500" value="${seg.max_fingerprints ?? 20000}" /></label>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:0;">
+          <div class="panel-header"><h3>${esc(t("abuse.title"))}</h3></div>
+          <div class="tri-stack" style="margin-bottom:8px;">
+            ${renderBinSlider({ attrName: "data-sd-ab-bin", attrVal: "enabled", label: t("abuse.enable"), sub: t("abuse.enable_sub"), val: ab.enabled })}
+          </div>
+          <div class="inspector-row">
+            <label style="flex:1.5;"><span>${esc(t("abuse.api_key"))}</span>
+              <input id="sd-ab-key" type="password" autocomplete="off" value="${esc(ab.api_key || "")}" placeholder="AbuseIPDB v2 API Key" />
+            </label>
+            <label><span>${esc(t("abuse.test_ip"))}</span>
+              <div style="display:flex;gap:6px;">
+                <input id="sd-ab-test-ip" value="${esc(abuseTestIp)}" placeholder="118.25.6.39" />
+                <button type="button" id="sd-ab-test-btn" class="btn sm primary" ${abuseTesting ? "disabled" : ""}>${esc(abuseTesting ? t("abuse.testing") : t("abuse.test_btn"))}</button>
+              </div>
+            </label>
+          </div>
+          ${
+            abuseTestResult
+              ? `<div class="muted-sm" style="margin:6px 0;padding:6px 8px;border-radius:6px;background:var(--bg-elev);">
+                  ${
+                    abuseTestResult.error
+                      ? `<span class="pill err">ERR</span> ${esc(abuseTestResult.error)}`
+                      : `<span class="pill ${abuseTestResult.abuse_confidence_score >= 50 ? "err" : abuseTestResult.abuse_confidence_score >= 25 ? "warn" : "ok"}">Score ${esc(abuseTestResult.abuse_confidence_score)}/100</span>
+                         <code>${esc(abuseTestResult.ip_address)}</code> · ${esc(abuseTestResult.country_code || "-")} · ${esc(abuseTestResult.isp || "-")} · reports: ${esc(abuseTestResult.total_reports)}${abuseTestResult.is_tor ? ` <span class="pill warn">TOR</span>` : ""}`
+                  }
+                </div>`
+              : ""
+          }
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("abuse.action"))}</span>
+              <select id="sd-ab-act">
+                <option value="off" ${ab.high_risk_action === "off" ? "selected" : ""}>${esc(t("abuse.action.off"))}</option>
+                <option value="monitor" ${ab.high_risk_action === "monitor" ? "selected" : ""}>${esc(t("abuse.action.monitor"))}</option>
+                <option value="challenge" ${ab.high_risk_action === "challenge" ? "selected" : ""}>${esc(t("abuse.action.challenge"))}</option>
+                <option value="block" ${(ab.high_risk_action || "block") === "block" ? "selected" : ""}>${esc(t("abuse.action.block"))}</option>
+                <option value="evilpot" ${ab.high_risk_action === "evilpot" ? "selected" : ""}>${esc(t("abuse.action.evilpot"))}</option>
+              </select>
+            </label>
+            <label><span>${esc(t("abuse.challenge_th"))}</span><input id="sd-ab-ch" type="number" min="0" max="100" value="${ab.challenge_threshold ?? 25}" /></label>
+            <label><span>${esc(t("abuse.block_th"))}</span><input id="sd-ab-blk" type="number" min="0" max="100" value="${ab.block_threshold ?? 75}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("abuse.max_age"))}</span><input id="sd-ab-age" type="number" min="1" max="365" value="${ab.max_age_days ?? 90}" /></label>
+            <label><span>${esc(t("abuse.cache_ttl"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
+            <label><span>${esc(t("abuse.daily_limit"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
           </div>
         </div>
 
@@ -254,6 +335,7 @@ export function createSystemView({ api, store }) {
     el("sd-waf-mode")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).mode = ev.target.value; }, false));
     el("sd-waf-conf")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).min_confidence = parseNum(ev.target.value, 0.65, 0.1, 1.0); }, false));
     el("sd-waf-bodykb")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).max_body_bytes = parseNum(ev.target.value, 32, 0, 256) * 1024; }, false));
+    el("sd-waf-pl")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).crs_paranoia_level = parseNum(ev.target.value, 1, 1, 4); }, false));
     wireBinSliders(container, "data-sd-waf-bin", (f, v) => store.mutate((s) => { ensureWaf(s)[f] = v; }, false));
 
     el("sd-eg-proto")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.egress.protocol = ev.target.value; }, false));
@@ -262,13 +344,71 @@ export function createSystemView({ api, store }) {
 
     wireBinSliders(container, "data-sd-ll-bin", (f, v) => store.mutate((s) => { s.defaults.link_listener[f] = v; }, false));
     const ensureGl = (s) => {
-      if (!s.global_logger) s.global_logger = { hmac_key: "", store_raw_ip: false, sample_rate: 1.0, hll_precision: 12, segment: { retention_hours: 72 } };
+      if (!s.global_logger) {
+        s.global_logger = {
+          hmac_key: "",
+          store_raw_ip: false,
+          sample_rate: 1.0,
+          hll_precision: 12,
+          segment: {
+            flush_interval_secs: 30,
+            max_batch_records: 500,
+            max_batch_bytes: 1024 * 1024,
+            max_disk_bytes: 512 * 1024 * 1024,
+            retention_hours: 72,
+            max_summaries: 50000,
+            max_fingerprints: 20000,
+          },
+        };
+      }
       if (!s.global_logger.segment) s.global_logger.segment = { retention_hours: 72 };
       return s.global_logger;
     };
     wireBinSliders(container, "data-sd-log-bin", (f, v) => store.mutate((s) => { ensureGl(s)[f] = v; }, false));
     el("sd-log-sr")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).sample_rate = parseNum(ev.target.value, 1.0, 0.01, 1.0); }, false));
+    el("sd-log-flush")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.flush_interval_secs = parseNum(ev.target.value, 30, 5); }, false));
+    el("sd-log-brec")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_batch_records = parseNum(ev.target.value, 500, 50); }, false));
+    el("sd-log-bkb")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_batch_bytes = parseNum(ev.target.value, 1024, 16) * 1024; }, false));
     el("sd-log-ret")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.retention_hours = parseNum(ev.target.value, 72, 1); }, false));
+    el("sd-log-disk")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_disk_bytes = parseNum(ev.target.value, 512, 16) * 1048576; }, false));
+    el("sd-log-maxsum")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_summaries = parseNum(ev.target.value, 50000, 500); }, false));
+    el("sd-log-maxfp")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_fingerprints = parseNum(ev.target.value, 20000, 500); }, false));
+
+    const ensureAb = (s) => {
+      if (!s.defaults.ingress.abuseipdb) s.defaults.ingress.abuseipdb = defaultAbuseIpDbConfig();
+      return s.defaults.ingress.abuseipdb;
+    };
+    wireBinSliders(container, "data-sd-ab-bin", (f, v) => store.mutate((s) => { ensureAb(s)[f] = v; }, false));
+    el("sd-ab-key")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).api_key = ev.target.value.trim(); }, false));
+    el("sd-ab-test-ip")?.addEventListener("input", (ev) => { abuseTestIp = ev.target.value.trim(); });
+    el("sd-ab-act")?.addEventListener("change", (ev) => store.mutate((s) => { ensureAb(s).high_risk_action = ev.target.value; }, false));
+    el("sd-ab-ch")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).challenge_threshold = parseNum(ev.target.value, 25, 0, 100); }, false));
+    el("sd-ab-blk")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).block_threshold = parseNum(ev.target.value, 75, 0, 100); }, false));
+    el("sd-ab-age")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_age_days = parseNum(ev.target.value, 90, 1, 365); }, false));
+    el("sd-ab-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).cache_ttl_secs = parseNum(ev.target.value, 21600, 60); }, false));
+    el("sd-ab-cap")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_daily_lookups = parseNum(ev.target.value, 900, 10); }, false));
+    el("sd-ab-test-btn")?.addEventListener("click", async () => {
+      if (abuseTesting) return;
+      abuseTesting = true;
+      abuseTestResult = null;
+      render();
+      try {
+        const curAb = store.spec.defaults?.ingress?.abuseipdb || defaultAbuseIpDbConfig();
+        abuseTestResult = await api("/api/security/abuseipdb/test", {
+          method: "POST",
+          body: JSON.stringify({
+            api_key: curAb.api_key || "",
+            ip: abuseTestIp || "118.25.6.39",
+            max_age_days: curAb.max_age_days || 90,
+          }),
+        });
+      } catch (e) {
+        abuseTestResult = { error: e.message };
+      } finally {
+        abuseTesting = false;
+        if (subTab === "defaults") render();
+      }
+    });
 
     const ensureCa = (s) => {
       if (!s.defaults.ingress.cache) s.defaults.ingress.cache = defaultNodeCacheConfig();

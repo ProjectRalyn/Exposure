@@ -83,6 +83,7 @@ impl ControlRuntime {
             }
         }
         let client = ControlClient::new(cfg.clone(), db)?;
+        client.restore_telemetry_cache().await;
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Arc::new(Self {
             cfg,
@@ -157,6 +158,76 @@ impl ControlRuntime {
                     if tick_count % 60 == 0 {
                         if let Err(e) = this.client.db().prune_old_records().await {
                             warn!(error = %e, "periodic sqlite pruning failed");
+                        }
+                    }
+                }
+            });
+        }
+
+        // Background OWASP CRS auto-updater loop (active Control only)
+        if self.cfg.role == ControlRole::Active {
+            let this = Arc::clone(self);
+            let mut rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                // Short startup grace delay before first check so bootstrap & panel bind finish cleanly
+                let mut first_wait = Duration::from_secs(30);
+                loop {
+                    tokio::select! {
+                        _ = rx.changed() => {
+                            if *rx.borrow() {
+                                return;
+                            }
+                        }
+                        _ = tokio::time::sleep(first_wait) => {}
+                    }
+                    first_wait = Duration::from_secs(30 * 60);
+
+                    let crs_cfg = match this.client.db().get_topology_yaml().await {
+                        Ok(yaml) if !yaml.trim().is_empty() => {
+                            serde_yaml::from_str::<exposure_core::config::TopologySpec>(&yaml)
+                                .map(|t| t.defaults.ingress.crs)
+                                .unwrap_or_default()
+                        }
+                        _ => exposure_core::config::CrsUpdateConfig::default(),
+                    };
+                    if !crs_cfg.auto_update {
+                        continue;
+                    }
+                    let interval_secs = (crs_cfg.update_interval_hours.clamp(1, 720) as i64) * 3600;
+                    let needs_sync = match this
+                        .client
+                        .db()
+                        .get_kv_json::<exposure_core::crs::CrsRulesetSnapshot>(
+                            crate::client::KV_CRS_RULESET,
+                        )
+                        .await
+                    {
+                        Ok(Some(snap)) => {
+                            if snap.rules.is_empty() {
+                                true
+                            } else {
+                                chrono::DateTime::parse_from_rfc3339(&snap.updated_at)
+                                    .map(|dt| {
+                                        chrono::Utc::now().timestamp() - dt.timestamp()
+                                            >= interval_secs
+                                    })
+                                    .unwrap_or(true)
+                            }
+                        }
+                        _ => true,
+                    };
+                    if needs_sync {
+                        match this.client.sync_owasp_crs("crs-auto-updater").await {
+                            Ok(snap) => {
+                                info!(
+                                    version = %snap.version,
+                                    rules = snap.rules.len(),
+                                    "auto-updated OWASP CRS ruleset"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "background OWASP CRS auto-update failed (will retry)");
+                            }
                         }
                     }
                 }

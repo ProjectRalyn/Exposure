@@ -40,6 +40,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 ipnet = { version = "2", features = ["serde"] }
 rand = "0.8"
 rcgen = "0.13"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled"] }

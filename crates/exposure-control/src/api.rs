@@ -105,6 +105,9 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/telemetry", get(get_telemetry))
         .route("/api/telemetry/pull", post(pull_telemetry))
         .route("/api/evilpot", get(get_evilpot))
+        .route("/api/waf/rules", get(get_waf_rules))
+        .route("/api/waf/crs/sync", post(sync_waf_crs))
+        .route("/api/security/abuseipdb/test", post(test_abuseipdb_key))
         .route("/api/fingerprints", get(list_fingerprints))
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
@@ -271,6 +274,9 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
     if !spec.defaults.ingress.clearance_secret.is_empty() {
         spec.defaults.ingress.clearance_secret = REDACTED_SECRET.into();
     }
+    if !spec.defaults.ingress.abuseipdb.api_key.is_empty() {
+        spec.defaults.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
+    }
     for g in spec.guard_templates.values_mut() {
         for h in &mut g.api_bypass_headers {
             if let Some((name, _)) = h.split_once(':') {
@@ -286,6 +292,9 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
     for node in spec.nodes.values_mut() {
         if !node.ingress.clearance_secret.is_empty() {
             node.ingress.clearance_secret = REDACTED_SECRET.into();
+        }
+        if !node.ingress.abuseipdb.api_key.is_empty() {
+            node.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
         }
         for g in node.ingress.guards.values_mut() {
             for h in &mut g.api_bypass_headers {
@@ -318,6 +327,10 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
         incoming.defaults.ingress.clearance_secret =
             existing.defaults.ingress.clearance_secret.clone();
     }
+    if incoming.defaults.ingress.abuseipdb.api_key == REDACTED_SECRET {
+        incoming.defaults.ingress.abuseipdb.api_key =
+            existing.defaults.ingress.abuseipdb.api_key.clone();
+    }
     for (g_name, new_g) in &mut incoming.guard_templates {
         if let Some(old_g) = existing.guard_templates.get(g_name) {
             for h in &mut new_g.api_bypass_headers {
@@ -346,6 +359,9 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
         if let Some(old_node) = existing.nodes.get(tag) {
             if new_node.ingress.clearance_secret == REDACTED_SECRET {
                 new_node.ingress.clearance_secret = old_node.ingress.clearance_secret.clone();
+            }
+            if new_node.ingress.abuseipdb.api_key == REDACTED_SECRET {
+                new_node.ingress.abuseipdb.api_key = old_node.ingress.abuseipdb.api_key.clone();
             }
             for (g_name, new_g) in &mut new_node.ingress.guards {
                 if let Some(old_g) = old_node.ingress.guards.get(g_name) {
@@ -399,6 +415,9 @@ fn redact_node_config_json(raw_json: &str) -> String {
     }
     if !cfg.ingress.clearance_secret.is_empty() {
         cfg.ingress.clearance_secret = REDACTED_SECRET.into();
+    }
+    if !cfg.ingress.abuseipdb.api_key.is_empty() {
+        cfg.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
     }
     if !cfg.logger.hmac_key.is_empty() {
         cfg.logger.hmac_key = REDACTED_SECRET.into();
@@ -2017,13 +2036,21 @@ async fn list_fingerprints(
             }
         }
         if let Some(ref fpq) = fp_str {
-            let hash_match = obs.fp_hash.to_ascii_lowercase().contains(fpq);
+            let hash_match = obs.fp_hash.to_ascii_lowercase().contains(fpq)
+                || obs
+                    .tls_ja3
+                    .as_deref()
+                    .map(|j| j.to_ascii_lowercase().contains(fpq))
+                    .unwrap_or(false);
             let canvas_match = obs
                 .js_fp
                 .as_ref()
                 .map(|j| {
                     j.canvas_hash.to_ascii_lowercase().contains(fpq)
                         || j.webgl.to_ascii_lowercase().contains(fpq)
+                        || j.webgl_vendor.to_ascii_lowercase().contains(fpq)
+                        || j.audio_hash.to_ascii_lowercase().contains(fpq)
+                        || j.fonts_hash.to_ascii_lowercase().contains(fpq)
                         || j.platform.to_ascii_lowercase().contains(fpq)
                         || j.screen.to_ascii_lowercase().contains(fpq)
                 })
@@ -2046,6 +2073,21 @@ async fn list_fingerprints(
                 || obs.ip_prefix.to_ascii_lowercase().contains(qs)
                 || obs.ip_hmac.to_ascii_lowercase().contains(qs)
                 || obs.fp_hash.to_ascii_lowercase().contains(qs)
+                || obs
+                    .tls_ja3
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || obs
+                    .abuse_country
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || obs
+                    .abuse_isp
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
                 || obs.user_agent.to_ascii_lowercase().contains(qs)
                 || obs.host.to_ascii_lowercase().contains(qs)
                 || obs.service_tag.to_ascii_lowercase().contains(qs)
@@ -2058,7 +2100,11 @@ async fn list_fingerprints(
                     .as_ref()
                     .map(|j| {
                         j.webgl.to_ascii_lowercase().contains(qs)
+                            || j.webgl_vendor.to_ascii_lowercase().contains(qs)
                             || j.canvas_hash.to_ascii_lowercase().contains(qs)
+                            || j.audio_hash.to_ascii_lowercase().contains(qs)
+                            || j.fonts_hash.to_ascii_lowercase().contains(qs)
+                            || j.ua_brands.to_ascii_lowercase().contains(qs)
                             || j.platform.to_ascii_lowercase().contains(qs)
                             || j.tz.to_ascii_lowercase().contains(qs)
                             || j.screen.to_ascii_lowercase().contains(qs)
@@ -2158,6 +2204,179 @@ async fn list_audit(State(state): State<ApiState>, headers: HeaderMap) -> Respon
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     Json(serde_json::json!({ "logs": logs })).into_response()
+}
+
+/// `GET /api/waf/rules`: return both built-in `sigil-filter` engines and active OWASP CRS rules,
+/// along with CRS sync metadata and current cluster CRS configuration.
+async fn get_waf_rules(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let crs_snap = state.client.active_crs_snapshot().await;
+    let builtin_rules = exposure_core::crs::builtin_sigil_rules();
+    let crs_cfg = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .ok()
+        .and_then(|y| serde_yaml::from_str::<TopologySpec>(&y).ok())
+        .map(|t| t.defaults.ingress.crs)
+        .unwrap_or_default();
+
+    Json(serde_json::json!({
+        "crs_meta": {
+            "version": crs_snap.version,
+            "source_url": crs_snap.source_url,
+            "updated_at": crs_snap.updated_at,
+            "total_parsed": crs_snap.total_parsed,
+            "skipped_pcre": crs_snap.skipped_pcre,
+            "active_count": crs_snap.rules.len(),
+        },
+        "crs_config": crs_cfg,
+        "builtin_rules": builtin_rules,
+        "crs_rules": crs_snap.rules,
+    }))
+    .into_response()
+}
+
+/// `POST /api/waf/crs/sync`: download & compile the latest OWASP CRS ruleset from `coreruleset.org`.
+async fn sync_waf_crs(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    match state.client.sync_owasp_crs(&actor).await {
+        Ok(snap) => Json(serde_json::json!({
+            "ok": true,
+            "version": snap.version,
+            "source_url": snap.source_url,
+            "updated_at": snap.updated_at,
+            "rules_count": snap.rules.len(),
+            "total_parsed": snap.total_parsed,
+            "skipped_pcre": snap.skipped_pcre,
+        }))
+        .into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct TestAbuseIpDbReq {
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    ip: String,
+    #[serde(default)]
+    max_age_days: Option<u16>,
+}
+
+/// `POST /api/security/abuseipdb/test`: verify an operator's AbuseIPDB v2 API key against a
+/// hardcoded `https://api.abuseipdb.com/api/v2/check` endpoint (SSRF-safe).
+async fn test_abuseipdb_key(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<TestAbuseIpDbReq>,
+) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let mut api_key = req.api_key.trim().to_string();
+    if api_key.is_empty() || api_key == REDACTED_SECRET {
+        api_key = state
+            .client
+            .db()
+            .get_topology_yaml()
+            .await
+            .ok()
+            .and_then(|y| serde_yaml::from_str::<TopologySpec>(&y).ok())
+            .map(|t| t.defaults.ingress.abuseipdb.api_key.trim().to_string())
+            .unwrap_or_default();
+    }
+    if api_key.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "AbuseIPDB API key is empty");
+    }
+    if api_key.len() > 256 || !api_key.bytes().all(|b| b.is_ascii_graphic()) {
+        return json_err(StatusCode::BAD_REQUEST, "invalid AbuseIPDB API key format");
+    }
+
+    let target_ip_str = if req.ip.trim().is_empty() {
+        "118.25.6.39".to_string()
+    } else {
+        req.ip.trim().to_string()
+    };
+    let parsed_ip: IpAddr = match target_ip_str.parse() {
+        Ok(ip) => canonical_ip(ip),
+        Err(_) => return json_err(StatusCode::BAD_REQUEST, "invalid test IP address"),
+    };
+    if parsed_ip.is_loopback() || parsed_ip.is_unspecified() {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "test IP must be a public routable IP address",
+        );
+    }
+
+    let max_age = req.max_age_days.unwrap_or(90).clamp(1, 365);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(5))
+        .user_agent("exposure-control/0.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let resp = match client
+        .get("https://api.abuseipdb.com/api/v2/check")
+        .header("Key", &api_key)
+        .header("Accept", "application/json")
+        .query(&[
+            ("ipAddress", parsed_ip.to_string()),
+            ("maxAgeInDays", max_age.to_string()),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return json_err(StatusCode::BAD_GATEWAY, format!("AbuseIPDB request failed: {e}")),
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| v["errors"][0]["detail"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("AbuseIPDB API returned HTTP {status}"));
+        return json_err(StatusCode::BAD_GATEWAY, msg);
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_str(&body_text) {
+        Ok(v) => v,
+        Err(e) => {
+            return json_err(
+                StatusCode::BAD_GATEWAY,
+                format!("parse AbuseIPDB JSON failed: {e}"),
+            )
+        }
+    };
+    let d = &parsed["data"];
+    Json(serde_json::json!({
+        "ok": true,
+        "ip_address": d["ipAddress"].as_str().unwrap_or(&parsed_ip.to_string()),
+        "abuse_confidence_score": d["abuseConfidenceScore"].as_u64().unwrap_or(0),
+        "country_code": d["countryCode"].as_str(),
+        "isp": d["isp"].as_str(),
+        "usage_type": d["usageType"].as_str(),
+        "is_tor": d["isTor"].as_bool().unwrap_or(false),
+        "total_reports": d["totalReports"].as_u64().unwrap_or(0),
+    }))
+    .into_response()
 }
 
 /// Serve Control Web Panel static files (returning JSON 404 for unknown `/api/*` paths).

@@ -412,6 +412,28 @@ where
     Ok(v.round().min(u8::MAX as f64) as u8)
 }
 
+fn deser_i16_lenient<'de, D>(deserializer: D) -> std::result::Result<i16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() {
+        return Ok(0);
+    }
+    Ok(v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+}
+
+fn deser_u32_lenient<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = f64::deserialize(deserializer)?;
+    if !v.is_finite() || v < 0.0 {
+        return Ok(0);
+    }
+    Ok(v.round().min(u32::MAX as f64) as u32)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientJsFingerprint {
     #[serde(default)]
@@ -419,13 +441,29 @@ pub struct ClientJsFingerprint {
     #[serde(default)]
     pub webgl: String,
     #[serde(default)]
+    pub webgl_vendor: String,
+    #[serde(default)]
+    pub webgl_ext_hash: String,
+    #[serde(default, deserialize_with = "deser_u32_lenient")]
+    pub webgl_max_tex: u32,
+    #[serde(default)]
     pub platform: String,
     #[serde(default)]
     pub screen: String,
     #[serde(default)]
+    pub avail_screen: String,
+    #[serde(default)]
     pub tz: String,
+    #[serde(default, deserialize_with = "deser_i16_lenient")]
+    pub tz_offset: i16,
+    #[serde(default)]
+    pub intl_locale: String,
     #[serde(default)]
     pub lang: String,
+    #[serde(default)]
+    pub languages: String,
+    #[serde(default)]
+    pub ua_brands: String,
     #[serde(default, deserialize_with = "deser_u16_lenient")]
     pub cores: u16,
     #[serde(default, deserialize_with = "deser_u16_lenient")]
@@ -435,9 +473,23 @@ pub struct ClientJsFingerprint {
     #[serde(default)]
     pub canvas_hash: String,
     #[serde(default)]
+    pub audio_hash: String,
+    #[serde(default)]
+    pub fonts_hash: String,
+    #[serde(default, deserialize_with = "deser_u16_lenient")]
+    pub fonts_count: u16,
+    #[serde(default)]
     pub dpr: String,
+    #[serde(default)]
+    pub media_prefs: String,
+    #[serde(default)]
+    pub storage_flags: String,
     #[serde(default, deserialize_with = "deser_u16_lenient")]
     pub plugins_count: u16,
+    #[serde(default, deserialize_with = "deser_u16_lenient")]
+    pub speech_voices: u16,
+    #[serde(default)]
+    pub tamper_flags: Vec<String>,
 }
 
 fn clean_fp_str(raw: &str, max_len: usize) -> String {
@@ -452,17 +504,34 @@ fn clean_fp_str(raw: &str, max_len: usize) -> String {
 impl ClientJsFingerprint {
     pub fn sanitize(&mut self) {
         self.webgl = clean_fp_str(&self.webgl, 96);
+        self.webgl_vendor = clean_fp_str(&self.webgl_vendor, 64);
+        self.webgl_ext_hash = clean_fp_str(&self.webgl_ext_hash, 32);
         self.platform = clean_fp_str(&self.platform, 32);
         self.screen = clean_fp_str(&self.screen, 32);
+        self.avail_screen = clean_fp_str(&self.avail_screen, 32);
         self.tz = clean_fp_str(&self.tz, 48);
+        self.intl_locale = clean_fp_str(&self.intl_locale, 48);
         self.lang = clean_fp_str(&self.lang, 24);
+        self.languages = clean_fp_str(&self.languages, 96);
+        self.ua_brands = clean_fp_str(&self.ua_brands, 96);
         self.canvas_hash = clean_fp_str(&self.canvas_hash, 32);
+        self.audio_hash = clean_fp_str(&self.audio_hash, 32);
+        self.fonts_hash = clean_fp_str(&self.fonts_hash, 32);
         self.dpr = clean_fp_str(&self.dpr, 16);
+        self.media_prefs = clean_fp_str(&self.media_prefs, 64);
+        self.storage_flags = clean_fp_str(&self.storage_flags, 64);
+        self.tamper_flags = self
+            .tamper_flags
+            .iter()
+            .take(12)
+            .map(|f| clean_fp_str(f, 32))
+            .filter(|f| !f.is_empty())
+            .collect();
     }
 
     pub fn canonical_hash(&self) -> String {
         let canonical = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.screen,
             self.tz,
             self.lang,
@@ -471,25 +540,42 @@ impl ClientJsFingerprint {
             self.mem,
             self.touch,
             self.webgl,
+            self.webgl_ext_hash,
             self.canvas_hash,
+            self.audio_hash,
+            self.fonts_hash,
             self.dpr,
+            self.media_prefs,
         );
         crate::crypto::short_sha256_hex(&canonical)
     }
 
+    /// Auxiliary client-side headless & tamper detector.
+    /// NOTE: Client JS signals are UNTRUSTED and may only flag anomalies/headless tampering;
+    /// they must NEVER reduce server-side suspicion scores or grant trust by themselves.
     pub fn detect_headless(&self, ua: &str) -> bool {
         let webgl_l = self.webgl.to_ascii_lowercase();
         let plat_l = self.platform.to_ascii_lowercase();
         let ua_l = ua.to_ascii_lowercase();
 
-        // 1. Direct automation / headless signals (only flag SwiftShader/llvmpipe when plugins_count == 0
-        //    so genuine desktop browsers with GPU acceleration disabled or in VMs aren't false-positived)
+        // 1. Direct automation / headless / tamper signals
         let is_sw_renderer = webgl_l.contains("swiftshader")
             || webgl_l.contains("llvmpipe")
             || webgl_l.contains("mesa offscreen");
         if self.webdriver
             || webgl_l.contains("headless")
             || (is_sw_renderer && self.plugins_count == 0)
+            || self.tamper_flags.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "playwright"
+                        | "puppeteer"
+                        | "selenium"
+                        | "phantom"
+                        | "zero_outer_dims"
+                        | "native_fn_tampered"
+                )
+            })
         {
             return true;
         }
@@ -600,6 +686,21 @@ pub struct FingerprintObservation {
     pub tls_cipher_count: u16,
     #[serde(default)]
     pub tls_alpn: bool,
+    /// Unforgeable server-observed TLS ClientHello fingerprint (JA3-like hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ja3: Option<String>,
+    /// Whether TLS ClientHello included RFC 8701 GREASE values (present in modern browsers, rare in bots).
+    #[serde(default)]
+    pub tls_grease: bool,
+    /// Server-side AbuseIPDB confidence score (0..=100, higher = more abusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse_score: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse_country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abuse_isp: Option<String>,
+    #[serde(default)]
+    pub abuse_is_tor: bool,
     #[serde(default)]
     pub js_fp: Option<ClientJsFingerprint>,
     pub first_seen_ts: i64,
@@ -627,6 +728,15 @@ impl FingerprintObservation {
         self.device_type = clean_fp_str(&self.device_type, 32);
         self.browser_family = clean_fp_str(&self.browser_family, 32);
         self.os_family = clean_fp_str(&self.os_family, 32);
+        if let Some(ref mut ja3) = self.tls_ja3 {
+            *ja3 = clean_fp_str(ja3, 40);
+        }
+        if let Some(ref mut cc) = self.abuse_country {
+            *cc = clean_fp_str(cc, 8);
+        }
+        if let Some(ref mut isp) = self.abuse_isp {
+            *isp = clean_fp_str(isp, 96);
+        }
         if let Some(ref mut js) = self.js_fp {
             js.sanitize();
         }
@@ -671,7 +781,21 @@ impl FingerprintObservation {
         if other.tls_cipher_count > 0 {
             self.tls_cipher_count = other.tls_cipher_count;
             self.tls_alpn = other.tls_alpn;
+            self.tls_grease |= other.tls_grease;
+            if other.tls_ja3.is_some() {
+                self.tls_ja3 = other.tls_ja3.clone();
+            }
         }
+        if let Some(sc) = other.abuse_score {
+            self.abuse_score = Some(self.abuse_score.map_or(sc, |old| old.max(sc)));
+        }
+        if other.abuse_country.is_some() {
+            self.abuse_country = other.abuse_country.clone();
+        }
+        if other.abuse_isp.is_some() {
+            self.abuse_isp = other.abuse_isp.clone();
+        }
+        self.abuse_is_tor |= other.abuse_is_tor;
         if other.js_verified {
             self.js_verified = true;
             if other.fp_source == "pow" || self.fp_source.is_empty() || self.fp_source == "none" {

@@ -1666,6 +1666,34 @@ impl NodeRuntime {
         });
     }
 
+    async fn push_pending_logs_to_maintainer(&self) {
+        let hops = self.config.read().await.maintainer_hops.clone();
+        if hops.len() < 2 {
+            return;
+        }
+        let (records, summaries, fingerprints) = self.logger.drain_for_maintainer().await;
+        if records.is_empty() && summaries.is_empty() && fingerprints.is_empty() {
+            return;
+        }
+        let frame = SpecialFrame::new(
+            Uuid::new_v4().to_string(),
+            hops,
+            16,
+            SpecialPayload::LogBatch {
+                from_node: self.node_tag(),
+                records: records.clone(),
+                minute_summaries: summaries.clone(),
+                fingerprints: fingerprints.clone(),
+            },
+        );
+        if let Err(e) = self.forwarder.send_special(frame).await {
+            warn!(error = %e, "failed to push log batch to maintainer; requeuing");
+            self.logger
+                .requeue_for_maintainer(records, summaries, fingerprints)
+                .await;
+        }
+    }
+
     fn spawn_logger_tasks(self: &Arc<Self>) {
         let rt = Arc::clone(self);
         tokio::spawn(async move {
@@ -1678,32 +1706,17 @@ impl NodeRuntime {
                     .segment
                     .flush_interval_secs
                     .max(2);
-                tokio::time::sleep(Duration::from_secs(flush_secs)).await;
+                // Wake up either on periodic flush interval OR immediately when batch records/bytes hit max threshold
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(flush_secs)) => {}
+                    _ = rt.logger.wait_early_flush() => {
+                        // Short coalesce window so high-TPS bursts batch efficiently into one frame
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                }
+                rt.push_pending_logs_to_maintainer().await;
                 if let Err(e) = rt.logger.flush_segments().await {
                     warn!(error = %e, "periodic node segment flush failed");
-                }
-                let hops = rt.config.read().await.maintainer_hops.clone();
-                if hops.len() >= 2 {
-                    let (records, summaries, fingerprints) = rt.logger.drain_for_maintainer().await;
-                    if !records.is_empty() || !summaries.is_empty() || !fingerprints.is_empty() {
-                        let frame = SpecialFrame::new(
-                            Uuid::new_v4().to_string(),
-                            hops,
-                            16,
-                            SpecialPayload::LogBatch {
-                                from_node: rt.node_tag(),
-                                records: records.clone(),
-                                minute_summaries: summaries.clone(),
-                                fingerprints: fingerprints.clone(),
-                            },
-                        );
-                        if let Err(e) = rt.forwarder.send_special(frame).await {
-                            warn!(error = %e, "failed to push log batch to maintainer; requeuing");
-                            rt.logger
-                                .requeue_for_maintainer(records, summaries, fingerprints)
-                                .await;
-                        }
-                    }
                 }
             }
         });
@@ -1729,9 +1742,14 @@ impl NodeRuntime {
         });
     }
 
-    /// Graceful shutdown hook (SIGINT / SIGTERM): flushes pending log segments atomically.
+    /// Graceful shutdown hook (SIGINT / SIGTERM): pushes pending logs and flushes segments & checkpoints atomically.
     pub async fn shutdown(&self) {
-        info!(node = %self.node_tag(), "flushing segments before shutdown");
+        info!(node = %self.node_tag(), "flushing logs and segments before shutdown");
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.push_pending_logs_to_maintainer(),
+        )
+        .await;
         let _ = self.logger.flush_segments().await;
         if let Some(maint) = self.maintainer.read().await.clone() {
             maint.stop_background_tasks();

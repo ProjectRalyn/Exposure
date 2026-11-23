@@ -21,6 +21,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 rand.workspace = true
 rcgen.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustls.workspace = true

@@ -173,7 +173,7 @@ impl ResolvesServerCert for DynamicCertResolver {
     }
 }
 
-/// Extracted pre-TLS ClientHello metadata for JA3-like bot scoring.
+/// Extracted pre-TLS ClientHello metadata for unforgeable server-side JA3/GREASE/ALPN scoring.
 #[derive(Debug, Clone, Default)]
 pub struct ClientHelloSignal {
     pub sni: Option<String>,
@@ -181,6 +181,9 @@ pub struct ClientHelloSignal {
     pub cipher_count: usize,
     pub extension_count: usize,
     pub has_alpn: bool,
+    pub alpn_h2: bool,
+    pub has_grease: bool,
+    pub supported_groups_count: usize,
     pub fingerprint: Option<String>,
 }
 
@@ -225,9 +228,12 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
         return None;
     }
     let mut ciphers = Vec::new();
+    let mut has_grease = false;
     for chunk in data[pos..pos + cs_len].chunks_exact(2) {
         let c = u16::from_be_bytes([chunk[0], chunk[1]]);
-        if (c & 0x0f0f) != 0x0a0a {
+        if (c & 0x0f0f) == 0x0a0a {
+            has_grease = true;
+        } else {
             ciphers.push(c);
         }
     }
@@ -240,8 +246,11 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
     pos += 1 + comp_len;
 
     let mut extensions = Vec::new();
+    let mut supported_groups = Vec::new();
+    let mut ec_point_formats = Vec::new();
     let mut sni = None;
     let mut has_alpn = false;
+    let mut alpn_h2 = false;
 
     if pos + 2 <= data.len() {
         let ext_total = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
@@ -255,7 +264,9 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
                 break;
             }
             let ext_data = &data[pos..pos + ext_len];
-            if (ext_type & 0x0f0f) != 0x0a0a {
+            if (ext_type & 0x0f0f) == 0x0a0a {
+                has_grease = true;
+            } else {
                 extensions.push(ext_type);
             }
             if ext_type == 0x0000 && ext_data.len() >= 5 {
@@ -266,15 +277,46 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
                         sni = Some(normalize_host(host));
                     }
                 }
-            } else if ext_type == 0x0010 {
+            } else if ext_type == 0x0010 && ext_data.len() >= 2 {
                 has_alpn = true;
+                let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                let mut ap = 2;
+                let ap_end = (2 + list_len).min(ext_data.len());
+                while ap < ap_end {
+                    let plen = ext_data[ap] as usize;
+                    ap += 1;
+                    if ap + plen > ap_end {
+                        break;
+                    }
+                    if &ext_data[ap..ap + plen] == b"h2" {
+                        alpn_h2 = true;
+                    }
+                    ap += plen;
+                }
+            } else if ext_type == 0x000a && ext_data.len() >= 2 {
+                // supported_groups (elliptic curves)
+                let g_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                let g_end = (2 + g_len).min(ext_data.len());
+                for chunk in ext_data[2..g_end].chunks_exact(2) {
+                    let g = u16::from_be_bytes([chunk[0], chunk[1]]);
+                    if (g & 0x0f0f) == 0x0a0a {
+                        has_grease = true;
+                    } else {
+                        supported_groups.push(g);
+                    }
+                }
+            } else if ext_type == 0x000b && !ext_data.is_empty() {
+                // ec_point_formats
+                let f_len = ext_data[0] as usize;
+                let f_end = (1 + f_len).min(ext_data.len());
+                ec_point_formats.extend_from_slice(&ext_data[1..f_end]);
             }
             pos += ext_len;
         }
     }
 
     let raw_fp = format!(
-        "{},{},{}",
+        "{},{},{},{},{}",
         tls_version,
         ciphers
             .iter()
@@ -284,6 +326,16 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
         extensions
             .iter()
             .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        supported_groups
+            .iter()
+            .map(|g| g.to_string())
+            .collect::<Vec<_>>()
+            .join("-"),
+        ec_point_formats
+            .iter()
+            .map(|f| f.to_string())
             .collect::<Vec<_>>()
             .join("-")
     );
@@ -297,6 +349,9 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
         cipher_count: ciphers.len(),
         extension_count: extensions.len(),
         has_alpn,
+        alpn_h2,
+        has_grease,
+        supported_groups_count: supported_groups.len(),
         fingerprint: Some(fp),
     })
 }

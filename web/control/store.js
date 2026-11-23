@@ -48,6 +48,62 @@ export function defaultWafConfig() {
     inspect_body: true,
     max_body_bytes: 32 * 1024,
     exempt_paths: [],
+    crs_enabled: true,
+    crs_paranoia_level: 1,
+    disabled_rule_ids: [],
+  };
+}
+
+export function defaultAbuseIpDbConfig() {
+  return {
+    enabled: false,
+    api_key: "",
+    max_age_days: 90,
+    challenge_threshold: 25,
+    block_threshold: 75,
+    high_risk_action: "block",
+    cache_ttl_secs: 21600,
+    max_daily_lookups: 900,
+  };
+}
+
+export function normalizeAbuseIpDbConfig(raw) {
+  const b = defaultAbuseIpDbConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const act = ["off", "monitor", "challenge", "block", "evilpot"].includes(s.high_risk_action)
+    ? s.high_risk_action
+    : b.high_risk_action;
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    api_key: String(s.api_key ?? b.api_key).trim(),
+    max_age_days: Math.min(365, Math.max(1, Number(s.max_age_days ?? b.max_age_days) || b.max_age_days)),
+    challenge_threshold: Math.min(100, Math.max(0, Number(s.challenge_threshold ?? b.challenge_threshold) || 0)),
+    block_threshold: Math.min(100, Math.max(0, Number(s.block_threshold ?? b.block_threshold) || 0)),
+    high_risk_action: act,
+    cache_ttl_secs: Math.max(60, Number(s.cache_ttl_secs ?? b.cache_ttl_secs) || b.cache_ttl_secs),
+    max_daily_lookups: Math.max(10, Number(s.max_daily_lookups ?? b.max_daily_lookups) || b.max_daily_lookups),
+  };
+}
+
+export function defaultCrsUpdateConfig() {
+  return {
+    auto_update: true,
+    update_interval_hours: 24,
+    paranoia_level: 1,
+    disabled_rule_ids: [],
+  };
+}
+
+export function normalizeCrsUpdateConfig(raw) {
+  const b = defaultCrsUpdateConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  return {
+    auto_update: Boolean(s.auto_update ?? b.auto_update),
+    update_interval_hours: Math.min(720, Math.max(1, Number(s.update_interval_hours ?? b.update_interval_hours) || b.update_interval_hours)),
+    paranoia_level: Math.min(4, Math.max(1, Number(s.paranoia_level ?? b.paranoia_level) || b.paranoia_level)),
+    disabled_rule_ids: Array.isArray(s.disabled_rule_ids)
+      ? [...new Set(s.disabled_rule_ids.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0))]
+      : [],
   };
 }
 
@@ -95,6 +151,11 @@ export function normalizeWafConfig(raw) {
     inspect_body: Boolean(s.inspect_body ?? b.inspect_body),
     max_body_bytes: Math.min(256 * 1024, Math.max(0, Number(s.max_body_bytes ?? b.max_body_bytes) || b.max_body_bytes)),
     exempt_paths: Array.isArray(s.exempt_paths) ? s.exempt_paths.map((x) => String(x).trim()).filter(Boolean) : [],
+    crs_enabled: Boolean(s.crs_enabled ?? b.crs_enabled),
+    crs_paranoia_level: Math.min(4, Math.max(1, Number(s.crs_paranoia_level ?? b.crs_paranoia_level) || b.crs_paranoia_level)),
+    disabled_rule_ids: Array.isArray(s.disabled_rule_ids)
+      ? [...new Set(s.disabled_rule_ids.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0))]
+      : [],
   };
 }
 
@@ -165,6 +226,8 @@ export function defaultTopologyDefaults() {
       js_fp_ttl_secs: 3600,
       cache: defaultNodeCacheConfig(),
       evilpot: defaultEvilpotConfig(),
+      abuseipdb: defaultAbuseIpDbConfig(),
+      crs: defaultCrsUpdateConfig(),
     },
     guard: {
       antibot: "challenge",
@@ -497,6 +560,8 @@ export function normalizeDefaults(raw) {
       js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
       cache: normalizeNodeCacheConfig(src.ingress?.cache),
       evilpot: normalizeEvilpotConfig(src.ingress?.evilpot),
+      abuseipdb: normalizeAbuseIpDbConfig(src.ingress?.abuseipdb),
+      crs: normalizeCrsUpdateConfig(src.ingress?.crs),
     },
     guard: {
       ...base.guard,

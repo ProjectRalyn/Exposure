@@ -36,6 +36,7 @@ pub struct SegmentWriter<T> {
     cfg: SegmentConfig,
     prefix: String,
     buffer: Vec<T>,
+    pending_bytes: usize,
     seq: u64,
 }
 
@@ -47,13 +48,20 @@ impl<T: Serialize> SegmentWriter<T> {
             cfg,
             prefix: safe_prefix,
             buffer: Vec::new(),
+            pending_bytes: 0,
             seq: 0,
         })
     }
 
+    /// Push a record to the batch buffer. Returns `Ok(true)` if either `max_batch_records` or
+    /// `max_batch_bytes` was reached and an immediate atomic flush occurred.
     pub fn push(&mut self, record: T) -> Result<bool> {
+        let est_bytes = serde_json::to_vec(&record).map(|v| v.len() + 1).unwrap_or(256);
         self.buffer.push(record);
-        if self.buffer.len() >= self.cfg.max_batch_records.max(1) {
+        self.pending_bytes = self.pending_bytes.saturating_add(est_bytes);
+        let max_records = self.cfg.max_batch_records.max(1);
+        let max_bytes = self.cfg.max_batch_bytes.max(1024);
+        if self.buffer.len() >= max_records || self.pending_bytes >= max_bytes {
             self.flush()?;
             return Ok(true);
         }
@@ -62,6 +70,10 @@ impl<T: Serialize> SegmentWriter<T> {
 
     pub fn pending_count(&self) -> usize {
         self.buffer.len()
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     pub fn flush(&mut self) -> Result<Option<PathBuf>> {
@@ -95,6 +107,7 @@ impl<T: Serialize> SegmentWriter<T> {
 
         fs::rename(&tmp_path, &final_path)?;
         self.buffer.clear();
+        self.pending_bytes = 0;
         self.enforce_limits()?;
         Ok(Some(final_path))
     }
@@ -162,6 +175,82 @@ pub fn read_segment_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Ve
     Ok(out)
 }
 
+/// Atomically persist a JSON state snapshot (`0o600` tmp -> `sync_all` -> rename).
+pub fn write_json_snapshot_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| ExposureError::Storage(format!("serialize snapshot: {e}")))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.json");
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Read an optional JSON state snapshot from disk (returns `Ok(None)` if missing).
+pub fn read_json_snapshot<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let val: T = serde_json::from_slice(&bytes)
+        .map_err(|e| ExposureError::Storage(format!("parse snapshot {}: {e}", path.display())))?;
+    Ok(Some(val))
+}
+
+/// List `.seg.jsonl` files in `dir` matching `prefix` within `retention_hours`, sorted oldest-first.
+pub fn list_recent_segment_files(dir: &Path, prefix: &str, retention_hours: u64) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let safe_prefix = format!("{}-", sanitize_prefix(prefix));
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_hours.saturating_mul(3600)))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with(&safe_prefix) || !name.ends_with(".seg.jsonl") {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                let m = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                if m >= cutoff {
+                    files.push((p, m));
+                }
+            }
+        }
+    }
+    files.sort_by_key(|(_, m)| *m);
+    files.into_iter().map(|(p, _)| p).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +297,56 @@ mod tests {
         assert_eq!(files.len(), 1);
         let rows: Vec<SessionSummary> = read_segment_file(&files[0].path()).unwrap();
         assert_eq!(rows.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn segment_flushes_early_when_batch_bytes_hit() {
+        let dir = std::env::temp_dir().join(format!("exposure-seg-bytes-{}", uuid::Uuid::new_v4()));
+        let cfg = SegmentConfig {
+            dir: dir.to_string_lossy().to_string(),
+            max_batch_records: 500, // high record cap
+            max_batch_bytes: 1024,  // 1 KiB cap to trigger early flush well before 500 records
+            ..Default::default()
+        };
+        let mut w = SegmentWriter::<SessionSummary>::new(cfg, "node-b").unwrap();
+        let sample = SessionSummary {
+            timestamp_ms: 1700000000000,
+            node_tag: "node-b".into(),
+            role: "ingress".into(),
+            service_tag: "api".into(),
+            status: 200,
+            latency_ms: 3.2,
+            bytes_in: 64,
+            bytes_out: 128,
+            ip_hmac: "0123456789abcdef".into(),
+            raw_ip: None,
+            rate_limited: false,
+            challenged: false,
+            challenge_passed: false,
+            error: None,
+            device_type: None,
+            browser_family: None,
+            os_family: None,
+            client_fp_verified: false,
+        };
+        let mut flushed_at = None;
+        for i in 1..=20 {
+            if w.push(sample.clone()).unwrap() {
+                flushed_at = Some(i);
+                break;
+            }
+        }
+        let n = flushed_at.expect("expected byte-triggered early flush within 20 records");
+        assert!(n < 20, "expected flush well before record cap 500, got {n}");
+        let files = list_recent_segment_files(&dir, "node-b", 24);
+        assert_eq!(files.len(), 1);
+
+        // Verify atomic JSON snapshot helper
+        let snap_path = dir.join("state.json");
+        write_json_snapshot_atomic(&snap_path, &vec!["ok".to_string()]).unwrap();
+        let loaded: Option<Vec<String>> = read_json_snapshot(&snap_path).unwrap();
+        assert_eq!(loaded, Some(vec!["ok".to_string()]));
         let _ = fs::remove_dir_all(&dir);
     }
 }
