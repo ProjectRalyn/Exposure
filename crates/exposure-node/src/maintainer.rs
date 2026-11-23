@@ -2523,86 +2523,106 @@ impl MaintainerService {
             None => binding.map(|b| b.provider.trim()).filter(|s| !s.is_empty()),
         };
 
-        let (cert_pem, key_pem) = if cfg.acme.directory_url.eq_ignore_ascii_case("self-signed")
-            || cfg.acme.directory_url.is_empty()
-        {
-            if let Some(pname) = resolved_provider_name {
+        let now = Utc::now();
+        let cached = if !cfg.acme.storage_dir.is_empty() {
+            load_valid_cached_cert(&cfg.acme.storage_dir, &order.domain, order.renew_before_days, now)
+        } else {
+            None
+        };
+
+        let from_cache = cached.is_some();
+        let (cert_pem, key_pem, issued_at, expires_at) = if let Some((c, k, iat, exp)) = cached {
+            info!(domain = %order.domain, "reusing valid cached certificate from disk; skipping ACME issuance");
+            (c, k, iat, exp)
+        } else {
+            let (c, k) = if cfg.acme.directory_url.eq_ignore_ascii_case("self-signed")
+                || cfg.acme.directory_url.is_empty()
+            {
+                if let Some(pname) = resolved_provider_name {
+                    let provider = cfg.dns_providers.get(pname).ok_or_else(|| {
+                        ExposureError::Config(format!(
+                            "cert order '{}' references unknown dns_provider '{pname}'",
+                            order.domain
+                        ))
+                    })?;
+                    let challenge_val = Uuid::new_v4().to_string();
+                    let rec_id = self
+                        .dns01_present(provider, binding, &order.domain, &challenge_val)
+                        .await?;
+                    let _ = self
+                        .dns01_cleanup(
+                            provider,
+                            binding,
+                            &order.domain,
+                            &challenge_val,
+                            rec_id.as_deref(),
+                        )
+                        .await;
+                }
+                generate_self_signed_pem(&order.domain)?
+            } else {
+                let pname = resolved_provider_name.ok_or_else(|| {
+                    ExposureError::Config(format!(
+                        "ACME order '{}' requires a DNS-01 provider (configure `provider` or `domains` binding)",
+                        order.domain
+                    ))
+                })?;
                 let provider = cfg.dns_providers.get(pname).ok_or_else(|| {
                     ExposureError::Config(format!(
                         "cert order '{}' references unknown dns_provider '{pname}'",
                         order.domain
                     ))
                 })?;
-                let challenge_val = Uuid::new_v4().to_string();
-                let rec_id = self
-                    .dns01_present(provider, binding, &order.domain, &challenge_val)
-                    .await?;
-                let _ = self
-                    .dns01_cleanup(
-                        provider,
-                        binding,
-                        &order.domain,
-                        &challenge_val,
-                        rec_id.as_deref(),
-                    )
-                    .await;
+                let acme_http = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| ExposureError::Link(format!("ACME HTTP client: {e}")))?;
+                crate::acme::issue_acme_dns01_cert(
+                    acme_http,
+                    &cfg.acme.directory_url,
+                    &cfg.acme.contact_email,
+                    &cfg.acme.storage_dir,
+                    &order.domain,
+                    |txt_val| {
+                        let domain = order.domain.clone();
+                        async move {
+                            self.dns01_present(provider, binding, &domain, &txt_val)
+                                .await
+                        }
+                    },
+                    |txt_val, rec_id| {
+                        let domain = order.domain.clone();
+                        async move {
+                            let _ = self
+                                .dns01_cleanup(provider, binding, &domain, &txt_val, rec_id.as_deref())
+                                .await;
+                        }
+                    },
+                )
+                .await?
+            };
+
+            let iat = now.timestamp();
+            let exp = (now + ChronoDuration::days(90)).timestamp();
+
+            // Persist certificate locally on Maintainer (strict domain validation + atomic 0600 private key!)
+            if !cfg.acme.storage_dir.is_empty() {
+                let dir = Path::new(&cfg.acme.storage_dir);
+                std::fs::create_dir_all(dir)?;
+                let safe = order.domain.replace('*', "_wildcard_");
+                std::fs::write(dir.join(format!("{safe}.crt.pem")), &c)?;
+                let key_path = dir.join(format!("{safe}.key.pem"));
+                write_secret_file_atomic(&key_path, k.as_bytes())?;
+                let meta = serde_json::json!({
+                    "domain": order.domain,
+                    "issued_at": iat,
+                    "expires_at": exp,
+                });
+                let _ = std::fs::write(dir.join(format!("{safe}.meta.json")), meta.to_string());
             }
-            generate_self_signed_pem(&order.domain)?
-        } else {
-            let pname = resolved_provider_name.ok_or_else(|| {
-                ExposureError::Config(format!(
-                    "ACME order '{}' requires a DNS-01 provider (configure `provider` or `domains` binding)",
-                    order.domain
-                ))
-            })?;
-            let provider = cfg.dns_providers.get(pname).ok_or_else(|| {
-                ExposureError::Config(format!(
-                    "cert order '{}' references unknown dns_provider '{pname}'",
-                    order.domain
-                ))
-            })?;
-            let acme_http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .map_err(|e| ExposureError::Link(format!("ACME HTTP client: {e}")))?;
-            crate::acme::issue_acme_dns01_cert(
-                acme_http,
-                &cfg.acme.directory_url,
-                &cfg.acme.contact_email,
-                &cfg.acme.storage_dir,
-                &order.domain,
-                |txt_val| {
-                    let domain = order.domain.clone();
-                    async move {
-                        self.dns01_present(provider, binding, &domain, &txt_val)
-                            .await
-                    }
-                },
-                |txt_val, rec_id| {
-                    let domain = order.domain.clone();
-                    async move {
-                        let _ = self
-                            .dns01_cleanup(provider, binding, &domain, &txt_val, rec_id.as_deref())
-                            .await;
-                    }
-                },
-            )
-            .await?
+
+            (c, k, iat, exp)
         };
-
-        // Persist certificate locally on Maintainer (strict domain validation + atomic 0600 private key!)
-        if !cfg.acme.storage_dir.is_empty() {
-            let dir = Path::new(&cfg.acme.storage_dir);
-            std::fs::create_dir_all(dir)?;
-            let safe = order.domain.replace('*', "_wildcard_");
-            std::fs::write(dir.join(format!("{safe}.crt.pem")), &cert_pem)?;
-            let key_path = dir.join(format!("{safe}.key.pem"));
-            write_secret_file_atomic(&key_path, key_pem.as_bytes())?;
-        }
-
-        let now = Utc::now();
-        let issued_at = now.timestamp();
-        let expires_at = (now + ChronoDuration::days(90)).timestamp();
 
         let mut all_ok = true;
         for target in &order.target_nodes {
@@ -2663,13 +2683,22 @@ impl MaintainerService {
                         },
                     ..
                 }) => {
-                    all_ok = false;
-                    let msg = format!(
-                        "cert apply failed on {} for {}: {:?}",
-                        node_tag, order.domain, error
-                    );
-                    warn!("{msg}");
-                    self.record_alert("error", msg).await;
+                    let same_or_newer_on_target = from_cache
+                        && error
+                            .as_deref()
+                            .map(|e| e.contains("cert bundle rollback rejected"))
+                            .unwrap_or(false);
+                    if same_or_newer_on_target {
+                        info!(domain = %order.domain, target = %node_tag, "target already holds current or newer certificate");
+                    } else {
+                        all_ok = false;
+                        let msg = format!(
+                            "cert apply failed on {} for {}: {:?}",
+                            node_tag, order.domain, error
+                        );
+                        warn!("{msg}");
+                        self.record_alert("error", msg).await;
+                    }
                 }
                 Err(e) => {
                     all_ok = false;
@@ -2687,12 +2716,13 @@ impl MaintainerService {
         }
 
         let mut cs = self.cert_statuses.lock().await;
+        let exp_dt = DateTime::<Utc>::from_timestamp(expires_at, 0).unwrap_or(now);
         cs.insert(
             order.domain.clone(),
             CertStatusInfo {
                 domain: order.domain.clone(),
                 targets: order.target_nodes.clone(),
-                expires_at: Some((now + ChronoDuration::days(90)).to_rfc3339()),
+                expires_at: Some(exp_dt.to_rfc3339()),
                 last_renewed: Some(now.to_rfc3339()),
                 status: if all_ok { "valid".into() } else { "degraded".into() },
             },
@@ -2731,6 +2761,7 @@ impl MaintainerService {
         let this2 = Arc::clone(self);
         let mut rx2 = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
+            let mut retry_after: HashMap<String, DateTime<Utc>> = HashMap::new();
             loop {
                 tokio::select! {
                     _ = rx2.changed() => {
@@ -2746,6 +2777,11 @@ impl MaintainerService {
                 }
                 let now = Utc::now();
                 for order in &cfg.acme.orders {
+                    if let Some(until) = retry_after.get(&order.domain) {
+                        if now < *until {
+                            continue;
+                        }
+                    }
                     let needs_issue = {
                         let cs = this2.cert_statuses.lock().await;
                         match cs.get(&order.domain) {
@@ -2770,19 +2806,65 @@ impl MaintainerService {
                     };
                     if needs_issue {
                         if let Err(e) = this2.issue_and_distribute_order(order, &forwarder).await {
-                            warn!(domain = %order.domain, error = %e, "certificate renewal failed");
+                            retry_after.insert(order.domain.clone(), now + ChronoDuration::minutes(15));
+                            warn!(domain = %order.domain, error = %e, "certificate renewal failed (backing off 15m)");
                             this2
                                 .record_alert(
                                     "error",
                                     format!("cert renew {} failed: {e}", order.domain),
                                 )
                                 .await;
+                        } else {
+                            retry_after.remove(&order.domain);
                         }
                     }
                 }
             }
         });
     }
+}
+
+fn load_valid_cached_cert(
+    storage_dir: &str,
+    domain: &str,
+    renew_before_days: u32,
+    now: DateTime<Utc>,
+) -> Option<(String, String, i64, i64)> {
+    let dir = Path::new(storage_dir);
+    let safe = domain.replace('*', "_wildcard_");
+    let crt_path = dir.join(format!("{safe}.crt.pem"));
+    let key_path = dir.join(format!("{safe}.key.pem"));
+    let cert_pem = std::fs::read_to_string(&crt_path).ok()?;
+    let key_pem = std::fs::read_to_string(&key_path).ok()?;
+    if cert_pem.trim().is_empty() || key_pem.trim().is_empty() {
+        return None;
+    }
+
+    let meta_path = dir.join(format!("{safe}.meta.json"));
+    let (issued_at, expires_at) = if let Ok(raw) = std::fs::read_to_string(&meta_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let iat = val.get("issued_at").and_then(|v| v.as_i64());
+            let exp = val.get("expires_at").and_then(|v| v.as_i64());
+            match (iat, exp) {
+                (Some(i), Some(e)) => (i, e),
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    } else {
+        // Fallback to cert file mtime (90-day standard ACME lifetime)
+        let mtime = std::fs::metadata(&crt_path).ok()?.modified().ok()?;
+        let iat = DateTime::<Utc>::from(mtime).timestamp();
+        let exp = iat + 90 * 86_400;
+        (iat, exp)
+    };
+
+    let renew_at = expires_at - (renew_before_days as i64) * 86_400;
+    if now.timestamp() >= renew_at {
+        return None;
+    }
+    Some((cert_pem, key_pem, issued_at, expires_at))
 }
 
 #[cfg(test)]
