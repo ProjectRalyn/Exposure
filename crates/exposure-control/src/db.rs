@@ -292,14 +292,30 @@ impl ControlDb {
 
     pub async fn latest_config_sequence(&self) -> Result<u64> {
         self.run(|conn| {
-            let cur: i64 = conn
+            let max_ver: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(sequence), 0) FROM config_versions",
                     [],
                     |r| r.get(0),
                 )
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
-            Ok(u64::try_from(cur).unwrap_or(0))
+            let kv_seq: i64 = conn
+                .query_row(
+                    "SELECT CAST(v AS INTEGER) FROM kv_store WHERE k = 'last_config_sequence'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| ExposureError::Storage(e.to_string()))?
+                .unwrap_or(0);
+            let node_max: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(config_seq), 0) FROM nodes",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            Ok(u64::try_from(max_ver.max(kv_seq).max(node_max)).unwrap_or(0))
         })
         .await
     }
@@ -333,7 +349,14 @@ impl ControlDb {
                 .optional()
                 .map_err(|e| ExposureError::Storage(e.to_string()))?
                 .unwrap_or(0);
-            let next_seq = max_ver.max(kv_seq).saturating_add(1);
+            let node_max: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(config_seq), 0) FROM nodes",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            let next_seq = max_ver.max(kv_seq).max(node_max).saturating_add(1);
             tx.execute(
                 "INSERT INTO kv_store (k, v) VALUES ('last_config_sequence', ?1)
                  ON CONFLICT(k) DO UPDATE SET v = excluded.v",
@@ -542,21 +565,7 @@ impl ControlDb {
                 )
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             let rows = stmt
-                .query_map([], |r| {
-                    let roles_s: String = r.get(3)?;
-                    let roles: Vec<String> = serde_json::from_str(&roles_s).unwrap_or_default();
-                    Ok(NodeRecord {
-                        node_tag: r.get(0)?,
-                        public_key: r.get(1)?,
-                        pubkey_fingerprint: r.get(2)?,
-                        roles,
-                        config_seq: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
-                        last_reload_status: r.get(5)?,
-                        online: r.get::<_, i64>(6)? != 0,
-                        maintainer_signing_secret: r.get(7)?,
-                        maintainer_signing_pubkey: r.get(8)?,
-                    })
-                })
+                .query_map([], row_to_node_record)
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             let mut out = Vec::new();
             for row in rows {
@@ -575,21 +584,7 @@ impl ControlDb {
                         last_reload_status, online, maintainer_signing_secret, maintainer_signing_pubkey
                  FROM nodes WHERE node_tag = ?1",
                 params![node_tag],
-                |r| {
-                    let roles_s: String = r.get(3)?;
-                    let roles: Vec<String> = serde_json::from_str(&roles_s).unwrap_or_default();
-                    Ok(NodeRecord {
-                        node_tag: r.get(0)?,
-                        public_key: r.get(1)?,
-                        pubkey_fingerprint: r.get(2)?,
-                        roles,
-                        config_seq: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
-                        last_reload_status: r.get(5)?,
-                        online: r.get::<_, i64>(6)? != 0,
-                        maintainer_signing_secret: r.get(7)?,
-                        maintainer_signing_pubkey: r.get(8)?,
-                    })
-                },
+                row_to_node_record,
             )
             .optional()
             .map_err(|e| ExposureError::Storage(e.to_string()))
@@ -825,16 +820,7 @@ impl ControlDb {
                 )
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             let rows = stmt
-                .query_map(params![limit], |r| {
-                    Ok(ConfigVersionRecord {
-                        id: r.get(0)?,
-                        sequence: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
-                        node_tag: r.get(2)?,
-                        config_json: r.get(3)?,
-                        status: r.get(4)?,
-                        created_at: r.get(5)?,
-                    })
-                })
+                .query_map(params![limit], row_to_config_version)
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             let mut out = Vec::new();
             for row in rows {
@@ -851,16 +837,7 @@ impl ControlDb {
                 "SELECT id, sequence, node_tag, config_json, status, created_at
                  FROM config_versions WHERE id = ?1",
                 params![id],
-                |r| {
-                    Ok(ConfigVersionRecord {
-                        id: r.get(0)?,
-                        sequence: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
-                        node_tag: r.get(2)?,
-                        config_json: r.get(3)?,
-                        status: r.get(4)?,
-                        created_at: r.get(5)?,
-                    })
-                },
+                row_to_config_version,
             )
             .optional()
             .map_err(|e| ExposureError::Storage(e.to_string()))
@@ -946,24 +923,55 @@ impl ControlDb {
         .await
     }
 
-    /// Periodic retention pruning so `audit_logs`, `config_versions`, and expired `passphrases` never grow without bound.
+    /// Periodic retention pruning so `audit_logs`, `config_versions`, and expired/revoked `passphrases` never grow without bound.
     pub async fn prune_old_records(&self) -> Result<()> {
-        let stale_pass_cutoff = Utc::now().timestamp().saturating_sub(86_400);
+        let now_ts = Utc::now().timestamp();
+        let stale_pass_cutoff = now_ts.saturating_sub(86_400);
         self.run(move |conn| {
-            let _ = conn.execute(
+            conn.execute(
                 "DELETE FROM audit_logs WHERE id NOT IN (SELECT id FROM audit_logs ORDER BY id DESC LIMIT 10000)",
                 [],
-            );
-            let _ = conn.execute(
+            )
+            .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            conn.execute(
                 "DELETE FROM config_versions WHERE id NOT IN (SELECT id FROM config_versions ORDER BY id DESC LIMIT 500)",
                 [],
-            );
-            let _ = conn.execute(
-                "DELETE FROM passphrases WHERE (revoked = 1 OR expires_ts < ?1) AND expires_ts < ?1",
+            )
+            .map_err(|e| ExposureError::Storage(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM passphrases WHERE revoked = 1 OR expires_ts < ?1",
                 params![stale_pass_cutoff],
-            );
+            )
+            .map_err(|e| ExposureError::Storage(e.to_string()))?;
             Ok(())
         })
         .await
     }
+}
+
+fn row_to_node_record(r: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
+    let roles_s: String = r.get(3)?;
+    let roles: Vec<String> = serde_json::from_str(&roles_s).unwrap_or_default();
+    Ok(NodeRecord {
+        node_tag: r.get(0)?,
+        public_key: r.get(1)?,
+        pubkey_fingerprint: r.get(2)?,
+        roles,
+        config_seq: u64::try_from(r.get::<_, i64>(4)?).unwrap_or(0),
+        last_reload_status: r.get(5)?,
+        online: r.get::<_, i64>(6)? != 0,
+        maintainer_signing_secret: r.get(7)?,
+        maintainer_signing_pubkey: r.get(8)?,
+    })
+}
+
+fn row_to_config_version(r: &rusqlite::Row<'_>) -> rusqlite::Result<ConfigVersionRecord> {
+    Ok(ConfigVersionRecord {
+        id: r.get(0)?,
+        sequence: u64::try_from(r.get::<_, i64>(1)?).unwrap_or(0),
+        node_tag: r.get(2)?,
+        config_json: r.get(3)?,
+        status: r.get(4)?,
+        created_at: r.get(5)?,
+    })
 }

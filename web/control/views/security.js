@@ -266,6 +266,36 @@ export function createSecurityView({ api, store }) {
     showToast(t("sec.migrate.done"));
   }
 
+  function isValidSetName(name) {
+    return typeof name === "string" && /^[A-Za-z0-9._-]{1,64}$/.test(name) && !isReservedKey(name);
+  }
+
+  function tryRenameSet(inp, cfg, kind, dataKey) {
+    const oldN = inp.dataset[dataKey];
+    const newN = inp.value.trim();
+    const cur = cfg.getMap(store.spec);
+    if (!newN || newN === oldN) {
+      inp.value = oldN;
+      return;
+    }
+    if (!isValidSetName(newN)) {
+      inp.value = oldN;
+      showToast(t("common.invalidName"), true);
+      return;
+    }
+    if (cur[newN]) {
+      inp.value = oldN;
+      return;
+    }
+    store.mutate((s) => {
+      const m = cfg.getMap(s);
+      m[newN] = m[oldN];
+      delete m[oldN];
+      renameSetReferences(s, kind, oldN, newN);
+    });
+    render();
+  }
+
   function renameSetReferences(s, kind, oldN, newN) {
     const defField = `default_${kind}`;
     if (s.defaults?.ingress?.[defField] === oldN) s.defaults.ingress[defField] = newN;
@@ -459,22 +489,7 @@ export function createSecurityView({ api, store }) {
     });
 
     container.querySelectorAll("[data-bk-rename]").forEach((inp) => {
-      inp.addEventListener("change", () => {
-        const oldN = inp.dataset.bkRename;
-        const newN = inp.value.trim();
-        const cur = cfg.getMap(store.spec);
-        if (!newN || newN === oldN || isReservedKey(newN) || cur[newN]) {
-          inp.value = oldN;
-          return;
-        }
-        store.mutate((s) => {
-          const m = cfg.getMap(s);
-          m[newN] = m[oldN];
-          delete m[oldN];
-          renameSetReferences(s, "bucket", oldN, newN);
-        });
-        render();
-      });
+      inp.addEventListener("change", () => tryRenameSet(inp, cfg, "bucket", "bkRename"));
     });
 
     container.querySelectorAll("[data-bk-cap]").forEach((inp) => {
@@ -712,22 +727,7 @@ export function createSecurityView({ api, store }) {
     });
 
     container.querySelectorAll("[data-ab-rename]").forEach((inp) => {
-      inp.addEventListener("change", () => {
-        const oldN = inp.dataset.abRename;
-        const newN = inp.value.trim();
-        const cur = cfg.getMap(store.spec);
-        if (!newN || newN === oldN || isReservedKey(newN) || cur[newN]) {
-          inp.value = oldN;
-          return;
-        }
-        store.mutate((s) => {
-          const m = cfg.getMap(s);
-          m[newN] = m[oldN];
-          delete m[oldN];
-          renameSetReferences(s, "antibot", oldN, newN);
-        });
-        render();
-      });
+      inp.addEventListener("change", () => tryRenameSet(inp, cfg, "antibot", "abRename"));
     });
 
     container.querySelectorAll("[data-ab-mode]").forEach((sel) => {
@@ -1188,22 +1188,7 @@ export function createSecurityView({ api, store }) {
     });
 
     container.querySelectorAll("[data-ws-rename]").forEach((inp) => {
-      inp.addEventListener("change", () => {
-        const oldN = inp.dataset.wsRename;
-        const newN = inp.value.trim();
-        const cur = cfg.getMap(store.spec);
-        if (!newN || newN === oldN || isReservedKey(newN) || cur[newN]) {
-          inp.value = oldN;
-          return;
-        }
-        store.mutate((s) => {
-          const m = cfg.getMap(s);
-          m[newN] = m[oldN];
-          delete m[oldN];
-          renameSetReferences(s, "waf", oldN, newN);
-        });
-        render();
-      });
+      inp.addEventListener("change", () => tryRenameSet(inp, cfg, "waf", "wsRename"));
     });
 
     container.querySelectorAll("[data-ws-mode]").forEach((sel) => {

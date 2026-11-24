@@ -797,7 +797,15 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         "signature": ch_json["signature"],
         "expires_at": ch_json["expires_at"],
         "difficulty": diff,
-        "redirect": "/protected"
+        "redirect": "/protected",
+        "client_fp": {
+            "webdriver": false,
+            "platform": "Linux x86_64",
+            "screen": "1920x1080x24",
+            "tz": "UTC",
+            "cores": 8,
+            "canvas_hash": "a1b2c3d4"
+        }
     });
     let verify_resp = http_client
         .post(format!("http://{ingress_http}/cdn-cgi/verify"))
@@ -963,7 +971,18 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     let login_json: serde_json::Value = login_resp.json().await.unwrap();
     let bearer = login_json["token"].as_str().unwrap().to_string();
 
-    // Pull telemetry actively via Maintainer Hop Table
+    // Pull telemetry actively via Maintainer Hop Table (Control-signed!)
+    let pull_req_id = uuid::Uuid::new_v4().to_string();
+    let pull_now = chrono::Utc::now().timestamp();
+    let pull_exp = pull_now + 60;
+    let pull_signing = exposure_core::protocol::pull_telemetry_req_signing_bytes(
+        &pull_req_id,
+        pull_now,
+        pull_exp,
+        "maintainer-1",
+        None,
+    );
+    let pull_sig = kp_ctrl_sign.sign_b64(&pull_signing);
     let pull_frame = SpecialFrame::new(
         uuid::Uuid::new_v4().to_string(),
         vec![
@@ -973,7 +992,14 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             "maintainer-1".into(),
         ],
         16,
-        SpecialPayload::PullTelemetryReq { since_minute: None },
+        SpecialPayload::PullTelemetryReq {
+            request_id: pull_req_id,
+            issued_at: pull_now,
+            expires_at: pull_exp,
+            maintainer_tag: "maintainer-1".into(),
+            since_minute: None,
+            control_signature: pull_sig,
+        },
     );
     let pulled = ctrl_rt
         .client()

@@ -10,9 +10,10 @@ use dashmap::DashMap;
 use exposure_core::assets::{load_web_asset, WebApp};
 use exposure_core::config::{AntibotMode, CustomPagesConfig, GuardProfile, RateLimitBucket};
 use exposure_core::crypto::{
-    ct_eq_hashed, keyed_short_hmac_hex, sign_challenge_token, sign_clearance_cookie,
-    sign_fp_cookie, sign_fp_token, verify_challenge_token, verify_clearance_cookie,
-    verify_fp_cookie, verify_fp_token, verify_pow_solution, ClearanceClaims, FpCookieClaims,
+    ct_eq_hashed, keyed_short_hmac_hex, short_sha256_hex, sign_challenge_token,
+    sign_clearance_cookie, sign_fp_cookie, sign_fp_token, verify_challenge_token,
+    verify_clearance_cookie, verify_fp_cookie, verify_fp_token, verify_pow_solution,
+    ClearanceClaims, FpCookieClaims,
 };
 use exposure_core::routing::{canonical_ip, ip_matches_cidrs, normalize_host};
 use exposure_core::telemetry::ClientJsFingerprint;
@@ -20,6 +21,7 @@ use http::{header, HeaderMap, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ban::evict_half;
 use crate::tls::ClientHelloSignal;
 
 pub const CLEARANCE_COOKIE_NAME: &str = "exposure_clearance";
@@ -38,28 +40,19 @@ const MAX_RATE_LIMIT_HTML_RESPONSES: u32 = 3;
 const CHALLENGE_CSP: &str =
     "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
 
-/// Evict roughly half of a bounded state map instead of wiping it entirely.
-///
-/// `DashMap::clear()` resets *all* rate-limit / replay state at once (fail-open) and, for
-/// spent-token caches, re-enables replay within the token TTL. Evicting a subset keeps the
-/// structure bounded while preserving most state.
-fn evict_half<K, V>(map: &DashMap<K, V>)
-where
-    K: Eq + std::hash::Hash,
-{
-    let to_remove = map.len() / 2;
-    if to_remove == 0 {
-        return;
-    }
-    let mut removed = 0usize;
-    map.retain(|_, _| {
-        if removed < to_remove {
-            removed += 1;
-            false
-        } else {
-            true
-        }
-    });
+fn profile_binding_hash(profile: Option<&GuardProfile>) -> String {
+    let def = GuardProfile::default();
+    let p = profile.unwrap_or(&def);
+    let raw = format!(
+        "{:?}|{}|{}|{}|{}|{}",
+        p.antibot,
+        p.pow_difficulty.clamp(1, 28),
+        p.effective_block_headless(),
+        p.effective_require_client_fp(),
+        p.effective_block_bots(),
+        p.effective_browser_only(),
+    );
+    short_sha256_hex(&raw)
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +93,78 @@ pub struct GuardHttpResponse {
     pub content_type: &'static str,
     pub body: Vec<u8>,
     pub extra_headers: Vec<(String, String)>,
+    /// True only when `POST /cdn-cgi/verify` rejected an actual PoW/signature/headless abuse
+    /// attempt (never set on pure CSRF header/content-type rejections).
+    pub(crate) record_verify_offense: bool,
+}
+
+fn c_sec_headers() -> Vec<(String, String)> {
+    vec![
+        ("X-Content-Type-Options".into(), "nosniff".into()),
+        ("X-Frame-Options".into(), "SAMEORIGIN".into()),
+        ("Content-Security-Policy".into(), CHALLENGE_CSP.into()),
+    ]
+}
+
+fn check_same_origin_json_post(
+    headers: &HeaderMap,
+    host_clean: &str,
+    allow_same_site: bool,
+    non_json_status: StatusCode,
+) -> Option<GuardHttpResponse> {
+    if let Some(site_hv) = headers.get("sec-fetch-site") {
+        let Ok(site) = site_hv.to_str() else {
+            return Some(GuardHttpResponse {
+                status: StatusCode::FORBIDDEN,
+                content_type: "text/plain; charset=utf-8",
+                body: b"forbidden".to_vec(),
+                extra_headers: c_sec_headers(),
+                record_verify_offense: false,
+            });
+        };
+        let ok = site.eq_ignore_ascii_case("same-origin")
+            || (allow_same_site
+                && (site.eq_ignore_ascii_case("same-site") || site.eq_ignore_ascii_case("none")));
+        if !ok {
+            return Some(GuardHttpResponse {
+                status: StatusCode::FORBIDDEN,
+                content_type: "text/plain; charset=utf-8",
+                body: b"forbidden".to_vec(),
+                extra_headers: c_sec_headers(),
+                record_verify_offense: false,
+            });
+        }
+    }
+    if let Some(origin_hv) = headers.get(header::ORIGIN) {
+        let origin_host = origin_hv
+            .to_str()
+            .ok()
+            .and_then(|o| o.parse::<http::Uri>().ok())
+            .and_then(|u| u.authority().map(|a| normalize_host(a.as_str())));
+        if origin_host.as_deref() != Some(host_clean) || host_clean.is_empty() {
+            return Some(GuardHttpResponse {
+                status: StatusCode::FORBIDDEN,
+                content_type: "text/plain; charset=utf-8",
+                body: b"forbidden".to_vec(),
+                extra_headers: c_sec_headers(),
+                record_verify_offense: false,
+            });
+        }
+    }
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct.trim().to_ascii_lowercase().starts_with("application/json") {
+        return Some(GuardHttpResponse {
+            status: non_json_status,
+            content_type: "text/plain; charset=utf-8",
+            body: b"application/json required".to_vec(),
+            extra_headers: c_sec_headers(),
+            record_verify_offense: false,
+        });
+    }
+    None
 }
 
 /// Constant-time check for authenticated API bypass headers (`"Header-Name: expected-secret"`).
@@ -381,6 +446,15 @@ impl GuardEngine {
 
     fn record_verify_failure(&self, client_ip: IpAddr) {
         let now = Instant::now();
+        if self.challenge_activity.len() >= MAX_SPENT_CHALLENGES {
+            self.challenge_activity.retain(|_, v| {
+                now.duration_since(v.window_start) < ADAPTIVE_WINDOW
+                    || now.duration_since(v.failure_window_start) < VERIFY_FAILURE_WINDOW
+            });
+            if self.challenge_activity.len() >= MAX_SPENT_CHALLENGES {
+                evict_half(&self.challenge_activity);
+            }
+        }
         let ip_key = client_ip_binding_key(client_ip);
         self.challenge_activity
             .entry(ip_key)
@@ -771,7 +845,7 @@ impl GuardEngine {
             self.fp_inject_cooldown
                 .retain(|_, ts| now.duration_since(*ts) < FP_INJECT_COOLDOWN);
             if self.fp_inject_cooldown.len() >= MAX_FP_COOLDOWNS {
-                self.fp_inject_cooldown.clear();
+                evict_half(&self.fp_inject_cooldown);
             }
         }
         let cd_key = (client_ip_binding_key(client_ip), normalize_host(host));
@@ -888,6 +962,10 @@ impl GuardEngine {
                 return None;
             }
         }
+        let expected_profile_hash = profile_binding_hash(Some(profile));
+        if claims.profile_hash.as_deref() != Some(expected_profile_hash.as_str()) {
+            return None;
+        }
         Some(claims)
     }
 
@@ -979,6 +1057,7 @@ impl GuardEngine {
                     content_type: "text/plain; charset=utf-8",
                     body: msg.to_vec(),
                     extra_headers: extra,
+                    record_verify_offense: false,
                 },
                 None,
             )
@@ -1025,6 +1104,7 @@ impl GuardEngine {
                     content_type: "application/json; charset=utf-8",
                     body: serde_json::to_vec(&payload).unwrap_or_default(),
                     extra_headers: extra,
+                    record_verify_offense: false,
                 },
                 None,
             );
@@ -1039,6 +1119,7 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"forbidden".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: false,
                     },
                     None,
                 )
@@ -1053,38 +1134,18 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"payload too large".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: false,
                     },
                     None,
                 );
             }
-            if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-                if !site.eq_ignore_ascii_case("same-origin") {
-                    return fp_forbidden();
-                }
-            }
-            if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-                let origin_host = origin
-                    .parse::<http::Uri>()
-                    .ok()
-                    .and_then(|u| u.authority().map(|a| normalize_host(a.as_str())));
-                if origin_host.as_deref() != Some(host_clean.as_str()) {
-                    return fp_forbidden();
-                }
-            }
-            let ct = headers
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if !ct.to_ascii_lowercase().starts_with("application/json") {
-                return (
-                    GuardHttpResponse {
-                        status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        content_type: "text/plain; charset=utf-8",
-                        body: b"unsupported media type".to_vec(),
-                        extra_headers: sec_headers(),
-                    },
-                    None,
-                );
+            if let Some(rej) = check_same_origin_json_post(
+                headers,
+                &host_clean,
+                false,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ) {
+                return (rej, None);
             }
 
             #[derive(Deserialize)]
@@ -1102,6 +1163,7 @@ impl GuardEngine {
                             content_type: "text/plain; charset=utf-8",
                             body: b"bad request".to_vec(),
                             extra_headers: sec_headers(),
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1179,6 +1241,7 @@ impl GuardEngine {
                             content_type: "text/plain; charset=utf-8",
                             body: b"failed to sign fp cookie".to_vec(),
                             extra_headers: sec_headers(),
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1198,6 +1261,7 @@ impl GuardEngine {
                     content_type: "text/plain; charset=utf-8",
                     body: Vec::new(),
                     extra_headers: extra,
+                    record_verify_offense: false,
                 },
                 Some(VerifiedFpSubmission {
                     service_tag: Some(service_tag),
@@ -1219,6 +1283,13 @@ impl GuardEngine {
             ) {
                 return rate_limit_resp(retry_after, b"verify rate limited");
             }
+            // Enforce CSRF & Content-Type checks BEFORE JSON parsing or failure-counter accounting
+            // so cross-site attackers cannot trigger victim verify failures or AutoBan DoS.
+            if let Some(rej) =
+                check_same_origin_json_post(headers, &host_clean, true, StatusCode::FORBIDDEN)
+            {
+                return (rej, None);
+            }
             if body.len() > 8192 {
                 return (
                     GuardHttpResponse {
@@ -1226,6 +1297,7 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"verify payload too large".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: false,
                     },
                     None,
                 );
@@ -1258,6 +1330,7 @@ impl GuardEngine {
                             content_type: "text/plain; charset=utf-8",
                             body: b"invalid verify payload".to_vec(),
                             extra_headers: sec_headers(),
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1286,6 +1359,7 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"challenge expired, downgraded, or invalid signature".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: true,
                     },
                     None,
                 );
@@ -1299,6 +1373,7 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"invalid proof-of-work solution".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: true,
                     },
                     None,
                 );
@@ -1312,6 +1387,7 @@ impl GuardEngine {
                         content_type: "text/plain; charset=utf-8",
                         body: b"challenge token already used".to_vec(),
                         extra_headers: sec_headers(),
+                        record_verify_offense: true,
                     },
                     None,
                 );
@@ -1343,6 +1419,7 @@ impl GuardEngine {
                             content_type: "text/plain; charset=utf-8",
                             body: b"headless or tampered browser fingerprint rejected".to_vec(),
                             extra_headers: sec_headers(),
+                            record_verify_offense: true,
                         },
                         None,
                     );
@@ -1356,6 +1433,18 @@ impl GuardEngine {
                     js_fp: cfp.clone(),
                 });
                 Some(h)
+            } else if block_headless {
+                self.record_verify_failure(client_ip);
+                return (
+                    GuardHttpResponse {
+                        status: StatusCode::FORBIDDEN,
+                        content_type: "text/plain; charset=utf-8",
+                        body: b"client browser fingerprint required".to_vec(),
+                        extra_headers: sec_headers(),
+                        record_verify_offense: true,
+                    },
+                    None,
+                );
             } else {
                 None
             };
@@ -1371,6 +1460,7 @@ impl GuardEngine {
                 },
                 ip_prefix: if bind_ip { Some(ip_key) } else { None },
                 fp_hash,
+                profile_hash: Some(profile_binding_hash(profile)),
             };
 
             let cookie_val = match sign_clearance_cookie(clearance_secret, &claims) {
@@ -1382,6 +1472,7 @@ impl GuardEngine {
                             content_type: "text/plain",
                             body: b"failed to sign clearance".to_vec(),
                             extra_headers: sec_headers(),
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1403,6 +1494,7 @@ impl GuardEngine {
                     body: serde_json::to_vec(&VerifyResp { ok: true, redirect })
                         .unwrap_or_default(),
                     extra_headers: extra,
+                    record_verify_offense: false,
                 },
                 verified_fp_sub,
             );
@@ -1435,6 +1527,7 @@ impl GuardEngine {
                             content_type: "text/html; charset=utf-8",
                             body: custom_html.as_bytes().to_vec(),
                             extra_headers: extra,
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1455,6 +1548,7 @@ impl GuardEngine {
                             content_type: "text/css; charset=utf-8",
                             body: custom_css.as_bytes().to_vec(),
                             extra_headers: extra,
+                            record_verify_offense: false,
                         },
                         None,
                     );
@@ -1475,6 +1569,7 @@ impl GuardEngine {
                     content_type: mime,
                     body: bytes,
                     extra_headers: extra,
+                    record_verify_offense: false,
                 },
                 None,
             );
@@ -1486,6 +1581,7 @@ impl GuardEngine {
                 content_type: "text/plain; charset=utf-8",
                 body: b"not found".to_vec(),
                 extra_headers: sec_headers(),
+                record_verify_offense: false,
             },
             None,
         )
@@ -1728,7 +1824,8 @@ fn client_ip_binding_key(ip: IpAddr) -> String {
     canonical_ip(ip).to_string()
 }
 
-/// Strict same-origin relative redirect sanitizer (blocks `//`, `/\`, backslashes, control chars, scheme URIs).
+/// Strict same-origin relative redirect sanitizer (blocks `//`, `/\`, `/cdn-cgi` loops,
+/// backslashes, control chars, scheme URIs).
 pub fn sanitize_redirect(raw: &str) -> String {
     if !raw.starts_with('/') {
         return "/".to_string();
@@ -1737,6 +1834,12 @@ pub fn sanitize_redirect(raw: &str) -> String {
         return "/".to_string();
     }
     if raw.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f) {
+        return "/".to_string();
+    }
+    let path_only = raw.split(['?', '#']).next().unwrap_or(raw);
+    if path_only.eq_ignore_ascii_case("/cdn-cgi")
+        || path_only.to_ascii_lowercase().starts_with("/cdn-cgi/")
+    {
         return "/".to_string();
     }
     match raw.parse::<http::Uri>() {
@@ -1961,6 +2064,8 @@ mod tests {
     fn guard_pow_challenge_clearance_replay_and_redirect_sanitization() {
         assert_eq!(sanitize_redirect("/\\evil.example"), "/");
         assert_eq!(sanitize_redirect("//evil.example"), "/");
+        assert_eq!(sanitize_redirect("/cdn-cgi/?redirect=%2F"), "/");
+        assert_eq!(sanitize_redirect("/cdn-cgi"), "/");
         assert_eq!(sanitize_redirect("/ok?a=1"), "/ok?a=1");
 
         let engine = GuardEngine::new();
@@ -1978,6 +2083,7 @@ mod tests {
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::USER_AGENT, "curl/8.0".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
 
         let dec = engine.evaluate(
             &profile,
@@ -2012,7 +2118,8 @@ mod tests {
         while !verify_pow_solution(&token, nonce, diff) {
             nonce += 1;
         }
-        let verify_body = serde_json::to_vec(&serde_json::json!({
+        // Omitting client_fp when block_headless is true must be rejected!
+        let missing_fp_body = serde_json::to_vec(&serde_json::json!({
             "token": token,
             "nonce": nonce,
             "signature": val["signature"],
@@ -2021,6 +2128,79 @@ mod tests {
             "redirect": "/hello"
         }))
         .unwrap();
+        let (no_fp_resp, _) = engine.handle_cdn_cgi(
+            &Method::POST,
+            "/cdn-cgi/verify",
+            &missing_fp_body,
+            &headers,
+            "example.com",
+            ip,
+            true,
+            None,
+            Some(&profile),
+            "my-secret-key-for-testing-123456",
+            3600,
+        );
+        assert_eq!(no_fp_resp.status, StatusCode::FORBIDDEN);
+        assert!(no_fp_resp.record_verify_offense);
+
+        // Fresh challenge for full roundtrip with valid non-headless client_fp
+        let (ch2, _) = engine.handle_cdn_cgi(
+            &Method::GET,
+            "/cdn-cgi/challenge",
+            &[],
+            &headers,
+            "example.com",
+            ip,
+            true,
+            None,
+            Some(&profile),
+            "my-secret-key-for-testing-123456",
+            3600,
+        );
+        let val: serde_json::Value = serde_json::from_slice(&ch2.body).unwrap();
+        let token = val["token"].as_str().unwrap().to_string();
+        let diff = val["difficulty"].as_u64().unwrap() as u8;
+        let mut nonce = 0u64;
+        while !verify_pow_solution(&token, nonce, diff) {
+            nonce += 1;
+        }
+        let verify_body = serde_json::to_vec(&serde_json::json!({
+            "token": token,
+            "nonce": nonce,
+            "signature": val["signature"],
+            "expires_at": val["expires_at"],
+            "difficulty": diff,
+            "redirect": "/hello",
+            "client_fp": {
+                "webdriver": false,
+                "platform": "Linux x86_64",
+                "screen": "1920x1080x24",
+                "tz": "UTC",
+                "cores": 8,
+                "canvas_hash": "a1b2c3d4"
+            }
+        }))
+        .unwrap();
+
+        // Cross-origin CSRF submission must return 403 WITHOUT marking verify offense!
+        let mut csrf_hdrs = headers.clone();
+        csrf_hdrs.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let (csrf_resp, _) = engine.handle_cdn_cgi(
+            &Method::POST,
+            "/cdn-cgi/verify",
+            &verify_body,
+            &csrf_hdrs,
+            "example.com",
+            ip,
+            true,
+            None,
+            Some(&profile),
+            "my-secret-key-for-testing-123456",
+            3600,
+        );
+        assert_eq!(csrf_resp.status, StatusCode::FORBIDDEN);
+        assert!(!csrf_resp.record_verify_offense);
 
         // Cross-host submission must fail
         let (cross_host, _) = engine.handle_cdn_cgi(
@@ -2235,6 +2415,7 @@ mod tests {
         hdrs.insert(header::ACCEPT, "text/html".parse().unwrap());
         hdrs.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
         hdrs.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        hdrs.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
 
         let solve = |ip: IpAddr, fp: serde_json::Value| {
             let (ch, _) = engine.handle_cdn_cgi(

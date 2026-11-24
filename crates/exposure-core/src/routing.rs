@@ -30,10 +30,12 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
 }
 
 /// Returns `true` for globally routable unicast IPv4/IPv6 addresses (excluding loopback,
-/// RFC1918 private, CGNAT `100.64.0.0/10`, link-local, documentation, ULA, multicast, etc.).
+/// RFC1918 private, `0.0.0.0/8`, CGNAT `100.64.0.0/10`, link-local, benchmarking `198.18.0.0/15`,
+/// documentation, reserved `240.0.0.0/4`, ULA, NAT64, deprecated site-local, multicast, etc.).
 pub fn is_public_routable_ip(ip: IpAddr) -> bool {
     match canonical_ip(ip) {
         IpAddr::V4(v4) => {
+            let o = v4.octets();
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -41,14 +43,25 @@ pub fn is_public_routable_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_multicast()
                 || v4.is_documentation()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64))
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240)
         }
         IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let is_nat64 = (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1);
+            let is_site_local = (s[0] & 0xffc0) == 0xfec0;
+            let is_doc = s[0] == 0x2001 && s[1] == 0x0db8;
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+                || is_nat64
+                || is_site_local
+                || is_doc)
         }
     }
 }
@@ -72,24 +85,112 @@ pub fn ip_matches_cidrs(ip: IpAddr, cidrs: &[String]) -> bool {
     false
 }
 
-/// Extract normalized hostname without port (IPv6-bracket safe) and without trailing FQDN dot.
+fn has_forbidden_host_chars(s: &str) -> bool {
+    s.is_empty()
+        || s.bytes().any(|b| {
+            b <= 0x20
+                || b >= 0x7f
+                || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#' | b'[' | b']')
+        })
+}
+
+/// Strictly validate an HTTP `Host` / `:authority` header value.
+/// Returns canonical lowercase `host` (keeping `[ipv6]` brackets and valid non-empty numeric `:port`)
+/// or `None` for malformed values (`@` userinfo, path separators, invalid ports, control chars).
+pub fn parse_valid_host(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.bytes().any(|b| {
+            b <= 0x20 || b >= 0x7f || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#' | b'*')
+        })
+    {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (v6, tail) = rest.split_once(']')?;
+        let parsed_v6 = v6.parse::<std::net::Ipv6Addr>().ok()?;
+        if tail.is_empty() {
+            return Some(format!("[{parsed_v6}]"));
+        }
+        let port_str = tail.strip_prefix(':')?;
+        let port: u16 = port_str.parse().ok().filter(|&p| p > 0)?;
+        return Some(format!("[{parsed_v6}]:{port}"));
+    }
+    if let Ok(parsed_v6) = trimmed.parse::<std::net::Ipv6Addr>() {
+        return Some(format!("[{parsed_v6}]"));
+    }
+    let (host_part, port_opt) = match trimmed.split_once(':') {
+        Some((h, p)) => {
+            if h.is_empty() || p.contains(':') {
+                return None;
+            }
+            let port: u16 = p.parse().ok().filter(|&n| n > 0)?;
+            (h, Some(port))
+        }
+        None => (trimmed, None),
+    };
+    let clean_host = host_part.trim_end_matches('.');
+    if clean_host.is_empty()
+        || has_forbidden_host_chars(clean_host)
+        || clean_host.starts_with('.')
+        || clean_host.contains("..")
+    {
+        return None;
+    }
+    let lower = clean_host.to_ascii_lowercase();
+    Some(match port_opt {
+        Some(p) => format!("{lower}:{p}"),
+        None => lower,
+    })
+}
+
+/// Extract normalized hostname without port (IPv6-bracket & strict-port safe) and without trailing FQDN dot.
+/// Malformed host strings (e.g. `allowed.example:@evil.example`) normalize to `""` so they never match.
 pub fn normalize_host(host: &str) -> String {
     let trimmed = host.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .bytes()
+            .any(|b| b <= 0x20 || b >= 0x7f || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#'))
+    {
+        return String::new();
+    }
     let without_port = if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some((v6, _)) = rest.split_once(']') {
-            v6
-        } else {
-            trimmed
+        let Some((v6, tail)) = rest.split_once(']') else {
+            return String::new();
+        };
+        if !tail.is_empty() {
+            let Some(port_str) = tail.strip_prefix(':') else {
+                return String::new();
+            };
+            if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+                return String::new();
+            }
         }
-    } else if trimmed.matches(':').count() == 1 {
-        trimmed.split(':').next().unwrap_or("")
+        if v6.parse::<std::net::Ipv6Addr>().is_err() {
+            return String::new();
+        }
+        v6
+    } else if let Some((h, port_str)) = trimmed.split_once(':') {
+        if trimmed.matches(':').count() == 1 {
+            if port_str.is_empty()
+                || !port_str.bytes().all(|b| b.is_ascii_digit())
+                || has_forbidden_host_chars(h)
+            {
+                return String::new();
+            }
+            h
+        } else if trimmed.parse::<std::net::Ipv6Addr>().is_ok() {
+            trimmed
+        } else {
+            return String::new();
+        }
+    } else if has_forbidden_host_chars(trimmed) {
+        return String::new();
     } else {
-        // Bare IPv6 address without brackets or hostname without port
         trimmed
     };
-    without_port
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    without_port.trim_end_matches('.').to_ascii_lowercase()
 }
 
 pub fn host_matches(pattern: &str, host: &str) -> bool {
@@ -358,9 +459,21 @@ mod tests {
         let r2 = match_ingress_rule(&rules, "api.example.com", "/api/v1", "198.51.100.5".parse().unwrap(), None);
         assert_eq!(r2.unwrap().service_tag, "web@default");
 
-        // IPv6 bracket host normalization
+        // IPv6 bracket host normalization & strict port validation
         assert_eq!(normalize_host("[2001:db8::1]:443"), "2001:db8::1");
         assert!(host_matches("2001:db8::1", "[2001:db8::1]:443"));
+        assert_eq!(normalize_host("allowed.example:@evil.example"), "");
+        assert!(!any_rule_matches_host(&rules, "api.example.com:@evil.example"));
+        assert_eq!(parse_valid_host("App.Example.COM.:443").as_deref(), Some("app.example.com:443"));
+        assert_eq!(parse_valid_host("allowed.example:@evil.example"), None);
+        assert_eq!(parse_valid_host("good.example/path"), None);
+        assert!(!is_public_routable_ip("0.0.0.1".parse().unwrap()));
+        assert!(!is_public_routable_ip("198.18.0.1".parse().unwrap()));
+        assert!(!is_public_routable_ip("240.0.0.1".parse().unwrap()));
+        assert!(!is_public_routable_ip("64:ff9b::1".parse().unwrap()));
+        assert!(!is_public_routable_ip("fec0::1".parse().unwrap()));
+        assert!(!is_public_routable_ip("2001:db8::1".parse().unwrap()));
+        assert!(is_public_routable_ip("1.1.1.1".parse().unwrap()));
 
         // Unknown host must not match; rule with host=None must fail closed unless host="*"
         assert!(!any_rule_matches_host(&rules, "evil.example"));

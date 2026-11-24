@@ -12,10 +12,10 @@ use exposure_core::protocol::ServiceStreamHeader;
 use exposure_core::{ExposureError, Result};
 use http::header::HeaderName;
 use http::{header, HeaderMap, Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
@@ -30,6 +30,7 @@ use tracing::{debug, warn};
 use crate::logger::{AccessLogMeta, NodeLogger};
 
 const ORIGIN_SIG_MAX_SKEW_SECS: u64 = 120;
+const MAX_ORIGIN_REPLAY_ENTRIES: usize = 65_536;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
@@ -111,6 +112,10 @@ pub struct EgressHandler {
     /// Local backend health status (true = healthy, false = unhealthy).
     local_health: Arc<DashMap<String, bool>>,
     last_hc_run: Arc<DashMap<String, Instant>>,
+    /// Cached backend TLS ClientConfigs keyed by `(insecure_skip_verify, ca_cert_path, offer_h2)`.
+    tls_client_configs: Arc<DashMap<(bool, Option<String>, bool), Arc<ClientConfig>>>,
+    /// Multi-hop origin signature replay guard keyed by `(origin_node_tag, request_id) -> expires_at`.
+    origin_replay_cache: Arc<DashMap<(String, String), i64>>,
 }
 
 impl EgressHandler {
@@ -131,6 +136,8 @@ impl EgressHandler {
             logger,
             local_health: Arc::new(DashMap::new()),
             last_hc_run: Arc::new(DashMap::new()),
+            tls_client_configs: Arc::new(DashMap::new()),
+            origin_replay_cache: Arc::new(DashMap::new()),
         })
     }
 
@@ -140,6 +147,38 @@ impl EgressHandler {
             .into_iter()
             .map(|o| (o.node_tag, o.public_key))
             .collect();
+        self.tls_client_configs.clear();
+        self.local_health.clear();
+        self.last_hc_run.clear();
+    }
+
+    pub(crate) async fn get_tls_client_config(
+        &self,
+        svc: &EgressServiceConfig,
+        offer_h2: bool,
+    ) -> std::result::Result<Arc<ClientConfig>, String> {
+        let insecure = svc.effective_insecure_skip_verify();
+        let ca_path = svc
+            .ca_cert_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let key = (insecure, ca_path.clone(), offer_h2);
+        if let Some(cached) = self.tls_client_configs.get(&key) {
+            return Ok(Arc::clone(&cached));
+        }
+        let cfg = tokio::task::spawn_blocking(move || {
+            build_backend_tls_client_config(insecure, ca_path.as_deref(), offer_h2)
+        })
+        .await
+        .map_err(|e| format!("backend TLS config task failed: {e}"))??;
+        let arc_cfg = Arc::new(cfg);
+        if self.tls_client_configs.len() >= 1024 {
+            self.tls_client_configs.clear();
+        }
+        self.tls_client_configs.insert(key, Arc::clone(&arc_cfg));
+        Ok(arc_cfg)
     }
 
     pub async fn has_service(&self, service_tag: &str) -> bool {
@@ -157,10 +196,6 @@ impl EgressHandler {
     pub fn spawn_local_health_checks(self: &Arc<Self>) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let hc_client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_default();
             loop {
                 let services = this.cfg.read().await.services.clone();
                 let now = Instant::now();
@@ -182,17 +217,7 @@ impl EgressHandler {
 
                         let timeout = Duration::from_millis(hc.timeout_ms.max(200));
                         let healthy = if let Some(ref http_path) = hc.http_path {
-                            let scheme = if svc.effective_tls() { "https" } else { "http" };
-                            let path = if http_path.starts_with('/') {
-                                http_path.as_str()
-                            } else {
-                                "/"
-                            };
-                            let url = format!("{scheme}://{}{path}", svc.backend);
-                            matches!(
-                                hc_client.get(&url).timeout(timeout).send().await,
-                                Ok(r) if r.status().as_u16() < 500
-                            )
+                            this.check_http_health(&svc, http_path, timeout).await
                         } else {
                             matches!(
                                 tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await,
@@ -213,6 +238,58 @@ impl EgressHandler {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+    }
+
+    async fn check_http_health(
+        &self,
+        svc: &EgressServiceConfig,
+        http_path: &str,
+        timeout: Duration,
+    ) -> bool {
+        let path = if http_path.starts_with('/') {
+            http_path
+        } else {
+            "/"
+        };
+        let fut = async {
+            let tcp = TcpStream::connect(&svc.backend).await.ok()?;
+            let req = Request::builder()
+                .method(http::Method::GET)
+                .uri(path)
+                .header(header::HOST, &svc.backend)
+                .header(header::CONNECTION, "close")
+                .header(header::USER_AGENT, "Exposure-HealthCheck/1.0")
+                .body(Empty::<Bytes>::new())
+                .ok()?;
+            if svc.effective_tls() {
+                let tls_cfg = self.get_tls_client_config(svc, false).await.ok()?;
+                let tls_stream = connect_backend_tls(tcp, svc, &tls_cfg).await.ok()?;
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+                        .await
+                        .ok()?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let resp = sender.send_request(req).await.ok()?;
+                Some(resp.status().as_u16() < 500)
+            } else {
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                        .await
+                        .ok()?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let resp = sender.send_request(req).await.ok()?;
+                Some(resp.status().as_u16() < 500)
+            }
+        };
+        tokio::time::timeout(timeout, fut)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
     }
 
     /// Verify cryptographic origin authenticity for `ServiceStreamHeader`.
@@ -271,7 +348,29 @@ impl EgressHandler {
                 "egress {} invalid origin signature for origin {}",
                 self.node_tag, header.origin_node_tag
             ))
-        })
+        })?;
+
+        // Check replay cache ONLY after signature verification so forged traffic cannot poison it
+        let replay_key = (header.origin_node_tag.clone(), header.request_id.clone());
+        let exp = header
+            .timestamp
+            .saturating_add(ORIGIN_SIG_MAX_SKEW_SECS as i64);
+        if self.origin_replay_cache.len() >= MAX_ORIGIN_REPLAY_ENTRIES {
+            self.origin_replay_cache.retain(|_, v| *v > now);
+            if self.origin_replay_cache.len() >= MAX_ORIGIN_REPLAY_ENTRIES {
+                crate::ban::evict_half(&self.origin_replay_cache);
+            }
+        }
+        if let Some(prev_exp) = self.origin_replay_cache.get(&replay_key) {
+            if *prev_exp > now {
+                return Err(ExposureError::AccessDenied(format!(
+                    "egress {} rejected replayed origin request {} from {}",
+                    self.node_tag, header.request_id, header.origin_node_tag
+                )));
+            }
+        }
+        self.origin_replay_cache.insert(replay_key, exp);
+        Ok(())
     }
 
     /// Handle an incoming L7 service stream (from remote Yamux OR local duplex pipe).
@@ -350,7 +449,17 @@ impl EgressHandler {
         });
 
         let io = TokioIo::new(stream);
-        let builder = AutoServerBuilder::new(TokioExecutor::new());
+        let mut builder = AutoServerBuilder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(10))
+            .max_headers(100);
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(15));
         if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
             debug!(error = %e, "egress stream connection closed");
         }
@@ -450,6 +559,7 @@ impl EgressHandler {
                     "The upstream backend failed local health checks.",
                     svc.effective_intercept_errors(),
                     error_html_tpl,
+                    &hdr.request_id,
                 );
         }
 
@@ -504,6 +614,7 @@ impl EgressHandler {
                     "Could not connect to the upstream server.",
                     svc.effective_intercept_errors(),
                     error_html_tpl,
+                    &hdr.request_id,
                 );
             }
             Err(_) => {
@@ -544,28 +655,49 @@ impl EgressHandler {
                     "The upstream server did not respond in time.",
                     svc.effective_intercept_errors(),
                     error_html_tpl,
+                    &hdr.request_id,
                 );
             }
         };
 
-        // Ensure Host header is present for HTTP/1.1 backends
-        if !req.headers().contains_key(header::HOST) {
+        // Ensure Host header is present for HTTP/1.1 backends (HTTP/2 uses :authority below)
+        if !use_h2 && !req.headers().contains_key(header::HOST) {
             if let Ok(hv) = svc.backend.parse() {
                 req.headers_mut().insert(header::HOST, hv);
             }
         }
 
         let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.effective_tls() {
-            match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, use_h2)).await {
-                Ok(Ok(tls_stream)) => {
-                    forward_http_stream(tls_stream, req, use_h2, is_upgrade, true, &svc.backend, timeout)
-                        .await
+            match self.get_tls_client_config(svc, use_h2).await {
+                Ok(tls_cfg) => {
+                    match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, &tls_cfg)).await {
+                        Ok(Ok(tls_stream)) => {
+                            let negotiated_h2 =
+                                tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                            let actual_use_h2 = if svc.protocol == BackendProtocol::Auto {
+                                negotiated_h2
+                            } else {
+                                use_h2
+                            };
+                            forward_http_stream(
+                                tls_stream,
+                                req,
+                                actual_use_h2,
+                                is_upgrade,
+                                true,
+                                &svc.backend,
+                                timeout,
+                            )
+                            .await
+                        }
+                        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
+                        Err(_) => Err((
+                            StatusCode::GATEWAY_TIMEOUT,
+                            format!("tls handshake timeout with backend {}", svc.backend),
+                        )),
+                    }
                 }
-                Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
-                Err(_) => Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    format!("tls handshake timeout with backend {}", svc.backend),
-                )),
+                Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
             }
         } else {
             forward_http_stream(tcp, req, use_h2, is_upgrade, false, &svc.backend, timeout).await
@@ -646,6 +778,7 @@ impl EgressHandler {
                     detail,
                     svc.effective_intercept_errors(),
                     error_html_tpl,
+                    &hdr.request_id,
                 )
             }
         }
@@ -658,26 +791,28 @@ impl EgressHandler {
         detail: &str,
         intercept: bool,
         error_html_tpl: Option<&str>,
+        ray_id: &str,
     ) -> Response<ProxyBody> {
         if intercept {
-            let ray_id: String = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
             let html = exposure_core::assets::render_exposure_error_html_with_template(
                 error_html_tpl,
                 status.as_u16(),
                 title,
                 detail,
-                &ray_id,
+                ray_id,
                 None,
             );
             return Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .header(header::CACHE_CONTROL, "no-store")
+                .header("x-exposure-ray", ray_id)
                 .body(full_body(html))
                 .unwrap();
         }
         Response::builder()
             .status(status)
+            .header("x-exposure-ray", ray_id)
             .body(full_body(format!("{} {title}", status.as_u16())))
             .unwrap()
     }
@@ -737,12 +872,15 @@ where
     if use_h2 {
         *req.version_mut() = http::Version::HTTP_2;
         strip_hop_by_hop_headers(req.headers_mut(), true, false);
-        // Ensure :scheme and :authority are populated when upgrading HTTP/1.1 -> H2
+        // Ensure :scheme and :authority are populated when upgrading HTTP/1.1 -> H2, and strip Host header
+        // so HTTP/2 pseudo-header :authority is authoritative.
         if req.uri().scheme().is_none() || req.uri().authority().is_none() {
             let authority = req
                 .headers()
                 .get(header::HOST)
                 .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .unwrap_or(backend_addr)
                 .to_string();
             let path_q = req
@@ -755,6 +893,7 @@ where
                 *req.uri_mut() = new_uri;
             }
         }
+        req.headers_mut().remove(header::HOST);
 
         let hs = tokio::time::timeout(
             timeout,
@@ -767,7 +906,10 @@ where
                     let _ = conn.await;
                 });
                 match tokio::time::timeout(timeout, sender.send_request(req)).await {
-                    Ok(Ok(resp)) => Ok(resp.map(|b| b.boxed())),
+                    Ok(Ok(mut resp)) => {
+                        strip_hop_by_hop_headers(resp.headers_mut(), true, false);
+                        Ok(resp.map(|b| b.boxed()))
+                    }
                     Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("h2 upstream error: {e}"))),
                     Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "h2 upstream timeout".into())),
                 }
@@ -814,6 +956,8 @@ where
                                     }
                                 });
                             }
+                        } else {
+                            strip_hop_by_hop_headers(resp.headers_mut(), false, false);
                         }
                         Ok(resp.map(|b| b.boxed()))
                     }
@@ -827,14 +971,14 @@ where
     }
 }
 
-pub(crate) async fn connect_backend_tls(
-    tcp: TcpStream,
-    svc: &EgressServiceConfig,
-    use_h2: bool,
-) -> std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+fn build_backend_tls_client_config(
+    insecure_skip_verify: bool,
+    ca_cert_path: Option<&str>,
+    offer_h2: bool,
+) -> std::result::Result<ClientConfig, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut cfg = if svc.effective_insecure_skip_verify() {
+    let mut cfg = if insecure_skip_verify {
         let algos = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         ClientConfig::builder()
             .dangerous()
@@ -843,7 +987,7 @@ pub(crate) async fn connect_backend_tls(
     } else {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        if let Some(ref ca_path) = svc.ca_cert_path {
+        if let Some(ca_path) = ca_cert_path {
             if !ca_path.trim().is_empty() {
                 let ca_bytes = std::fs::read(ca_path)
                     .map_err(|e| format!("read backend ca_cert_path '{ca_path}': {e}"))?;
@@ -867,12 +1011,19 @@ pub(crate) async fn connect_backend_tls(
             .with_no_client_auth()
     };
 
-    cfg.alpn_protocols = if use_h2 {
+    cfg.alpn_protocols = if offer_h2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
         vec![b"http/1.1".to_vec()]
     };
+    Ok(cfg)
+}
 
+pub(crate) async fn connect_backend_tls(
+    tcp: TcpStream,
+    svc: &EgressServiceConfig,
+    cfg: &Arc<ClientConfig>,
+) -> std::result::Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let host = svc
         .backend
         .rsplit_once(':')
@@ -882,7 +1033,7 @@ pub(crate) async fn connect_backend_tls(
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|e| format!("invalid backend TLS server name '{host}': {e}"))?;
 
-    TlsConnector::from(Arc::new(cfg))
+    TlsConnector::from(Arc::clone(cfg))
         .connect(server_name, tcp)
         .await
         .map_err(|e| format!("tls handshake with backend {} failed: {e}", svc.backend))

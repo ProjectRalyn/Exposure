@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,8 @@ use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret}
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic, SegmentWriter};
 use exposure_core::telemetry::{
-    sanitize_and_redact_query, sanitize_log_text, sanitize_referer, sanitize_url_path,
-    AlertRecord, ClientJsFingerprint, FingerprintObservation, LogProtectionStats, MinuteSummary,
-    SessionSummary,
+    sanitize_log_text, AlertRecord, ClientJsFingerprint, FingerprintObservation, LogProtectionStats,
+    MinuteSummary, SessionSummary,
 };
 use exposure_core::Result;
 use rand::Rng;
@@ -158,7 +157,7 @@ struct FoldedLogEntry {
 }
 
 enum AdmitDecision {
-    Emit,
+    Emit(Box<SessionSummary>),
     Folded,
     Dropped,
 }
@@ -176,6 +175,7 @@ struct LogDoSGuard {
     minute_bytes: StdMutex<(Instant, u64)>,
     per_ip_buckets: DashMap<String, BucketState>,
     folded: DashMap<(String, u16, String, String), FoldedLogEntry>,
+    displaced_folded: StdMutex<Vec<SessionSummary>>,
     warn_cooldowns: DashMap<String, (Instant, u64)>,
     alert_cooldowns: DashMap<(String, String), Instant>,
     dropped_records: AtomicU64,
@@ -195,6 +195,7 @@ impl LogDoSGuard {
             minute_bytes: StdMutex::new((now, 0)),
             per_ip_buckets: DashMap::new(),
             folded: DashMap::new(),
+            displaced_folded: StdMutex::new(Vec::new()),
             warn_cooldowns: DashMap::new(),
             alert_cooldowns: DashMap::new(),
             dropped_records: AtomicU64::new(0),
@@ -203,26 +204,56 @@ impl LogDoSGuard {
         }
     }
 
-    fn fold_key(rec: &SessionSummary, overflow_wildcard: bool) -> (String, u16, String, String) {
-        let act = rec.action.as_deref().unwrap_or("").to_string();
+    fn fold_key_raw(
+        ip_hmac: &str,
+        status: u16,
+        action: Option<&str>,
+        path: Option<&str>,
+        overflow_wildcard: bool,
+    ) -> (String, u16, String, String) {
+        let act = action.map(|s| sanitize_log_text(s, 32)).unwrap_or_default();
         let path_k = if overflow_wildcard {
             "*".to_string()
         } else {
-            rec.path
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .take(64)
-                .collect()
+            path.unwrap_or("").chars().take(64).collect()
         };
-        (rec.ip_hmac.clone(), rec.status, act, path_k)
+        (ip_hmac.to_string(), status, act, path_k)
     }
 
-    fn try_fold(&self, rec: &SessionSummary, key: (String, u16, String, String), window: Duration, now: Instant) -> bool {
-        if let Some(mut existing) = self.folded.get_mut(&key) {
+    fn finalize_folded(is_wildcard: bool, mut entry: FoldedLogEntry) -> Option<SessionSummary> {
+        if entry.suppressed_count == 0 {
+            return None;
+        }
+        entry.template.timestamp_ms = entry.last_ts_ms;
+        entry.template.repeat_count = entry.suppressed_count;
+        if is_wildcard {
+            entry.template.path = Some("/* (folded flood)".to_string());
+            entry.template.query = None;
+        }
+        entry.template.sanitize();
+        Some(entry.template)
+    }
+
+    fn push_displaced(&self, summary: SessionSummary) {
+        let mut disp = self.displaced_folded.lock().unwrap_or_else(|e| e.into_inner());
+        if disp.len() < MAX_FOLDED_LOG_KEYS {
+            disp.push(summary);
+        } else {
+            self.dropped_records.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn try_fold(
+        &self,
+        now_ms: i64,
+        key: &(String, u16, String, String),
+        window: Duration,
+        now: Instant,
+    ) -> bool {
+        if let Some(mut existing) = self.folded.get_mut(key) {
             if now.duration_since(existing.started_at) < window {
                 existing.suppressed_count = existing.suppressed_count.saturating_add(1);
-                existing.last_ts_ms = existing.last_ts_ms.max(rec.timestamp_ms);
+                existing.last_ts_ms = existing.last_ts_ms.max(now_ms);
                 self.folded_records.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -230,41 +261,97 @@ impl LogDoSGuard {
         false
     }
 
-    fn arm_fold(&self, rec: &SessionSummary, key: (String, u16, String, String), initial_suppressed: u32, window: Duration, now: Instant) {
+    fn arm_fold(
+        &self,
+        rec: &SessionSummary,
+        key: (String, u16, String, String),
+        initial_suppressed: u32,
+        window: Duration,
+        now: Instant,
+    ) {
         if self.folded.len() >= MAX_FOLDED_LOG_KEYS && !self.folded.contains_key(&key) {
-            self.folded
-                .retain(|_, v| now.duration_since(v.started_at) < window || v.suppressed_count > 0);
+            // Drain expired entries first (emitting any accumulated suppressed counts instead of losing them).
+            let expired_keys: Vec<(String, u16, String, String)> = self
+                .folded
+                .iter()
+                .filter_map(|e| {
+                    if now.duration_since(e.value().started_at) >= window {
+                        Some(e.key().clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for ek in expired_keys {
+                if let Some((rk, entry)) = self.folded.remove(&ek) {
+                    if let Some(s) = Self::finalize_folded(rk.3 == "*", entry) {
+                        self.push_displaced(s);
+                    }
+                }
+            }
+            // If still at capacity, evict half while preserving any accumulated suppressed counts.
             if self.folded.len() >= MAX_FOLDED_LOG_KEYS {
-                evict_half(&self.folded);
+                let to_remove = self.folded.len() / 2;
+                let victim_keys: Vec<(String, u16, String, String)> = self
+                    .folded
+                    .iter()
+                    .take(to_remove)
+                    .map(|e| e.key().clone())
+                    .collect();
+                for vk in victim_keys {
+                    if let Some((rk, entry)) = self.folded.remove(&vk) {
+                        if let Some(s) = Self::finalize_folded(rk.3 == "*", entry) {
+                            self.push_displaced(s);
+                        }
+                    }
+                }
             }
         }
-        self.folded.insert(
-            key,
+        if let Some(old) = self.folded.insert(
+            key.clone(),
             FoldedLogEntry {
                 template: rec.clone(),
                 started_at: now,
                 last_ts_ms: rec.timestamp_ms,
                 suppressed_count: initial_suppressed,
             },
-        );
+        ) {
+            if let Some(s) = Self::finalize_folded(key.3 == "*", old) {
+                self.push_displaced(s);
+            }
+        }
     }
 
-    fn admit(&self, rec: &SessionSummary, est_bytes: usize, priority: LogPriority, cfg: &LogProtectionConfig) -> AdmitDecision {
+    fn admit<F>(
+        &self,
+        ip_hmac: &str,
+        status: u16,
+        action: Option<&str>,
+        path: Option<&str>,
+        now_ms: i64,
+        est_bytes: usize,
+        priority: LogPriority,
+        cfg: &LogProtectionConfig,
+        build_rec: F,
+    ) -> AdmitDecision
+    where
+        F: FnOnce() -> SessionSummary,
+    {
         if !cfg.enabled {
-            return AdmitDecision::Emit;
+            return AdmitDecision::Emit(Box::new(build_rec()));
         }
         let now = Instant::now();
         let dedup_secs = cfg.dedup_window_secs.clamp(1, 300);
         let dedup_window = Duration::from_secs(dedup_secs);
 
-        // 1. Fold duplicate low-priority flood events (429 / autoban / 404 / waf_block / evilpot)
+        // 1. Fold duplicate low-priority flood events BEFORE building/serializing SessionSummary
         if priority == LogPriority::Low {
-            let exact_key = Self::fold_key(rec, false);
-            if self.try_fold(rec, exact_key.clone(), dedup_window, now) {
+            let exact_key = Self::fold_key_raw(ip_hmac, status, action, path, false);
+            if self.try_fold(now_ms, &exact_key, dedup_window, now) {
                 return AdmitDecision::Folded;
             }
-            let overflow_key = Self::fold_key(rec, true);
-            if self.try_fold(rec, overflow_key, dedup_window, now) {
+            let overflow_key = Self::fold_key_raw(ip_hmac, status, action, path, true);
+            if self.try_fold(now_ms, &overflow_key, dedup_window, now) {
                 return AdmitDecision::Folded;
             }
         }
@@ -272,7 +359,7 @@ impl LogDoSGuard {
         // 2. Per-IP token bucket (for Normal & Low priority; High priority bypasses per-IP limit)
         if priority != LogPriority::High && cfg.max_per_ip_per_sec > 0 {
             if self.per_ip_buckets.len() >= MAX_PER_IP_LOG_BUCKETS
-                && !self.per_ip_buckets.contains_key(&rec.ip_hmac)
+                && !self.per_ip_buckets.contains_key(ip_hmac)
             {
                 self.per_ip_buckets
                     .retain(|_, b| now.duration_since(b.last_refill) < PER_IP_IDLE_TTL);
@@ -284,17 +371,16 @@ impl LogDoSGuard {
             let cap = (rate * 2.0).max(2.0);
             let mut b = self
                 .per_ip_buckets
-                .entry(rec.ip_hmac.clone())
+                .entry(ip_hmac.to_string())
                 .or_insert_with(|| BucketState::new(cap, now));
             if !b.try_consume(cap, rate, now) {
                 drop(b);
-                // Per-IP quota exceeded (e.g. randomized URL scanner from one IP):
-                // fold into an IP-wide summary bucket instead of emitting or dropping silently.
-                let overflow_key = Self::fold_key(rec, true);
-                if self.try_fold(rec, overflow_key.clone(), dedup_window, now) {
+                let overflow_key = Self::fold_key_raw(ip_hmac, status, action, path, true);
+                if self.try_fold(now_ms, &overflow_key, dedup_window, now) {
                     return AdmitDecision::Folded;
                 }
-                self.arm_fold(rec, overflow_key, 1, dedup_window, now);
+                let rec = build_rec();
+                self.arm_fold(&rec, overflow_key, 1, dedup_window, now);
                 self.folded_records.fetch_add(1, Ordering::Relaxed);
                 return AdmitDecision::Folded;
             }
@@ -341,17 +427,28 @@ impl LogDoSGuard {
             mb.1 = mb.1.saturating_add(est_bytes as u64);
         }
 
+        let rec = build_rec();
         // Arm duplicate folder for Low-priority events after admitting the initial full URL record
         if priority == LogPriority::Low {
-            let exact_key = Self::fold_key(rec, false);
-            self.arm_fold(rec, exact_key, 0, dedup_window, now);
+            let exact_key = Self::fold_key_raw(
+                &rec.ip_hmac,
+                rec.status,
+                rec.action.as_deref(),
+                rec.path.as_deref(),
+                false,
+            );
+            self.arm_fold(&rec, exact_key, 0, dedup_window, now);
         }
 
-        AdmitDecision::Emit
+        AdmitDecision::Emit(Box::new(rec))
     }
 
     fn drain_folded(&self, flush_all: bool, dedup_window: Duration) -> Vec<SessionSummary> {
         let now = Instant::now();
+        let mut out = {
+            let mut disp = self.displaced_folded.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *disp)
+        };
         let expired_keys: Vec<(String, u16, String, String)> = self
             .folded
             .iter()
@@ -363,18 +460,10 @@ impl LogDoSGuard {
                 }
             })
             .collect();
-        let mut out = Vec::new();
         for k in expired_keys {
-            if let Some((_, mut entry)) = self.folded.remove(&k) {
-                if entry.suppressed_count > 0 {
-                    entry.template.timestamp_ms = entry.last_ts_ms;
-                    entry.template.repeat_count = entry.suppressed_count;
-                    if k.3 == "*" {
-                        entry.template.path = Some("/* (folded flood)".to_string());
-                        entry.template.query = None;
-                    }
-                    entry.template.sanitize();
-                    out.push(entry.template);
+            if let Some((rk, entry)) = self.folded.remove(&k) {
+                if let Some(s) = Self::finalize_folded(rk.3 == "*", entry) {
+                    out.push(s);
                 }
             }
         }
@@ -532,6 +621,7 @@ pub struct NodeLogger {
     alerts: Arc<Mutex<Vec<AlertRecord>>>,
     dos_guard: Arc<LogDoSGuard>,
     flush_notify: Arc<Notify>,
+    dirty: AtomicBool,
 }
 
 impl NodeLogger {
@@ -579,6 +669,7 @@ impl NodeLogger {
             alerts: Arc::new(Mutex::new(init_alerts)),
             dos_guard,
             flush_notify: Arc::new(Notify::new()),
+            dirty: AtomicBool::new(false),
         }))
     }
 
@@ -609,8 +700,10 @@ impl NodeLogger {
         self.dos_guard.should_log_warn(key, &prot)
     }
 
-    pub async fn update_config(&self, new_cfg: LoggerConfig) -> Result<()> {
-        let new_cfg = ensure_strong_hmac_key(new_cfg);
+    pub async fn update_config(&self, mut new_cfg: LoggerConfig) -> Result<()> {
+        if is_weak_secret(&new_cfg.hmac_key) {
+            new_cfg.hmac_key = self.cfg.read().await.hmac_key.clone();
+        }
         let writer = Arc::clone(&self.writer);
         let seg_cfg = new_cfg.segment.clone();
         let tag = self.node_tag.clone();
@@ -671,46 +764,6 @@ impl NodeLogger {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn record_session_with_fp(
-        &self,
-        role: &str,
-        service_tag: &str,
-        client_ip: &str,
-        status: u16,
-        latency_ms: f64,
-        bytes_in: u64,
-        bytes_out: u64,
-        rate_limited: bool,
-        challenged: bool,
-        challenge_passed: bool,
-        error: Option<String>,
-        device_type: Option<String>,
-        browser_family: Option<String>,
-        os_family: Option<String>,
-        client_fp_verified: bool,
-    ) {
-        self.record_access_log(
-            role,
-            service_tag,
-            client_ip,
-            status,
-            latency_ms,
-            bytes_in,
-            bytes_out,
-            rate_limited,
-            challenged,
-            challenge_passed,
-            error,
-            device_type,
-            browser_family,
-            os_family,
-            client_fp_verified,
-            AccessLogMeta::default(),
-        )
-        .await;
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub async fn record_access_log(
         &self,
         role: &str,
@@ -733,60 +786,20 @@ impl NodeLogger {
         let cfg = Arc::clone(&*self.cfg.read().await);
 
         let now = Utc::now();
+        let now_ms = now.timestamp_millis();
         let canon_ip = canonical_ip_str(client_ip);
         let ip_tag = hmac_ip(&cfg.hmac_key, &canon_ip);
         let priority = LogPriority::classify(status, rate_limited, meta.action);
 
-        let clean_query = if cfg.protection.log_query_string {
-            meta.query
-                .map(sanitize_and_redact_query)
-                .filter(|s| !s.is_empty())
-        } else {
-            None
-        };
-
-        let mut rec = SessionSummary {
-            timestamp_ms: now.timestamp_millis(),
-            node_tag: self.node_tag.clone(),
-            role: role.to_string(),
-            service_tag: service_tag.to_string(),
-            status,
-            latency_ms,
-            bytes_in,
-            bytes_out,
-            ip_hmac: ip_tag,
-            raw_ip: if cfg.store_raw_ip {
-                Some(canon_ip)
-            } else {
-                None
-            },
-            client_country: meta.client_country.map(|s| sanitize_log_text(s, 8)),
-            rate_limited,
-            challenged,
-            challenge_passed,
-            error: error.map(sanitize_alert_msg),
-            device_type,
-            browser_family,
-            os_family,
-            client_fp_verified,
-            ray_id: meta.ray_id.map(|s| sanitize_log_text(s, 32)),
-            method: meta.method.map(|s| sanitize_log_text(s, 16)),
-            host: meta.host.map(|s| sanitize_log_text(s, 128)),
-            path: meta.path.map(sanitize_url_path),
-            query: clean_query,
-            protocol: meta.protocol.map(|s| sanitize_log_text(s, 16)),
-            scheme: meta.scheme.map(|s| sanitize_log_text(s, 8)),
-            user_agent: meta.user_agent.map(|s| sanitize_log_text(s, 192)),
-            referer: meta.referer.map(sanitize_referer).filter(|s| !s.is_empty()),
-            action: meta.action.map(|s| sanitize_log_text(s, 32)),
-            cache_status: meta.cache_status.map(|s| sanitize_log_text(s, 16)),
-            tls_ja3: meta.tls_ja3.map(|s| sanitize_log_text(s, 32)),
-            waf_rule_id: meta.waf_rule_id,
-            waf_category: meta.waf_category.map(|s| sanitize_log_text(s, 48)),
-            suspicion_score: meta.suspicion_score,
-            repeat_count: 1,
-        };
-        rec.sanitize();
+        let clean_device = device_type
+            .map(|s| sanitize_log_text(&s, 32))
+            .filter(|s| !s.is_empty());
+        let clean_browser = browser_family
+            .map(|s| sanitize_log_text(&s, 32))
+            .filter(|s| !s.is_empty());
+        let clean_os = os_family
+            .map(|s| sanitize_log_text(&s, 32))
+            .filter(|s| !s.is_empty());
 
         // 1. Always update exact minute summary metrics BEFORE sampling / DoS log folding
         let minute_epoch = (now.timestamp() / 60) * 60;
@@ -812,8 +825,40 @@ impl NodeLogger {
                         cfg.histogram_buckets_ms.clone(),
                     )
                 });
-            entry.record(&rec);
+            entry.requests = entry.requests.saturating_add(1);
+            if status >= 500 {
+                entry.errors = entry.errors.saturating_add(1);
+            }
+            if rate_limited {
+                entry.rate_limited = entry.rate_limited.saturating_add(1);
+            }
+            if challenged {
+                entry.challenges_issued = entry.challenges_issued.saturating_add(1);
+            }
+            if challenge_passed {
+                entry.challenges_passed = entry.challenges_passed.saturating_add(1);
+            }
+            if client_fp_verified {
+                entry.client_fp_verified = entry.client_fp_verified.saturating_add(1);
+            }
+            if let Some(ref d) = clean_device {
+                let e = entry.device_counts.entry(d.clone()).or_insert(0);
+                *e = e.saturating_add(1);
+            }
+            if let Some(ref b) = clean_browser {
+                let e = entry.browser_counts.entry(b.clone()).or_insert(0);
+                *e = e.saturating_add(1);
+            }
+            if let Some(ref o) = clean_os {
+                let e = entry.os_counts.entry(o.clone()).or_insert(0);
+                *e = e.saturating_add(1);
+            }
+            entry.bytes_in = entry.bytes_in.saturating_add(bytes_in);
+            entry.bytes_out = entry.bytes_out.saturating_add(bytes_out);
+            entry.uv_hll.insert(&ip_tag);
+            entry.latency_hist.observe(latency_ms);
         }
+        self.dirty.store(true, Ordering::Relaxed);
 
         let sampled = if cfg.sample_rate >= 1.0 || priority == LogPriority::High {
             true
@@ -826,13 +871,80 @@ impl NodeLogger {
             return;
         }
 
-        let est_bytes = serde_json::to_vec(&rec).map(|v| v.len() + 1).unwrap_or(256);
+        let est_bytes = 200usize
+            .saturating_add(meta.path.map(|s| s.len().min(512)).unwrap_or(0))
+            .saturating_add(if cfg.protection.log_query_string {
+                meta.query.map(|s| s.len().min(512)).unwrap_or(0)
+            } else {
+                0
+            })
+            .saturating_add(meta.user_agent.map(|s| s.len().min(192)).unwrap_or(0))
+            .saturating_add(meta.referer.map(|s| s.len().min(512)).unwrap_or(0))
+            .saturating_add(error.as_ref().map(|s| s.len().min(256)).unwrap_or(0));
 
-        // 2. Evaluate anti-DoS log protection (per-IP/global caps, byte budget, flood folding)
-        match self.dos_guard.admit(&rec, est_bytes, priority, &cfg.protection) {
-            AdmitDecision::Emit => {}
+        // 2. Evaluate anti-DoS log protection BEFORE allocating/sanitizing SessionSummary fields
+        let rec = match self.dos_guard.admit(
+            &ip_tag,
+            status,
+            meta.action,
+            meta.path,
+            now_ms,
+            est_bytes,
+            priority,
+            &cfg.protection,
+            || {
+                let mut rec = SessionSummary {
+                    timestamp_ms: now_ms,
+                    node_tag: self.node_tag.clone(),
+                    role: role.to_string(),
+                    service_tag: service_tag.to_string(),
+                    status,
+                    latency_ms,
+                    bytes_in,
+                    bytes_out,
+                    ip_hmac: ip_tag.clone(),
+                    raw_ip: if cfg.store_raw_ip {
+                        Some(canon_ip)
+                    } else {
+                        None
+                    },
+                    client_country: meta.client_country.map(str::to_string),
+                    rate_limited,
+                    challenged,
+                    challenge_passed,
+                    error,
+                    device_type: clean_device,
+                    browser_family: clean_browser,
+                    os_family: clean_os,
+                    client_fp_verified,
+                    ray_id: meta.ray_id.map(str::to_string),
+                    method: meta.method.map(str::to_string),
+                    host: meta.host.map(str::to_string),
+                    path: meta.path.map(str::to_string),
+                    query: if cfg.protection.log_query_string {
+                        meta.query.map(str::to_string)
+                    } else {
+                        None
+                    },
+                    protocol: meta.protocol.map(str::to_string),
+                    scheme: meta.scheme.map(str::to_string),
+                    user_agent: meta.user_agent.map(str::to_string),
+                    referer: meta.referer.map(str::to_string),
+                    action: meta.action.map(str::to_string),
+                    cache_status: meta.cache_status.map(str::to_string),
+                    tls_ja3: meta.tls_ja3.map(str::to_string),
+                    waf_rule_id: meta.waf_rule_id,
+                    waf_category: meta.waf_category.map(str::to_string),
+                    suspicion_score: meta.suspicion_score,
+                    repeat_count: 1,
+                };
+                rec.sanitize();
+                rec
+            },
+        ) {
+            AdmitDecision::Emit(rec) => *rec,
             AdmitDecision::Folded | AdmitDecision::Dropped => return,
-        }
+        };
 
         if cfg.protection.access_log_stdout {
             info!(
@@ -945,6 +1057,7 @@ impl NodeLogger {
             let drain = alerts.len() - 200;
             alerts.drain(0..drain);
         }
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub async fn recent_alerts(&self) -> Vec<AlertRecord> {
@@ -971,12 +1084,16 @@ impl NodeLogger {
             *pb = 0;
             std::mem::take(&mut *p)
         };
-        let cp = NodeLoggerCheckpoint {
-            summaries: self.minute_buckets.lock().await.values().cloned().collect(),
-            fingerprints: self.fp_observations.lock().await.values().cloned().collect(),
-            alerts: self.alerts.lock().await.clone(),
+        let cp = if self.dirty.swap(false, Ordering::AcqRel) {
+            Some(NodeLoggerCheckpoint {
+                summaries: self.minute_buckets.lock().await.values().cloned().collect(),
+                fingerprints: self.fp_observations.lock().await.values().cloned().collect(),
+                alerts: self.alerts.lock().await.clone(),
+            })
+        } else {
+            None
         };
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let cp_err = tokio::task::spawn_blocking(move || -> Result<bool> {
             let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
             if !pending_disk.is_empty() {
                 w.push_batch(pending_disk)?;
@@ -984,13 +1101,20 @@ impl NodeLogger {
             if let Some(path) = w.flush()? {
                 debug!(path = %path.display(), "flushed node segment file");
             }
-            if let Err(e) = write_json_snapshot_atomic(&cp_path, &cp) {
-                warn!(path = %cp_path.display(), error = %e, "failed to persist node logger checkpoint");
+            if let Some(cp) = cp {
+                if let Err(e) = write_json_snapshot_atomic(&cp_path, &cp) {
+                    warn!(path = %cp_path.display(), error = %e, "failed to persist node logger checkpoint");
+                    return Ok(true);
+                }
             }
-            Ok(())
+            Ok(false)
         })
         .await
-        .map_err(|e| exposure_core::ExposureError::Storage(format!("flush join: {e}")))?
+        .map_err(|e| exposure_core::ExposureError::Storage(format!("flush join: {e}")))??;
+        if cp_err {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Record or enrich a visitor + browser fingerprint observation (server UA/TLS/AbuseIPDB + optional JS beacon/PoW).
@@ -1154,6 +1278,7 @@ impl NodeLogger {
         map.entry(obs.id.clone())
             .and_modify(|existing| existing.merge_from(&obs))
             .or_insert(obs);
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Asynchronously backfills AbuseIPDB reputation into matching `FingerprintObservation` entries
@@ -1199,6 +1324,7 @@ impl NodeLogger {
         }
 
         let mut map = self.fp_observations.lock().await;
+        let mut changed = false;
         for obs in map.values_mut() {
             if obs.ip_hmac == ip_tag {
                 obs.abuse_score = Some(obs.abuse_score.map_or(abuse_score, |old| old.max(abuse_score)));
@@ -1210,7 +1336,11 @@ impl NodeLogger {
                 }
                 obs.abuse_is_tor |= abuse_is_tor;
                 obs.sanitize();
+                changed = true;
             }
+        }
+        if changed {
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1231,12 +1361,15 @@ impl NodeLogger {
         };
         let summaries = {
             let mut b = self.minute_buckets.lock().await;
-            b.drain().map(|(_, v)| v).collect()
+            b.drain().map(|(_, v)| v).collect::<Vec<_>>()
         };
         let fingerprints = {
             let mut f = self.fp_observations.lock().await;
-            f.drain().map(|(_, v)| v).collect()
+            f.drain().map(|(_, v)| v).collect::<Vec<_>>()
         };
+        if !summaries.is_empty() || !fingerprints.is_empty() {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
         (records, summaries, fingerprints)
     }
 
@@ -1275,6 +1408,7 @@ impl NodeLogger {
                     .and_modify(|existing| existing.merge_from(&s))
                     .or_insert(s);
             }
+            self.dirty.store(true, Ordering::Relaxed);
         }
         if !fingerprints.is_empty() {
             let mut f = self.fp_observations.lock().await;
@@ -1290,6 +1424,7 @@ impl NodeLogger {
                     .and_modify(|existing| existing.merge_from(&fp))
                     .or_insert(fp);
             }
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 }

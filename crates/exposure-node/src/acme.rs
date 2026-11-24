@@ -86,8 +86,14 @@ fn load_or_create_account_key(storage_dir: &str, rng: &SystemRandom) -> Result<E
 
 impl AcmeClient {
     async fn connect(http: Client, directory_url: &str, storage_dir: &str) -> Result<Self> {
+        let storage_owned = storage_dir.to_string();
+        let key = tokio::task::spawn_blocking(move || {
+            let rng = SystemRandom::new();
+            load_or_create_account_key(&storage_owned, &rng)
+        })
+        .await
+        .map_err(|e| ExposureError::Crypto(format!("ACME key task join: {e}")))??;
         let rng = SystemRandom::new();
-        let key = load_or_create_account_key(storage_dir, &rng)?;
 
         let pub_bytes = key.public_key().as_ref();
         if pub_bytes.len() != 65 || pub_bytes[0] != 0x04 {
@@ -147,7 +153,7 @@ impl AcmeClient {
     }
 
     async fn jws_post(&mut self, url: &str, payload: Option<&Value>) -> Result<(reqwest::header::HeaderMap, String)> {
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             let protected = match &self.kid {
                 Some(kid) => json!({
                     "alg": "ES256",
@@ -187,8 +193,10 @@ impl AcmeClient {
                 .await
                 .map_err(|e| ExposureError::Link(format!("ACME POST {url}: {e}")))?;
 
+            let mut got_fresh_nonce = false;
             if let Some(next_nonce) = resp.headers().get("replay-nonce").and_then(|v| v.to_str().ok()) {
                 self.nonce = next_nonce.to_string();
+                got_fresh_nonce = true;
             }
 
             let status = resp.status();
@@ -201,9 +209,9 @@ impl AcmeClient {
             if status.is_success() {
                 return Ok((headers, text));
             }
-            if attempt == 0 && text.contains("badNonce") {
+            if attempt < 2 && text.contains("badNonce") {
                 debug!("ACME badNonce received; refreshing nonce and retrying");
-                if self.nonce.is_empty() {
+                if !got_fresh_nonce || attempt > 0 {
                     self.refresh_nonce().await?;
                 }
                 continue;
@@ -312,9 +320,11 @@ where
     let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
         .map_err(|e| ExposureError::Crypto(format!("CSR params: {e}")))?;
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, domain);
+    if domain.len() <= 64 {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, domain);
+    }
     let csr = params
         .serialize_request(&domain_kp)
         .map_err(|e| ExposureError::Crypto(format!("serialize CSR: {e}")))?;

@@ -432,11 +432,6 @@ impl EdgeCache {
         if !vary_includes(&vary_headers, "cookie") && req_headers.contains_key(header::COOKIE) {
             return false;
         }
-        if !vary_includes(&vary_headers, "accept-language")
-            && req_headers.contains_key(header::ACCEPT_LANGUAGE)
-        {
-            return false;
-        }
         let Some(ttl_secs) = resolve_ttl_secs(policy, resp_headers) else {
             return false;
         };
@@ -525,13 +520,23 @@ impl EdgeCache {
     }
 
     /// Refresh a stale entry after upstream confirms `304 Not Modified`.
+    /// Returns `None` (and evicts the cached entry) if the `304` response carries `Set-Cookie`,
+    /// `Vary: *`, or non-cacheable directives (`no-store`/`private`/`max-age=0`).
     pub fn revalidate_304(
         &self,
         policy: &EffectiveCachePolicy,
         base_key: &str,
         old_entry: &CachedEntry,
         not_modified_headers: &HeaderMap,
-    ) -> Arc<CachedEntry> {
+    ) -> Option<Arc<CachedEntry>> {
+        if not_modified_headers.contains_key(header::SET_COOKIE)
+            || parse_vary_headers(not_modified_headers).is_none()
+        {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.remove_entry(base_key, &old_entry.vary_signature);
+            return None;
+        }
+
         let mut merged_headers = old_entry.headers.clone();
         for h in [
             header::CACHE_CONTROL,
@@ -541,11 +546,18 @@ impl EdgeCache {
             header::DATE,
             header::VARY,
         ] {
-            if let Some(v) = not_modified_headers.get(&h) {
-                merged_headers.insert(h, v.clone());
+            if not_modified_headers.contains_key(&h) {
+                merged_headers.remove(&h);
+                for v in not_modified_headers.get_all(&h) {
+                    merged_headers.append(h.clone(), v.clone());
+                }
             }
         }
-        let ttl_secs = resolve_ttl_secs(policy, &merged_headers).unwrap_or(policy.default_ttl_secs.max(1));
+        let Some(ttl_secs) = resolve_ttl_secs(policy, &merged_headers) else {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.remove_entry(base_key, &old_entry.vary_signature);
+            return None;
+        };
         let cc = parse_cache_control(&merged_headers);
         let stale_secs = cc.stale_if_error.unwrap_or(policy.stale_if_error_secs);
         let now = Instant::now();
@@ -583,7 +595,7 @@ impl EdgeCache {
             st.lru_index
                 .insert(new_seq, (base_key.to_string(), old_entry.vary_signature.clone()));
         }
-        refreshed
+        Some(refreshed)
     }
 }
 
@@ -632,8 +644,10 @@ pub fn build_response_from_cache(
         h.append(k, v.clone());
     }
     h.remove(header::TRANSFER_ENCODING);
-    if let Ok(hv) = HeaderValue::from_str(&entry.body.len().to_string()) {
-        h.insert(header::CONTENT_LENGTH, hv);
+    if entry.status != StatusCode::NO_CONTENT && entry.status != StatusCode::NOT_MODIFIED {
+        if let Ok(hv) = HeaderValue::from_str(&entry.body.len().to_string()) {
+            h.insert(header::CONTENT_LENGTH, hv);
+        }
     }
     if let Ok(hv) = HeaderValue::from_str(&age.to_string()) {
         h.insert(header::AGE, hv);
@@ -805,21 +819,21 @@ fn compute_vary_signature(vary_headers: &[String], req_headers: &HeaderMap) -> S
     }
     let mut out = String::new();
     for name in vary_headers {
-        out.push_str(name);
-        out.push('=');
+        let mut combined = String::new();
         if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
             let mut first = true;
             for hv in req_headers.get_all(&hn) {
                 if !first {
-                    out.push(',');
+                    combined.push(',');
                 }
                 first = false;
                 if let Ok(s) = hv.to_str() {
-                    out.push_str(s.trim());
+                    combined.push_str(s.trim());
                 }
             }
         }
-        out.push(';');
+        use std::fmt::Write as _;
+        let _ = write!(out, "{}:{name}={}:{combined};", name.len(), combined.len());
     }
     out
 }
@@ -1027,7 +1041,9 @@ mod tests {
         // Upstream responds 304 Not Modified with extended max-age=120
         let mut h304 = HeaderMap::new();
         h304.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=120"));
-        let refreshed = cache.revalidate_304(&policy, &bk, &stale_entry, &h304);
+        let refreshed = cache
+            .revalidate_304(&policy, &bk, &stale_entry, &h304)
+            .expect("valid 304 should refresh entry");
         assert!(refreshed.is_fresh(Instant::now()));
 
         // Subsequent normal request gets fresh HIT with preserved body
@@ -1036,5 +1052,14 @@ mod tests {
             other => panic!("expected fresh Hit after 304, got {other:?}"),
         };
         assert_eq!(&hit.body[..], b"payload");
+
+        // 304 carrying Cache-Control: no-store must evict cached entry instead of extending TTL
+        let mut h304_ns = HeaderMap::new();
+        h304_ns.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        assert!(cache.revalidate_304(&policy, &bk, &hit, &h304_ns).is_none());
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "example.com", "/data", &h),
+            CacheLookup::Miss { .. }
+        ));
     }
 }

@@ -1,11 +1,13 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use exposure_core::config::GeoIpConfig;
 use exposure_core::geoip::{GeoIpDatabase, GeoLookupResult};
+use exposure_core::routing::is_public_routable_ip;
 use exposure_core::telemetry::GeoIpStatusSnapshot;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -40,10 +42,10 @@ struct GeoIpRuntimeState {
 /// - Automatic background sync from free CC0 mirrors with disk binary caching (`geoip.bin`).
 pub struct GeoIpManager {
     db: StdRwLock<Arc<GeoIpDatabase>>,
+    enabled: AtomicBool,
     state: RwLock<GeoIpRuntimeState>,
     sync_lock: Mutex<()>,
     last_error: StdRwLock<Option<String>>,
-    http: reqwest::Client,
 }
 
 impl GeoIpManager {
@@ -63,13 +65,10 @@ impl GeoIpManager {
     ) -> Arc<Self> {
         let effective_dir = resolve_cache_dir(&cfg, &default_cache_dir);
         let initial_db = load_cached_db(&effective_dir).unwrap_or_default();
-        let http = reqwest::Client::builder()
-            .timeout(GEOIP_FETCH_TIMEOUT)
-            .user_agent("Exposure-GeoIP-Updater/0.1")
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let enabled = AtomicBool::new(cfg.enabled);
         Arc::new(Self {
             db: StdRwLock::new(Arc::new(initial_db)),
+            enabled,
             state: RwLock::new(GeoIpRuntimeState {
                 cfg,
                 cache_dir: default_cache_dir,
@@ -77,12 +76,12 @@ impl GeoIpManager {
             }),
             sync_lock: Mutex::new(()),
             last_error: StdRwLock::new(None),
-            http,
         })
     }
 
     /// Hot-reload GeoIP configuration (and try loading binary cache if directory changed & DB is empty).
     pub async fn update_config(&self, cfg: GeoIpConfig, default_cache_dir: PathBuf) {
+        self.enabled.store(cfg.enabled, Ordering::Relaxed);
         let new_dir = resolve_cache_dir(&cfg, &default_cache_dir);
         let mut st = self.state.write().await;
         st.cfg = cfg;
@@ -90,7 +89,7 @@ impl GeoIpManager {
         drop(st);
         let need_load = self.db.read().map(|g| g.is_empty()).unwrap_or(true);
         if need_load {
-            if let Some(loaded) = load_cached_db(&new_dir) {
+            if let Ok(Some(loaded)) = tokio::task::spawn_blocking(move || load_cached_db(&new_dir)).await {
                 if let Ok(mut g) = self.db.write() {
                     *g = Arc::new(loaded);
                 }
@@ -100,12 +99,7 @@ impl GeoIpManager {
 
     /// Synchronous ~50ns local lookup used on every Ingress HTTP request.
     pub fn lookup(&self, ip: IpAddr) -> Option<GeoLookupResult> {
-        let enabled = self
-            .state
-            .try_read()
-            .map(|s| s.cfg.enabled)
-            .unwrap_or(true);
-        if !enabled {
+        if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
         let guard = self.db.read().ok()?;
@@ -127,11 +121,7 @@ impl GeoIpManager {
     }
 
     pub fn status(&self) -> GeoIpStatusSnapshot {
-        let enabled = self
-            .state
-            .try_read()
-            .map(|s| s.cfg.enabled)
-            .unwrap_or(true);
+        let enabled = self.enabled.load(Ordering::Relaxed);
         let db = self
             .db
             .read()
@@ -177,8 +167,8 @@ impl GeoIpManager {
         let v6_urls = build_url_list(st.cfg.ipv6_url.as_deref(), DEFAULT_GEOIP_IPV6_MIRRORS);
 
         let (v4_csv, v4_src) =
-            fetch_first_mirror(&self.http, &v4_urls, st.allow_insecure_loopback_http).await?;
-        let v6_csv = match fetch_first_mirror(&self.http, &v6_urls, st.allow_insecure_loopback_http).await {
+            fetch_first_mirror(&v4_urls, st.allow_insecure_loopback_http).await?;
+        let v6_csv = match fetch_first_mirror(&v6_urls, st.allow_insecure_loopback_http).await {
             Ok((text, _)) => Some(text),
             Err(e) => {
                 warn!(error = %e, "geoip IPv6 mirror fetch failed (keeping IPv4 GeoIP coverage)");
@@ -186,8 +176,14 @@ impl GeoIpManager {
             }
         };
 
+        let effective_dir = resolve_cache_dir(&st.cfg, &st.cache_dir);
         let parsed = tokio::task::spawn_blocking(move || {
-            GeoIpDatabase::parse_csv_ranges(Some(&v4_csv), v6_csv.as_deref(), v4_src, now_ts)
+            let db = GeoIpDatabase::parse_csv_ranges(Some(&v4_csv), v6_csv.as_deref(), v4_src, now_ts);
+            if !db.is_empty() {
+                let bin_bytes = db.encode_binary();
+                let _ = write_cached_db(&effective_dir, &bin_bytes);
+            }
+            db
         })
         .await
         .map_err(|e| format!("geoip parse join failed: {e}"))?;
@@ -199,11 +195,6 @@ impl GeoIpManager {
             }
             return Err(msg);
         }
-
-        let effective_dir = resolve_cache_dir(&st.cfg, &st.cache_dir);
-        let bin_bytes = parsed.encode_binary();
-        let save_dir = effective_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || write_cached_db(&save_dir, &bin_bytes)).await;
 
         let v4_count = parsed.ipv4_len();
         let v6_count = parsed.ipv6_len();
@@ -245,10 +236,11 @@ impl GeoIpManager {
 
 fn resolve_cache_dir(cfg: &GeoIpConfig, default_dir: &Path) -> PathBuf {
     if let Some(custom) = cfg.cache_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        PathBuf::from(custom)
-    } else {
-        default_dir.to_path_buf()
+        if !custom.contains('\0') && !custom.split(['/', '\\']).any(|seg| seg == "..") {
+            return PathBuf::from(custom);
+        }
     }
+    default_dir.to_path_buf()
 }
 
 fn load_cached_db(dir: &Path) -> Option<GeoIpDatabase> {
@@ -274,29 +266,91 @@ fn build_url_list(custom: Option<&str>, defaults: &[&str]) -> Vec<String> {
     }
 }
 
-fn validate_url_scheme(url: &str, allow_loopback_http: bool) -> Result<(), String> {
-    if url.starts_with("https://") {
-        return Ok(());
-    }
-    if allow_loopback_http
+fn parse_and_validate_url(url: &str, allow_loopback_http: bool) -> Result<(String, u16, bool), String> {
+    let (rest, default_port, is_loopback_http) = if let Some(r) = url.strip_prefix("https://") {
+        (r, 443u16, false)
+    } else if allow_loopback_http
         && (url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:"))
     {
-        return Ok(());
+        (url.strip_prefix("http://").unwrap_or(""), 80u16, true)
+    } else {
+        return Err(format!("GeoIP source URL '{url}' must use https://"));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!("GeoIP source URL '{url}' has invalid authority"));
     }
-    Err(format!("GeoIP source URL '{url}' must use https://"))
+    let (host, port) = if let Some(v6_rest) = authority.strip_prefix('[') {
+        let Some((h, tail)) = v6_rest.split_once(']') else {
+            return Err(format!("GeoIP source URL '{url}' has malformed IPv6 host"));
+        };
+        let port = if let Some(p_str) = tail.strip_prefix(':') {
+            p_str
+                .parse::<u16>()
+                .ok()
+                .filter(|&p| p > 0)
+                .ok_or_else(|| format!("GeoIP source URL '{url}' has invalid port"))?
+        } else if tail.is_empty() {
+            default_port
+        } else {
+            return Err(format!("GeoIP source URL '{url}' has invalid authority"));
+        };
+        (h.to_string(), port)
+    } else if let Some((h, p_str)) = authority.split_once(':') {
+        let port = p_str
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| format!("GeoIP source URL '{url}' has invalid port"))?;
+        (h.to_string(), port)
+    } else {
+        (authority.to_string(), default_port)
+    };
+    if host.is_empty() {
+        return Err(format!("GeoIP source URL '{url}' missing host"));
+    }
+    Ok((host, port, is_loopback_http))
+}
+
+async fn build_ssrf_safe_client(
+    url: &str,
+    allow_loopback_http: bool,
+) -> Result<reqwest::Client, String> {
+    let (host, port, is_loopback_http) = parse_and_validate_url(url, allow_loopback_http)?;
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("DNS returned no addresses for {host}"));
+    }
+    if !is_loopback_http && addrs.iter().any(|sa| !is_public_routable_ip(sa.ip())) {
+        return Err(format!(
+            "GeoIP URL host '{host}' resolved to non-public IP address (SSRF protection)"
+        ));
+    }
+    reqwest::Client::builder()
+        .timeout(GEOIP_FETCH_TIMEOUT)
+        .user_agent("Exposure-GeoIP-Updater/0.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| format!("failed to build GeoIP HTTP client: {e}"))
 }
 
 async fn fetch_first_mirror(
-    client: &reqwest::Client,
     urls: &[String],
     allow_loopback_http: bool,
 ) -> Result<(String, String), String> {
     let mut last_err = "no GeoIP URLs configured".to_string();
     for url in urls {
-        if let Err(e) = validate_url_scheme(url, allow_loopback_http) {
-            last_err = e;
-            continue;
-        }
+        let client = match build_ssrf_safe_client(url, allow_loopback_http).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
         let Ok(mut resp) = client.get(url).send().await else {
             last_err = format!("HTTP request failed for {url}");
             continue;
@@ -307,15 +361,29 @@ async fn fetch_first_mirror(
         }
         let mut buf = Vec::new();
         let mut overflow = false;
-        while let Ok(Some(chunk)) = resp.chunk().await {
-            if buf.len().saturating_add(chunk.len()) > MAX_GEOIP_CSV_BYTES {
-                overflow = true;
-                break;
+        let mut stream_err: Option<String> = None;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if buf.len().saturating_add(chunk.len()) > MAX_GEOIP_CSV_BYTES {
+                        overflow = true;
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    stream_err = Some(format!("GeoIP stream error from {url}: {e}"));
+                    break;
+                }
             }
-            buf.extend_from_slice(&chunk);
         }
         if overflow {
             last_err = format!("GeoIP payload from {url} exceeded {MAX_GEOIP_CSV_BYTES} byte limit");
+            continue;
+        }
+        if let Some(err) = stream_err {
+            last_err = err;
             continue;
         }
         let text = String::from_utf8_lossy(&buf).into_owned();

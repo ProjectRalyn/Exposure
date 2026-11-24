@@ -79,6 +79,11 @@ pub fn verify_password(plaintext: &str, stored_hash: &str) -> bool {
         .is_ok()
 }
 
+pub fn is_valid_argon2_hash(stored_hash: &str) -> bool {
+    let trimmed = stored_hash.trim();
+    trimmed.starts_with("$argon2") && PasswordHash::new(trimmed).is_ok()
+}
+
 /// Returns true if a secret is empty, too short, or matches a known hardcoded weak placeholder.
 pub fn is_weak_secret(secret: &str) -> bool {
     let s = secret.trim();
@@ -456,6 +461,8 @@ pub struct ClearanceClaims {
     pub ip_prefix: Option<String>,
     #[serde(default)]
     pub fp_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_hash: Option<String>,
 }
 
 pub fn sign_clearance_cookie(secret: &str, claims: &ClearanceClaims) -> Result<String> {
@@ -697,6 +704,7 @@ mod tests {
             ua_hash: Some(keyed_short_hmac_hex("secret-key", "exposure-ua", "Mozilla/5.0")),
             ip_prefix: Some("203.0.113.10".into()),
             fp_hash: None,
+            profile_hash: None,
         };
         let cookie = sign_clearance_cookie("secret-key", &claims).unwrap();
         let decoded = verify_clearance_cookie("secret-key", &cookie).unwrap();

@@ -49,6 +49,7 @@ pub struct LinkManager {
     bootstrap_state: Arc<BootstrapAuthState>,
     nonce_cache: Arc<NonceReplayCache>,
     probe_cfg: Arc<RwLock<ProbeConfig>>,
+    listen_policy: Arc<RwLock<LinkListenConfig>>,
     /// Keyed by endpoint address (for authenticated outbound sessions).
     outbound_sessions: Arc<DashMap<String, ActiveSession>>,
     /// Keyed by remote `node_tag` (ONLY authenticated inbound / control / registered outbound sessions).
@@ -142,6 +143,12 @@ impl LinkManager {
             bootstrap_state: Arc::new(BootstrapAuthState::new()),
             nonce_cache: Arc::new(NonceReplayCache::new()),
             probe_cfg: Arc::new(RwLock::new(probe_cfg)),
+            listen_policy: Arc::new(RwLock::new(LinkListenConfig {
+                listen_addr: String::new(),
+                allow_on_demand: None,
+                allow_tunnel: None,
+                allow_bootstrap: None,
+            })),
             outbound_sessions: Arc::new(DashMap::new()),
             inbound_sessions: Arc::new(DashMap::new()),
             bootstrap_sessions: Arc::new(DashMap::new()),
@@ -247,16 +254,22 @@ impl LinkManager {
             valid
         });
 
-        // Prune stale probe trackers for removed peers/endpoints
+        // Prune stale probe trackers and dial locks for removed peers/endpoints
         let valid_peer_tags: HashSet<String> = peers.iter().map(|p| p.peer_tag.clone()).collect();
         self.probe_trackers
             .retain(|(pt, _), _| valid_peer_tags.contains(pt));
+        self.dial_locks
+            .retain(|addr, _| valid_endpoints.contains(addr));
 
         for sess in to_close {
             sess.close().await;
         }
 
         self.spawn_outbound_tunnels();
+    }
+
+    pub async fn update_listener_policy(&self, policy: LinkListenConfig) {
+        *self.listen_policy.write().await = policy;
     }
 
     /// Start listening for inbound on-demand, tunnel, and (when permitted) bootstrap connections.
@@ -272,8 +285,8 @@ impl LinkManager {
             "link listener started"
         );
 
+        *self.listen_policy.write().await = cfg;
         let mgr = Arc::clone(self);
-        let listen_policy = Arc::new(cfg);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -286,11 +299,10 @@ impl LinkManager {
                             }
                         };
                         let mgr2 = Arc::clone(&mgr);
-                        let policy2 = Arc::clone(&listen_policy);
                         tokio::spawn(async move {
                             let res = tokio::time::timeout(
                                 HANDSHAKE_TIMEOUT,
-                                mgr2.handle_inbound_connection(stream, remote_addr, &policy2),
+                                mgr2.handle_inbound_connection(stream, remote_addr),
                             )
                             .await;
                             drop(permit);
@@ -319,12 +331,12 @@ impl LinkManager {
         self: &Arc<Self>,
         stream: crate::transport::BoxedStream,
         remote_addr: SocketAddr,
-        listen_policy: &LinkListenConfig,
     ) -> Result<()> {
         let mut noise = NoiseStream::handshake_responder(stream).await?;
         let hs_hash = noise.handshake_hash().to_vec();
         let peers = self.peers.read().await.clone();
         let ctrl_keys = self.trusted_control_pubkeys.read().await.clone();
+        let listen_policy = self.listen_policy.read().await.clone();
 
         let outcome = server_hello(
             &mut noise,
@@ -332,7 +344,7 @@ impl LinkManager {
             remote_addr,
             &self.local_tag,
             &self.keypair,
-            listen_policy,
+            &listen_policy,
             &peers,
             &ctrl_keys,
             &self.bootstrap_state,
@@ -406,7 +418,7 @@ impl LinkManager {
             let peers = mgr.peers.read().await.clone();
             for peer in peers {
                 if peer.mode == LinkMode::Tunnel
-                    && peer.tunnel_direction == Some(TunnelDirection::Outbound)
+                    && peer.tunnel_direction != Some(TunnelDirection::Inbound)
                 {
                     for ep in peer.endpoints.clone() {
                         let mgr2 = Arc::clone(&mgr);
@@ -519,17 +531,28 @@ impl LinkManager {
                                 .get(&peer.node_tag)
                                 .filter(|s| s.authenticated && !s.session.is_closed())
                                 .map(|s| s.session.clone());
-                            let res = match sess_opt {
+                            let res = match sess_opt.as_ref() {
                                 Some(session) => session.probe_rtt_ms(cfg2.timeout_ms).await,
                                 None => Err(ExposureError::Link("inbound tunnel disconnected".into())),
                             };
-                            let mut tr = mgr2
-                                .probe_trackers
-                                .entry((peer.peer_tag.clone(), INBOUND_TUNNEL_TRACKER_KEY.to_string()))
-                                .or_default();
-                            match res {
-                                Ok(rtt) => tr.record_success(rtt, &cfg2),
-                                Err(_) => tr.record_failure(&cfg2),
+                            let is_down = {
+                                let mut tr = mgr2
+                                    .probe_trackers
+                                    .entry((peer.peer_tag.clone(), INBOUND_TUNNEL_TRACKER_KEY.to_string()))
+                                    .or_default();
+                                match res {
+                                    Ok(rtt) => tr.record_success(rtt, &cfg2),
+                                    Err(_) => tr.record_failure(&cfg2),
+                                }
+                                tr.state == exposure_core::routing::LinkHealthState::Down
+                            };
+                            if is_down {
+                                if let Some(session) = sess_opt {
+                                    warn!(peer = %peer.node_tag, "evicting dead inbound tunnel session after probe failures");
+                                    session.close().await;
+                                    mgr2.inbound_sessions
+                                        .remove_if(&peer.node_tag, |_, v| v.session.is_closed());
+                                }
                             }
                         }));
                         continue;
@@ -547,8 +570,11 @@ impl LinkManager {
                                 .filter(|s| s.authenticated && !s.session.is_closed())
                                 .map(|s| s.session.clone());
 
+                            let mut probed_sess = None;
                             let res = if let Some(sess) = maybe_sess {
-                                sess.probe_rtt_ms(cfg2.timeout_ms).await
+                                let r = sess.probe_rtt_ms(cfg2.timeout_ms).await;
+                                probed_sess = Some(sess);
+                                r
                             } else if mode == LinkMode::OnDemand {
                                 // Only probe idle on-demand links via lightweight TCP connect
                                 let start = std::time::Instant::now();
@@ -565,13 +591,24 @@ impl LinkManager {
                                 Err(ExposureError::Link("tunnel disconnected".into()))
                             };
 
-                            let mut tr = mgr2
-                                .probe_trackers
-                                .entry((peer_tag, ep.address))
-                                .or_default();
-                            match res {
-                                Ok(rtt) => tr.record_success(rtt, &cfg2),
-                                Err(_) => tr.record_failure(&cfg2),
+                            let is_down = {
+                                let mut tr = mgr2
+                                    .probe_trackers
+                                    .entry((peer_tag.clone(), ep.address.clone()))
+                                    .or_default();
+                                match res {
+                                    Ok(rtt) => tr.record_success(rtt, &cfg2),
+                                    Err(_) => tr.record_failure(&cfg2),
+                                }
+                                tr.state == exposure_core::routing::LinkHealthState::Down
+                            };
+                            if is_down {
+                                if let Some(sess) = probed_sess {
+                                    warn!(peer = %peer_tag, addr = %ep.address, "evicting dead outbound session after probe failures");
+                                    sess.close().await;
+                                    mgr2.outbound_sessions
+                                        .remove_if(&ep.address, |_, v| v.session.is_closed());
+                                }
                             }
                         }));
                     }

@@ -886,7 +886,7 @@ impl ClientJsFingerprint {
                 .iter()
                 .filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(crate::routing::canonical_ip))
                 .collect();
-            if !raw_pubs.is_empty() && !raw_pubs.iter().any(|ip| *ip == canon_obs) {
+            if !raw_pubs.is_empty() && !raw_pubs.contains(&canon_obs) {
                 self.webrtc_ip_mismatch = true;
                 push_unique_bounded(&mut self.tamper_flags, "webrtc_ip_leak".into(), 12);
             }

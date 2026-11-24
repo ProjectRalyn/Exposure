@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,25 +8,24 @@ use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::{
     ConfigBundlePurpose, DnsProviderAccountConfig, LinkMode, NodeConfig, SignedConfigBundle,
-    TunnelDirection,
+    TlsCertEntry, TunnelDirection,
 };
 use exposure_core::crypto::{
-    compute_bootstrap_reply_proof, compute_passphrase_proof, generate_five_word_passphrase,
-    validate_dns_domain, verify_bootstrap_reply_proof, verify_signature_b64,
-    write_secret_file_atomic, NodeKeyPair,
+    compute_bootstrap_reply_proof, compute_passphrase_proof, validate_dns_domain,
+    verify_bootstrap_reply_proof, verify_signature_b64, write_secret_file_atomic, NodeKeyPair,
 };
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
     dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes,
-    unban_req_signing_bytes, DiscoveryNeighbor, DnsManageOp, DnsProviderCapabilities,
-    DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem, PreflightReport, SpecialFrame,
-    SpecialPayload, StreamKind,
+    pull_telemetry_req_signing_bytes, unban_req_signing_bytes, DiscoveryNeighbor, DnsManageOp,
+    DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem,
+    PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::routing::is_public_routable_ip;
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
 use rand::RngCore;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -49,6 +49,8 @@ pub struct NodeRuntime {
     config: Arc<RwLock<NodeConfig>>,
     /// Serializes config hot-reloads and auto-rollbacks to prevent concurrent sequence races.
     config_reload_lock: Arc<Mutex<()>>,
+    /// Serializes atomic config file writes.
+    config_write_lock: Arc<Mutex<()>>,
     keypair: NodeKeyPair,
     link_manager: Arc<LinkManager>,
     forwarder: Arc<Forwarder>,
@@ -64,10 +66,42 @@ pub struct NodeRuntime {
     connected_control_tag: Arc<RwLock<Option<String>>>,
     /// Monotonic `issued_at` per domain for `CertBundle` anti-rollback protection.
     cert_last_issued_at: Arc<DashMap<String, i64>>,
-    /// Spent `DialEnrollReq.request_id` cache for replay protection.
-    used_dial_enroll_ids: Arc<DashMap<String, i64>>,
-    /// Spent `DnsSyncReq.request_id` cache for replay protection.
-    used_dns_sync_ids: Arc<DashMap<String, i64>>,
+    /// Unified spent `request_id` cache for Control-signed command replay protection.
+    used_control_cmd_ids: Arc<DashMap<String, i64>>,
+    /// Bounds concurrent active bootstrap forwards handled on a bootstrap relay node.
+    bootstrap_fwd_sem: Arc<Semaphore>,
+    egress_hc_started: AtomicBool,
+    geoip_updater_started: AtomicBool,
+}
+
+fn load_persisted_certs_from_dir(cert_resolver: &DynamicCertResolver, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(stem) = fname.strip_suffix(".crt.pem") else {
+            continue;
+        };
+        let key_path = dir.join(format!("{stem}.key.pem"));
+        if !key_path.exists() {
+            continue;
+        }
+        let domain = stem.replace("_wildcard_", "*");
+        match (std::fs::read_to_string(&path), std::fs::read_to_string(&key_path)) {
+            (Ok(cert_pem), Ok(key_pem)) => {
+                if let Err(e) = cert_resolver.load_from_pem(&domain, &cert_pem, &key_pem) {
+                    warn!(domain = %domain, error = %e, "skipped invalid persisted TLS cert on startup");
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(domain = %domain, error = %e, "failed reading persisted TLS cert on startup");
+            }
+        }
+    }
 }
 
 fn collect_trusted_control_keys(cfg: &NodeConfig) -> Vec<String> {
@@ -96,6 +130,9 @@ impl NodeRuntime {
         let cert_resolver = DynamicCertResolver::new();
         if !config.ingress.tls_certs.is_empty() {
             cert_resolver.load_from_files(&config.ingress.tls_certs)?;
+        }
+        if let Some(ref dir_str) = config.ingress.cert_store_dir {
+            load_persisted_certs_from_dir(&cert_resolver, Path::new(dir_str));
         }
 
         let link_manager = LinkManager::new(
@@ -156,6 +193,7 @@ impl NodeRuntime {
             config_path,
             config: Arc::new(RwLock::new(config)),
             config_reload_lock: Arc::new(Mutex::new(())),
+            config_write_lock: Arc::new(Mutex::new(())),
             keypair,
             link_manager,
             forwarder,
@@ -169,8 +207,10 @@ impl NodeRuntime {
             passphrase: Arc::new(RwLock::new(passphrase_state)),
             connected_control_tag: Arc::new(RwLock::new(None)),
             cert_last_issued_at: Arc::new(DashMap::new()),
-            used_dial_enroll_ids: Arc::new(DashMap::new()),
-            used_dns_sync_ids: Arc::new(DashMap::new()),
+            used_control_cmd_ids: Arc::new(DashMap::new()),
+            bootstrap_fwd_sem: Arc::new(Semaphore::new(16)),
+            egress_hc_started: AtomicBool::new(false),
+            geoip_updater_started: AtomicBool::new(false),
         });
 
         rt.spawn_stream_dispatcher();
@@ -211,21 +251,6 @@ impl NodeRuntime {
         self.config.read().await.clone()
     }
 
-    /// Generate or reset a high-entropy one-time passphrase valid for 10 minutes.
-    pub async fn reset_passphrase(&self) -> String {
-        let phrase = generate_five_word_passphrase();
-        let entry = OnboardingPassphrase {
-            phrase: phrase.clone(),
-            expires_at: Utc::now().timestamp() + 600,
-            revoked: false,
-        };
-        *self.passphrase.write().await = Some(entry);
-        self.link_manager
-            .set_bootstrap_passphrase(Some(phrase.clone()))
-            .await;
-        phrase
-    }
-
     pub async fn revoke_passphrase(&self) {
         if let Some(ref mut p) = *self.passphrase.write().await {
             p.revoked = true;
@@ -246,12 +271,12 @@ impl NodeRuntime {
         self.link_manager.spawn_outbound_tunnels();
         self.link_manager.spawn_probe_loop();
 
-        if cfg.roles.egress {
+        if cfg.roles.egress && !self.egress_hc_started.swap(true, Ordering::AcqRel) {
             self.egress.spawn_local_health_checks();
         }
 
         let mut ingress_addrs = Vec::new();
-        if cfg.roles.ingress {
+        if cfg.roles.ingress && !self.geoip_updater_started.swap(true, Ordering::AcqRel) {
             Arc::clone(self.ingress.geoip()).spawn_updater();
         }
         if cfg.roles.ingress && !cfg.roles.maintainer {
@@ -277,25 +302,49 @@ impl NodeRuntime {
         Ok((link_bound, ingress_addrs))
     }
 
+    async fn persist_config_yaml(&self, cfg: &NodeConfig) -> Result<()> {
+        let Some(ref path) = self.config_path else {
+            return Ok(());
+        };
+        let _w = self.config_write_lock.lock().await;
+        let yaml = serde_yaml::to_string(cfg)
+            .map_err(|e| ExposureError::Config(format!("serialize yaml: {e}")))?;
+        let path_owned = path.clone();
+        tokio::task::spawn_blocking(move || write_secret_file_atomic(&path_owned, yaml.as_bytes()))
+            .await
+            .map_err(|e| ExposureError::Storage(format!("config write join: {e}")))?
+    }
+
+    async fn reload_tls_files(&self, entries: &[TlsCertEntry]) -> Result<()> {
+        if entries.is_empty() {
+            self.cert_resolver.load_from_files(&[])?;
+            return Ok(());
+        }
+        let resolver = Arc::clone(&self.cert_resolver);
+        let owned = entries.to_vec();
+        tokio::task::spawn_blocking(move || resolver.load_from_files(&owned))
+            .await
+            .map_err(|e| ExposureError::Crypto(format!("TLS reload join: {e}")))?
+    }
+
     async fn install_enrolled_control_keys(
         &self,
         signing_pk: String,
         link_pk: Option<String>,
     ) -> Result<()> {
-        let mut cfg = self.config.write().await;
-        if cfg.control_public_key.is_some() {
-            return Err(ExposureError::Auth(
-                "node is already enrolled with a Control public key".into(),
-            ));
-        }
-        let eff_link_pk = link_pk.unwrap_or_else(|| signing_pk.clone());
-        cfg.control_public_key = Some(signing_pk);
-        cfg.control_link_public_key = Some(eff_link_pk);
-        let trusted = collect_trusted_control_keys(&cfg);
-        if let Some(ref path) = self.config_path {
-            atomic_write_yaml(path, &*cfg)?;
-        }
-        drop(cfg);
+        let (trusted, cfg_snapshot) = {
+            let mut cfg = self.config.write().await;
+            if cfg.control_public_key.is_some() {
+                return Err(ExposureError::Auth(
+                    "node is already enrolled with a Control public key".into(),
+                ));
+            }
+            let eff_link_pk = link_pk.unwrap_or_else(|| signing_pk.clone());
+            cfg.control_public_key = Some(signing_pk);
+            cfg.control_link_public_key = Some(eff_link_pk);
+            (collect_trusted_control_keys(&cfg), cfg.clone())
+        };
+        self.persist_config_yaml(&cfg_snapshot).await?;
         self.link_manager
             .set_trusted_control_pubkeys(trusted)
             .await;
@@ -320,16 +369,15 @@ impl NodeRuntime {
                         let should_install =
                             rt.config.read().await.control_link_public_key.is_none();
                         if should_install {
-                            let mut cfg = rt.config.write().await;
-                            cfg.control_link_public_key = Some(link_pk.clone());
-                            if cfg.control_public_key.is_none() {
-                                cfg.control_public_key = Some(link_pk.clone());
-                            }
-                            let trusted = collect_trusted_control_keys(&cfg);
-                            if let Some(ref path) = rt.config_path {
-                                let _ = atomic_write_yaml(path, &*cfg);
-                            }
-                            drop(cfg);
+                            let (trusted, cfg_snapshot) = {
+                                let mut cfg = rt.config.write().await;
+                                cfg.control_link_public_key = Some(link_pk.clone());
+                                if cfg.control_public_key.is_none() {
+                                    cfg.control_public_key = Some(link_pk.clone());
+                                }
+                                (collect_trusted_control_keys(&cfg), cfg.clone())
+                            };
+                            let _ = rt.persist_config_yaml(&cfg_snapshot).await;
                             rt.link_manager
                                 .set_trusted_control_pubkeys(trusted)
                                 .await;
@@ -531,16 +579,45 @@ impl NodeRuntime {
                     }))
                 }
             }
-            SpecialPayload::PullTelemetryReq { since_minute } => {
+            SpecialPayload::PullTelemetryReq {
+                request_id,
+                issued_at,
+                expires_at,
+                maintainer_tag,
+                since_minute,
+                control_signature,
+            } => {
                 if !incoming.authenticated {
                     None
-                } else if let Some(maint) = self.maintainer.read().await.clone() {
-                    let snap = maint.build_telemetry_snapshot(since_minute).await;
-                    Some(SpecialPayload::PullTelemetryResp(snap))
                 } else {
-                    Some(SpecialPayload::ErrorReply {
-                        message: "node is not maintainer".into(),
-                    })
+                    let signing = pull_telemetry_req_signing_bytes(
+                        &request_id,
+                        issued_at,
+                        expires_at,
+                        &maintainer_tag,
+                        since_minute,
+                    );
+                    if let Err(msg) = self
+                        .verify_control_signed_cmd(
+                            "PullTelemetryReq",
+                            &request_id,
+                            issued_at,
+                            expires_at,
+                            &maintainer_tag,
+                            &signing,
+                            &control_signature,
+                        )
+                        .await
+                    {
+                        Some(SpecialPayload::ErrorReply { message: msg })
+                    } else if let Some(maint) = self.maintainer.read().await.clone() {
+                        let snap = maint.build_telemetry_snapshot(since_minute).await;
+                        Some(SpecialPayload::PullTelemetryResp(snap))
+                    } else {
+                        Some(SpecialPayload::ErrorReply {
+                            message: "node is not maintainer".into(),
+                        })
+                    }
                 }
             }
             SpecialPayload::BootstrapForward {
@@ -568,7 +645,16 @@ impl NodeRuntime {
                         nonce: vec![],
                         error: Some("bootstrap forwarding disabled on this node".into()),
                     })
-                } else {
+                } else if via_node.trim().is_empty() || via_node != self.node_tag() {
+                    Some(SpecialPayload::BootstrapReply {
+                        accepted: false,
+                        control_public_key: None,
+                        control_link_public_key: None,
+                        reply_proof: None,
+                        nonce: vec![],
+                        error: Some("bootstrap via_node does not match relay node".into()),
+                    })
+                } else if let Ok(_fwd_permit) = Arc::clone(&self.bootstrap_fwd_sem).try_acquire_owned() {
                     let ctrl_tag = self.connected_control_tag.read().await.clone();
                     if let Some(ctrl) = ctrl_tag {
                         let fwd_frame = SpecialFrame::new(
@@ -580,7 +666,7 @@ impl NodeRuntime {
                                 public_key,
                                 nonce,
                                 proof,
-                                via_node,
+                                via_node: self.node_tag(),
                             },
                         );
                         match self
@@ -608,6 +694,15 @@ impl NodeRuntime {
                             error: Some("no active control connected to bootstrap node".into()),
                         })
                     }
+                } else {
+                    Some(SpecialPayload::BootstrapReply {
+                        accepted: false,
+                        control_public_key: None,
+                        control_link_public_key: None,
+                        reply_proof: None,
+                        nonce: vec![],
+                        error: Some("bootstrap forwarding busy; retry shortly".into()),
+                    })
                 }
             }
             SpecialPayload::DialEnrollReq {
@@ -823,15 +918,18 @@ impl NodeRuntime {
 
                 if already_enrolled {
                     // Allow updating signing key during initial Control-authenticated bootstrap handshake if link_pk was set first
-                    let mut cfg = self.config.write().await;
-                    if cfg.control_public_key.as_deref() == cfg.control_link_public_key.as_deref() {
-                        cfg.control_public_key = Some(pk);
-                        cfg.control_link_public_key = Some(link_pk);
-                        let trusted = collect_trusted_control_keys(&cfg);
-                        if let Some(ref path) = self.config_path {
-                            let _ = atomic_write_yaml(path, &*cfg);
+                    let update_snap = {
+                        let mut cfg = self.config.write().await;
+                        if cfg.control_public_key.as_deref() == cfg.control_link_public_key.as_deref() {
+                            cfg.control_public_key = Some(pk);
+                            cfg.control_link_public_key = Some(link_pk);
+                            Some((collect_trusted_control_keys(&cfg), cfg.clone()))
+                        } else {
+                            None
                         }
-                        drop(cfg);
+                    };
+                    if let Some((trusted, cfg_snapshot)) = update_snap {
+                        let _ = self.persist_config_yaml(&cfg_snapshot).await;
                         self.link_manager
                             .set_trusted_control_pubkeys(trusted)
                             .await;
@@ -876,62 +974,39 @@ impl NodeRuntime {
         control_link_public_key: String,
         control_signature: String,
     ) -> SpecialPayload {
-        // 1. Verify Control authorization signature using this node's pinned control_public_key!
-        let local_ctrl_pk = self.config.read().await.control_public_key.clone();
-        let Some(local_ctrl_pk) = local_ctrl_pk else {
-            return SpecialPayload::DialEnrollResp {
-                success: false,
-                node_public_key: None,
-                error: Some("relay node has no Control public key configured".into()),
-            };
-        };
-        let now = Utc::now().timestamp();
-        if now > expires_at || issued_at > now + 60 {
-            return SpecialPayload::DialEnrollResp {
-                success: false,
-                node_public_key: None,
-                error: Some("DialEnrollReq expired or invalid timestamp".into()),
-            };
-        }
+        // 1. Verify Control authorization signature & replay using unified Control command verifier
+        let relay_tag = self.node_tag();
         let signing = dial_enroll_req_signing_bytes(
             &request_id,
             issued_at,
             expires_at,
-            &self.node_tag(),
+            &relay_tag,
             &target_node_tag,
             &target_addr,
             &passphrase,
             &control_public_key,
             &control_link_public_key,
         );
-        if let Err(e) = verify_signature_b64(&local_ctrl_pk, &signing, &control_signature) {
+        if let Err(msg) = self
+            .verify_control_signed_cmd(
+                "DialEnrollReq",
+                &request_id,
+                issued_at,
+                expires_at,
+                &relay_tag,
+                &signing,
+                &control_signature,
+            )
+            .await
+        {
             return SpecialPayload::DialEnrollResp {
                 success: false,
                 node_public_key: None,
-                error: Some(format!("DialEnrollReq signature invalid: {e}")),
+                error: Some(msg),
             };
         }
 
-        // 2. Single-use request_id anti-replay check
-        if self.used_dial_enroll_ids.len() > 4096 {
-            self.used_dial_enroll_ids.retain(|_, exp| *exp >= now);
-        }
-        let mut is_new = false;
-        self.used_dial_enroll_ids
-            .entry(request_id)
-            .or_insert_with(|| {
-                is_new = true;
-                expires_at
-            });
-        if !is_new {
-            return SpecialPayload::DialEnrollResp {
-                success: false,
-                node_public_key: None,
-                error: Some("DialEnrollReq replay rejected".into()),
-            };
-        }
-
-        // 3. Dial the listening node, enforcing expected node_tag & mutual authentication
+        // 2. Dial the listening node, enforcing expected node_tag & mutual authentication
         let mut nonce = vec![0u8; 24];
         rand::thread_rng().fill_bytes(&mut nonce);
         let proof = compute_passphrase_proof(
@@ -993,7 +1068,13 @@ impl NodeRuntime {
                         error: None,
                     },
                 );
-                let _ = self.forwarder.send_bootstrap(install).await;
+                if let Err(e) = self.forwarder.send_bootstrap(install).await {
+                    return SpecialPayload::DialEnrollResp {
+                        success: false,
+                        node_public_key: None,
+                        error: Some(format!("failed to deliver BootstrapReply: {e}")),
+                    };
+                }
                 SpecialPayload::DialEnrollResp {
                     success: true,
                     node_public_key: Some(node_pk),
@@ -1025,23 +1106,6 @@ impl NodeRuntime {
             error: Some(msg),
         };
 
-        if maintainer_tag != self.node_tag() {
-            return reject(format!(
-                "DnsSyncReq target '{maintainer_tag}' != local node '{}'",
-                self.node_tag()
-            ));
-        }
-
-        let local_ctrl_pk = self.config.read().await.control_public_key.clone();
-        let Some(local_ctrl_pk) = local_ctrl_pk else {
-            return reject("node has no Control public key configured".into());
-        };
-
-        let now = Utc::now().timestamp();
-        if now > expires_at || issued_at > now + 60 {
-            return reject("DnsSyncReq expired or invalid timestamp".into());
-        }
-
         let signing = dns_sync_req_signing_bytes(
             &request_id,
             issued_at,
@@ -1049,22 +1113,19 @@ impl NodeRuntime {
             &maintainer_tag,
             &records,
         );
-        if let Err(e) = verify_signature_b64(&local_ctrl_pk, &signing, &control_signature) {
-            return reject(format!("DnsSyncReq signature invalid: {e}"));
-        }
-
-        if self.used_dns_sync_ids.len() > 4096 {
-            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
-        }
-        let mut is_new = false;
-        self.used_dns_sync_ids
-            .entry(request_id.clone())
-            .or_insert_with(|| {
-                is_new = true;
-                expires_at
-            });
-        if !is_new {
-            return reject("DnsSyncReq replay rejected".into());
+        if let Err(msg) = self
+            .verify_control_signed_cmd(
+                "DnsSyncReq",
+                &request_id,
+                issued_at,
+                expires_at,
+                &maintainer_tag,
+                &signing,
+                &control_signature,
+            )
+            .await
+        {
+            return reject(msg);
         }
 
         let maint = self.maintainer.read().await.clone();
@@ -1103,23 +1164,6 @@ impl NodeRuntime {
             error: Some(msg),
         };
 
-        if maintainer_tag != self.node_tag() {
-            return reject(format!(
-                "DnsManageReq target '{maintainer_tag}' != local node '{}'",
-                self.node_tag()
-            ));
-        }
-
-        let local_ctrl_pk = self.config.read().await.control_public_key.clone();
-        let Some(local_ctrl_pk) = local_ctrl_pk else {
-            return reject("node has no Control public key configured".into());
-        };
-
-        let now = Utc::now().timestamp();
-        if now > expires_at || issued_at > now + 60 {
-            return reject("DnsManageReq expired or invalid timestamp".into());
-        }
-
         let signing = dns_manage_req_signing_bytes(
             &request_id,
             issued_at,
@@ -1127,22 +1171,19 @@ impl NodeRuntime {
             &maintainer_tag,
             &op,
         );
-        if let Err(e) = verify_signature_b64(&local_ctrl_pk, &signing, &control_signature) {
-            return reject(format!("DnsManageReq signature invalid: {e}"));
-        }
-
-        if self.used_dns_sync_ids.len() > 4096 {
-            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
-        }
-        let mut is_new = false;
-        self.used_dns_sync_ids
-            .entry(request_id.clone())
-            .or_insert_with(|| {
-                is_new = true;
-                expires_at
-            });
-        if !is_new {
-            return reject("DnsManageReq replay rejected".into());
+        if let Err(msg) = self
+            .verify_control_signed_cmd(
+                "DnsManageReq",
+                &request_id,
+                issued_at,
+                expires_at,
+                &maintainer_tag,
+                &signing,
+                &control_signature,
+            )
+            .await
+        {
+            return reject(msg);
         }
 
         let maint = self.maintainer.read().await.clone();
@@ -1165,6 +1206,7 @@ impl NodeRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn verify_control_signed_cmd(
         &self,
         cmd_name: &str,
@@ -1194,11 +1236,14 @@ impl NodeRuntime {
         }
         verify_signature_b64(&local_ctrl_pk, signing_bytes, control_signature)
             .map_err(|e| format!("{cmd_name} signature invalid: {e}"))?;
-        if self.used_dns_sync_ids.len() > 4096 {
-            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
+        if self.used_control_cmd_ids.len() > 4096 {
+            self.used_control_cmd_ids.retain(|_, exp| *exp >= now);
+            if self.used_control_cmd_ids.len() > 4096 {
+                crate::ban::evict_half(&self.used_control_cmd_ids);
+            }
         }
         let mut is_new = false;
-        self.used_dns_sync_ids
+        self.used_control_cmd_ids
             .entry(request_id.to_string())
             .or_insert_with(|| {
                 is_new = true;
@@ -1479,30 +1524,39 @@ impl NodeRuntime {
                 Ok(Ok(tcp)) => {
                     if svc.tls.unwrap_or(false) {
                         let use_h2 = svc.protocol == exposure_core::config::BackendProtocol::H2;
-                        match tokio::time::timeout(
-                            Duration::from_millis(2000),
-                            crate::egress::connect_backend_tls(tcp, svc, use_h2),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => checks.push(PreflightCheckItem {
-                                target,
-                                ok: true,
-                                detail: if svc.effective_insecure_skip_verify() {
-                                    "backend TLS reachable (insecure skip-verify)".into()
-                                } else {
-                                    "backend TLS verified & reachable".into()
-                                },
-                            }),
-                            Ok(Err(e)) => checks.push(PreflightCheckItem {
+                        match self.egress.get_tls_client_config(svc, use_h2).await {
+                            Ok(tls_cfg) => {
+                                match tokio::time::timeout(
+                                    Duration::from_millis(2000),
+                                    crate::egress::connect_backend_tls(tcp, svc, &tls_cfg),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => checks.push(PreflightCheckItem {
+                                        target,
+                                        ok: true,
+                                        detail: if svc.effective_insecure_skip_verify() {
+                                            "backend TLS reachable (insecure skip-verify)".into()
+                                        } else {
+                                            "backend TLS verified & reachable".into()
+                                        },
+                                    }),
+                                    Ok(Err(e)) => checks.push(PreflightCheckItem {
+                                        target,
+                                        ok: false,
+                                        detail: format!("backend TLS check failed: {e}"),
+                                    }),
+                                    Err(_) => checks.push(PreflightCheckItem {
+                                        target,
+                                        ok: false,
+                                        detail: "backend TLS handshake timed out (2000ms)".into(),
+                                    }),
+                                }
+                            }
+                            Err(e) => checks.push(PreflightCheckItem {
                                 target,
                                 ok: false,
-                                detail: format!("backend TLS check failed: {e}"),
-                            }),
-                            Err(_) => checks.push(PreflightCheckItem {
-                                target,
-                                ok: false,
-                                detail: "backend TLS handshake timed out (2000ms)".into(),
+                                detail: format!("backend TLS config failed: {e}"),
                             }),
                         }
                     } else {
@@ -1571,11 +1625,16 @@ impl NodeRuntime {
     async fn restore_previous_config(&self, mut prev_cfg: NodeConfig, keep_seq: u64) -> Result<()> {
         let _lock = self.config_reload_lock.lock().await;
         prev_cfg.config_sequence = keep_seq;
+        self.reload_tls_files(&prev_cfg.ingress.tls_certs).await?;
+        self.persist_config_yaml(&prev_cfg).await?;
         let trusted_ctrl = collect_trusted_control_keys(&prev_cfg);
         if !trusted_ctrl.is_empty() {
             self.link_manager
                 .set_trusted_control_pubkeys(trusted_ctrl)
                 .await;
+        }
+        if let Some(ref lp) = prev_cfg.link_listener {
+            self.link_manager.update_listener_policy(lp.clone()).await;
         }
         self.link_manager
             .update_peers(prev_cfg.peers.clone(), prev_cfg.probe.clone())
@@ -1586,6 +1645,7 @@ impl NodeRuntime {
         self.egress
             .update_config(prev_cfg.egress.clone(), prev_cfg.trusted_origins.clone())
             .await;
+        self.ingress.update_default_ttl(prev_cfg.default_ttl);
         self.ingress
             .update_config(
                 prev_cfg.ingress.clone(),
@@ -1594,8 +1654,11 @@ impl NodeRuntime {
             .await?;
         self.logger.update_config(prev_cfg.logger.clone()).await?;
         self.reconcile_maintainer(&prev_cfg).await?;
-        if let Some(ref path) = self.config_path {
-            atomic_write_yaml(path, &prev_cfg)?;
+        if prev_cfg.roles.egress && !self.egress_hc_started.swap(true, Ordering::AcqRel) {
+            self.egress.spawn_local_health_checks();
+        }
+        if prev_cfg.roles.ingress && !self.geoip_updater_started.swap(true, Ordering::AcqRel) {
+            Arc::clone(self.ingress.geoip()).spawn_updater();
         }
         *self.config.write().await = prev_cfg;
         let msg = "auto-rolled back: node isolated from all peers after config push".to_string();
@@ -1703,16 +1766,9 @@ impl NodeRuntime {
             new_cfg.identity_secret_key = self.keypair.secret_key_b64();
         }
 
-        // Pre-validate YAML serialization and TLS cert files before mutating live components
-        let yaml_bytes = serde_yaml::to_string(&new_cfg)
-            .map_err(|e| ExposureError::Config(format!("serialize yaml: {e}")))?;
-        self.cert_resolver
-            .load_from_files(&new_cfg.ingress.tls_certs)?;
-
-        // Persist atomically with 0o600 permissions before applying to memory
-        if let Some(ref path) = self.config_path {
-            write_secret_file_atomic(path, yaml_bytes.as_bytes())?;
-        }
+        // Pre-validate TLS cert files and YAML serialization atomically before mutating live components
+        self.reload_tls_files(&new_cfg.ingress.tls_certs).await?;
+        self.persist_config_yaml(&new_cfg).await?;
 
         // Update logger & maintainer (fallible) before mutating forwarding planes
         self.logger.update_config(new_cfg.logger.clone()).await?;
@@ -1724,6 +1780,9 @@ impl NodeRuntime {
                 .set_trusted_control_pubkeys(trusted_ctrl)
                 .await;
         }
+        if let Some(ref lp) = new_cfg.link_listener {
+            self.link_manager.update_listener_policy(lp.clone()).await;
+        }
         self.link_manager
             .update_peers(new_cfg.peers.clone(), new_cfg.probe.clone())
             .await;
@@ -1733,12 +1792,20 @@ impl NodeRuntime {
         self.egress
             .update_config(new_cfg.egress.clone(), new_cfg.trusted_origins.clone())
             .await;
+        self.ingress.update_default_ttl(new_cfg.default_ttl);
         self.ingress
             .update_config(
                 new_cfg.ingress.clone(),
                 new_cfg.roles.ingress && !new_cfg.roles.maintainer,
             )
             .await?;
+
+        if new_cfg.roles.egress && !self.egress_hc_started.swap(true, Ordering::AcqRel) {
+            self.egress.spawn_local_health_checks();
+        }
+        if new_cfg.roles.ingress && !self.geoip_updater_started.swap(true, Ordering::AcqRel) {
+            Arc::clone(self.ingress.geoip()).spawn_updater();
+        }
 
         *self.config.write().await = new_cfg;
         *self.last_reload_status.write().await = (true, None);
@@ -1813,12 +1880,18 @@ impl NodeRuntime {
 
         // Persist to disk with atomic 0600 permissions for private key
         if let Some(ref dir_str) = cfg.ingress.cert_store_dir {
-            let dir = Path::new(dir_str);
-            std::fs::create_dir_all(dir)?;
+            let dir = PathBuf::from(dir_str);
             let safe = domain.replace('*', "_wildcard_");
-            std::fs::write(dir.join(format!("{safe}.crt.pem")), cert_pem)?;
-            let key_path = dir.join(format!("{safe}.key.pem"));
-            write_secret_file_atomic(&key_path, key_pem.as_bytes())?;
+            let cert_owned = cert_pem.to_string();
+            let key_owned = key_pem.to_string();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                std::fs::create_dir_all(&dir)?;
+                write_secret_file_atomic(&dir.join(format!("{safe}.crt.pem")), cert_owned.as_bytes())?;
+                write_secret_file_atomic(&dir.join(format!("{safe}.key.pem")), key_owned.as_bytes())?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| ExposureError::Storage(format!("cert persist join: {e}")))??;
         }
         Ok(())
     }
@@ -1920,30 +1993,68 @@ impl NodeRuntime {
     }
 
     async fn push_pending_logs_to_maintainer(&self) {
+        const MAX_RECS_PER_BATCH: usize = 250;
+        const MAX_SUMS_PER_BATCH: usize = 200;
+        const MAX_FPS_PER_BATCH: usize = 200;
+
         let hops = self.config.read().await.maintainer_hops.clone();
         if hops.len() < 2 {
             return;
         }
-        let (records, summaries, fingerprints) = self.logger.drain_for_maintainer().await;
+        let (mut records, mut summaries, mut fingerprints) = self.logger.drain_for_maintainer().await;
         if records.is_empty() && summaries.is_empty() && fingerprints.is_empty() {
             return;
         }
-        let frame = SpecialFrame::new(
-            Uuid::new_v4().to_string(),
-            hops,
-            16,
-            SpecialPayload::LogBatch {
-                from_node: self.node_tag(),
-                records: records.clone(),
-                minute_summaries: summaries.clone(),
-                fingerprints: fingerprints.clone(),
-            },
-        );
-        if let Err(e) = self.forwarder.send_special(frame).await {
-            warn!(error = %e, "failed to push log batch to maintainer; requeuing");
-            self.logger
-                .requeue_for_maintainer(records, summaries, fingerprints)
-                .await;
+
+        while !records.is_empty() || !summaries.is_empty() || !fingerprints.is_empty() {
+            let r_n = records.len().min(MAX_RECS_PER_BATCH);
+            let s_n = summaries.len().min(MAX_SUMS_PER_BATCH);
+            let f_n = fingerprints.len().min(MAX_FPS_PER_BATCH);
+            let rec_chunk: Vec<_> = records.drain(..r_n).collect();
+            let sum_chunk: Vec<_> = summaries.drain(..s_n).collect();
+            let fp_chunk: Vec<_> = fingerprints.drain(..f_n).collect();
+
+            let frame = SpecialFrame::new(
+                Uuid::new_v4().to_string(),
+                hops.clone(),
+                16,
+                SpecialPayload::LogBatch {
+                    from_node: self.node_tag(),
+                    records: rec_chunk.clone(),
+                    minute_summaries: sum_chunk.clone(),
+                    fingerprints: fp_chunk.clone(),
+                },
+            );
+            let acked = match self
+                .forwarder
+                .send_special_rpc(frame, Duration::from_secs(10))
+                .await
+            {
+                Ok(SpecialFrame {
+                    payload: SpecialPayload::LogAck { .. },
+                    ..
+                }) => true,
+                Ok(other) => {
+                    warn!(reply = ?other.payload, "unexpected reply to LogBatch; requeuing unsent batches");
+                    false
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to push log batch to maintainer; requeuing unsent batches");
+                    false
+                }
+            };
+            if !acked {
+                let mut rem_recs = rec_chunk;
+                rem_recs.append(&mut records);
+                let mut rem_sums = sum_chunk;
+                rem_sums.append(&mut summaries);
+                let mut rem_fps = fp_chunk;
+                rem_fps.append(&mut fingerprints);
+                self.logger
+                    .requeue_for_maintainer(rem_recs, rem_sums, rem_fps)
+                    .await;
+                break;
+            }
         }
     }
 
@@ -2009,10 +2120,4 @@ impl NodeRuntime {
             let _ = maint.flush_segments().await;
         }
     }
-}
-
-fn atomic_write_yaml<T: serde::Serialize>(path: &Path, val: &T) -> Result<()> {
-    let yaml = serde_yaml::to_string(val)
-        .map_err(|e| ExposureError::Config(format!("serialize yaml: {e}")))?;
-    write_secret_file_atomic(path, yaml.as_bytes())
 }

@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::io::BufReader;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use exposure_core::config::{
     resolve_domain_binding, CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig,
     MaintainerConfig,
@@ -16,7 +18,7 @@ use exposure_core::protocol::{
     DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult, DnsSyncRecordSpec,
     MaintainerTelemetrySnapshot, SpecialFrame, SpecialPayload,
 };
-use exposure_core::routing::canonical_ip;
+use exposure_core::routing::is_public_routable_ip;
 use exposure_core::segment::{
     list_recent_segment_files, read_json_snapshot, read_segment_file, write_json_snapshot_atomic,
     SegmentWriter,
@@ -347,28 +349,7 @@ fn cloudflare_zone_candidates(domain: &str, root_domain: Option<&str>) -> Result
     Ok(out)
 }
 
-fn is_forbidden_ssrf_ip(ip: IpAddr) -> bool {
-    match canonical_ip(ip) {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64) // CGNAT 100.64.0.0/10
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // Link-local fe80::/10
-        }
-    }
-}
-
-async fn validate_webhook_url(raw_url: &str) -> Result<()> {
+async fn build_ssrf_pinned_webhook_client(raw_url: &str) -> Result<reqwest::Client> {
     let url = reqwest::Url::parse(raw_url)
         .map_err(|e| ExposureError::Config(format!("invalid webhook URL '{raw_url}': {e}")))?;
     if url.scheme() != "https" {
@@ -382,7 +363,7 @@ async fn validate_webhook_url(raw_url: &str) -> Result<()> {
         .ok_or_else(|| ExposureError::Config("webhook URL missing host".into()))?;
     let port = url.port_or_known_default().unwrap_or(443);
     let host_owned = host.to_string();
-    let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
+    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
         (host_owned.as_str(), port)
             .to_socket_addrs()
             .map(|iter| iter.collect())
@@ -396,15 +377,120 @@ async fn validate_webhook_url(raw_url: &str) -> Result<()> {
             "webhook host '{host}' resolved to no addresses"
         )));
     }
-    for addr in addrs {
-        if is_forbidden_ssrf_ip(addr.ip()) {
+    for addr in &addrs {
+        if !is_public_routable_ip(addr.ip()) {
             return Err(ExposureError::AccessDenied(format!(
                 "webhook target '{host}' resolved to forbidden private/internal IP {}",
                 addr.ip()
             )));
         }
     }
-    Ok(())
+    reqwest::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, &addrs)
+        .build()
+        .map_err(|e| ExposureError::Link(format!("build webhook http client: {e}")))
+}
+
+fn ensure_non_acme_sync_domain(domain: &str) -> Result<String> {
+    let clean_dom = domain.trim().trim_end_matches('.');
+    let lower = clean_dom.to_ascii_lowercase();
+    if clean_dom == "*"
+        || lower == "_acme-challenge"
+        || lower.starts_with("_acme-challenge.")
+        || lower.contains("._acme-challenge.")
+    {
+        return Err(ExposureError::AccessDenied(format!(
+            "domain '{domain}' cannot be modified via Exposure DNS sync or editor"
+        )));
+    }
+    Ok(clean_dom.to_string())
+}
+
+fn read_der_tlv(data: &[u8], offset: usize) -> Option<(u8, &[u8], usize)> {
+    let tag = *data.get(offset)?;
+    let len_byte = *data.get(offset + 1)?;
+    let (len, hdr) = if len_byte & 0x80 == 0 {
+        (len_byte as usize, 2usize)
+    } else {
+        let num_octets = (len_byte & 0x7f) as usize;
+        if num_octets == 0 || num_octets > 4 || offset + 2 + num_octets > data.len() {
+            return None;
+        }
+        let mut v = 0usize;
+        for &b in &data[offset + 2..offset + 2 + num_octets] {
+            v = (v << 8) | (b as usize);
+        }
+        (v, 2 + num_octets)
+    };
+    let end = offset.checked_add(hdr)?.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((tag, &data[offset + hdr..end], end))
+}
+
+fn parse_asn1_time_unix(tag: u8, bytes: &[u8]) -> Option<i64> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let (year, rest) = match tag {
+        0x17 if s.len() == 13 && s.ends_with('Z') => {
+            let yy: i32 = s.get(0..2)?.parse().ok()?;
+            let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
+            (year, s.get(2..12)?)
+        }
+        0x18 if s.len() == 15 && s.ends_with('Z') => {
+            let year: i32 = s.get(0..4)?.parse().ok()?;
+            (year, s.get(4..14)?)
+        }
+        _ => return None,
+    };
+    let month: u32 = rest.get(0..2)?.parse().ok()?;
+    let day: u32 = rest.get(2..4)?.parse().ok()?;
+    let hour: u32 = rest.get(4..6)?.parse().ok()?;
+    let min: u32 = rest.get(6..8)?.parse().ok()?;
+    let sec: u32 = rest.get(8..10)?.parse().ok()?;
+    let dt = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    Some(dt.and_utc().timestamp())
+}
+
+/// Parse X.509 leaf certificate `Validity.notAfter` timestamp directly from DER without external subprocesses.
+pub(crate) fn parse_x509_not_after_unix(cert_pem: &str) -> Option<i64> {
+    let mut reader = BufReader::new(cert_pem.as_bytes());
+    let cert_der = rustls_pemfile::certs(&mut reader).next()?.ok()?;
+    let (cert_tag, cert_val, _) = read_der_tlv(cert_der.as_ref(), 0)?;
+    if cert_tag != 0x30 {
+        return None;
+    }
+    let (tbs_tag, tbs_val, _) = read_der_tlv(cert_val, 0)?;
+    if tbs_tag != 0x30 {
+        return None;
+    }
+    let mut off = 0usize;
+    let (tag0, _, next0) = read_der_tlv(tbs_val, off)?;
+    if tag0 == 0xA0 {
+        off = next0;
+    }
+    // serialNumber (INTEGER 0x02), signature (SEQUENCE 0x30), issuer (SEQUENCE 0x30)
+    let (t_ser, _, n_ser) = read_der_tlv(tbs_val, off)?;
+    if t_ser != 0x02 {
+        return None;
+    }
+    let (t_sig, _, n_sig) = read_der_tlv(tbs_val, n_ser)?;
+    if t_sig != 0x30 {
+        return None;
+    }
+    let (t_iss, _, n_iss) = read_der_tlv(tbs_val, n_sig)?;
+    if t_iss != 0x30 {
+        return None;
+    }
+    let (t_val, val_bytes, _) = read_der_tlv(tbs_val, n_iss)?;
+    if t_val != 0x30 {
+        return None;
+    }
+    let (_, _, not_after_off) = read_der_tlv(val_bytes, 0)?;
+    let (na_tag, na_bytes, _) = read_der_tlv(val_bytes, not_after_off)?;
+    parse_asn1_time_unix(na_tag, na_bytes)
 }
 
 /// Maintainer Mode Service (DESIGN.md §4, §12, §13):
@@ -424,6 +510,8 @@ pub struct MaintainerService {
     last_merge_latency_ms: Arc<Mutex<f64>>,
     http_client: reqwest::Client,
     shutdown_tx: watch::Sender<bool>,
+    state_dirty: AtomicBool,
+    last_state_persist: Mutex<Instant>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -575,13 +663,14 @@ impl MaintainerService {
                 );
             }
             Ok(None) => {
-                // Fallback: replay recent `.seg.jsonl` segment files if no state checkpoint exists yet
+                // Fallback: replay newest <=64 `.seg.jsonl` segment files if no state checkpoint exists yet
                 let seg_files = list_recent_segment_files(
                     Path::new(&cfg.logger.segment.dir),
                     &format!("maintainer-{tag}"),
                     retention_hours,
                 );
-                for path in seg_files.into_iter().take(64) {
+                let skip = seg_files.len().saturating_sub(64);
+                for path in seg_files.into_iter().skip(skip) {
                     if let Ok(rows) = read_segment_file::<SessionSummary>(&path) {
                         for mut rec in rows {
                             let min_epoch = ((rec.timestamp_ms / 1000) / 60) * 60;
@@ -609,7 +698,45 @@ impl MaintainerService {
                                     cfg.logger.histogram_buckets_ms.clone(),
                                 )
                             });
+                            let reps = rec.repeat_count.clamp(1, 100_000) as u64;
                             entry.record(&rec);
+                            if reps > 1 {
+                                let extra = reps - 1;
+                                entry.requests = entry.requests.saturating_add(extra);
+                                if rec.status >= 500 {
+                                    entry.errors = entry.errors.saturating_add(extra);
+                                }
+                                if rec.rate_limited {
+                                    entry.rate_limited = entry.rate_limited.saturating_add(extra);
+                                }
+                                if rec.challenged {
+                                    entry.challenges_issued =
+                                        entry.challenges_issued.saturating_add(extra);
+                                }
+                                if rec.challenge_passed {
+                                    entry.challenges_passed =
+                                        entry.challenges_passed.saturating_add(extra);
+                                }
+                                if rec.client_fp_verified {
+                                    entry.client_fp_verified =
+                                        entry.client_fp_verified.saturating_add(extra);
+                                }
+                                if let Some(ref d) = rec.device_type {
+                                    if let Some(c) = entry.device_counts.get_mut(d) {
+                                        *c = c.saturating_add(extra);
+                                    }
+                                }
+                                if let Some(ref b) = rec.browser_family {
+                                    if let Some(c) = entry.browser_counts.get_mut(b) {
+                                        *c = c.saturating_add(extra);
+                                    }
+                                }
+                                if let Some(ref o) = rec.os_family {
+                                    if let Some(c) = entry.os_counts.get_mut(o) {
+                                        *c = c.saturating_add(extra);
+                                    }
+                                }
+                            }
                             if init_recent_logs.len() >= max_recent_logs {
                                 init_recent_logs.pop_front();
                             }
@@ -656,6 +783,8 @@ impl MaintainerService {
             last_merge_latency_ms: Arc::new(Mutex::new(0.0)),
             http_client,
             shutdown_tx,
+            state_dirty: AtomicBool::new(false),
+            last_state_persist: Mutex::new(Instant::now()),
         }))
     }
 
@@ -678,14 +807,21 @@ impl MaintainerService {
 
         {
             let mut cs = self.cert_statuses.lock().await;
+            let active_domains: HashSet<&str> =
+                cfg.acme.orders.iter().map(|o| o.domain.as_str()).collect();
+            cs.retain(|dom, _| active_domains.contains(dom.as_str()));
             for order in &cfg.acme.orders {
-                cs.entry(order.domain.clone()).or_insert_with(|| CertStatusInfo {
-                    domain: order.domain.clone(),
-                    targets: order.target_nodes.clone(),
-                    expires_at: None,
-                    last_renewed: None,
-                    status: "pending".into(),
-                });
+                cs.entry(order.domain.clone())
+                    .and_modify(|existing| {
+                        existing.targets = order.target_nodes.clone();
+                    })
+                    .or_insert_with(|| CertStatusInfo {
+                        domain: order.domain.clone(),
+                        targets: order.target_nodes.clone(),
+                        expires_at: None,
+                        last_renewed: None,
+                        status: "pending".into(),
+                    });
             }
         }
         *self.cfg.write().await = cfg;
@@ -806,73 +942,120 @@ impl MaintainerService {
         }
 
         *self.last_merge_latency_ms.lock().await = start.elapsed().as_secs_f64() * 1000.0;
-        rec_count + accepted_summaries + accepted_fps
+        let total = rec_count + accepted_summaries + accepted_fps;
+        if total > 0 {
+            self.state_dirty.store(true, Ordering::Relaxed);
+        }
+        total
     }
 
     pub async fn flush_segments(&self) -> Result<()> {
-        let (dir, retention_hours, max_summaries, max_fps) = {
-            let c = self.cfg.read().await;
-            (
-                c.logger.segment.dir.clone(),
-                c.logger.segment.retention_hours.max(1),
-                c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
-                c.logger
-                    .segment
-                    .max_fingerprints
-                    .clamp(100, MAX_MERGED_FINGERPRINTS),
-            )
-        };
-        let now_ts = Utc::now().timestamp();
-        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
-        let max_allowed = now_ts.saturating_add(300);
+        self.flush_segments_inner(true).await
+    }
 
-        let summaries: Vec<MinuteSummary> = {
-            let mut map = self.merged_summaries.lock().await;
-            prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
-            map.values().cloned().collect()
+    async fn flush_segments_inner(&self, force_state_persist: bool) -> Result<()> {
+        const STATE_PERSIST_CADENCE: Duration = Duration::from_secs(30);
+
+        let should_persist_state = if self.state_dirty.load(Ordering::Acquire) {
+            if force_state_persist {
+                true
+            } else {
+                let last = *self.last_state_persist.lock().await;
+                last.elapsed() >= STATE_PERSIST_CADENCE
+            }
+        } else {
+            false
         };
-        let fingerprints: Vec<FingerprintObservation> = {
-            let mut fp_map = self.merged_fingerprints.lock().await;
-            prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
-            fp_map.values().cloned().collect()
-        };
-        let recent_logs: Vec<SessionSummary> = {
-            let q = self.recent_logs.lock().await;
-            let skip = q.len().saturating_sub(1000);
-            q.iter().skip(skip).cloned().collect()
-        };
-        let alerts = self.alerts.lock().await.clone();
-        let state_path = maintainer_state_path(&dir, &self.node_tag);
-        let state = MaintainerPersistedState {
-            summaries,
-            fingerprints,
-            recent_logs,
-            alerts,
+
+        let state_payload = if should_persist_state {
+            self.state_dirty.store(false, Ordering::Release);
+            *self.last_state_persist.lock().await = Instant::now();
+            let (dir, retention_hours, max_summaries, max_fps) = {
+                let c = self.cfg.read().await;
+                (
+                    c.logger.segment.dir.clone(),
+                    c.logger.segment.retention_hours.max(1),
+                    c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
+                    c.logger
+                        .segment
+                        .max_fingerprints
+                        .clamp(100, MAX_MERGED_FINGERPRINTS),
+                )
+            };
+            let now_ts = Utc::now().timestamp();
+            let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
+            let max_allowed = now_ts.saturating_add(300);
+
+            let summaries: Vec<MinuteSummary> = {
+                let mut map = self.merged_summaries.lock().await;
+                prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
+                map.values().cloned().collect()
+            };
+            let fingerprints: Vec<FingerprintObservation> = {
+                let mut fp_map = self.merged_fingerprints.lock().await;
+                prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
+                fp_map.values().cloned().collect()
+            };
+            let recent_logs: Vec<SessionSummary> = {
+                let q = self.recent_logs.lock().await;
+                let skip = q.len().saturating_sub(1000);
+                q.iter().skip(skip).cloned().collect()
+            };
+            let alerts = self.alerts.lock().await.clone();
+            Some((
+                maintainer_state_path(&dir, &self.node_tag),
+                MaintainerPersistedState {
+                    summaries,
+                    fingerprints,
+                    recent_logs,
+                    alerts,
+                },
+            ))
+        } else {
+            None
         };
 
         let writer = Arc::clone(&self.segment_writer);
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let state_write_res = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
             let _ = w.flush()?;
             let _ = w.enforce_limits();
-            write_json_snapshot_atomic(&state_path, &state)?;
+            if let Some((state_path, state)) = state_payload {
+                write_json_snapshot_atomic(&state_path, &state)?;
+            }
             Ok(())
         })
         .await
-        .map_err(|e| ExposureError::Storage(format!("maintainer flush join: {e}")))?
+        .map_err(|e| ExposureError::Storage(format!("maintainer flush join: {e}")))?;
+
+        if state_write_res.is_err() && should_persist_state {
+            self.state_dirty.store(true, Ordering::Relaxed);
+        }
+        state_write_res
     }
 
-    /// Build telemetry snapshot for Control's active Pull RPC.
+    /// Build bounded telemetry snapshot for Control's active Pull RPC.
     pub async fn build_telemetry_snapshot(
         &self,
         since_minute: Option<i64>,
     ) -> MaintainerTelemetrySnapshot {
+        const MAX_PULL_SUMMARIES: usize = 2000;
+        const MAX_PULL_FINGERPRINTS: usize = 1500;
+        const MAX_PULL_LOGS: usize = 2000;
+        const MAX_PULL_ALERTS: usize = 200;
+
         let summaries = {
             let map = self.merged_summaries.lock().await;
-            map.values()
+            let mut list: Vec<MinuteSummary> = map
+                .values()
                 .filter(|s| since_minute.map(|m| s.minute_epoch >= m).unwrap_or(true))
                 .cloned()
-                .collect()
+                .collect();
+            if list.len() > MAX_PULL_SUMMARIES {
+                list.sort_by(|a, b| b.minute_epoch.cmp(&a.minute_epoch));
+                list.truncate(MAX_PULL_SUMMARIES);
+            }
+            list
         };
         let fingerprints = {
             let fp_map = self.merged_fingerprints.lock().await;
@@ -882,7 +1065,7 @@ impl MaintainerService {
                 .cloned()
                 .collect();
             list.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
-            list.truncate(5000);
+            list.truncate(MAX_PULL_FINGERPRINTS);
             list
         };
         let recent_logs: Vec<SessionSummary> = {
@@ -894,7 +1077,7 @@ impl MaintainerService {
                 .cloned()
                 .collect();
             list.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-            list.truncate(1000);
+            list.truncate(MAX_PULL_LOGS);
             list
         };
         let certificates = self
@@ -910,7 +1093,11 @@ impl MaintainerService {
             .unwrap_or_else(|e| e.into_inner())
             .pending_count();
         let merge_latency_ms = *self.last_merge_latency_ms.lock().await;
-        let alerts = self.alerts.lock().await.clone();
+        let alerts = {
+            let a = self.alerts.lock().await;
+            let skip = a.len().saturating_sub(MAX_PULL_ALERTS);
+            a.iter().skip(skip).cloned().collect()
+        };
 
         MaintainerTelemetrySnapshot {
             maintainer_tag: self.node_tag.clone(),
@@ -942,6 +1129,7 @@ impl MaintainerService {
             let drain = a.len() - 200;
             a.drain(0..drain);
         }
+        self.state_dirty.store(true, Ordering::Relaxed);
     }
 
     async fn call_alidns_api(
@@ -1301,11 +1489,15 @@ impl MaintainerService {
                 let desired: BTreeSet<String> = desired_list
                     .iter()
                     .map(|s| {
-                        if rtype == "CNAME" {
-                            s.trim().trim_end_matches('.').to_string()
-                        } else {
-                            s.trim().to_string()
-                        }
+                        validate_exposure_dns_record(rtype, s)
+                            .map(|(_, norm)| norm)
+                            .unwrap_or_else(|_| {
+                                if rtype == "CNAME" {
+                                    s.trim().trim_end_matches('.').to_string()
+                                } else {
+                                    s.trim().to_string()
+                                }
+                            })
                     })
                     .filter(|s| !s.is_empty())
                     .collect();
@@ -1317,11 +1509,15 @@ impl MaintainerService {
                     .filter(|r| r["Type"].as_str() == Some(rtype))
                 {
                     let raw_val = rec["Value"].as_str().unwrap_or("");
-                    let norm_val = if rtype == "CNAME" {
-                        raw_val.trim().trim_end_matches('.')
-                    } else {
-                        raw_val.trim()
-                    };
+                    let norm_val = validate_exposure_dns_record(rtype, raw_val)
+                        .map(|(_, norm)| norm)
+                        .unwrap_or_else(|_| {
+                            if rtype == "CNAME" {
+                                raw_val.trim().trim_end_matches('.').to_string()
+                            } else {
+                                raw_val.trim().to_string()
+                            }
+                        });
                     let Some(rec_id) = rec["RecordId"]
                         .as_str()
                         .map(str::to_string)
@@ -1331,11 +1527,12 @@ impl MaintainerService {
                     };
                     validate_aliyun_record_id(&rec_id)?;
 
-                    if desired.contains(norm_val) && matched_vals.insert(norm_val.to_string()) {
+                    if desired.contains(&norm_val) && matched_vals.insert(norm_val.clone()) {
                         let rec_disabled = rec["Status"]
                             .as_str()
                             .map(|s| s.eq_ignore_ascii_case("DISABLE"))
                             .unwrap_or(false);
+                        let mut changed = false;
                         if rec["TTL"].as_u64() != Some(ttl as u64) {
                             self.call_alidns_api(
                                 base_url,
@@ -1346,14 +1543,15 @@ impl MaintainerService {
                                     ("RecordId", &rec_id),
                                     ("RR", &rr),
                                     ("Type", rtype),
-                                    ("Value", norm_val),
+                                    ("Value", &norm_val),
                                     ("Line", &line),
                                     ("TTL", &ttl_str),
                                 ],
                             )
                             .await?;
-                            updated += 1;
-                        } else if rec_disabled {
+                            changed = true;
+                        }
+                        if rec_disabled {
                             self.call_alidns_api(
                                 base_url,
                                 access_key_id,
@@ -1362,6 +1560,9 @@ impl MaintainerService {
                                 &[("RecordId", &rec_id), ("Status", "Enable")],
                             )
                             .await?;
+                            changed = true;
+                        }
+                        if changed {
                             updated += 1;
                         } else {
                             unchanged += 1;
@@ -1880,10 +2081,16 @@ impl MaintainerService {
         let mut eff_proxied = default_proxied;
         for e in &entries {
             for ip in &e.ipv4s {
-                merged_v4.insert(ip.trim().to_string());
+                let norm = validate_exposure_dns_record("A", ip)
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|_| ip.trim().to_string());
+                merged_v4.insert(norm);
             }
             for ip in &e.ipv6s {
-                merged_v6.insert(ip.trim().to_string());
+                let norm = validate_exposure_dns_record("AAAA", ip)
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|_| ip.trim().to_string());
+                merged_v6.insert(norm);
             }
             for cn in &e.cnames {
                 merged_cname.insert(cn.trim().trim_end_matches('.').to_string());
@@ -1952,8 +2159,17 @@ impl MaintainerService {
                     continue;
                 };
                 validate_cloudflare_id(id, "record_id")?;
-                let content = rec["content"].as_str().unwrap_or("");
-                if desired.contains(content) && matched_ips.insert(content.to_string()) {
+                let raw_content = rec["content"].as_str().unwrap_or("");
+                let norm_content = validate_exposure_dns_record(rtype, raw_content)
+                    .map(|(_, norm)| norm)
+                    .unwrap_or_else(|_| {
+                        if rtype == "CNAME" {
+                            raw_content.trim().trim_end_matches('.').to_string()
+                        } else {
+                            raw_content.trim().to_string()
+                        }
+                    });
+                if desired.contains(norm_content.as_str()) && matched_ips.insert(norm_content.clone()) {
                     let cur_ttl = rec["ttl"].as_u64();
                     let cur_proxied = rec["proxied"].as_bool().unwrap_or(false);
                     if cur_ttl != Some(ttl as u64) || cur_proxied != proxied {
@@ -1965,7 +2181,7 @@ impl MaintainerService {
                             .json(&serde_json::json!({
                                 "type": rtype,
                                 "name": rec_name,
-                                "content": content,
+                                "content": norm_content,
                                 "ttl": ttl,
                                 "proxied": proxied,
                             }))
@@ -2308,12 +2524,7 @@ impl MaintainerService {
             | DnsManageOp::Delete { domain, .. } => domain.as_str(),
         };
         validate_dns_domain(domain)?;
-        let clean_dom = domain.trim().trim_end_matches('.');
-        if clean_dom == "*" || clean_dom.to_ascii_lowercase().starts_with("_acme-challenge.") {
-            return Err(ExposureError::AccessDenied(format!(
-                "domain '{domain}' cannot be managed via Exposure DNS record editor"
-            )));
-        }
+        let _clean_dom = ensure_non_acme_sync_domain(domain)?;
         let binding = resolve_domain_binding(&cfg.domains, domain)
             .map(|(_, b)| b)
             .ok_or_else(|| {
@@ -2408,27 +2619,44 @@ impl MaintainerService {
         spec: &DnsSyncRecordSpec,
     ) -> Result<DnsSyncDomainResult> {
         validate_dns_domain(&spec.domain)?;
-        if spec.domain.trim() == "*" {
-            return Err(ExposureError::Config(
-                "cannot sync DNS records for bare wildcard '*'".into(),
-            ));
-        }
-        let entries = effective_sync_line_entries(spec);
+        let clean_domain = ensure_non_acme_sync_domain(&spec.domain)?;
+
+        let raw_entries = effective_sync_line_entries(spec);
+        let mut canonical_entries: Vec<DnsLineSyncEntry> = Vec::with_capacity(raw_entries.len());
+        let mut flat_v4: BTreeSet<String> = BTreeSet::new();
+        let mut flat_v6: BTreeSet<String> = BTreeSet::new();
         let mut total_targets = 0usize;
-        for entry in &entries {
-            validate_dns_line_code(&entry.line)?;
+
+        for entry in &raw_entries {
+            let norm_line = validate_dns_line_code(&entry.line)?;
+            let mut v4s = Vec::new();
+            let mut v6s = Vec::new();
+            let mut cnames = Vec::new();
             for raw in &entry.ipv4s {
-                validate_exposure_dns_record("A", raw)?;
+                let (_, norm) = validate_exposure_dns_record("A", raw)?;
+                flat_v4.insert(norm.clone());
+                v4s.push(norm);
                 total_targets += 1;
             }
             for raw in &entry.ipv6s {
-                validate_exposure_dns_record("AAAA", raw)?;
+                let (_, norm) = validate_exposure_dns_record("AAAA", raw)?;
+                flat_v6.insert(norm.clone());
+                v6s.push(norm);
                 total_targets += 1;
             }
             for raw in &entry.cnames {
-                validate_exposure_dns_record("CNAME", raw)?;
+                let (_, norm) = validate_exposure_dns_record("CNAME", raw)?;
+                cnames.push(norm);
                 total_targets += 1;
             }
+            canonical_entries.push(DnsLineSyncEntry {
+                line: norm_line,
+                ipv4s: v4s,
+                ipv6s: v6s,
+                cnames,
+                ttl: entry.ttl,
+                proxied: entry.proxied,
+            });
         }
         if total_targets == 0 {
             return Err(ExposureError::Config(format!(
@@ -2438,54 +2666,91 @@ impl MaintainerService {
         }
 
         // Scope enforcement: only domains explicitly configured in `maintainer.domains` may be
-        // mutated. Without this, a signed `DnsSyncReq` could create/update/delete records in any
-        // zone reachable by the configured provider credentials (see `manage_dns`, which enforces
-        // the same binding check).
-        let binding = resolve_domain_binding(&cfg.domains, &spec.domain).ok_or_else(|| {
+        // mutated, and caller-supplied provider / zone_id / root_domain cannot override the binding.
+        let binding = resolve_domain_binding(&cfg.domains, &clean_domain).ok_or_else(|| {
             ExposureError::Config(format!(
                 "domain '{}' is not authorized in maintainer domains (no DNS provider configured for this zone)",
                 spec.domain
             ))
         })?;
         let binding = binding.1;
-        let provider_name = spec
+        let bound_provider = binding.provider.trim();
+        let spec_provider = spec
             .provider
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| binding.provider.trim());
-        if provider_name.is_empty() {
-            return Err(ExposureError::Config(format!(
-                "domain '{}' has no DNS provider configured",
-                spec.domain
-            )));
-        }
+            .filter(|s| !s.is_empty());
+        let provider_name = if !bound_provider.is_empty() {
+            if let Some(sp) = spec_provider {
+                if sp != bound_provider {
+                    return Err(ExposureError::AccessDenied(format!(
+                        "DNS sync provider '{sp}' does not match configured binding provider '{bound_provider}' for '{}'",
+                        spec.domain
+                    )));
+                }
+            }
+            bound_provider
+        } else {
+            spec_provider.ok_or_else(|| {
+                ExposureError::Config(format!(
+                    "domain '{}' has no DNS provider configured",
+                    spec.domain
+                ))
+            })?
+        };
         let provider = cfg.dns_providers.get(provider_name).ok_or_else(|| {
             ExposureError::Config(format!(
                 "maintainer missing DNS provider credentials for '{provider_name}'"
             ))
         })?;
 
-        let eff_zone_id = spec
+        let bound_zone = binding
             .zone_id
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or(binding.zone_id.as_deref());
-        let eff_root = spec
+            .filter(|s| !s.is_empty());
+        let spec_zone = spec
+            .zone_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(bz), Some(sz)) = (bound_zone, spec_zone) {
+            if bz != sz {
+                return Err(ExposureError::AccessDenied(format!(
+                    "DNS sync zone_id '{sz}' does not match configured binding zone_id '{bz}' for '{}'",
+                    spec.domain
+                )));
+            }
+        }
+        let eff_zone_id = bound_zone.or(spec_zone);
+
+        let bound_root = binding
             .root_domain
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or(binding.root_domain.as_deref());
+            .filter(|s| !s.is_empty());
+        let spec_root = spec
+            .root_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(br), Some(sr)) = (bound_root, spec_root) {
+            if !br.eq_ignore_ascii_case(sr) {
+                return Err(ExposureError::AccessDenied(format!(
+                    "DNS sync root_domain '{sr}' does not match configured binding root_domain '{br}' for '{}'",
+                    spec.domain
+                )));
+            }
+        }
+        let eff_root = bound_root.or(spec_root);
         let eff_ttl = spec.ttl.or(Some(binding.ttl));
         let eff_proxied = spec.proxied.or(Some(binding.proxied));
 
         let eff_spec = DnsSyncRecordSpec {
-            domain: spec.domain.clone(),
-            ipv4s: spec.ipv4s.clone(),
-            ipv6s: spec.ipv6s.clone(),
-            line_entries: spec.line_entries.clone(),
+            domain: clean_domain,
+            ipv4s: flat_v4.into_iter().collect(),
+            ipv6s: flat_v6.into_iter().collect(),
+            line_entries: canonical_entries,
             provider: Some(provider_name.to_string()),
             zone_id: eff_zone_id.map(str::to_string),
             root_domain: eff_root.map(str::to_string),
@@ -2539,12 +2804,13 @@ impl MaintainerService {
                             "webhook provider '{provider_name}' missing sync_url for DNS A/AAAA sync"
                         ))
                     })?;
-                validate_webhook_url(url).await?;
-                let mut req = self.http_client.post(url).json(&serde_json::json!({
+                let webhook_client = build_ssrf_pinned_webhook_client(url).await?;
+                let mut req = webhook_client.post(url).json(&serde_json::json!({
                     "action": "sync",
                     "domain": eff_spec.domain,
                     "ipv4s": eff_spec.ipv4s,
                     "ipv6s": eff_spec.ipv6s,
+                    "line_entries": eff_spec.line_entries,
                     "ttl": eff_spec.ttl.unwrap_or(600),
                     "proxied": eff_spec.proxied.unwrap_or(false),
                 }));
@@ -2577,18 +2843,16 @@ impl MaintainerService {
                         "DNS exec hook disabled by default; set EXPOSURE_ALLOW_EXEC_HOOK=1 on maintainer host to opt in".into(),
                     ));
                 }
-                let status = tokio::time::timeout(
-                    EXEC_HOOK_TIMEOUT,
-                    Command::new(command)
-                        .args(args)
-                        .arg("sync")
-                        .arg(&eff_spec.domain)
-                        .arg(eff_spec.ipv4s.join(","))
-                        .arg(eff_spec.ipv6s.join(","))
-                        .status(),
-                )
-                .await
-                .map_err(|_| ExposureError::Link("exec dns sync timed out".into()))??;
+                let mut cmd = Command::new(command);
+                cmd.kill_on_drop(true)
+                    .args(args)
+                    .arg("sync")
+                    .arg(&eff_spec.domain)
+                    .arg(eff_spec.ipv4s.join(","))
+                    .arg(eff_spec.ipv6s.join(","));
+                let status = tokio::time::timeout(EXEC_HOOK_TIMEOUT, cmd.status())
+                    .await
+                    .map_err(|_| ExposureError::Link("exec dns sync timed out".into()))??;
                 if !status.success() {
                     return Err(ExposureError::Protocol(format!(
                         "exec dns sync exited with {status}"
@@ -2653,8 +2917,8 @@ impl MaintainerService {
                 auth_header,
                 ..
             } => {
-                validate_webhook_url(present_url).await?;
-                let mut req = self.http_client.post(present_url).json(&serde_json::json!({
+                let webhook_client = build_ssrf_pinned_webhook_client(present_url).await?;
+                let mut req = webhook_client.post(present_url).json(&serde_json::json!({
                     "action": "present",
                     "domain": domain,
                     "fqdn": fqdn,
@@ -2681,17 +2945,15 @@ impl MaintainerService {
                         "DNS-01 exec hook disabled by default; set EXPOSURE_ALLOW_EXEC_HOOK=1 on maintainer host to opt in".into(),
                     ));
                 }
-                let status = tokio::time::timeout(
-                    EXEC_HOOK_TIMEOUT,
-                    Command::new(command)
-                        .args(args)
-                        .arg("present")
-                        .arg(&fqdn)
-                        .arg(txt_value)
-                        .status(),
-                )
-                .await
-                .map_err(|_| ExposureError::Link("exec dns01 present timed out".into()))??;
+                let mut cmd = Command::new(command);
+                cmd.kill_on_drop(true)
+                    .args(args)
+                    .arg("present")
+                    .arg(&fqdn)
+                    .arg(txt_value);
+                let status = tokio::time::timeout(EXEC_HOOK_TIMEOUT, cmd.status())
+                    .await
+                    .map_err(|_| ExposureError::Link("exec dns01 present timed out".into()))??;
                 if !status.success() {
                     return Err(ExposureError::Protocol(format!(
                         "exec dns01 present exited with {status}"
@@ -2749,8 +3011,8 @@ impl MaintainerService {
                 auth_header,
                 ..
             } => {
-                validate_webhook_url(cleanup_url).await?;
-                let mut req = self.http_client.post(cleanup_url).json(&serde_json::json!({
+                let webhook_client = build_ssrf_pinned_webhook_client(cleanup_url).await?;
+                let mut req = webhook_client.post(cleanup_url).json(&serde_json::json!({
                     "action": "cleanup",
                     "domain": domain,
                     "fqdn": fqdn,
@@ -2766,16 +3028,13 @@ impl MaintainerService {
                 if std::env::var("EXPOSURE_ALLOW_EXEC_HOOK").ok().as_deref() != Some("1") {
                     return Ok(());
                 }
-                let _ = tokio::time::timeout(
-                    EXEC_HOOK_TIMEOUT,
-                    Command::new(command)
-                        .args(args)
-                        .arg("cleanup")
-                        .arg(&fqdn)
-                        .arg(txt_value)
-                        .status(),
-                )
-                .await;
+                let mut cmd = Command::new(command);
+                cmd.kill_on_drop(true)
+                    .args(args)
+                    .arg("cleanup")
+                    .arg(&fqdn)
+                    .arg(txt_value);
+                let _ = tokio::time::timeout(EXEC_HOOK_TIMEOUT, cmd.status()).await;
                 Ok(())
             }
         }
@@ -2863,6 +3122,7 @@ impl MaintainerService {
                 })?;
                 let acme_http = reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .map_err(|e| ExposureError::Link(format!("ACME HTTP client: {e}")))?;
                 crate::acme::issue_acme_dns01_cert(
@@ -2891,7 +3151,8 @@ impl MaintainerService {
             };
 
             let iat = now.timestamp();
-            let exp = (now + ChronoDuration::days(90)).timestamp();
+            let exp = parse_x509_not_after_unix(&c)
+                .unwrap_or_else(|| (now + ChronoDuration::days(90)).timestamp());
 
             // Persist certificate locally on Maintainer (strict domain validation + atomic 0600 private key!)
             if !cfg.acme.storage_dir.is_empty() {
@@ -3015,6 +3276,7 @@ impl MaintainerService {
                 status: if all_ok { "valid".into() } else { "degraded".into() },
             },
         );
+        self.state_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3039,17 +3301,18 @@ impl MaintainerService {
                     }
                     _ = tokio::time::sleep(Duration::from_secs(flush_secs)) => {}
                 }
-                if let Err(e) = this.flush_segments().await {
+                if let Err(e) = this.flush_segments_inner(false).await {
                     warn!(error = %e, "maintainer periodic segment flush failed");
                 }
             }
         });
 
-        // Periodic certificate renewal check honoring `order.renew_before_days`
+        // Periodic certificate renewal check honoring `order.renew_before_days` + exponential backoff
         let this2 = Arc::clone(self);
         let mut rx2 = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let mut retry_after: HashMap<String, DateTime<Utc>> = HashMap::new();
+            let mut fail_counts: HashMap<String, u32> = HashMap::new();
             loop {
                 tokio::select! {
                     _ = rx2.changed() => {
@@ -3097,8 +3360,21 @@ impl MaintainerService {
                     };
                     if needs_issue {
                         if let Err(e) = this2.issue_and_distribute_order(order, &forwarder).await {
-                            retry_after.insert(order.domain.clone(), now + ChronoDuration::minutes(15));
-                            warn!(domain = %order.domain, error = %e, "certificate renewal failed (backing off 15m)");
+                            let fails = fail_counts
+                                .entry(order.domain.clone())
+                                .and_modify(|c| *c = c.saturating_add(1))
+                                .or_insert(1);
+                            let backoff_mins = (15i64 << (*fails - 1).min(5)).min(360);
+                            retry_after.insert(
+                                order.domain.clone(),
+                                now + ChronoDuration::minutes(backoff_mins),
+                            );
+                            warn!(
+                                domain = %order.domain,
+                                error = %e,
+                                backoff_mins,
+                                "certificate renewal failed (exponential backoff)"
+                            );
                             this2
                                 .record_alert(
                                     "error",
@@ -3106,7 +3382,22 @@ impl MaintainerService {
                                 )
                                 .await;
                         } else {
-                            retry_after.remove(&order.domain);
+                            let still_degraded = this2
+                                .cert_statuses
+                                .lock()
+                                .await
+                                .get(&order.domain)
+                                .map(|s| s.status != "valid")
+                                .unwrap_or(false);
+                            if still_degraded {
+                                retry_after.insert(
+                                    order.domain.clone(),
+                                    now + ChronoDuration::minutes(5),
+                                );
+                            } else {
+                                retry_after.remove(&order.domain);
+                                fail_counts.remove(&order.domain);
+                            }
                         }
                     }
                 }
@@ -3131,23 +3422,23 @@ fn load_valid_cached_cert(
         return None;
     }
 
+    let real_exp = parse_x509_not_after_unix(&cert_pem);
     let meta_path = dir.join(format!("{safe}.meta.json"));
     let (issued_at, expires_at) = if let Ok(raw) = std::fs::read_to_string(&meta_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
             let iat = val.get("issued_at").and_then(|v| v.as_i64());
             let exp = val.get("expires_at").and_then(|v| v.as_i64());
             match (iat, exp) {
-                (Some(i), Some(e)) => (i, e),
+                (Some(i), Some(e)) => (i, real_exp.map_or(e, |re| e.min(re))),
                 _ => return None,
             }
         } else {
             return None;
         }
     } else {
-        // Fallback to cert file mtime (90-day standard ACME lifetime)
         let mtime = std::fs::metadata(&crt_path).ok()?.modified().ok()?;
         let iat = DateTime::<Utc>::from(mtime).timestamp();
-        let exp = iat + 90 * 86_400;
+        let exp = real_exp.unwrap_or_else(|| iat + 90 * 86_400);
         (iat, exp)
     };
 
@@ -3888,5 +4179,24 @@ mod tests {
         assert_eq!(snap.summaries[0].requests, 42);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn x509_not_after_der_and_pem_parsing() {
+        let (cert_pem, _) = generate_self_signed_pem("cert-parse.example.com").unwrap();
+        let exp = parse_x509_not_after_unix(&cert_pem).expect("parse rcgen X.509 notAfter");
+        assert!(exp > Utc::now().timestamp());
+
+        // Direct UTCTime & GeneralizedTime vector checks
+        let utc_ts = parse_asn1_time_unix(0x17, b"291231235959Z").unwrap();
+        let gen_ts = parse_asn1_time_unix(0x18, b"20550615120000Z").unwrap();
+        assert!(utc_ts < gen_ts);
+        assert!(parse_asn1_time_unix(0x17, b"bad").is_none());
+
+        // ACME challenge domain tamper rejection
+        assert!(ensure_non_acme_sync_domain("_acme-challenge.app.example.com").is_err());
+        assert!(ensure_non_acme_sync_domain("sub._acme-challenge.example.com").is_err());
+        assert!(ensure_non_acme_sync_domain("*").is_err());
+        assert!(ensure_non_acme_sync_domain("app.example.com").is_ok());
     }
 }

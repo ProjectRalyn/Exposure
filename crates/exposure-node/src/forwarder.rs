@@ -11,7 +11,7 @@ use exposure_core::protocol::{
 use exposure_core::{ExposureError, Result};
 use exposure_link::{IncomingMuxStream, LinkManager};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
 use tracing::{debug, warn};
 
 use crate::egress::EgressHandler;
@@ -20,6 +20,9 @@ use crate::logger::NodeLogger;
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BOOTSTRAP_FRAME_BYTES: usize = 64 * 1024;
 const RELAY_COPY_TIMEOUT: Duration = Duration::from_secs(3600);
+const MAX_CONCURRENT_SERVICE_STREAMS: usize = 2048;
+const MAX_CONCURRENT_SPECIAL_STREAMS: usize = 256;
+const MAX_CONCURRENT_BOOTSTRAP_STREAMS: usize = 64;
 
 pub trait ServiceIo: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServiceIo for T {}
@@ -48,7 +51,10 @@ pub struct Forwarder {
     egress: Arc<EgressHandler>,
     logger: Arc<NodeLogger>,
     special_tx: mpsc::Sender<IncomingSpecialFrame>,
-    pending_replies: Arc<DashMap<String, oneshot::Sender<SpecialFrame>>>,
+    pending_replies: Arc<DashMap<(StreamKind, String), oneshot::Sender<SpecialFrame>>>,
+    service_sem: Arc<Semaphore>,
+    special_sem: Arc<Semaphore>,
+    bootstrap_sem: Arc<Semaphore>,
 }
 
 impl Forwarder {
@@ -70,6 +76,9 @@ impl Forwarder {
             logger,
             special_tx,
             pending_replies: Arc::new(DashMap::new()),
+            service_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SERVICE_STREAMS)),
+            special_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SPECIAL_STREAMS)),
+            bootstrap_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_BOOTSTRAP_STREAMS)),
         });
         (fwd, special_rx)
     }
@@ -88,6 +97,12 @@ impl Forwarder {
         header: ServiceStreamHeader,
     ) -> Result<BoxedServiceIo> {
         if next_peer == self.node_tag || next_peer.eq_ignore_ascii_case("local") {
+            if !self.roles.read().await.egress {
+                return Err(ExposureError::Routing(format!(
+                    "node {} does not have egress role enabled for local service {}",
+                    self.node_tag, header.service_tag
+                )));
+            }
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let egress = Arc::clone(&self.egress);
             let self_tag = self.node_tag.clone();
@@ -180,25 +195,33 @@ impl Forwarder {
         kind: StreamKind,
         timeout: Duration,
     ) -> Result<SpecialFrame> {
-        let id = frame.id.clone();
+        let key = (kind, frame.id.clone());
         let (tx, rx) = oneshot::channel();
-        self.pending_replies.insert(id.clone(), tx);
+        self.pending_replies.insert(key.clone(), tx);
 
-        if let Err(e) = self.send_special_with_kind(frame, kind).await {
-            self.pending_replies.remove(&id);
-            return Err(e);
+        struct PendingGuard {
+            map: Arc<DashMap<(StreamKind, String), oneshot::Sender<SpecialFrame>>>,
+            key: (StreamKind, String),
         }
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.map.remove(&self.key);
+            }
+        }
+        let _guard = PendingGuard {
+            map: Arc::clone(&self.pending_replies),
+            key: key.clone(),
+        };
+
+        self.send_special_with_kind(frame, kind).await?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Err(ExposureError::Link("special RPC waiter cancelled".into())),
-            Err(_) => {
-                self.pending_replies.remove(&id);
-                Err(ExposureError::Link(format!(
-                    "special RPC {id} timed out after {:?}",
-                    timeout
-                )))
-            }
+            Err(_) => Err(ExposureError::Link(format!(
+                "special RPC {} timed out after {:?}",
+                key.1, timeout
+            ))),
         }
     }
 
@@ -209,7 +232,8 @@ impl Forwarder {
     /// (replies reuse the request id) and the waiter would receive the request as its "reply".
     async fn deliver_local_special(&self, incoming: IncomingSpecialFrame, match_pending: bool) {
         if match_pending {
-            if let Some((_, waiter)) = self.pending_replies.remove(&incoming.frame.id) {
+            let key = (incoming.stream_kind, incoming.frame.id.clone());
+            if let Some((_, waiter)) = self.pending_replies.remove(&key) {
                 let _ = waiter.send(incoming.frame);
                 return;
             }
@@ -238,9 +262,18 @@ impl Forwarder {
                     );
                     return;
                 }
+                let Ok(permit) = Arc::clone(&self.service_sem).try_acquire_owned() else {
+                    warn!(
+                        node = %self.node_tag,
+                        remote = %incoming.remote_node_tag,
+                        "dropped service stream: concurrent stream limit reached"
+                    );
+                    return;
+                };
                 let fwd = Arc::clone(self);
                 let remote_tag = incoming.remote_node_tag;
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = fwd
                         .process_service_stream(remote_tag, incoming.stream)
                         .await
@@ -257,16 +290,34 @@ impl Forwarder {
                     );
                     return;
                 }
+                let Ok(permit) = Arc::clone(&self.special_sem).try_acquire_owned() else {
+                    warn!(
+                        node = %self.node_tag,
+                        remote = %incoming.remote_node_tag,
+                        "dropped special stream: concurrent stream limit reached"
+                    );
+                    return;
+                };
                 let fwd = Arc::clone(self);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = fwd.process_special_stream(incoming).await {
                         warn!(error = %e, "special frame processing failed");
                     }
                 });
             }
             StreamKind::Bootstrap => {
+                let Ok(permit) = Arc::clone(&self.bootstrap_sem).try_acquire_owned() else {
+                    warn!(
+                        node = %self.node_tag,
+                        remote = %incoming.remote_node_tag,
+                        "dropped bootstrap stream: concurrent stream limit reached"
+                    );
+                    return;
+                };
                 let fwd = Arc::clone(self);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = fwd.process_bootstrap_stream(incoming).await {
                         warn!(error = %e, "bootstrap stream processing failed");
                     }
@@ -370,10 +421,18 @@ impl Forwarder {
             ));
         }
 
-        if !frame.is_final_hop(&self.node_tag) {
+        if frame.hops.len() != 2 || frame.hop_index != 1 || !frame.is_final_hop(&self.node_tag) {
             return Err(ExposureError::Auth(
                 "bootstrap stream may only target the directly connected node".into(),
             ));
+        }
+        if incoming.authenticated && frame.prev_hop() != Some(incoming.remote_node_tag.as_str()) {
+            return Err(ExposureError::Auth(format!(
+                "bootstrap frame {} prev_hop {:?} != authenticated link peer '{}'",
+                frame.id,
+                frame.prev_hop(),
+                incoming.remote_node_tag
+            )));
         }
 
         self.deliver_local_special(
@@ -399,7 +458,13 @@ impl Forwarder {
 
         frame.validate_hops()?;
 
-        // Verify this node is the expected hop and the previous hop matches the authenticated peer
+        // Verify this node is the expected hop (`hop_index >= 1`) and the previous hop matches the authenticated peer
+        if frame.hop_index == 0 {
+            return Err(ExposureError::Routing(format!(
+                "special frame {} received with hop_index=0 at node {}",
+                frame.id, self.node_tag
+            )));
+        }
         if frame.current_target() != Some(self.node_tag.as_str()) {
             return Err(ExposureError::Routing(format!(
                 "special frame {} target {:?} != local node {}",
@@ -408,13 +473,13 @@ impl Forwarder {
                 self.node_tag
             )));
         }
-        if let Some(prev) = frame.prev_hop() {
-            if prev != incoming.remote_node_tag {
-                return Err(ExposureError::Auth(format!(
-                    "special frame {} prev_hop '{}' != authenticated link peer '{}'",
-                    frame.id, prev, incoming.remote_node_tag
-                )));
-            }
+        if frame.prev_hop() != Some(incoming.remote_node_tag.as_str()) {
+            return Err(ExposureError::Auth(format!(
+                "special frame {} prev_hop {:?} != authenticated link peer '{}'",
+                frame.id,
+                frame.prev_hop(),
+                incoming.remote_node_tag
+            )));
         }
 
         if frame.is_final_hop(&self.node_tag) {

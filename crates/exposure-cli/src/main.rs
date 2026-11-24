@@ -337,23 +337,17 @@ async fn main() -> Result<()> {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
             };
-            let phrase = if reset_passphrase {
-                let p = generate_five_word_passphrase();
-                println!("========================================================");
-                println!("ONE-TIME ONBOARDING PASSPHRASE (valid 10m, shown once):");
-                println!("  {p}");
-                println!("========================================================");
-                Some(p)
-            } else if supplied.is_none() && cfg.control_public_key.is_none() {
-                let p = generate_five_word_passphrase();
-                println!("========================================================");
-                println!("ONE-TIME ONBOARDING PASSPHRASE (valid 10m, shown once):");
-                println!("  {p}");
-                println!("========================================================");
-                Some(p)
-            } else {
-                supplied
-            };
+            let phrase =
+                if reset_passphrase || (supplied.is_none() && cfg.control_public_key.is_none()) {
+                    let p = generate_five_word_passphrase();
+                    println!("========================================================");
+                    println!("ONE-TIME ONBOARDING PASSPHRASE (valid 10m, shown once):");
+                    println!("  {p}");
+                    println!("========================================================");
+                    Some(p)
+                } else {
+                    supplied
+                };
 
             let runtime = NodeRuntime::new(cfg, Some(config), phrase).await?;
             let (link_addr, ingress_addrs) = runtime.start().await?;

@@ -18,10 +18,14 @@ use exposure_core::protocol::DnsManageOp;
 use exposure_core::crypto::{
     ct_eq_hashed, generate_random_secret_hex, hmac_ip, validate_identifier, verify_password,
 };
-use exposure_core::routing::{canonical_ip, LinkHealthState};
+use exposure_core::routing::{
+    canonical_ip, is_public_routable_ip, parse_valid_host, LinkHealthState,
+};
 use exposure_core::telemetry::{HyperLogLog, LatencyHistogram, MinuteSummary};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use crate::client::ControlClient;
 
@@ -53,15 +57,26 @@ pub struct ApiState {
     pub client: Arc<ControlClient>,
     sessions: Arc<DashMap<String, AdminSession>>,
     login_limiter: Arc<DashMap<String, LoginAttemptState>>,
+    auth_sem: Arc<Semaphore>,
+    http_client: reqwest::Client,
 }
 
 impl ApiState {
     pub fn new(cfg: ControlConfig, client: Arc<ControlClient>) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .connect_timeout(Duration::from_secs(5))
+            .user_agent("exposure-control/0.1")
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             cfg,
             client,
             sessions: Arc::new(DashMap::new()),
             login_limiter: Arc::new(DashMap::new()),
+            auth_sem: Arc::new(Semaphore::new(4)),
+            http_client,
         }
     }
 }
@@ -116,8 +131,8 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/logs", get(list_logs))
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
-        .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(csrf_origin_guard))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(state)
 }
 
@@ -143,76 +158,143 @@ async fn security_headers_middleware(req: axum::extract::Request, next: Next) ->
     resp
 }
 
-/// Lowercased host (sans port/brackets) from an authority such as `example.com:8090` or `[::1]:8090`.
-fn host_from_authority(v: &str) -> Option<String> {
-    let uri: axum::http::Uri = format!("http://{}", v.trim()).parse().ok()?;
-    uri.host()
-        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())
+fn default_port_for_scheme(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
 }
 
-/// Lowercased host from an absolute URI such as an `Origin`/`Referer` value.
-fn host_from_absolute_uri(v: &str) -> Option<String> {
-    let uri: axum::http::Uri = v.trim().parse().ok()?;
-    if uri.scheme().is_none() {
+/// Lowercased host and optional explicit port from an authority (`example.com:8090`, `[::1]:8090`).
+fn host_and_port_from_authority(v: &str) -> Option<(String, Option<u16>)> {
+    let trimmed = v.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    uri.host()
-        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())
+    let uri: axum::http::Uri = format!("http://{trimmed}").parse().ok()?;
+    let host = uri
+        .host()
+        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, uri.port_u16()))
+}
+
+/// Lowercased `(scheme, host, normalized_port)` from an absolute URI (`Origin`/`Referer`).
+fn origin_tuple_from_uri(v: &str) -> Option<(String, String, Option<u16>)> {
+    let uri: axum::http::Uri = v.trim().parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let host = uri
+        .host()
+        .map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase())?;
+    if host.is_empty() {
+        return None;
+    }
+    let port = uri.port_u16().or_else(|| default_port_for_scheme(&scheme));
+    Some((scheme, host, port))
 }
 
 /// CSRF defense for state-changing requests.
 ///
 /// `SameSite=Strict` alone does not protect against a same-site sibling subdomain
 /// (`evil.example.com` -> `control.example.com`) because the cookie is still sent. For
-/// browser-originated mutations we require any `Origin` (or `Referer`) host to match the
-/// request's own host (incl. `X-Forwarded-Host` behind a trusted proxy). Non-browser clients
-/// that send neither header are still allowed, and a present opaque/unparseable origin is rejected.
+/// browser-originated mutations we require any `Origin` (or `Referer`) `(scheme, host, port)` to
+/// match the request's own authority/forwarded headers (preserving compatibility with proxies that
+/// omit default/forwarded ports unless an explicit mismatched port is present).
 async fn csrf_origin_guard(req: axum::extract::Request, next: Next) -> Response {
     let state_changing = matches!(req.method().as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
     if state_changing {
-        let mut expected: Vec<String> = Vec::new();
-        if let Some(a) = req.uri().authority() {
-            expected.push(a.host().trim_matches(['[', ']']).to_ascii_lowercase());
-        }
         let headers = req.headers();
-        if let Some(h) = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .and_then(host_from_authority)
-        {
-            expected.push(h);
+        let expected_scheme = if let Some(hv) = headers.get("x-forwarded-proto") {
+            let Ok(s) = hv.to_str() else {
+                return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+            };
+            s.split(',')
+                .next()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_ascii_lowercase())
+        } else {
+            req.uri().scheme_str().map(str::to_ascii_lowercase)
+        };
+
+        let mut expected: Vec<(String, Option<u16>)> = Vec::new();
+        if let Some(a) = req.uri().authority() {
+            expected.push((
+                a.host().trim_matches(['[', ']']).to_ascii_lowercase(),
+                a.port_u16(),
+            ));
+        }
+        for hv in headers.get_all(header::HOST) {
+            let Ok(s) = hv.to_str() else {
+                return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+            };
+            let Some(hp) = host_and_port_from_authority(s) else {
+                return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+            };
+            expected.push(hp);
         }
         for hv in headers.get_all("x-forwarded-host") {
-            if let Ok(s) = hv.to_str() {
-                if let Some(h) = s
-                    .split(',')
-                    .next()
-                    .map(str::trim)
-                    .and_then(host_from_authority)
-                {
-                    expected.push(h);
-                }
+            let Ok(s) = hv.to_str() else {
+                return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+            };
+            let first = s.split(',').next().map(str::trim).unwrap_or("");
+            if !first.is_empty() {
+                let Some(hp) = host_and_port_from_authority(first) else {
+                    return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+                };
+                expected.push(hp);
             }
         }
         expected.sort();
         expected.dedup();
 
-        let origin = headers
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(host_from_absolute_uri);
-        let referer = headers
-            .get(header::REFERER)
-            .and_then(|v| v.to_str().ok())
-            .map(host_from_absolute_uri);
+        let origin = match headers.get(header::ORIGIN) {
+            Some(hv) => {
+                let Ok(s) = hv.to_str() else {
+                    return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+                };
+                let Some(parsed) = origin_tuple_from_uri(s) else {
+                    return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+                };
+                Some(parsed)
+            }
+            None => None,
+        };
+        let referer = if origin.is_none() {
+            match headers.get(header::REFERER) {
+                Some(hv) => {
+                    let Ok(s) = hv.to_str() else {
+                        return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+                    };
+                    let Some(parsed) = origin_tuple_from_uri(s) else {
+                        return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
+                    };
+                    Some(parsed)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
-        if let Some(candidate) = origin.or(referer) {
-            let allowed = match candidate {
-                Some(src) => expected.iter().any(|h| h == &src),
-                // Origin: null / unparseable → treat as hostile for mutations.
-                None => false,
-            };
-            if !allowed {
+        if let Some((src_scheme, src_host, src_port)) = origin.or(referer) {
+            let scheme_ok = expected_scheme
+                .as_deref()
+                .map(|es| es == src_scheme)
+                .unwrap_or(true);
+            let target_ok = expected.iter().any(|(exp_host, exp_port)| {
+                if exp_host != &src_host {
+                    return false;
+                }
+                match *exp_port {
+                    Some(ep) => src_port == Some(ep),
+                    None => true,
+                }
+            });
+            if !(scheme_ok && target_ok) {
                 return json_err(StatusCode::FORBIDDEN, "cross-origin request blocked");
             }
         }
@@ -286,28 +368,31 @@ fn create_admin_session(state: &ApiState, username: &str) -> String {
     raw_token
 }
 
-fn verify_admin_auth(state: &ApiState, headers: &HeaderMap) -> Result<String, Response> {
+fn verify_admin_auth(state: &ApiState, headers: &HeaderMap) -> Result<String, Box<Response>> {
     let raw_token = extract_raw_session_token(headers)
-        .ok_or_else(|| json_err(StatusCode::UNAUTHORIZED, "missing session authentication"))?;
+        .ok_or_else(|| Box::new(json_err(StatusCode::UNAUTHORIZED, "missing session authentication")))?;
     let key = hash_session_token(&state.cfg.admin.token_secret, &raw_token);
     let now = Utc::now().timestamp();
     let Some(entry) = state.sessions.get(&key) else {
-        return Err(json_err(StatusCode::UNAUTHORIZED, "invalid or revoked session"));
+        return Err(Box::new(json_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or revoked session",
+        )));
     };
     if entry.expires_at < now || entry.username != state.cfg.admin.username {
         drop(entry);
         state.sessions.remove(&key);
-        return Err(json_err(StatusCode::UNAUTHORIZED, "session expired"));
+        return Err(Box::new(json_err(StatusCode::UNAUTHORIZED, "session expired")));
     }
     Ok(entry.username.clone())
 }
 
-fn require_active_role(state: &ApiState) -> Result<(), Response> {
+fn require_active_role(state: &ApiState) -> Result<(), Box<Response>> {
     if state.cfg.role != ControlRole::Active {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::CONFLICT,
             "control instance is in standby mode",
-        ));
+        )));
     }
     Ok(())
 }
@@ -340,38 +425,84 @@ fn redact_dns_provider_account(prov: &mut DnsProviderAccountConfig) {
 }
 
 fn restore_dns_provider_account(
+    name: &str,
     new_p: &mut DnsProviderAccountConfig,
-    old_p: &DnsProviderAccountConfig,
-) {
-    match (new_p, old_p) {
-        (
-            DnsProviderAccountConfig::Cloudflare { api_token },
-            DnsProviderAccountConfig::Cloudflare { api_token: old_tok },
-        ) if api_token == REDACTED_SECRET => {
-            *api_token = old_tok.clone();
+    old_p: Option<&DnsProviderAccountConfig>,
+) -> Result<(), String> {
+    if let Some(old_p) = old_p {
+        match (new_p.clone(), old_p) {
+            (
+                DnsProviderAccountConfig::Cloudflare { api_token },
+                DnsProviderAccountConfig::Cloudflare { api_token: old_tok },
+            ) if api_token == REDACTED_SECRET => {
+                if old_tok.is_empty() {
+                    return Err(format!(
+                        "DNS provider '{name}' cannot use redacted placeholder with no existing token"
+                    ));
+                }
+                if let DnsProviderAccountConfig::Cloudflare { api_token } = new_p {
+                    *api_token = old_tok.clone();
+                }
+                return Ok(());
+            }
+            (
+                DnsProviderAccountConfig::Aliyun {
+                    access_key_secret, ..
+                },
+                DnsProviderAccountConfig::Aliyun {
+                    access_key_secret: old_secret,
+                    ..
+                },
+            ) if access_key_secret == REDACTED_SECRET => {
+                if old_secret.is_empty() {
+                    return Err(format!(
+                        "DNS provider '{name}' cannot use redacted placeholder with no existing secret"
+                    ));
+                }
+                if let DnsProviderAccountConfig::Aliyun {
+                    access_key_secret, ..
+                } = new_p
+                {
+                    *access_key_secret = old_secret.clone();
+                }
+                return Ok(());
+            }
+            (
+                DnsProviderAccountConfig::Webhook { auth_header, .. },
+                DnsProviderAccountConfig::Webhook {
+                    auth_header: old_auth,
+                    ..
+                },
+            ) if auth_header.as_deref() == Some(REDACTED_SECRET) => {
+                if old_auth.as_deref().map(str::is_empty).unwrap_or(true) {
+                    return Err(format!(
+                        "DNS provider '{name}' cannot use redacted placeholder with no existing auth header"
+                    ));
+                }
+                if let DnsProviderAccountConfig::Webhook { auth_header, .. } = new_p {
+                    *auth_header = old_auth.clone();
+                }
+                return Ok(());
+            }
+            _ => {}
         }
-        (
-            DnsProviderAccountConfig::Aliyun {
-                access_key_secret, ..
-            },
-            DnsProviderAccountConfig::Aliyun {
-                access_key_secret: old_secret,
-                ..
-            },
-        ) if access_key_secret == REDACTED_SECRET => {
-            *access_key_secret = old_secret.clone();
-        }
-        (
-            DnsProviderAccountConfig::Webhook { auth_header, .. },
-            DnsProviderAccountConfig::Webhook {
-                auth_header: old_auth,
-                ..
-            },
-        ) if auth_header.as_deref() == Some(REDACTED_SECRET) => {
-            *auth_header = old_auth.clone();
-        }
-        _ => {}
     }
+    let has_redacted = match new_p {
+        DnsProviderAccountConfig::Cloudflare { api_token } => api_token == REDACTED_SECRET,
+        DnsProviderAccountConfig::Aliyun {
+            access_key_secret, ..
+        } => access_key_secret == REDACTED_SECRET,
+        DnsProviderAccountConfig::Webhook { auth_header, .. } => {
+            auth_header.as_deref() == Some(REDACTED_SECRET)
+        }
+        DnsProviderAccountConfig::Exec { .. } => false,
+    };
+    if has_redacted {
+        return Err(format!(
+            "DNS provider '{name}' contains redacted secret placeholder without a matching prior secret"
+        ));
+    }
+    Ok(())
 }
 
 fn redact_api_bypass_headers(headers: &mut [String]) {
@@ -382,20 +513,42 @@ fn redact_api_bypass_headers(headers: &mut [String]) {
     }
 }
 
-fn restore_api_bypass_headers(new_headers: &mut [String], old_headers: &[String]) {
+fn restore_api_bypass_headers(
+    new_headers: &mut [String],
+    old_headers: &[String],
+) -> Result<(), String> {
+    let mut seen_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for h in new_headers {
         if let Some((name, val)) = h.split_once(':') {
+            let key = name.trim().to_ascii_lowercase();
+            let idx = {
+                let c = seen_counts.entry(key.clone()).or_insert(0);
+                let cur = *c;
+                *c += 1;
+                cur
+            };
             if val.trim() == REDACTED_SECRET {
-                if let Some(old_h) = old_headers.iter().find(|oh| {
-                    oh.split_once(':')
-                        .map(|(on, _)| on.trim().eq_ignore_ascii_case(name.trim()))
-                        .unwrap_or(false)
-                }) {
+                let matched = old_headers
+                    .iter()
+                    .filter(|oh| {
+                        oh.split_once(':')
+                            .map(|(on, _)| on.trim().to_ascii_lowercase() == key)
+                            .unwrap_or(false)
+                    })
+                    .nth(idx);
+                if let Some(old_h) = matched {
                     *h = old_h.clone();
+                } else {
+                    return Err(format!(
+                        "API bypass header '{}' uses redacted placeholder without a matching prior header",
+                        name.trim()
+                    ));
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Redact all sensitive fields in `TopologySpec` before returning to API callers.
@@ -448,80 +601,137 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
     spec
 }
 
-/// Restore redacted sentinel (`"********"`) secrets from previously stored topology on save.
-fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec) -> TopologySpec {
+fn bad_redacted_secret(msg: impl Into<String>) -> Box<Response> {
+    Box::new(json_err(StatusCode::BAD_REQUEST, msg))
+}
+
+/// Restore redacted sentinel (`"********"`) secrets from previously stored topology on save,
+/// rejecting any sentinel that has no non-empty prior secret to restore from.
+fn restore_redacted_secrets(
+    mut incoming: TopologySpec,
+    existing: &TopologySpec,
+) -> Result<TopologySpec, Box<Response>> {
     if incoming.defaults.ingress.clearance_secret == REDACTED_SECRET {
+        if existing.defaults.ingress.clearance_secret.is_empty() {
+            return Err(bad_redacted_secret(
+                "defaults.ingress.clearance_secret uses redacted placeholder with no existing secret",
+            ));
+        }
         incoming.defaults.ingress.clearance_secret =
             existing.defaults.ingress.clearance_secret.clone();
     }
     if incoming.defaults.ingress.abuseipdb.api_key == REDACTED_SECRET {
+        if existing.defaults.ingress.abuseipdb.api_key.is_empty() {
+            return Err(bad_redacted_secret(
+                "defaults.ingress.abuseipdb.api_key uses redacted placeholder with no existing secret",
+            ));
+        }
         incoming.defaults.ingress.abuseipdb.api_key =
             existing.defaults.ingress.abuseipdb.api_key.clone();
     }
     for (g_name, new_g) in &mut incoming.guard_templates {
-        if let Some(old_g) = existing.guard_templates.get(g_name) {
-            restore_api_bypass_headers(&mut new_g.api_bypass_headers, &old_g.api_bypass_headers);
-        }
+        let old = existing
+            .guard_templates
+            .get(g_name)
+            .map(|g| g.api_bypass_headers.as_slice())
+            .unwrap_or(&[]);
+        restore_api_bypass_headers(&mut new_g.api_bypass_headers, old).map_err(bad_redacted_secret)?;
     }
     for (ab_name, new_ab) in &mut incoming.antibot_templates {
-        if let Some(old_ab) = existing.antibot_templates.get(ab_name) {
-            restore_api_bypass_headers(&mut new_ab.api_bypass_headers, &old_ab.api_bypass_headers);
-        }
+        let old = existing
+            .antibot_templates
+            .get(ab_name)
+            .map(|ab| ab.api_bypass_headers.as_slice())
+            .unwrap_or(&[]);
+        restore_api_bypass_headers(&mut new_ab.api_bypass_headers, old)
+            .map_err(bad_redacted_secret)?;
     }
-    if let (Some(new_gl), Some(old_gl)) =
-        (&mut incoming.global_logger, &existing.global_logger)
-    {
+    if let Some(new_gl) = &mut incoming.global_logger {
         if new_gl.hmac_key == REDACTED_SECRET {
+            let Some(old_gl) = &existing.global_logger else {
+                return Err(bad_redacted_secret(
+                    "global_logger.hmac_key uses redacted placeholder with no existing secret",
+                ));
+            };
+            if old_gl.hmac_key.is_empty() {
+                return Err(bad_redacted_secret(
+                    "global_logger.hmac_key uses redacted placeholder with no existing secret",
+                ));
+            }
             new_gl.hmac_key = old_gl.hmac_key.clone();
         }
     }
     for (tag, new_node) in &mut incoming.nodes {
-        if let Some(old_node) = existing.nodes.get(tag) {
-            if new_node.ingress.clearance_secret == REDACTED_SECRET {
-                new_node.ingress.clearance_secret = old_node.ingress.clearance_secret.clone();
+        let old_node = existing.nodes.get(tag);
+        if new_node.ingress.clearance_secret == REDACTED_SECRET {
+            let old_s = old_node
+                .map(|n| n.ingress.clearance_secret.as_str())
+                .unwrap_or("");
+            if old_s.is_empty() {
+                return Err(bad_redacted_secret(format!(
+                    "nodes.{tag}.ingress.clearance_secret uses redacted placeholder with no existing secret"
+                )));
             }
-            if new_node.ingress.abuseipdb.api_key == REDACTED_SECRET {
-                new_node.ingress.abuseipdb.api_key = old_node.ingress.abuseipdb.api_key.clone();
+            new_node.ingress.clearance_secret = old_s.to_string();
+        }
+        if new_node.ingress.abuseipdb.api_key == REDACTED_SECRET {
+            let old_k = old_node
+                .map(|n| n.ingress.abuseipdb.api_key.as_str())
+                .unwrap_or("");
+            if old_k.is_empty() {
+                return Err(bad_redacted_secret(format!(
+                    "nodes.{tag}.ingress.abuseipdb.api_key uses redacted placeholder with no existing secret"
+                )));
             }
-            for (g_name, new_g) in &mut new_node.ingress.guards {
-                if let Some(old_g) = old_node.ingress.guards.get(g_name) {
-                    restore_api_bypass_headers(
-                        &mut new_g.api_bypass_headers,
-                        &old_g.api_bypass_headers,
-                    );
-                }
-            }
-            for (ab_name, new_ab) in &mut new_node.ingress.antibot_sets {
-                if let Some(old_ab) = old_node.ingress.antibot_sets.get(ab_name) {
-                    restore_api_bypass_headers(
-                        &mut new_ab.api_bypass_headers,
-                        &old_ab.api_bypass_headers,
-                    );
-                }
-            }
+            new_node.ingress.abuseipdb.api_key = old_k.to_string();
+        }
+        for (g_name, new_g) in &mut new_node.ingress.guards {
+            let old = old_node
+                .and_then(|n| n.ingress.guards.get(g_name))
+                .map(|g| g.api_bypass_headers.as_slice())
+                .unwrap_or(&[]);
+            restore_api_bypass_headers(&mut new_g.api_bypass_headers, old)
+                .map_err(bad_redacted_secret)?;
+        }
+        for (ab_name, new_ab) in &mut new_node.ingress.antibot_sets {
+            let old = old_node
+                .and_then(|n| n.ingress.antibot_sets.get(ab_name))
+                .map(|ab| ab.api_bypass_headers.as_slice())
+                .unwrap_or(&[]);
+            restore_api_bypass_headers(&mut new_ab.api_bypass_headers, old)
+                .map_err(bad_redacted_secret)?;
         }
     }
     for (p_name, new_p) in &mut incoming.dns_providers {
-        if let Some(old_p) = existing.dns_providers.get(p_name) {
-            restore_dns_provider_account(new_p, old_p);
-        }
+        restore_dns_provider_account(p_name, new_p, existing.dns_providers.get(p_name))
+            .map_err(bad_redacted_secret)?;
     }
     for (tpl_name, new_m) in &mut incoming.maintainer_templates {
-        if let Some(old_m) = existing.maintainer_templates.get(tpl_name) {
-            if new_m.cert_signing_secret_key.as_deref() == Some(REDACTED_SECRET) {
-                new_m.cert_signing_secret_key = old_m.cert_signing_secret_key.clone();
+        let old_m = existing.maintainer_templates.get(tpl_name);
+        if new_m.cert_signing_secret_key.as_deref() == Some(REDACTED_SECRET) {
+            let old_ck = old_m.and_then(|m| m.cert_signing_secret_key.as_ref());
+            let Some(old_ck) = old_ck.filter(|k| !k.is_empty()) else {
+                return Err(bad_redacted_secret(format!(
+                    "maintainer_templates.{tpl_name}.cert_signing_secret_key uses redacted placeholder with no existing secret"
+                )));
+            };
+            new_m.cert_signing_secret_key = Some(old_ck.clone());
+        }
+        if new_m.logger.hmac_key == REDACTED_SECRET {
+            let old_hk = old_m.map(|m| m.logger.hmac_key.as_str()).unwrap_or("");
+            if old_hk.is_empty() {
+                return Err(bad_redacted_secret(format!(
+                    "maintainer_templates.{tpl_name}.logger.hmac_key uses redacted placeholder with no existing secret"
+                )));
             }
-            if new_m.logger.hmac_key == REDACTED_SECRET {
-                new_m.logger.hmac_key = old_m.logger.hmac_key.clone();
-            }
-            for (p_name, new_p) in &mut new_m.dns_providers {
-                if let Some(old_p) = old_m.dns_providers.get(p_name) {
-                    restore_dns_provider_account(new_p, old_p);
-                }
-            }
+            new_m.logger.hmac_key = old_hk.to_string();
+        }
+        for (p_name, new_p) in &mut new_m.dns_providers {
+            let old_p = old_m.and_then(|m| m.dns_providers.get(p_name));
+            restore_dns_provider_account(p_name, new_p, old_p).map_err(bad_redacted_secret)?;
         }
     }
-    incoming
+    Ok(incoming)
 }
 
 /// Redact secret fields from serialized `NodeConfig` JSON returned by `/api/config-versions`.
@@ -537,6 +747,12 @@ fn redact_node_config_json(raw_json: &str) -> String {
     }
     if !cfg.ingress.abuseipdb.api_key.is_empty() {
         cfg.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
+    }
+    for g in cfg.ingress.guards.values_mut() {
+        redact_api_bypass_headers(&mut g.api_bypass_headers);
+    }
+    for ab in cfg.ingress.antibot_sets.values_mut() {
+        redact_api_bypass_headers(&mut ab.api_bypass_headers);
     }
     if !cfg.logger.hmac_key.is_empty() {
         cfg.logger.hmac_key = REDACTED_SECRET.into();
@@ -566,12 +782,8 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Response {
-    // Brute-force throttle for admin login.
-    //
-    // SECURITY: credentials are ALWAYS verified before the lockout is enforced. Rejecting early
-    // while locked would let any unauthenticated client permanently lock out the only admin
-    // account (trivial DoS). Wrong credentials are still throttled with 429 while locked, but a
-    // correct login always succeeds.
+    // Reject immediately during lockout BEFORE touching Argon2, and cap concurrent
+    // password-hashing tasks via `auth_sem` inside `spawn_blocking` to prevent CPU/reactor DoS.
     let now = Instant::now();
     let locked = state
         .login_limiter
@@ -579,9 +791,25 @@ async fn login(
         .and_then(|st| st.locked_until)
         .map(|until| now < until)
         .unwrap_or(false);
+    if locked {
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts; please try again shortly",
+        );
+    }
+    let Ok(_permit) = state.auth_sem.clone().try_acquire_owned() else {
+        return json_err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent login attempts; please try again shortly",
+        );
+    };
 
     let user_ok = ct_eq_hashed(req.username.as_bytes(), state.cfg.admin.username.as_bytes());
-    let pass_ok = verify_password(&req.password, &state.cfg.admin.password_hash);
+    let password = req.password.clone();
+    let expected_hash = state.cfg.admin.password_hash.clone();
+    let pass_ok = tokio::task::spawn_blocking(move || verify_password(&password, &expected_hash))
+        .await
+        .unwrap_or(false);
     if !user_ok || !pass_ok {
         let mut entry = state.login_limiter.entry("global".into()).or_default();
         if entry.locked_until.map(|u| now >= u).unwrap_or(false) {
@@ -603,12 +831,6 @@ async fn login(
                 .db()
                 .append_audit(&safe_user, "login", "control", false, "bad credentials")
                 .await;
-        }
-        if locked {
-            return json_err(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many failed login attempts; please try again shortly",
-            );
         }
         return json_err(StatusCode::UNAUTHORIZED, "invalid username or password");
     }
@@ -676,7 +898,7 @@ async fn auth_me(State(state): State<ApiState>, headers: HeaderMap) -> Response 
             "username": username,
         }))
         .into_response(),
-        Err(r) => r,
+        Err(r) => *r,
     };
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -928,7 +1150,7 @@ async fn overview(
     Query(q): Query<OverviewQuery>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let cutoff = q
         .window_secs
@@ -1007,7 +1229,7 @@ async fn overview(
 
 async fn list_nodes(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let nodes = match state.client.db().list_nodes().await {
         Ok(n) => n,
@@ -1047,10 +1269,10 @@ async fn push_single_node(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let yaml = match state.client.db().get_topology_yaml().await {
         Ok(y) => y,
@@ -1077,7 +1299,7 @@ async fn push_single_node(
 
 async fn get_topology(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let yaml = match state.client.db().get_topology_yaml().await {
         Ok(y) => y,
@@ -1119,25 +1341,119 @@ struct TopoReq {
     sync_dns: bool,
 }
 
-fn reject_yaml_bomb(yaml: &str) -> Result<(), Response> {
+fn reject_yaml_bomb(yaml: &str) -> Result<(), Box<Response>> {
     if yaml.len() > MAX_YAML_BYTES {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::PAYLOAD_TOO_LARGE,
             "topology YAML exceeds 256 KiB limit",
-        ));
+        )));
     }
-    // Reject YAML anchors/aliases to prevent billion-laughs memory expansion in serde_yaml
-    for line in yaml.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
+    if yaml.lines().count() > 16_384 {
+        return Err(Box::new(json_err(
+            StatusCode::BAD_REQUEST,
+            "topology YAML exceeds maximum line count",
+        )));
+    }
+    // Scan outside single/double quotes and line comments for flow depth explosions,
+    // YAML anchors/aliases (`&anchor`, `*alias`), and merge keys (`<<:`).
+    let bytes = yaml.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0usize;
+    let mut sol = true;
+    while i < len {
+        let b = bytes[i];
+        if in_double {
+            if b == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            sol = b == b'\n';
+            i += 1;
             continue;
         }
-        if trimmed.contains(" *") || trimmed.contains(": *") || trimmed.contains(" &") || trimmed.contains(": &") {
-            return Err(json_err(
-                StatusCode::BAD_REQUEST,
-                "YAML anchors and aliases are not permitted",
-            ));
+        if in_single {
+            if b == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            sol = b == b'\n';
+            i += 1;
+            continue;
         }
+        if b == b'\n' || b == b'\r' {
+            sol = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = true;
+            sol = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_single = true;
+            sol = false;
+            i += 1;
+            continue;
+        }
+        let prev_ws_or_sol = sol || matches!(bytes[i - 1], b' ' | b'\t');
+        if b == b'#' && prev_ws_or_sol {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'{' || b == b'[' {
+            depth += 1;
+            if depth > 32 {
+                return Err(Box::new(json_err(
+                    StatusCode::BAD_REQUEST,
+                    "YAML flow collection nesting exceeds 32 levels",
+                )));
+            }
+        } else if b == b'}' || b == b']' {
+            depth = depth.saturating_sub(1);
+        }
+        let at_indicator_pos = sol
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b':' | b'-' | b'[' | b'{' | b',' | b'\n' | b'\r'
+            );
+        if at_indicator_pos {
+            if b == b'<' && i + 2 < len && bytes[i + 1] == b'<' {
+                let mut k = i + 2;
+                while k < len && matches!(bytes[k], b' ' | b'\t') {
+                    k += 1;
+                }
+                if k < len && bytes[k] == b':' {
+                    return Err(Box::new(json_err(
+                        StatusCode::BAD_REQUEST,
+                        "YAML merge keys are not permitted",
+                    )));
+                }
+            }
+            if (b == b'&' || b == b'*') && i + 1 < len {
+                let next = bytes[i + 1];
+                if !matches!(next, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}') {
+                    return Err(Box::new(json_err(
+                        StatusCode::BAD_REQUEST,
+                        "YAML anchors and aliases are not permitted",
+                    )));
+                }
+            }
+        }
+        sol = false;
+        i += 1;
     }
     Ok(())
 }
@@ -1145,7 +1461,7 @@ fn reject_yaml_bomb(yaml: &str) -> Result<(), Response> {
 async fn resolve_and_merge_topo_yaml(
     state: &ApiState,
     req: &TopoReq,
-) -> Result<String, Response> {
+) -> Result<String, Box<Response>> {
     let existing_yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
     let existing_spec: TopologySpec = if existing_yaml.trim().is_empty() {
         TopologySpec::default()
@@ -1158,22 +1474,22 @@ async fn resolve_and_merge_topo_yaml(
     } else if let Some(yaml) = &req.yaml {
         reject_yaml_bomb(yaml)?;
         serde_yaml::from_str(yaml)
-            .map_err(|e| json_err(StatusCode::BAD_REQUEST, format!("parse topology yaml: {e}")))?
+            .map_err(|e| Box::new(json_err(StatusCode::BAD_REQUEST, format!("parse topology yaml: {e}"))))?
     } else {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::BAD_REQUEST,
             "either yaml or spec must be provided",
-        ));
+        )));
     };
 
-    let merged = restore_redacted_secrets(parsed_spec, &existing_spec);
+    let merged = restore_redacted_secrets(parsed_spec, &existing_spec)?;
     let out_yaml = serde_yaml::to_string(&merged)
-        .map_err(|e| json_err(StatusCode::BAD_REQUEST, format!("serialize spec: {e}")))?;
+        .map_err(|e| Box::new(json_err(StatusCode::BAD_REQUEST, format!("serialize spec: {e}"))))?;
     if out_yaml.len() > MAX_YAML_BYTES {
-        return Err(json_err(
+        return Err(Box::new(json_err(
             StatusCode::PAYLOAD_TOO_LARGE,
             "serialized topology exceeds 256 KiB limit",
-        ));
+        )));
     }
     Ok(out_yaml)
 }
@@ -1184,11 +1500,11 @@ async fn validate_topology(
     Json(req): Json<TopoReq>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let yaml = match resolve_and_merge_topo_yaml(&state, &req).await {
         Ok(y) => y,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.client.compile_yaml_readonly(&yaml).await {
         Ok((topo, report, _)) => {
@@ -1214,14 +1530,14 @@ async fn preflight_topology(
     Json(req): Json<TopoReq>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let yaml = match resolve_and_merge_topo_yaml(&state, &req).await {
         Ok(y) => y,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let (topo, report, compiled) = match state.client.compile_yaml_readonly(&yaml).await {
         Ok(t) => t,
@@ -1241,9 +1557,20 @@ async fn preflight_topology(
             .into_response();
     }
 
-    let mut reports = Vec::new();
+    let mut reports = Vec::with_capacity(compiled.len());
+    let sem = Arc::new(Semaphore::new(8));
+    let mut futs = FuturesUnordered::new();
     for (tag, cfg) in compiled {
-        reports.push(state.client.preflight_node_config(&topo, &tag, cfg).await);
+        let client = Arc::clone(&state.client);
+        let topo_ref = &topo;
+        let sem = Arc::clone(&sem);
+        futs.push(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            client.preflight_node_config(topo_ref, &tag, cfg).await
+        });
+    }
+    while let Some(rep) = futs.next().await {
+        reports.push(rep);
     }
     let all_ok = reports.iter().all(|r| r.ok);
     Json(serde_json::json!({
@@ -1262,14 +1589,14 @@ async fn save_topology(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let yaml = match resolve_and_merge_topo_yaml(&state, &req).await {
         Ok(y) => y,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let (topo, report, compiled) = match state.client.compile_yaml_and_provision(&yaml).await {
         Ok(t) => t,
@@ -1290,8 +1617,21 @@ async fn save_topology(
     let mut pushed_count = 0usize;
     let mut push_errors = Vec::new();
     if req.push {
+        let sem = Arc::new(Semaphore::new(8));
+        let mut futs = FuturesUnordered::new();
         for (tag, cfg) in compiled {
-            match state.client.push_node_config(&actor, &topo, &tag, cfg).await {
+            let client = Arc::clone(&state.client);
+            let actor_ref = actor.as_str();
+            let topo_ref = &topo;
+            let sem = Arc::clone(&sem);
+            futs.push(async move {
+                let _permit = sem.acquire_owned().await.ok();
+                let res = client.push_node_config(actor_ref, topo_ref, &tag, cfg).await;
+                (tag, res)
+            });
+        }
+        while let Some((tag, res)) = futs.next().await {
+            match res {
                 Ok(_) => pushed_count += 1,
                 Err(e) => push_errors.push(format!("{tag}: {e}")),
             }
@@ -1325,7 +1665,7 @@ async fn save_topology(
 
 async fn list_config_versions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let versions = match state.client.db().list_config_versions(50).await {
         Ok(v) => v,
@@ -1354,10 +1694,10 @@ async fn rollback_version(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let rec = match state.client.db().get_config_version(id).await {
         Ok(Some(r)) => r,
@@ -1382,7 +1722,7 @@ async fn rollback_version(
 
 async fn list_passphrases(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let items = match state.client.db().list_passphrases().await {
         Ok(v) => v,
@@ -1402,47 +1742,43 @@ struct RegisterPassphraseReq {
     via_hops: Vec<String>,
 }
 
-fn validate_dial_address(addr: &str) -> Result<(), &'static str> {
+async fn validate_dial_address_async(addr: &str) -> Result<(), &'static str> {
     let trimmed = addr.trim();
     let Some((host, port_s)) = trimmed.rsplit_once(':') else {
         return Err("address must be host:port");
     };
-    if host.is_empty() || !port_s.parse::<u16>().map(|p| p > 0).unwrap_or(false) {
+    let port: u16 = port_s
+        .parse()
+        .ok()
+        .filter(|&p| p > 0)
+        .ok_or("invalid host or port in address")?;
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
         return Err("invalid host or port in address");
     }
-    let clean = host
-        .trim_matches(|c| c == '[' || c == ']')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let Some(clean) = parse_valid_host(host) else {
+        return Err("invalid host or port in address");
+    };
     if clean == "localhost" || clean.ends_with(".localhost") {
         return Err("loopback target address is not allowed");
     }
     if let Ok(ip) = clean.parse::<IpAddr>() {
-        let c = canonical_ip(ip);
-        if c.is_loopback() || c.is_unspecified() {
-            return Err("loopback or unspecified IP address is not allowed");
+        if !is_public_routable_ip(canonical_ip(ip)) {
+            return Err("private/internal or non-routable IP address is not allowed");
         }
-        match c {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                // RFC1918, link-local, broadcast/multicast, documentation, and CGNAT (100.64/10).
-                let cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
-                if v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_documentation()
-                    || v4.is_multicast()
-                    || cgnat
-                {
-                    return Err("private/internal IP address is not allowed");
-                }
-            }
-            IpAddr::V6(v6) => {
-                if v6.is_unique_local() || v6.is_unicast_link_local() || v6.is_multicast() {
-                    return Err("private/internal IP address is not allowed");
-                }
-            }
+        return Ok(());
+    }
+    let resolved = tokio::net::lookup_host((clean.as_str(), port))
+        .await
+        .map_err(|_| "failed to resolve target address")?;
+    let mut saw_any = false;
+    for sock in resolved {
+        saw_any = true;
+        if !is_public_routable_ip(canonical_ip(sock.ip())) {
+            return Err("target hostname resolves to non-public/internal IP address");
         }
+    }
+    if !saw_any {
+        return Err("failed to resolve target address");
     }
     Ok(())
 }
@@ -1454,10 +1790,10 @@ async fn register_passphrase(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
 
     if let Err(e) = validate_identifier(&req.node_tag, "node_tag") {
@@ -1491,7 +1827,7 @@ async fn register_passphrase(
                 "listening mode requires target address (host:port)",
             );
         };
-        if let Err(msg) = validate_dial_address(addr) {
+        if let Err(msg) = validate_dial_address_async(addr).await {
             return json_err(StatusCode::BAD_REQUEST, msg);
         }
     }
@@ -1552,10 +1888,10 @@ async fn revoke_passphrase(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     if let Err(e) = state.client.db().revoke_passphrase(&tag).await {
         return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
@@ -1571,10 +1907,10 @@ async fn revoke_passphrase(
 async fn run_discovery(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     match state.client.run_discovery(&actor).await {
         Ok(n) => Json(serde_json::json!({ "discovered_nodes": n })).into_response(),
@@ -1597,10 +1933,10 @@ async fn sync_dns(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let req = body.map(|Json(b)| b).unwrap_or_default();
     match state
@@ -1629,6 +1965,12 @@ struct DnsInspectQuery {
     maintainer_tag: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct DnsMaintainerQuery {
+    #[serde(default)]
+    maintainer_tag: Option<String>,
+}
+
 async fn inspect_dns_domain(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1637,7 +1979,7 @@ async fn inspect_dns_domain(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let op = DnsManageOp::Inspect {
         domain: domain.clone(),
@@ -1679,10 +2021,10 @@ async fn create_dns_record(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let op = DnsManageOp::Create {
         domain,
@@ -1711,10 +2053,10 @@ async fn update_dns_record(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let op = DnsManageOp::Update {
         domain,
@@ -1751,10 +2093,10 @@ async fn set_dns_record_status(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let op = DnsManageOp::SetStatus {
         domain,
@@ -1776,16 +2118,17 @@ async fn delete_dns_record(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path((domain, record_id)): Path<(String, String)>,
+    Query(q): Query<DnsMaintainerQuery>,
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let op = DnsManageOp::Delete { domain, record_id };
-    match state.client.manage_dns(&actor, op, None).await {
+    match state.client.manage_dns(&actor, op, q.maintainer_tag).await {
         Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
             "ok": true,
             "maintainer_tag": maintainer_tag,
@@ -1840,7 +2183,7 @@ fn evilpot_status_rank(s: &str) -> u8 {
 
 async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let tel = state.client.cached_telemetry().await;
     let mut requests_handled = 0u64;
@@ -1931,6 +2274,7 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
         let tb = b.get("last_seen_unix").and_then(|v| v.as_u64()).unwrap_or(0);
         rb.cmp(&ra).then_with(|| tb.cmp(&ta))
     });
+    let total_tracked_sessions: usize = tel.evilpot_reports.iter().map(|r| r.sessions.len()).sum();
     sessions.truncate(200);
 
     recent_events.sort_by(|a, b| {
@@ -1963,7 +2307,7 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
             "traps_triggered": traps_triggered,
             "canary_verifications": canary_verifications,
             "verified_attack_sessions": verified_attack_sessions,
-            "tracked_sessions": sessions.len(),
+            "tracked_sessions": total_tracked_sessions,
             "tarpit_bytes_dripped": tarpit_bytes_dripped,
             "active_tarpit_connections": active_tarpit_connections,
             "active_ip_bans": active_ip_bans,
@@ -1985,7 +2329,7 @@ async fn get_telemetry(
     Query(q): Query<TelemetryQuery>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let tel = state.client.cached_telemetry().await;
     let node_f = q
@@ -2138,13 +2482,25 @@ async fn is_store_raw_ip_enabled(state: &ApiState) -> bool {
         .unwrap_or(false)
 }
 
+fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() {
+        let nb = needle_lower.as_bytes();
+        let hb = haystack.as_bytes();
+        return hb.len() >= nb.len() && hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb));
+    }
+    haystack.to_lowercase().contains(&needle_lower.to_lowercase())
+}
+
 async fn list_fingerprints(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(q): Query<FingerprintQuery>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let tel = state.client.cached_telemetry().await;
     let hmac_key = state.client.effective_logger_hmac_key().await;
@@ -2212,8 +2568,8 @@ async fn list_fingerprints(
         if let Some(cc) = obs
             .geo_country
             .as_deref()
-            .or(obs.abuse_country.as_deref())
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| obs.abuse_country.as_deref().filter(|s| !s.trim().is_empty()))
         {
             available_countries.insert(cc.to_ascii_uppercase());
         }
@@ -2251,7 +2607,8 @@ async fn list_fingerprints(
             let obs_cc = obs
                 .geo_country
                 .as_deref()
-                .or(obs.abuse_country.as_deref())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| obs.abuse_country.as_deref().filter(|s| !s.trim().is_empty()))
                 .unwrap_or("");
             if !obs_cc.eq_ignore_ascii_case(cf) {
                 continue;
@@ -2284,10 +2641,10 @@ async fn list_fingerprints(
             let raw_match = obs
                 .client_ip
                 .as_deref()
-                .map(|v| v.to_ascii_lowercase().contains(ipq))
+                .map(|v| contains_ascii_icase(v, ipq))
                 .unwrap_or(false);
-            let prefix_match = obs.ip_prefix.to_ascii_lowercase().contains(ipq);
-            let hmac_sub_match = obs.ip_hmac.to_ascii_lowercase().contains(ipq);
+            let prefix_match = contains_ascii_icase(&obs.ip_prefix, ipq);
+            let hmac_sub_match = contains_ascii_icase(&obs.ip_hmac, ipq);
             let hmac_exact_match = ip_filter_hmac
                 .as_deref()
                 .map(|h| obs.ip_hmac.eq_ignore_ascii_case(h))
@@ -2299,7 +2656,7 @@ async fn list_fingerprints(
                     j.webrtc_public_ips
                         .iter()
                         .chain(j.webrtc_local_ips.iter())
-                        .any(|w| w.to_ascii_lowercase().contains(ipq))
+                        .any(|w| contains_ascii_icase(w, ipq))
                 })
                 .unwrap_or(false);
             if !(raw_match || prefix_match || hmac_sub_match || hmac_exact_match || webrtc_match) {
@@ -2307,23 +2664,23 @@ async fn list_fingerprints(
             }
         }
         if let Some(ref fpq) = fp_str {
-            let hash_match = obs.fp_hash.to_ascii_lowercase().contains(fpq)
+            let hash_match = contains_ascii_icase(&obs.fp_hash, fpq)
                 || obs
                     .tls_ja3
                     .as_deref()
-                    .map(|j| j.to_ascii_lowercase().contains(fpq))
+                    .map(|j| contains_ascii_icase(j, fpq))
                     .unwrap_or(false);
             let canvas_match = obs
                 .js_fp
                 .as_ref()
                 .map(|j| {
-                    j.canvas_hash.to_ascii_lowercase().contains(fpq)
-                        || j.webgl.to_ascii_lowercase().contains(fpq)
-                        || j.webgl_vendor.to_ascii_lowercase().contains(fpq)
-                        || j.audio_hash.to_ascii_lowercase().contains(fpq)
-                        || j.fonts_hash.to_ascii_lowercase().contains(fpq)
-                        || j.platform.to_ascii_lowercase().contains(fpq)
-                        || j.screen.to_ascii_lowercase().contains(fpq)
+                    contains_ascii_icase(&j.canvas_hash, fpq)
+                        || contains_ascii_icase(&j.webgl, fpq)
+                        || contains_ascii_icase(&j.webgl_vendor, fpq)
+                        || contains_ascii_icase(&j.audio_hash, fpq)
+                        || contains_ascii_icase(&j.fonts_hash, fpq)
+                        || contains_ascii_icase(&j.platform, fpq)
+                        || contains_ascii_icase(&j.screen, fpq)
                 })
                 .unwrap_or(false);
             if !(hash_match || canvas_match) {
@@ -2339,61 +2696,61 @@ async fn list_fingerprints(
                 || obs
                     .client_ip
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
-                || obs.ip_prefix.to_ascii_lowercase().contains(qs)
-                || obs.ip_hmac.to_ascii_lowercase().contains(qs)
-                || obs.fp_hash.to_ascii_lowercase().contains(qs)
+                || contains_ascii_icase(&obs.ip_prefix, qs)
+                || contains_ascii_icase(&obs.ip_hmac, qs)
+                || contains_ascii_icase(&obs.fp_hash, qs)
                 || obs
                     .tls_ja3
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || obs
                     .abuse_country
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || obs
                     .geo_country
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || obs
                     .geo_continent
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || obs
                     .abuse_isp
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
-                || obs.user_agent.to_ascii_lowercase().contains(qs)
-                || obs.host.to_ascii_lowercase().contains(qs)
-                || obs.service_tag.to_ascii_lowercase().contains(qs)
-                || obs.node_tag.to_ascii_lowercase().contains(qs)
-                || obs.browser_family.to_ascii_lowercase().contains(qs)
-                || obs.os_family.to_ascii_lowercase().contains(qs)
-                || obs.device_type.to_ascii_lowercase().contains(qs)
+                || contains_ascii_icase(&obs.user_agent, qs)
+                || contains_ascii_icase(&obs.host, qs)
+                || contains_ascii_icase(&obs.service_tag, qs)
+                || contains_ascii_icase(&obs.node_tag, qs)
+                || contains_ascii_icase(&obs.browser_family, qs)
+                || contains_ascii_icase(&obs.os_family, qs)
+                || contains_ascii_icase(&obs.device_type, qs)
                 || obs
                     .js_fp
                     .as_ref()
                     .map(|j| {
-                        j.webgl.to_ascii_lowercase().contains(qs)
-                            || j.webgl_vendor.to_ascii_lowercase().contains(qs)
-                            || j.canvas_hash.to_ascii_lowercase().contains(qs)
-                            || j.audio_hash.to_ascii_lowercase().contains(qs)
-                            || j.fonts_hash.to_ascii_lowercase().contains(qs)
-                            || j.ua_brands.to_ascii_lowercase().contains(qs)
-                            || j.platform.to_ascii_lowercase().contains(qs)
-                            || j.tz.to_ascii_lowercase().contains(qs)
-                            || j.screen.to_ascii_lowercase().contains(qs)
-                            || j.webrtc_status.to_ascii_lowercase().contains(qs)
+                        contains_ascii_icase(&j.webgl, qs)
+                            || contains_ascii_icase(&j.webgl_vendor, qs)
+                            || contains_ascii_icase(&j.canvas_hash, qs)
+                            || contains_ascii_icase(&j.audio_hash, qs)
+                            || contains_ascii_icase(&j.fonts_hash, qs)
+                            || contains_ascii_icase(&j.ua_brands, qs)
+                            || contains_ascii_icase(&j.platform, qs)
+                            || contains_ascii_icase(&j.tz, qs)
+                            || contains_ascii_icase(&j.screen, qs)
+                            || contains_ascii_icase(&j.webrtc_status, qs)
                             || j.webrtc_public_ips
                                 .iter()
                                 .chain(j.webrtc_local_ips.iter())
-                                .any(|w| w.to_ascii_lowercase().contains(qs))
+                                .any(|w| contains_ascii_icase(w, qs))
                     })
                     .unwrap_or(false);
             if !hit {
@@ -2515,7 +2872,7 @@ async fn list_logs(
     Query(q): Query<LogQuery>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let tel = state.client.cached_telemetry().await;
     let hmac_key = state.client.effective_logger_hmac_key().await;
@@ -2650,6 +3007,15 @@ async fn list_logs(
                 if !is_blocked_rec {
                     continue;
                 }
+            } else if af == "allow" {
+                let allowed_rec = rec
+                    .action
+                    .as_deref()
+                    .map(|a| a.eq_ignore_ascii_case("allow"))
+                    .unwrap_or(!is_blocked_rec);
+                if !allowed_rec {
+                    continue;
+                }
             } else if !rec
                 .action
                 .as_deref()
@@ -2665,7 +3031,7 @@ async fn list_logs(
                 "3xx" => (300..400).contains(&rec.status),
                 "4xx" => (400..500).contains(&rec.status),
                 "5xx" => (500..600).contains(&rec.status),
-                exact => exact.parse::<u16>().map(|code| rec.status == code).unwrap_or(true),
+                exact => exact.parse::<u16>().map(|code| rec.status == code).unwrap_or(false),
             };
             if !ok {
                 continue;
@@ -2675,7 +3041,7 @@ async fn list_logs(
             if !rec
                 .host
                 .as_deref()
-                .map(|h| h.to_ascii_lowercase().contains(hf))
+                .map(|h| contains_ascii_icase(h, hf))
                 .unwrap_or(false)
             {
                 continue;
@@ -2685,9 +3051,9 @@ async fn list_logs(
             let raw_match = rec
                 .raw_ip
                 .as_deref()
-                .map(|v| v.to_ascii_lowercase().contains(ipq))
+                .map(|v| contains_ascii_icase(v, ipq))
                 .unwrap_or(false);
-            let hmac_sub = rec.ip_hmac.to_ascii_lowercase().contains(ipq);
+            let hmac_sub = contains_ascii_icase(&rec.ip_hmac, ipq);
             let hmac_exact = ip_filter_hmac
                 .as_deref()
                 .map(|h| rec.ip_hmac.eq_ignore_ascii_case(h))
@@ -2705,61 +3071,61 @@ async fn list_logs(
                 || rec
                     .path
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .query
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .host
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .ray_id
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .user_agent
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .referer
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .error
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .waf_category
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .action
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .raw_ip
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
                     .client_country
                     .as_deref()
-                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
-                || rec.ip_hmac.to_ascii_lowercase().contains(qs)
-                || rec.service_tag.to_ascii_lowercase().contains(qs)
-                || rec.node_tag.to_ascii_lowercase().contains(qs);
+                || contains_ascii_icase(&rec.ip_hmac, qs)
+                || contains_ascii_icase(&rec.service_tag, qs)
+                || contains_ascii_icase(&rec.node_tag, qs);
             if !hit {
                 continue;
             }
@@ -2871,10 +3237,10 @@ async fn list_logs(
 
 async fn pull_telemetry(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     match state.client.pull_all_telemetry().await {
         Ok(n) => Json(serde_json::json!({ "pulled_sources": n })).into_response(),
@@ -2884,7 +3250,7 @@ async fn pull_telemetry(State(state): State<ApiState>, headers: HeaderMap) -> Re
 
 async fn list_audit(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let logs = match state.client.db().list_audit_logs(100).await {
         Ok(l) => l,
@@ -2896,7 +3262,7 @@ async fn list_audit(State(state): State<ApiState>, headers: HeaderMap) -> Respon
 /// `GET /api/waf/rules`: return active OWASP CRS ruleset metadata, rules, and cluster CRS configuration.
 async fn get_waf_rules(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let crs_snap = state.client.active_crs_snapshot().await;
     let builtin_rules: Vec<exposure_core::crs::WafRuleDescriptor> = Vec::new();
@@ -2931,10 +3297,10 @@ async fn get_waf_rules(State(state): State<ApiState>, headers: HeaderMap) -> Res
 async fn sync_waf_crs(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     match state.client.sync_owasp_crs(&actor).await {
         Ok(snap) => Json(serde_json::json!({
@@ -2969,7 +3335,7 @@ async fn test_abuseipdb_key(
     Json(req): Json<TestAbuseIpDbReq>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let mut api_key = req.api_key.trim().to_string();
     if api_key.is_empty() || api_key == REDACTED_SECRET {
@@ -2999,7 +3365,7 @@ async fn test_abuseipdb_key(
         Ok(ip) => canonical_ip(ip),
         Err(_) => return json_err(StatusCode::BAD_REQUEST, "invalid test IP address"),
     };
-    if parsed_ip.is_loopback() || parsed_ip.is_unspecified() {
+    if !is_public_routable_ip(parsed_ip) {
         return json_err(
             StatusCode::BAD_REQUEST,
             "test IP must be a public routable IP address",
@@ -3007,18 +3373,8 @@ async fn test_abuseipdb_key(
     }
 
     let max_age = req.max_age_days.unwrap_or(90).clamp(1, 365);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(5))
-        .user_agent("exposure-control/0.1")
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    let resp = match client
+    let resp = match state
+        .http_client
         .get("https://api.abuseipdb.com/api/v2/check")
         .header("Key", &api_key)
         .header("Accept", "application/json")
@@ -3083,10 +3439,10 @@ async fn unban_security_target(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let kind = req.kind.trim();
     let target = req.target.trim();
@@ -3104,7 +3460,7 @@ async fn unban_security_target(
 /// `GET /api/security/geoip/status`: return per-ingress GeoIP database status and defaults.
 async fn get_geoip_status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let status = state.client.geoip_status().await;
     Json(status).into_response()
@@ -3126,10 +3482,10 @@ async fn sync_geoip(
 ) -> Response {
     let actor = match verify_admin_auth(&state, &headers) {
         Ok(u) => u,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Err(r) = require_active_role(&state) {
-        return r;
+        return *r;
     }
     let req = body.map(|Json(b)| b).unwrap_or_default();
     let node_tag = req
@@ -3161,7 +3517,7 @@ async fn lookup_geoip(
     Query(q): Query<LookupGeoIpQuery>,
 ) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let ip = q.ip.trim();
     if ip.is_empty() {

@@ -14,8 +14,8 @@ use exposure_core::crypto::{
 };
 use exposure_core::protocol::{
     dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, dns_manage_req_signing_bytes,
-    dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes, read_json_frame,
-    unban_req_signing_bytes, write_json_frame, DnsLineSyncEntry, DnsManageOp,
+    dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes, pull_telemetry_req_signing_bytes,
+    read_json_frame, unban_req_signing_bytes, write_json_frame, DnsLineSyncEntry, DnsManageOp,
     DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult,
     DnsSyncRecordSpec, MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame,
     SpecialPayload, StreamKind,
@@ -97,7 +97,10 @@ pub struct ControlClient {
     db: Arc<ControlDb>,
     active_bootstrap_node: Arc<RwLock<Option<String>>>,
     pending_replies: Arc<DashMap<String, oneshot::Sender<SpecialFrame>>>,
-    telemetry_cache: Arc<RwLock<CachedTelemetry>>,
+    telemetry_cache: Arc<RwLock<Arc<CachedTelemetry>>>,
+    cached_topology: Arc<RwLock<Option<(String, Arc<TopologySpec>)>>>,
+    cached_crs: Arc<RwLock<Option<Arc<CrsRulesetSnapshot>>>>,
+    pull_telemetry_lock: Arc<Mutex<()>>,
     incoming_sem: Arc<Semaphore>,
     /// Per-node push lock serializing concurrent `push_node_config` calls for the same node.
     node_push_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
@@ -127,7 +130,10 @@ impl ControlClient {
             db,
             active_bootstrap_node: Arc::new(RwLock::new(None)),
             pending_replies: Arc::new(DashMap::new()),
-            telemetry_cache: Arc::new(RwLock::new(CachedTelemetry::default())),
+            telemetry_cache: Arc::new(RwLock::new(Arc::new(CachedTelemetry::default()))),
+            cached_topology: Arc::new(RwLock::new(None)),
+            cached_crs: Arc::new(RwLock::new(None)),
+            pull_telemetry_lock: Arc::new(Mutex::new(())),
             incoming_sem: Arc::new(Semaphore::new(MAX_INCOMING_DISPATCH_TASKS)),
             node_push_locks: Arc::new(DashMap::new()),
         });
@@ -152,22 +158,39 @@ impl ControlClient {
         &self.db
     }
 
+    /// Return parsed `TopologySpec` using string-equality cached YAML to avoid repeated deep parses.
+    async fn cached_topology_spec(&self) -> Result<Arc<TopologySpec>> {
+        let yaml = self.db.get_topology_yaml().await?;
+        if let Some((ref cached_yaml, ref spec)) = *self.cached_topology.read().await {
+            if cached_yaml == &yaml {
+                return Ok(Arc::clone(spec));
+            }
+        }
+        let spec: TopologySpec = if yaml.trim().is_empty() {
+            TopologySpec::default()
+        } else {
+            serde_yaml::from_str(&yaml)
+                .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?
+        };
+        let arc_spec = Arc::new(spec);
+        *self.cached_topology.write().await = Some((yaml, Arc::clone(&arc_spec)));
+        Ok(arc_spec)
+    }
+
     /// Return the effective cluster-wide logger IP HMAC key (from topology `global_logger` or persisted SQLite key).
     pub async fn effective_logger_hmac_key(&self) -> Option<String> {
-        if let Ok(yaml) = self.db.get_topology_yaml().await {
-            if let Ok(topo) = serde_yaml::from_str::<TopologySpec>(&yaml) {
-                if let Some(gl) = topo.global_logger {
-                    if !gl.hmac_key.trim().is_empty() {
-                        return Some(gl.hmac_key);
-                    }
+        if let Ok(topo) = self.cached_topology_spec().await {
+            if let Some(ref gl) = topo.global_logger {
+                if !gl.hmac_key.trim().is_empty() {
+                    return Some(gl.hmac_key.clone());
                 }
             }
         }
         self.db.get_cluster_hmac_key().await.ok().flatten()
     }
 
-    pub async fn cached_telemetry(&self) -> CachedTelemetry {
-        self.telemetry_cache.read().await.clone()
+    pub async fn cached_telemetry(&self) -> Arc<CachedTelemetry> {
+        Arc::clone(&*self.telemetry_cache.read().await)
     }
 
     /// Restore previously persisted telemetry cache from SQLite on Control startup so dashboards
@@ -181,7 +204,7 @@ impl ControlClient {
                     last_pulled_at = ?saved.last_pulled_at,
                     "restored persisted telemetry cache from SQLite"
                 );
-                *self.telemetry_cache.write().await = saved;
+                *self.telemetry_cache.write().await = Arc::new(saved);
             }
             Ok(None) => {}
             Err(e) => {
@@ -190,22 +213,30 @@ impl ControlClient {
         }
     }
 
-    /// Return the active OWASP CRS ruleset snapshot (synced from GitHub merged with the built-in
+    /// Return the active OWASP CRS ruleset snapshot (cached in RAM; synced from GitHub merged with the built-in
     /// baseline). The built-in rules are always unioned in so a partial/limited upstream sync can
     /// never silently remove SQLi/XSS/RCE detection coverage.
-    pub async fn active_crs_snapshot(&self) -> CrsRulesetSnapshot {
-        match self.db.get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET).await {
+    pub async fn active_crs_snapshot(&self) -> Arc<CrsRulesetSnapshot> {
+        if let Some(ref cached) = *self.cached_crs.read().await {
+            return Arc::clone(cached);
+        }
+        let snap = match self.db.get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET).await {
             Ok(Some(snap)) if !snap.rules.is_empty() => {
                 merge_crs_snapshots(snap, builtin_crs_snapshot())
             }
             _ => builtin_crs_snapshot(),
-        }
+        };
+        let arc_snap = Arc::new(snap);
+        *self.cached_crs.write().await = Some(Arc::clone(&arc_snap));
+        arc_snap
     }
 
     /// Sync the latest OWASP Core Rule Set from `coreruleset.org` / GitHub and persist to SQLite.
     pub async fn sync_owasp_crs(&self, actor: &str) -> Result<CrsRulesetSnapshot> {
-        let snap = crate::crs_sync::sync_owasp_crs_from_github().await?;
+        let raw = crate::crs_sync::sync_owasp_crs_from_github().await?;
+        let snap = merge_crs_snapshots(raw, builtin_crs_snapshot());
         self.db.set_kv_json(KV_CRS_RULESET, &snap).await?;
+        *self.cached_crs.write().await = Some(Arc::new(snap.clone()));
         self.db
             .append_audit(
                 actor,
@@ -747,7 +778,24 @@ impl ControlClient {
             Ok(SpecialFrame {
                 payload: SpecialPayload::PreflightResp(report),
                 ..
-            }) => report,
+            }) => {
+                if report.node_tag != node_tag {
+                    PreflightReport {
+                        node_tag: node_tag.to_string(),
+                        ok: false,
+                        checks: vec![PreflightCheckItem {
+                            target: "rpc".into(),
+                            ok: false,
+                            detail: format!(
+                                "preflight response node_tag mismatch: expected {}, got {}",
+                                node_tag, report.node_tag
+                            ),
+                        }],
+                    }
+                } else {
+                    report
+                }
+            }
             Ok(other) => PreflightReport {
                 node_tag: node_tag.to_string(),
                 ok: false,
@@ -814,10 +862,13 @@ impl ControlClient {
             Ok(SpecialFrame {
                 payload:
                     SpecialPayload::ConfigAck {
-                        applied: true, ..
+                        node_tag: ack_node,
+                        sequence: ack_seq,
+                        applied: true,
+                        ..
                     },
                 ..
-            }) => {
+            }) if ack_node == node_tag && ack_seq == seq => {
                 self.db
                     .update_config_version_status(ver_id, "applied")
                     .await?;
@@ -832,12 +883,13 @@ impl ControlClient {
             Ok(SpecialFrame {
                 payload:
                     SpecialPayload::ConfigAck {
+                        node_tag: ack_node,
+                        sequence: ack_seq,
                         applied: false,
                         error,
-                        ..
                     },
                 ..
-            }) => {
+            }) if ack_node == node_tag && ack_seq == seq => {
                 let err_s = error.unwrap_or_else(|| "node rejected config".into());
                 self.db
                     .update_config_version_status(ver_id, "failed")
@@ -921,8 +973,8 @@ impl ControlClient {
                         warn!(expected = %req_id, got = %request_id, "discovery response request_id mismatch");
                         continue;
                     }
-                    if node_tag != target {
-                        warn!(expected = %target, got = %node_tag, "discovery response node_tag mismatch");
+                    if node_tag != target || public_key.trim().is_empty() {
+                        warn!(expected = %target, got = %node_tag, "discovery response node_tag or empty public key mismatch");
                         continue;
                     }
                     let signing = discovery_resp_signing_bytes(
@@ -992,15 +1044,14 @@ impl ControlClient {
 
     /// Concurrently pull node status from all Nodes and aggregated stats/certs from all Maintainers.
     pub async fn pull_all_telemetry(self: &Arc<Self>) -> Result<usize> {
+        let _pull_guard = self.pull_telemetry_lock.lock().await;
         let Some(boot) = self.active_bootstrap_tag().await else {
             return Ok(0);
         };
-        let yaml = self.db.get_topology_yaml().await?;
-        let topo: TopologySpec = if yaml.trim().is_empty() {
-            TopologySpec::default()
-        } else {
-            serde_yaml::from_str(&yaml).unwrap_or_default()
-        };
+        let topo = self
+            .cached_topology_spec()
+            .await
+            .unwrap_or_else(|_| Arc::new(TopologySpec::default()));
 
         let mut tag_set: HashSet<String> = topo.nodes.keys().cloned().collect();
         tag_set.insert(boot.clone());
@@ -1010,6 +1061,7 @@ impl ControlClient {
             }
         }
 
+        let mut expected_maintainers = 0usize;
         let mut futs = FuturesUnordered::new();
         for tag in tag_set {
             let Some(hops) = compute_control_hops(&self.cfg.control_id, &boot, &tag, &topo)
@@ -1024,6 +1076,9 @@ impl ControlClient {
                 let _ = self.db.set_node_online(&tag, false).await;
                 continue;
             };
+            if topo.nodes.get(&tag).map(|s| s.roles.maintainer).unwrap_or(false) {
+                expected_maintainers += 1;
+            }
             let this = Arc::clone(self);
             futs.push(tokio::spawn(async move {
                 let status_frame = SpecialFrame::new(
@@ -1059,11 +1114,29 @@ impl ControlClient {
                             .await;
 
                         let maint_snap = if snap.roles.maintainer {
+                            let request_id = Uuid::new_v4().to_string();
+                            let now = Utc::now().timestamp();
+                            let expires_at = now + 60;
+                            let signing = pull_telemetry_req_signing_bytes(
+                                &request_id,
+                                now,
+                                expires_at,
+                                &tag,
+                                None,
+                            );
+                            let control_signature = this.signing_kp.sign_b64(&signing);
                             let pull_frame = SpecialFrame::new(
                                 Uuid::new_v4().to_string(),
                                 hops,
                                 16,
-                                SpecialPayload::PullTelemetryReq { since_minute: None },
+                                SpecialPayload::PullTelemetryReq {
+                                    request_id,
+                                    issued_at: now,
+                                    expires_at,
+                                    maintainer_tag: tag.clone(),
+                                    since_minute: None,
+                                    control_signature,
+                                },
                             );
                             match this
                                 .send_special_rpc(pull_frame, Duration::from_secs(6))
@@ -1072,8 +1145,8 @@ impl ControlClient {
                                 Ok(SpecialFrame {
                                     payload: SpecialPayload::PullTelemetryResp(ms),
                                     ..
-                                }) if ms.maintainer_tag == tag => Some(ms),
-                                _ => None,
+                                }) if ms.maintainer_tag == tag => Some(Some(ms)),
+                                _ => Some(None),
                             }
                         } else {
                             None
@@ -1088,8 +1161,13 @@ impl ControlClient {
             }));
         }
 
+        let prev = Arc::clone(&*self.telemetry_cache.read().await);
         let mut cache = CachedTelemetry::default();
         let mut pulled = 0usize;
+        let mut succeeded_nodes: HashSet<String> = HashSet::new();
+        let mut succeeded_maintainers: HashSet<String> = HashSet::new();
+        let mut failed_maintainers = false;
+
         let mut dedup_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
             HashMap::new();
         let mut dedup_fingerprints: HashMap<String, FingerprintObservation> = HashMap::new();
@@ -1098,7 +1176,7 @@ impl ControlClient {
         let mut dedup_certs: HashMap<String, CertStatusInfo> = HashMap::new();
 
         while let Some(res) = futs.next().await {
-            if let Ok(Some((snap, maint_opt))) = res {
+            if let Ok(Some((snap, maint_state))) = res {
                 let NodeStatusSnapshot {
                     node_tag,
                     uptime_secs,
@@ -1109,6 +1187,7 @@ impl ControlClient {
                     log_stats,
                     ..
                 } = snap;
+                succeeded_nodes.insert(node_tag.clone());
                 cache.node_uptimes.insert(node_tag.clone(), uptime_secs);
                 if let Some(gs) = geoip {
                     cache.geoip_status.insert(node_tag.clone(), gs);
@@ -1121,85 +1200,186 @@ impl ControlClient {
                 }
                 pulled += 1;
 
-                if let Some(MaintainerTelemetrySnapshot {
-                    maintainer_tag,
-                    summaries,
-                    fingerprints,
-                    recent_logs,
-                    certificates,
-                    segment_backlog,
-                    merge_latency_ms,
-                    alerts: m_alerts,
-                }) = maint_opt
-                {
-                    cache.maintainers.push(MaintainerHealthInfo {
+                match maint_state {
+                    Some(Some(MaintainerTelemetrySnapshot {
                         maintainer_tag,
+                        summaries,
+                        fingerprints,
+                        recent_logs,
+                        certificates,
                         segment_backlog,
                         merge_latency_ms,
-                    });
-                    for s in summaries {
-                        // Deduplicate summaries reported by multiple maintainers by keeping the highest-count entry
-                        let key = (
-                            s.minute_epoch,
-                            s.node_tag.clone(),
-                            s.role.clone(),
-                            s.service_tag.clone(),
-                        );
-                        dedup_summaries
-                            .entry(key)
-                            .and_modify(|existing| {
-                                if s.requests > existing.requests {
-                                    *existing = s.clone();
-                                }
-                            })
-                            .or_insert(s);
+                        alerts: m_alerts,
+                    })) => {
+                        succeeded_maintainers.insert(maintainer_tag.clone());
+                        cache.maintainers.push(MaintainerHealthInfo {
+                            maintainer_tag,
+                            segment_backlog,
+                            merge_latency_ms,
+                        });
+                        for s in summaries {
+                            let key = (
+                                s.minute_epoch,
+                                s.node_tag.clone(),
+                                s.role.clone(),
+                                s.service_tag.clone(),
+                            );
+                            dedup_summaries
+                                .entry(key)
+                                .and_modify(|existing| {
+                                    if s.requests > existing.requests {
+                                        *existing = s.clone();
+                                    }
+                                })
+                                .or_insert(s);
+                        }
+                        for fp in fingerprints {
+                            // Non-additive reconciliation across maintainers holding overlapping observations
+                            dedup_fingerprints
+                                .entry(fp.id.clone())
+                                .and_modify(|existing| {
+                                    let prefer_new = fp.request_count > existing.request_count
+                                        || (fp.request_count == existing.request_count
+                                            && fp.last_seen_ts > existing.last_seen_ts);
+                                    let max_req = existing.request_count.max(fp.request_count);
+                                    let max_ch = existing.challenge_count.max(fp.challenge_count);
+                                    let max_rl = existing.rate_limited_count.max(fp.rate_limited_count);
+                                    let max_ab = match (existing.abuse_score, fp.abuse_score) {
+                                        (Some(a), Some(b)) => Some(a.max(b)),
+                                        (a, b) => a.or(b),
+                                    };
+                                    if prefer_new {
+                                        let mut merged = fp.clone();
+                                        if !merged.js_verified && existing.js_verified {
+                                            merged.js_verified = true;
+                                            merged.fp_source = existing.fp_source.clone();
+                                            merged.js_fp = existing.js_fp.clone();
+                                        } else if merged.js_fp.is_none() {
+                                            merged.js_fp = existing.js_fp.clone();
+                                        }
+                                        *existing = merged;
+                                    } else if !existing.js_verified && fp.js_verified {
+                                        existing.js_verified = true;
+                                        existing.fp_source = fp.fp_source.clone();
+                                        existing.js_fp = fp.js_fp.clone();
+                                    } else if existing.js_fp.is_none() {
+                                        existing.js_fp = fp.js_fp.clone();
+                                    }
+                                    existing.request_count = max_req;
+                                    existing.challenge_count = max_ch;
+                                    existing.rate_limited_count = max_rl;
+                                    existing.abuse_score = max_ab;
+                                })
+                                .or_insert(fp);
+                        }
+                        for rec in recent_logs {
+                            let key = (
+                                rec.node_tag.clone(),
+                                rec.role.clone(),
+                                rec.timestamp_ms,
+                                rec.ray_id.clone().unwrap_or_else(|| {
+                                    format!(
+                                        "{}:{}:{}",
+                                        rec.ip_hmac,
+                                        rec.path.as_deref().unwrap_or(""),
+                                        rec.status
+                                    )
+                                }),
+                            );
+                            dedup_logs
+                                .entry(key)
+                                .and_modify(|existing| {
+                                    if rec.repeat_count > existing.repeat_count {
+                                        *existing = rec.clone();
+                                    }
+                                })
+                                .or_insert(rec);
+                        }
+                        for c in certificates {
+                            dedup_certs.insert(c.domain.clone(), c);
+                        }
+                        cache.alerts.extend(m_alerts);
                     }
-                    for fp in fingerprints {
-                        dedup_fingerprints
-                            .entry(fp.id.clone())
-                            .and_modify(|existing| {
-                                if fp.request_count > existing.request_count
-                                    || (fp.js_verified && !existing.js_verified)
-                                    || fp.last_seen_ts > existing.last_seen_ts
-                                {
-                                    existing.merge_from(&fp);
-                                }
-                            })
-                            .or_insert(fp);
+                    Some(None) => {
+                        failed_maintainers = true;
                     }
-                    for rec in recent_logs {
-                        let key = (
-                            rec.node_tag.clone(),
-                            rec.role.clone(),
-                            rec.timestamp_ms,
-                            rec.ray_id.clone().unwrap_or_else(|| {
-                                format!(
-                                    "{}:{}:{}",
-                                    rec.ip_hmac,
-                                    rec.path.as_deref().unwrap_or(""),
-                                    rec.status
-                                )
-                            }),
-                        );
-                        dedup_logs
-                            .entry(key)
-                            .and_modify(|existing| {
-                                if rec.repeat_count > existing.repeat_count {
-                                    *existing = rec.clone();
-                                }
-                            })
-                            .or_insert(rec);
-                    }
-                    for c in certificates {
-                        dedup_certs.insert(c.domain.clone(), c);
-                    }
-                    cache.alerts.extend(m_alerts);
+                    None => {}
                 }
             }
         }
 
         if pulled == 0 {
             return Ok(0);
+        }
+
+        // Preserve last-known telemetry slices for nodes/maintainers that were temporarily unreachable.
+        for (k, v) in &prev.node_uptimes {
+            if !succeeded_nodes.contains(k) {
+                cache.node_uptimes.insert(k.clone(), *v);
+            }
+        }
+        for (k, v) in &prev.geoip_status {
+            if !succeeded_nodes.contains(k) {
+                cache.geoip_status.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in &prev.log_stats {
+            if !succeeded_nodes.contains(k) {
+                cache.log_stats.insert(k.clone(), v.clone());
+            }
+        }
+        for l in &prev.links {
+            if !succeeded_nodes.contains(&l.node_tag) {
+                cache.links.push(l.clone());
+            }
+        }
+        for ep in &prev.evilpot_reports {
+            if !succeeded_nodes.contains(&ep.node_tag) {
+                cache.evilpot_reports.push(ep.clone());
+            }
+        }
+
+        if failed_maintainers || succeeded_maintainers.len() < expected_maintainers {
+            for m in &prev.maintainers {
+                if !succeeded_maintainers.contains(&m.maintainer_tag) {
+                    cache.maintainers.push(m.clone());
+                }
+            }
+            for s in &prev.summaries {
+                let key = (
+                    s.minute_epoch,
+                    s.node_tag.clone(),
+                    s.role.clone(),
+                    s.service_tag.clone(),
+                );
+                dedup_summaries.entry(key).or_insert_with(|| s.clone());
+            }
+            for fp in &prev.fingerprints {
+                dedup_fingerprints
+                    .entry(fp.id.clone())
+                    .or_insert_with(|| fp.clone());
+            }
+            for rec in &prev.recent_logs {
+                let key = (
+                    rec.node_tag.clone(),
+                    rec.role.clone(),
+                    rec.timestamp_ms,
+                    rec.ray_id.clone().unwrap_or_else(|| {
+                        format!(
+                            "{}:{}:{}",
+                            rec.ip_hmac,
+                            rec.path.as_deref().unwrap_or(""),
+                            rec.status
+                        )
+                    }),
+                );
+                dedup_logs.entry(key).or_insert_with(|| rec.clone());
+            }
+            for c in &prev.certificates {
+                dedup_certs
+                    .entry(c.domain.clone())
+                    .or_insert_with(|| c.clone());
+            }
         }
 
         cache.summaries = dedup_summaries.into_values().collect();
@@ -1214,26 +1394,8 @@ impl ControlClient {
         cache.certificates = dedup_certs.into_values().collect();
         cache.last_pulled_at = Some(Utc::now().to_rfc3339());
 
-        // If no Maintainer responded during this cycle, retain previously persisted summaries/fingerprints/logs
-        // so transient Maintainer restarts never blank out Control telemetry.
-        {
-            let mut guard = self.telemetry_cache.write().await;
-            if cache.maintainers.is_empty() {
-                if cache.summaries.is_empty() && !guard.summaries.is_empty() {
-                    cache.summaries = guard.summaries.clone();
-                }
-                if cache.fingerprints.is_empty() && !guard.fingerprints.is_empty() {
-                    cache.fingerprints = guard.fingerprints.clone();
-                }
-                if cache.recent_logs.is_empty() && !guard.recent_logs.is_empty() {
-                    cache.recent_logs = guard.recent_logs.clone();
-                }
-                if cache.certificates.is_empty() && !guard.certificates.is_empty() {
-                    cache.certificates = guard.certificates.clone();
-                }
-            }
-            *guard = cache.clone();
-        }
+        let arc_cache = Arc::new(cache.clone());
+        *self.telemetry_cache.write().await = arc_cache;
 
         // Persist bounded telemetry snapshot to SQLite so Control restarts keep recent telemetry.
         let mut persisted = cache;
@@ -1829,16 +1991,22 @@ impl ControlClient {
             .active_bootstrap_tag()
             .await
             .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
-        let yaml = self.db.get_topology_yaml().await.unwrap_or_default();
-        let topo: TopologySpec = if yaml.trim().is_empty() {
-            TopologySpec::default()
-        } else {
-            serde_yaml::from_str(&yaml)
-                .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?
-        };
+        let topo = self.cached_topology_spec().await?;
 
         let mut tags: Vec<String> = Vec::new();
         if let Some(specific) = target_node.map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
+            let is_ingress = if let Some(spec) = topo.nodes.get(specific) {
+                spec.roles.ingress
+            } else if let Ok(Some(rec)) = self.db.get_node(specific).await {
+                rec.roles.iter().any(|r| r == "ingress")
+            } else {
+                false
+            };
+            if !is_ingress {
+                return Err(ExposureError::Config(format!(
+                    "target node '{specific}' is not a known ingress node"
+                )));
+            }
             tags.push(specific.to_string());
         } else {
             for (tag, spec) in &topo.nodes {
@@ -1984,7 +2152,8 @@ impl ControlClient {
 
         if !succeeded_nodes.is_empty() {
             let mut guard = self.telemetry_cache.write().await;
-            for rep in &mut guard.evilpot_reports {
+            let mut updated = (**guard).clone();
+            for rep in &mut updated.evilpot_reports {
                 if !succeeded_nodes.contains(&rep.node_tag) {
                     continue;
                 }
@@ -2008,6 +2177,7 @@ impl ControlClient {
                         .count();
                 }
             }
+            *guard = Arc::new(updated);
         }
 
         let all_ok = !results.is_empty()
@@ -2161,9 +2331,11 @@ impl ControlClient {
         }
         if !updates.is_empty() {
             let mut guard = self.telemetry_cache.write().await;
+            let mut updated = (**guard).clone();
             for (k, v) in updates {
-                guard.geoip_status.insert(k, v);
+                updated.geoip_status.insert(k, v);
             }
+            *guard = Arc::new(updated);
         }
         let all_ok = !results.is_empty()
             && results

@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use exposure_core::config::{ControlConfig, ControlRole, ControlTlsConfig};
-use exposure_core::crypto::is_weak_secret;
+use exposure_core::crypto::{is_valid_argon2_hash, is_weak_secret};
 use exposure_core::{ExposureError, Result};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
@@ -60,7 +60,7 @@ impl ControlRuntime {
                 "admin.token_secret must be a high-entropy random secret (>= 32 chars)".into(),
             ));
         }
-        if !cfg.admin.password_hash.trim().starts_with("$argon2") {
+        if !is_valid_argon2_hash(&cfg.admin.password_hash) {
             return Err(ExposureError::Config(
                 "admin.password_hash must be a valid Argon2id PHC hash ($argon2id$...)".into(),
             ));
@@ -259,47 +259,59 @@ impl ControlRuntime {
 
         let router = build_router(ApiState::new(self.cfg.clone(), Arc::clone(&self.client)));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let conn_sem = Arc::new(Semaphore::new(512));
 
-        if let Some(acceptor) = tls_acceptor {
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
                         }
-                        accept_res = listener.accept() => {
-                            let Ok((tcp, _)) = accept_res else {
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                continue;
-                            };
-                            let acc = acceptor.clone();
-                            let svc = TowerToHyperService::new(router.clone());
-                            tokio::spawn(async move {
+                    }
+                    accept_res = listener.accept() => {
+                        let Ok((tcp, _)) = accept_res else {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        };
+                        let Ok(permit) = Arc::clone(&conn_sem).try_acquire_owned() else {
+                            warn!("control panel connection dropped: concurrent limit reached");
+                            continue;
+                        };
+                        let acc_opt = tls_acceptor.clone();
+                        let svc = TowerToHyperService::new(router.clone());
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let mut builder = AutoServerBuilder::new(TokioExecutor::new());
+                            builder
+                                .http1()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(Duration::from_secs(10))
+                                .max_headers(100);
+                            builder
+                                .http2()
+                                .timer(TokioTimer::new())
+                                .keep_alive_interval(Duration::from_secs(30))
+                                .keep_alive_timeout(Duration::from_secs(15));
+                            if let Some(acc) = acc_opt {
                                 if let Ok(Ok(tls_stream)) = tokio::time::timeout(
                                     Duration::from_secs(10),
                                     acc.accept(tcp),
                                 ).await {
-                                    let _ = AutoServerBuilder::new(TokioExecutor::new())
+                                    let _ = builder
                                         .serve_connection(TokioIo::new(tls_stream), svc)
                                         .await;
                                 }
-                            });
-                        }
+                            } else {
+                                let _ = builder
+                                    .serve_connection(TokioIo::new(tcp), svc)
+                                    .await;
+                            }
+                        });
                     }
                 }
-            });
-        } else {
-            tokio::spawn(async move {
-                let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.changed().await;
-                });
-                if let Err(e) = server.await {
-                    warn!(error = %e, "control web panel server exited");
-                }
-            });
-        }
+            }
+        });
 
         Ok(bound)
     }

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -22,7 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
+use crate::ban::{evict_half, AutoBanManager, OffenseContext, OffenseKind};
 use crate::egress::ProxyBody;
 use crate::waf::WafFinding;
 
@@ -56,25 +56,6 @@ const MAX_EVILPOT_STREAM_DURATION: Duration = Duration::from_secs(30);
 const ALERT_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
 
-fn evict_half<K, V>(map: &DashMap<K, V>)
-where
-    K: Eq + std::hash::Hash,
-{
-    let to_remove = map.len() / 2;
-    if to_remove == 0 {
-        return;
-    }
-    let mut removed = 0usize;
-    map.retain(|_, _| {
-        if removed < to_remove {
-            removed += 1;
-            false
-        } else {
-            true
-        }
-    });
-}
-
 /// Optional post-stream verification hook attached to `BoundedEvilpotBody`.
 /// When a slow-drip tarpit stream completes or hits its deadline, this checks whether
 /// `evilpot` upgraded the attacker to `VerifiedExploit` (`SustainedTarpitRead`) mid-stream
@@ -88,25 +69,22 @@ pub struct TarpitBanHook {
     pub js_fp_hash: Option<String>,
 }
 
-/// Zero-sized response extension marker indicating the response was synthesized by `evilpot`.
-/// Ensures Ingress preserves `evilpot`'s rotating spoofed `Server` persona header without adding
-/// any Exposure-specific wire headers.
-#[derive(Debug, Clone, Copy)]
-pub struct EvilpotStealthMarker;
-
 /// RAII concurrency permit guarding both global and per-IP active `evilpot` request/stream slots.
 pub struct EvilpotInflightPermit {
     _global: OwnedSemaphorePermit,
-    per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
+    per_ip_map: Arc<DashMap<IpAddr, usize>>,
     ip: IpAddr,
-    counter: Arc<AtomicUsize>,
 }
 
 impl Drop for EvilpotInflightPermit {
     fn drop(&mut self) {
-        if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.per_ip_map
-                .remove_if(&self.ip, |_, c| c.load(Ordering::Acquire) == 0);
+        if let dashmap::mapref::entry::Entry::Occupied(mut e) = self.per_ip_map.entry(self.ip) {
+            let val = *e.get();
+            if val <= 1 {
+                e.remove();
+            } else {
+                *e.get_mut() = val - 1;
+            }
         }
     }
 }
@@ -188,7 +166,7 @@ pub struct EvilpotManager {
     node_tag: String,
     active: RwLock<Option<ActiveEvilpot>>,
     global_inflight: Arc<Semaphore>,
-    per_ip_inflight: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
+    per_ip_inflight: Arc<DashMap<IpAddr, usize>>,
     per_ip_rate: DashMap<IpAddr, (Instant, u32)>,
     alert_cooldowns: DashMap<(IpAddr, u8), Instant>,
 }
@@ -322,29 +300,18 @@ impl EvilpotManager {
         // 2. Global concurrent Evilpot cap
         let global_permit = Arc::clone(&self.global_inflight).try_acquire_owned().ok()?;
 
-        // 3. Per-IP concurrent Evilpot cap
-        let counter = self
-            .per_ip_inflight
-            .entry(client_ip)
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone();
-        loop {
-            let cur = counter.load(Ordering::Acquire);
-            if cur >= MAX_PER_IP_EVILPOT_INFLIGHT {
-                return None;
-            }
-            if counter
-                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(EvilpotInflightPermit {
-                    _global: global_permit,
-                    per_ip_map: Arc::clone(&self.per_ip_inflight),
-                    ip: client_ip,
-                    counter,
-                });
-            }
+        // 3. Per-IP concurrent Evilpot cap (atomic under DashMap entry shard lock)
+        let mut entry = self.per_ip_inflight.entry(client_ip).or_insert(0);
+        if *entry >= MAX_PER_IP_EVILPOT_INFLIGHT {
+            return None;
         }
+        *entry += 1;
+        drop(entry);
+        Some(EvilpotInflightPermit {
+            _global: global_permit,
+            per_ip_map: Arc::clone(&self.per_ip_inflight),
+            ip: client_ip,
+        })
     }
 
     /// Deduplicates alerts per `(client_ip, status)` with a 5-minute cooldown so repeated
@@ -612,9 +579,8 @@ pub fn build_attack_signal(
 }
 
 /// Zero-copy conversion from `evilpot::EvilpotBody` (`Infallible` error) to Exposure's `ProxyBody`,
-/// enforcing an active timer-driven stream duration deadline (`MAX_EVILPOT_STREAM_DURATION`),
-/// retaining the admission `EvilpotInflightPermit` until stream completion, and attaching
-/// `EvilpotStealthMarker` so Ingress preserves `evilpot`'s spoofed persona `Server` header.
+/// enforcing an active timer-driven stream duration deadline (`MAX_EVILPOT_STREAM_DURATION`), and
+/// retaining the admission `EvilpotInflightPermit` until stream completion.
 pub fn into_proxy_response(
     resp: Response<EvilpotBody>,
     permit: Option<EvilpotInflightPermit>,
@@ -628,7 +594,7 @@ pub fn into_proxy_response_with_ban_hook(
     ban_hook: Option<TarpitBanHook>,
 ) -> Response<ProxyBody> {
     let deadline_sleep = Box::pin(tokio::time::sleep(MAX_EVILPOT_STREAM_DURATION));
-    let mut out = resp.map(|body| {
+    resp.map(|body| {
         BoundedEvilpotBody {
             inner: body,
             deadline_sleep,
@@ -636,9 +602,7 @@ pub fn into_proxy_response_with_ban_hook(
             ban_hook,
         }
         .boxed()
-    });
-    out.extensions_mut().insert(EvilpotStealthMarker);
-    out
+    })
 }
 
 #[cfg(test)]
@@ -696,7 +660,6 @@ mod tests {
         assert!(EvilpotManager::has_triggered_traps(&engine));
 
         let proxy_resp = into_proxy_response(outcome.response, Some(permit));
-        assert!(proxy_resp.extensions().get::<EvilpotStealthMarker>().is_some());
         let body_bytes = proxy_resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = std::str::from_utf8(&body_bytes).unwrap();
 

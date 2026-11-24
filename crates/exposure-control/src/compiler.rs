@@ -14,7 +14,7 @@ use exposure_core::config::{
 use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
 use exposure_core::geoip::is_valid_region_token;
-use exposure_core::routing::canonical_ip;
+use exposure_core::routing::{canonical_ip, is_public_routable_ip};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -159,7 +159,7 @@ fn synthesize_guard_from_sets(
         let ab = resolve_antibot_profile(ab, defs);
         GuardProfile {
             antibot: ab.antibot,
-            rate_limit_bucket: None,
+            rate_limit_bucket: legacy_guard.and_then(|lg| lg.rate_limit_bucket.clone()),
             allow_cidrs: ab.allow_cidrs,
             deny_cidrs: ab.deny_cidrs,
             challenge_threshold: ab.challenge_threshold,
@@ -184,7 +184,8 @@ fn synthesize_guard_from_sets(
     } else if let Some(lg) = legacy_guard {
         resolve_guard_profile(lg, defs)
     } else {
-        // Pure bucket and/or WAF binding without an antibot set must keep antibot Off.
+        // Pure bucket and/or WAF binding without an antibot set must keep antibot and all
+        // bot/browser/beacon flags strictly disabled so `GuardDefaults` cannot leak into them.
         GuardProfile {
             antibot: AntibotMode::Off,
             rate_limit_bucket: None,
@@ -194,15 +195,15 @@ fn synthesize_guard_from_sets(
             reject_threshold: defs.reject_threshold,
             pow_difficulty: defs.pow_difficulty,
             clearance_ttl_secs: defs.clearance_ttl_secs,
-            bind_ua: Some(defs.bind_ua),
-            bind_ip_prefix: Some(defs.bind_ip_prefix),
+            bind_ua: Some(false),
+            bind_ip_prefix: Some(false),
             api_bypass_headers: Vec::new(),
-            block_bots: Some(defs.block_bots),
-            browser_only: Some(defs.browser_only),
-            block_headless: Some(defs.block_headless),
-            require_client_fp: Some(defs.require_client_fp),
-            js_fp_beacon: Some(defs.js_fp_beacon),
-            js_fp_ttl_secs: Some(defs.js_fp_ttl_secs.max(60)),
+            block_bots: Some(false),
+            browser_only: Some(false),
+            block_headless: Some(false),
+            require_client_fp: Some(false),
+            js_fp_beacon: None,
+            js_fp_ttl_secs: None,
             waf: Some(WafConfig {
                 mode: WafMode::Off,
                 ..Default::default()
@@ -215,13 +216,43 @@ fn synthesize_guard_from_sets(
     }
     if let Some(w) = waf_set {
         out.waf = Some(normalize_waf_config(w.clone()));
-    } else if legacy_guard.is_none() {
+    } else if let Some(lg) = legacy_guard {
+        let lg_waf = lg.waf.clone().unwrap_or_else(|| defs.waf.clone());
+        out.waf = Some(normalize_waf_config(lg_waf));
+    } else {
         out.waf = Some(WafConfig {
             mode: WafMode::Off,
             ..Default::default()
         });
     }
     out
+}
+
+fn validate_set_name(name: &str, kind: &str, errors: &mut Vec<String>) {
+    if name.starts_with("__sec:") {
+        errors.push(format!("{kind} name '{name}' uses reserved '__sec:' prefix"));
+    } else if let Err(e) = validate_identifier(name, kind) {
+        errors.push(e.to_string());
+    }
+}
+
+fn validate_rate_limit_bucket(
+    bucket: &RateLimitBucket,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    if !bucket.capacity.is_finite() || bucket.capacity < 1.0 {
+        errors.push(format!(
+            "{label}.capacity ({}) must be a finite number >= 1",
+            bucket.capacity
+        ));
+    }
+    if !bucket.refill_per_sec.is_finite() || bucket.refill_per_sec <= 0.0 {
+        errors.push(format!(
+            "{label}.refill_per_sec ({}) must be a finite number > 0",
+            bucket.refill_per_sec
+        ));
+    }
 }
 
 fn validate_geo_policy_cfg(
@@ -261,10 +292,48 @@ fn validate_geo_policy_cfg(
 }
 
 fn validate_geoip_config(cfg: &GeoIpConfig, label: &str, errors: &mut Vec<String>) {
+    if let Some(ref raw_dir) = cfg.cache_dir {
+        let dir = raw_dir.trim();
+        if !dir.is_empty()
+            && (dir.contains('\0')
+                || dir.split(['/', '\\']).any(|seg| seg == ".."))
+        {
+            errors.push(format!(
+                "{label}.cache_dir ('{raw_dir}') must not contain NUL or '..' traversal segments"
+            ));
+        }
+    }
     for (field, url_opt) in [("ipv4_url", &cfg.ipv4_url), ("ipv6_url", &cfg.ipv6_url)] {
         if let Some(raw) = url_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if !raw.starts_with("https://") {
+            let Some(after_scheme) = raw.strip_prefix("https://") else {
                 errors.push(format!("{label}.{field} ('{raw}') must use https://"));
+                continue;
+            };
+            let authority = after_scheme
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            if authority.is_empty() || authority.contains('@') {
+                errors.push(format!(
+                    "{label}.{field} ('{raw}') has invalid URL authority"
+                ));
+                continue;
+            }
+            let host = if let Some(rest) = authority.strip_prefix('[') {
+                rest.split(']').next().unwrap_or("")
+            } else {
+                authority.split(':').next().unwrap_or("")
+            };
+            let clean = host.trim_end_matches('.').to_ascii_lowercase();
+            let is_local_name = clean == "localhost" || clean.ends_with(".localhost");
+            let non_public_ip = clean
+                .parse::<IpAddr>()
+                .map(|ip| !is_public_routable_ip(ip))
+                .unwrap_or(false);
+            if clean.is_empty() || is_local_name || non_public_ip {
+                errors.push(format!(
+                    "{label}.{field} ('{raw}') must reference a public HTTPS host"
+                ));
             }
         }
     }
@@ -417,10 +486,44 @@ fn resolve_ingress_config(
     }
 
     for rule in &mut out.rules {
-        let eff_bucket = opt_non_empty(&rule.bucket).or_else(|| out.default_bucket.clone());
-        let eff_antibot = opt_non_empty(&rule.antibot).or_else(|| out.default_antibot.clone());
-        let eff_waf = opt_non_empty(&rule.waf).or_else(|| out.default_waf.clone());
         let raw_guard = opt_non_empty(&rule.guard);
+        let lg_ref = raw_guard.as_deref().and_then(|k| out.guards.get(k));
+        let expl_bucket = opt_non_empty(&rule.bucket);
+        let expl_antibot = opt_non_empty(&rule.antibot);
+        let expl_waf = opt_non_empty(&rule.waf);
+
+        // An explicit rule.guard on the rule overrides cluster/node defaults for antibot & WAF,
+        // while explicit rule.{bucket,antibot,waf} always take highest priority, and unset
+        // bucket/waf slots on a legacy guard can still be backfilled from defaults.
+        let lg_has_bucket = lg_ref
+            .and_then(|g| opt_non_empty(&g.rate_limit_bucket))
+            .is_some();
+        let lg_has_waf = lg_ref
+            .and_then(|g| g.waf.as_ref())
+            .map(|w| w.mode != WafMode::Off)
+            .unwrap_or(false);
+
+        let eff_bucket = expl_bucket.or_else(|| {
+            if lg_has_bucket {
+                None
+            } else {
+                out.default_bucket.clone()
+            }
+        });
+        let eff_antibot = expl_antibot.or_else(|| {
+            if raw_guard.is_some() {
+                None
+            } else {
+                out.default_antibot.clone()
+            }
+        });
+        let eff_waf = expl_waf.or_else(|| {
+            if lg_has_waf {
+                None
+            } else {
+                out.default_waf.clone()
+            }
+        });
 
         if eff_bucket.is_some() || eff_antibot.is_some() || eff_waf.is_some() {
             rule.bucket = eff_bucket.clone();
@@ -455,7 +558,6 @@ fn resolve_ingress_config(
                 if !out.guards.contains_key(&synth_key) {
                     let ab_ref = eff_antibot.as_deref().and_then(|k| out.antibot_sets.get(k));
                     let waf_ref = eff_waf.as_deref().and_then(|k| out.waf_sets.get(k));
-                    let lg_ref = raw_guard.as_deref().and_then(|k| out.guards.get(k));
                     let synth = synthesize_guard_from_sets(
                         ab_ref,
                         lg_ref,
@@ -1154,7 +1256,15 @@ pub fn compile_topology_full(
             ));
         }
     }
+    for (b_name, b) in &topo.bucket_templates {
+        validate_set_name(b_name, "bucket_template", &mut errors);
+        validate_rate_limit_bucket(b, &format!("bucket_templates '{b_name}'"), &mut errors);
+    }
+    for (w_name, _) in &topo.waf_templates {
+        validate_set_name(w_name, "waf_template", &mut errors);
+    }
     for (a_name, ab) in &topo.antibot_templates {
+        validate_set_name(a_name, "antibot_template", &mut errors);
         validate_cidr_list(
             &ab.allow_cidrs,
             &format!("antibot_templates '{a_name}'.allow_cidrs"),
@@ -1340,6 +1450,20 @@ pub fn compile_topology_full(
         }
         if let Some(ing) = resolved_ingress.get(node_tag) {
             validate_geoip_config(&ing.geoip, &format!("ingress '{node_tag}'.geoip"), &mut errors);
+            for (b_name, b) in &spec.ingress.rate_limit_buckets {
+                validate_set_name(b_name, &format!("ingress '{node_tag}'.rate_limit_buckets"), &mut errors);
+                validate_rate_limit_bucket(
+                    b,
+                    &format!("ingress '{node_tag}' rate_limit_bucket '{b_name}'"),
+                    &mut errors,
+                );
+            }
+            for a_name in spec.ingress.antibot_sets.keys() {
+                validate_set_name(a_name, &format!("ingress '{node_tag}'.antibot_sets"), &mut errors);
+            }
+            for w_name in spec.ingress.waf_sets.keys() {
+                validate_set_name(w_name, &format!("ingress '{node_tag}'.waf_sets"), &mut errors);
+            }
             if let Some(ref bname) = ing.default_bucket {
                 if !ing.rate_limit_buckets.contains_key(bname) {
                     errors.push(format!(
@@ -2200,7 +2324,7 @@ pub fn compute_control_hops(
     }
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for link in &topo.links {
-        if link.mode == LinkMode::Tunnel && link.tunnel_direction != Some(TunnelDirection::Outbound) {
+        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound) {
             continue;
         }
         adj.entry(link.from.as_str()).or_default().push(link.to.as_str());
@@ -2852,10 +2976,15 @@ mod tests {
         let (rep, compiled) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(rep.valid, "errors: {:?}", rep.errors);
 
-        // ingress-cn gets std-rate + Evilpot WAF, with antibot strictly Off (no accidental Challenge!)
+        // ingress-cn gets std-rate + Evilpot WAF, with antibot and bot/browser/beacon flags strictly disabled!
         let cn_ing = &compiled["ingress-cn"].ingress;
         let cn_g = cn_ing.guards.get(cn_ing.rules[0].guard.as_ref().unwrap()).unwrap();
         assert_eq!(cn_g.antibot, AntibotMode::Off);
+        assert_eq!(cn_g.block_bots, Some(false));
+        assert_eq!(cn_g.browser_only, Some(false));
+        assert_eq!(cn_g.block_headless, Some(false));
+        assert_eq!(cn_g.require_client_fp, Some(false));
+        assert_eq!(cn_g.js_fp_beacon, None);
         assert_eq!(cn_g.rate_limit_bucket.as_deref(), Some("std-rate"));
         assert_eq!(cn_g.waf.as_ref().unwrap().mode, WafMode::Evilpot);
 
@@ -2866,6 +2995,67 @@ mod tests {
         assert_eq!(us_g.rate_limit_bucket.as_deref(), Some("tight-rate"));
         assert_eq!(us_g.waf.as_ref().unwrap().mode, WafMode::Evilpot);
         assert!(us_g.geo.as_ref().unwrap().enabled);
+
+        // Legacy guard with WAF must NOT be wiped when default_antibot / default_bucket is also set!
+        let mut hybrid = topo.clone();
+        hybrid.defaults.ingress.default_waf = None;
+        hybrid.defaults.ingress.default_antibot = Some("cn-challenge".into());
+        hybrid.guard_templates.insert(
+            "legacy-waf".into(),
+            GuardProfile {
+                antibot: AntibotMode::Off,
+                waf: Some(WafConfig {
+                    mode: WafMode::Block,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        hybrid.services.get_mut("api").unwrap().guard = Some("legacy-waf".into());
+        let (hyb_rep, hyb_comp) = compile_topology(&hybrid, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(hyb_rep.valid, "hybrid errors: {:?}", hyb_rep.errors);
+        let hyb_g = hyb_comp["ingress-cn"]
+            .ingress
+            .guards
+            .get(hyb_comp["ingress-cn"].ingress.rules[0].guard.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(hyb_g.waf.as_ref().unwrap().mode, WafMode::Block);
+        assert_eq!(hyb_g.rate_limit_bucket.as_deref(), Some("std-rate"));
+        assert_eq!(hyb_g.antibot, AntibotMode::Off);
+
+        // compute_control_hops treats LinkMode::Tunnel with tunnel_direction: None as Outbound
+        let mut tun_topo = TopologySpec::default();
+        tun_topo.nodes.insert("ing-a".into(), TopologyNodeSpec::default());
+        tun_topo.nodes.insert("eg-b".into(), TopologyNodeSpec::default());
+        tun_topo.links.push(TopologyLinkSpec {
+            from: "ing-a".into(),
+            to: "eg-b".into(),
+            peer_tag: None,
+            mode: LinkMode::Tunnel,
+            tunnel_direction: None,
+            bidirectional: false,
+            endpoints: vec![],
+            reverse_endpoints: vec![],
+            expected_client_addr: None,
+        });
+        assert_eq!(
+            compute_control_hops("ctrl", "ing-a", "eg-b", &tun_topo),
+            Some(vec!["ctrl".into(), "ing-a".into(), "eg-b".into()])
+        );
+
+        // Invalid GeoIP cache_dir, non-public GeoIP URL, and non-positive bucket fail validation
+        let mut bad_geoip = topo.clone();
+        bad_geoip.defaults.ingress.geoip.cache_dir = Some("../escape".into());
+        bad_geoip.defaults.ingress.geoip.ipv4_url = Some("https://127.0.0.1/geo.csv".into());
+        bad_geoip.bucket_templates.insert(
+            "bad-bkt".into(),
+            RateLimitBucket { capacity: 0.0, refill_per_sec: -1.0, per_ip: None },
+        );
+        let (bad_gip_rep, _) = compile_topology(&bad_geoip, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!bad_gip_rep.valid);
+        assert!(bad_gip_rep.errors.iter().any(|e| e.contains("cache_dir")));
+        assert!(bad_gip_rep.errors.iter().any(|e| e.contains("public HTTPS host")));
+        assert!(bad_gip_rep.errors.iter().any(|e| e.contains("bad-bkt")));
 
         // Invalid Geo region token fails validation
         let mut bad_geo = topo.clone();

@@ -15,7 +15,7 @@ pub const MAX_HEADER_FRAME_BYTES: usize = 32 * 1024;
 pub const MAX_SPECIAL_HOPS: usize = 32;
 pub const MAX_TTL: u8 = 32;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum StreamKind {
     Service = 1,
@@ -524,8 +524,13 @@ pub enum SpecialPayload {
     StatusReq,
     StatusResp(NodeStatusSnapshot),
     PullTelemetryReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
         #[serde(default)]
         since_minute: Option<i64>,
+        control_signature: String,
     },
     PullTelemetryResp(MaintainerTelemetrySnapshot),
     BootstrapForward {
@@ -804,6 +809,29 @@ pub fn geoip_sync_req_signing_bytes(
     out.extend_from_slice(&expires_at.to_be_bytes());
     push_len_prefixed(&mut out, target_node_tag.as_bytes());
     out.push(u8::from(force));
+    out
+}
+
+pub fn pull_telemetry_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    maintainer_tag: &str,
+    since_minute: Option<i64>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(160);
+    out.extend_from_slice(b"exposure-pull-telemetry-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, maintainer_tag.as_bytes());
+    match since_minute {
+        Some(m) => {
+            out.push(1);
+            out.extend_from_slice(&m.to_be_bytes());
+        }
+        None => out.push(0),
+    }
     out
 }
 

@@ -106,6 +106,7 @@ const MESSAGES = {
     "common.no": "No",
     "common.back": "Back",
     "common.generate": "Generate",
+    "common.invalidName": "Invalid name (use 1-64 letters, digits, ., _, -)",
 
     // Overview
     "ov.kpi.nodes": "Mesh Hosts",
@@ -627,6 +628,7 @@ const MESSAGES = {
     "common.no": "否",
     "common.back": "返回",
     "common.generate": "生成",
+    "common.invalidName": "名称无效（请使用 1-64 位字母、数字、.、_、-）",
 
     // Overview
     "ov.kpi.nodes": "网格主机",

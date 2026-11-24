@@ -247,7 +247,15 @@ export function normalizeWafConfig(raw) {
       : [],
     inspect_headers: Boolean(s.inspect_headers ?? b.inspect_headers),
     inspect_body: Boolean(s.inspect_body ?? b.inspect_body),
-    max_body_bytes: Math.min(256 * 1024, Math.max(0, Number(s.max_body_bytes ?? b.max_body_bytes) || b.max_body_bytes)),
+    max_body_bytes: Math.min(
+      256 * 1024,
+      Math.max(
+        0,
+        s.max_body_bytes !== null && s.max_body_bytes !== undefined && s.max_body_bytes !== "" && Number.isFinite(Number(s.max_body_bytes))
+          ? Number(s.max_body_bytes)
+          : b.max_body_bytes,
+      ),
+    ),
     exempt_paths: Array.isArray(s.exempt_paths) ? s.exempt_paths.map((x) => String(x).trim()).filter(Boolean) : [],
     crs_paranoia_level: Math.min(4, Math.max(1, Number(s.crs_paranoia_level ?? b.crs_paranoia_level) || b.crs_paranoia_level)),
     disabled_rule_ids: Array.isArray(s.disabled_rule_ids)

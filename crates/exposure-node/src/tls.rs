@@ -1,6 +1,5 @@
-use std::fs::File;
+use std::collections::HashSet;
 use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -14,53 +13,58 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
-/// Dynamic SNI certificate resolver supporting exact & wildcard domain hot-reloading.
+/// Dynamic SNI certificate resolver supporting exact & wildcard domain hot-reloading,
+/// keeping ACME/pushed certs (`dynamic_certs`) isolated from config file certs (`file_certs`).
 #[derive(Debug, Default)]
 pub struct DynamicCertResolver {
-    certs: DashMap<String, Arc<CertifiedKey>>,
-    /// Domains loaded from static `tls_certs` config files (so removed entries can be pruned on reload).
-    file_domains: DashMap<String, ()>,
+    dynamic_certs: DashMap<String, Arc<CertifiedKey>>,
+    file_certs: DashMap<String, Arc<CertifiedKey>>,
+}
+
+fn parse_certified_key_pem(domain: &str, cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>> {
+    let mut cert_reader = BufReader::new(cert_pem.as_bytes());
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| ExposureError::Crypto(format!("parse cert PEM for {domain}: {e}")))?;
+    if certs.is_empty() {
+        return Err(ExposureError::Crypto(format!(
+            "no certificates found in PEM for {domain}"
+        )));
+    }
+
+    let mut key_reader = BufReader::new(key_pem.as_bytes());
+    let key = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| ExposureError::Crypto(format!("parse private key PEM for {domain}: {e}")))?
+        .ok_or_else(|| ExposureError::Crypto(format!("no private key found for {domain}")))?;
+
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| ExposureError::Crypto(format!("unsupported private key for {domain}: {e}")))?;
+
+    let ck = CertifiedKey::new(certs, signing_key);
+    ck.keys_match().map_err(|e| {
+        ExposureError::Crypto(format!("certificate and private key mismatch for {domain}: {e}"))
+    })?;
+    Ok(Arc::new(ck))
 }
 
 impl DynamicCertResolver {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            certs: DashMap::new(),
-            file_domains: DashMap::new(),
+            dynamic_certs: DashMap::new(),
+            file_certs: DashMap::new(),
         })
     }
 
     pub fn load_from_pem(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
-        let mut cert_reader = BufReader::new(cert_pem.as_bytes());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| ExposureError::Crypto(format!("parse cert PEM for {domain}: {e}")))?;
-        if certs.is_empty() {
-            return Err(ExposureError::Crypto(format!(
-                "no certificates found in PEM for {domain}"
-            )));
-        }
-
-        let mut key_reader = BufReader::new(key_pem.as_bytes());
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| ExposureError::Crypto(format!("parse private key PEM for {domain}: {e}")))?
-            .ok_or_else(|| ExposureError::Crypto(format!("no private key found for {domain}")))?;
-
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| ExposureError::Crypto(format!("unsupported private key for {domain}: {e}")))?;
-
-        let ck = CertifiedKey::new(certs, signing_key);
-        ck.keys_match().map_err(|e| {
-            ExposureError::Crypto(format!("certificate and private key mismatch for {domain}: {e}"))
-        })?;
-
+        let ck = parse_certified_key_pem(domain, cert_pem, key_pem)?;
         let key_domain = normalize_host(domain);
-        self.certs.insert(key_domain, Arc::new(ck));
+        self.dynamic_certs.insert(key_domain, ck);
         info!(domain = %domain, "loaded TLS certificate into dynamic resolver");
         Ok(())
     }
 
-    /// Replace file-based certificates atomically (validating all files before updating, and pruning removed ones).
+    /// Replace file-based certificates atomically (validating all files before updating, and pruning removed ones)
+    /// without touching ACME/pushed certificates in `dynamic_certs`.
     pub fn load_from_files(&self, entries: &[TlsCertEntry]) -> Result<()> {
         let mut parsed: Vec<(String, Arc<CertifiedKey>)> = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -70,72 +74,20 @@ impl DynamicCertResolver {
             let key_pem = std::fs::read_to_string(&entry.key_path).map_err(|e| {
                 ExposureError::Config(format!("read key file {}: {e}", entry.key_path))
             })?;
-            let mut cert_reader = BufReader::new(cert_pem.as_bytes());
-            let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| ExposureError::Crypto(format!("parse cert PEM for {}: {e}", entry.domain)))?;
-            if certs.is_empty() {
-                return Err(ExposureError::Crypto(format!(
-                    "no certificates found in PEM for {}",
-                    entry.domain
-                )));
-            }
-            let mut key_reader = BufReader::new(key_pem.as_bytes());
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|e| ExposureError::Crypto(format!("parse key PEM for {}: {e}", entry.domain)))?
-                .ok_or_else(|| ExposureError::Crypto(format!("no private key for {}", entry.domain)))?;
-            let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-                .map_err(|e| ExposureError::Crypto(format!("unsupported key for {}: {e}", entry.domain)))?;
-            let ck = CertifiedKey::new(certs, signing_key);
-            ck.keys_match().map_err(|e| {
-                ExposureError::Crypto(format!(
-                    "cert/key mismatch for {}: {e}",
-                    entry.domain
-                ))
-            })?;
-            parsed.push((normalize_host(&entry.domain), Arc::new(ck)));
+            let ck = parse_certified_key_pem(&entry.domain, &cert_pem, &key_pem)?;
+            parsed.push((normalize_host(&entry.domain), ck));
         }
 
-        // Remove stale file-backed domains no longer present
-        let new_set: std::collections::HashSet<&str> =
-            parsed.iter().map(|(d, _)| d.as_str()).collect();
-        let old_domains: Vec<String> = self
-            .file_domains
-            .iter()
-            .map(|e| e.key().clone())
-            .collect();
+        let new_set: HashSet<&str> = parsed.iter().map(|(d, _)| d.as_str()).collect();
+        let old_domains: Vec<String> = self.file_certs.iter().map(|e| e.key().clone()).collect();
         for old in old_domains {
             if !new_set.contains(old.as_str()) {
-                self.file_domains.remove(&old);
-                self.certs.remove(&old);
+                self.file_certs.remove(&old);
             }
         }
         for (domain, ck) in parsed {
-            self.file_domains.insert(domain.clone(), ());
-            self.certs.insert(domain, ck);
+            self.file_certs.insert(domain, ck);
         }
-        Ok(())
-    }
-
-    pub fn load_pem_file_pair(&self, domain: &str, cert_path: &Path, key_path: &Path) -> Result<()> {
-        let mut cert_reader = BufReader::new(File::open(cert_path)?);
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| ExposureError::Crypto(format!("parse cert file: {e}")))?;
-        if certs.is_empty() {
-            return Err(ExposureError::Crypto("no certificates found in file".into()));
-        }
-        let mut key_reader = BufReader::new(File::open(key_path)?);
-        let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| ExposureError::Crypto(format!("parse key file: {e}")))?
-            .ok_or_else(|| ExposureError::Crypto("no private key in file".into()))?;
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| ExposureError::Crypto(format!("unsupported key: {e}")))?;
-        let ck = CertifiedKey::new(certs, signing_key);
-        ck.keys_match().map_err(|e| {
-            ExposureError::Crypto(format!("certificate and private key mismatch: {e}"))
-        })?;
-        self.certs.insert(normalize_host(domain), Arc::new(ck));
         Ok(())
     }
 
@@ -150,7 +102,22 @@ impl DynamicCertResolver {
     }
 
     pub fn cert_count(&self) -> usize {
-        self.certs.len()
+        let mut domains: HashSet<String> =
+            HashSet::with_capacity(self.dynamic_certs.len() + self.file_certs.len());
+        for entry in self.dynamic_certs.iter() {
+            domains.insert(entry.key().clone());
+        }
+        for entry in self.file_certs.iter() {
+            domains.insert(entry.key().clone());
+        }
+        domains.len()
+    }
+
+    fn resolve_exact_or_wildcard(&self, key: &str) -> Option<Arc<CertifiedKey>> {
+        if let Some(c) = self.dynamic_certs.get(key) {
+            return Some(Arc::clone(&c));
+        }
+        self.file_certs.get(key).map(|c| Arc::clone(&c))
     }
 }
 
@@ -158,18 +125,18 @@ impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = client_hello.server_name() {
             let lower = normalize_host(sni);
-            if let Some(exact) = self.certs.get(&lower) {
-                return Some(Arc::clone(&exact));
+            if let Some(exact) = self.resolve_exact_or_wildcard(&lower) {
+                return Some(exact);
             }
             if let Some((_, rest)) = lower.split_once('.') {
                 let wildcard = format!("*.{rest}");
-                if let Some(wc) = self.certs.get(&wildcard) {
-                    return Some(Arc::clone(&wc));
+                if let Some(wc) = self.resolve_exact_or_wildcard(&wildcard) {
+                    return Some(wc);
                 }
             }
         }
         // Only serve explicit wildcard default "*" certificate; never leak another tenant's certificate
-        self.certs.get("*").map(|e| Arc::clone(e.value()))
+        self.resolve_exact_or_wildcard("*")
     }
 }
 
@@ -187,19 +154,43 @@ pub struct ClientHelloSignal {
     pub fingerprint: Option<String>,
 }
 
+/// Check RFC 8701 GREASE codepoint: both bytes identical and `(byte & 0x0f) == 0x0a`.
+#[inline]
+fn is_grease_value(val: u16) -> bool {
+    (val & 0x0f0f) == 0x0a0a && (val >> 8) == (val & 0xff)
+}
+
 /// Non-destructively peek at the TCP stream's TLS ClientHello before rustls consumes it.
 pub async fn peek_client_hello(stream: &TcpStream) -> ClientHelloSignal {
     let mut buf = [0u8; 4096];
-    let n = match tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        stream.peek(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok(n)) if n >= 43 => n,
-        _ => return ClientHelloSignal::default(),
-    };
-    parse_client_hello_bytes(&buf[..n]).unwrap_or_default()
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut last_n = 0usize;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, stream.peek(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                last_n = n;
+                if buf[0] != 0x16 {
+                    return ClientHelloSignal::default();
+                }
+                if n >= 5 {
+                    let rec_len = 5usize + u16::from_be_bytes([buf[3], buf[4]]) as usize;
+                    if n >= rec_len.min(buf.len()) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            _ => break,
+        }
+    }
+    if last_n < 43 {
+        return ClientHelloSignal::default();
+    }
+    parse_client_hello_bytes(&buf[..last_n]).unwrap_or_default()
 }
 
 pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
@@ -231,7 +222,7 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
     let mut has_grease = false;
     for chunk in data[pos..pos + cs_len].chunks_exact(2) {
         let c = u16::from_be_bytes([chunk[0], chunk[1]]);
-        if (c & 0x0f0f) == 0x0a0a {
+        if is_grease_value(c) {
             has_grease = true;
         } else {
             ciphers.push(c);
@@ -264,7 +255,7 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
                 break;
             }
             let ext_data = &data[pos..pos + ext_len];
-            if (ext_type & 0x0f0f) == 0x0a0a {
+            if is_grease_value(ext_type) {
                 has_grease = true;
             } else {
                 extensions.push(ext_type);
@@ -299,7 +290,7 @@ pub fn parse_client_hello_bytes(data: &[u8]) -> Option<ClientHelloSignal> {
                 let g_end = (2 + g_len).min(ext_data.len());
                 for chunk in ext_data[2..g_end].chunks_exact(2) {
                     let g = u16::from_be_bytes([chunk[0], chunk[1]]);
-                    if (g & 0x0f0f) == 0x0a0a {
+                    if is_grease_value(g) {
                         has_grease = true;
                     } else {
                         supported_groups.push(g);
@@ -364,4 +355,44 @@ pub fn generate_self_signed_pem(domain: &str) -> Result<(String, String)> {
     let key_pem = cert.key_pair.serialize_pem();
     warn!(domain = %domain, "generated self-signed certificate");
     Ok((cert_pem, key_pem))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grease_mask_matches_rfc8701_only() {
+        assert!(is_grease_value(0x0a0a));
+        assert!(is_grease_value(0xfafa));
+        assert!(!is_grease_value(0x0a1a));
+        assert!(!is_grease_value(0x1301));
+    }
+
+    #[test]
+    fn file_reload_does_not_overwrite_dynamic_certs() {
+        let store = DynamicCertResolver::new();
+        let (cert_a, key_a) = generate_self_signed_pem("dyn.example.com").unwrap();
+        let (cert_b, key_b) = generate_self_signed_pem("file.example.com").unwrap();
+        store.load_from_pem("dyn.example.com", &cert_a, &key_a).unwrap();
+        let tmp = std::env::temp_dir().join(format!("exp-tls-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cp = tmp.join("f.crt");
+        let kp = tmp.join("f.key");
+        std::fs::write(&cp, &cert_b).unwrap();
+        std::fs::write(&kp, &key_b).unwrap();
+        store
+            .load_from_files(&[TlsCertEntry {
+                domain: "file.example.com".into(),
+                cert_path: cp.to_string_lossy().into_owned(),
+                key_path: kp.to_string_lossy().into_owned(),
+            }])
+            .unwrap();
+        assert_eq!(store.cert_count(), 2);
+        // Empty file reload prunes file_certs but keeps dynamic_certs intact.
+        store.load_from_files(&[]).unwrap();
+        assert_eq!(store.cert_count(), 1);
+        assert!(store.resolve_exact_or_wildcard("dyn.example.com").is_some());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

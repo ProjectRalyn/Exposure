@@ -385,23 +385,8 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(e);
     }
 
-    // Only consume a replay-cache slot AFTER the peer proves possession of its key, so an
-    // unauthenticated client cannot pollute the bounded nonce cache.
-    if !nonce_cache.check_and_insert(&hello.nonce, now) {
-        let ack = build_signed_ack(
-            keypair,
-            noise_handshake_hash,
-            &hello.nonce,
-            local_tag,
-            false,
-            false,
-            false,
-            Some("hello nonce replay detected".into()),
-        );
-        let _ = write_json_frame(stream, &ack).await;
-        return Err(ExposureError::Auth("hello nonce replay detected".into()));
-    }
-
+    // Wait to consume a replay-cache slot until the peer passes identity / bootstrap eligibility,
+    // so unauthenticated Internet scanners cannot pollute the bounded nonce cache.
     let mut authenticated = false;
     let mut bootstrap_pending = false;
     let mut warning: Option<String> = None;
@@ -411,9 +396,37 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             .iter()
             .any(|pk| !pk.trim().is_empty() && pk.trim() == hello.public_key.trim())
         {
+            if !nonce_cache.check_and_insert(&hello.nonce, now) {
+                let ack = build_signed_ack(
+                    keypair,
+                    noise_handshake_hash,
+                    &hello.nonce,
+                    local_tag,
+                    false,
+                    false,
+                    false,
+                    Some("hello nonce replay detected".into()),
+                );
+                let _ = write_json_frame(stream, &ack).await;
+                return Err(ExposureError::Auth("hello nonce replay detected".into()));
+            }
             authenticated = true;
         } else if listen_policy.effective_allow_bootstrap() {
             if let Some(ref proof) = hello.bootstrap_proof {
+                if !nonce_cache.check_and_insert(&hello.nonce, now) {
+                    let ack = build_signed_ack(
+                        keypair,
+                        noise_handshake_hash,
+                        &hello.nonce,
+                        local_tag,
+                        false,
+                        false,
+                        false,
+                        Some("hello nonce replay detected".into()),
+                    );
+                    let _ = write_json_frame(stream, &ack).await;
+                    return Err(ExposureError::Auth("hello nonce replay detected".into()));
+                }
                 match bootstrap_state
                     .verify_and_consume(&hello.node_tag, &hello.public_key, &hello.nonce, proof)
                     .await
@@ -556,6 +569,20 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         if pk_ok {
+            if !nonce_cache.check_and_insert(&hello.nonce, now) {
+                let ack = build_signed_ack(
+                    keypair,
+                    noise_handshake_hash,
+                    &hello.nonce,
+                    local_tag,
+                    false,
+                    false,
+                    false,
+                    Some("hello nonce replay detected".into()),
+                );
+                let _ = write_json_frame(stream, &ack).await;
+                return Err(ExposureError::Auth("hello nonce replay detected".into()));
+            }
             authenticated = true;
             if let Some(ref expected_addr) = peer.expected_client_addr {
                 if !ip_matches_cidrs(remote_addr.ip(), std::slice::from_ref(expected_addr)) {
@@ -588,6 +615,20 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         }
     } else if listen_policy.effective_allow_bootstrap() {
         if let Some(ref proof) = hello.bootstrap_proof {
+            if !nonce_cache.check_and_insert(&hello.nonce, now) {
+                let ack = build_signed_ack(
+                    keypair,
+                    noise_handshake_hash,
+                    &hello.nonce,
+                    local_tag,
+                    false,
+                    false,
+                    false,
+                    Some("hello nonce replay detected".into()),
+                );
+                let _ = write_json_frame(stream, &ack).await;
+                return Err(ExposureError::Auth("hello nonce replay detected".into()));
+            }
             if bootstrap_state.has_active().await {
                 // Listening node being dialed via DialEnrollReq by a relay node with local passphrase proof
                 match bootstrap_state

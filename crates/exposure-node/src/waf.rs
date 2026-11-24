@@ -5,13 +5,16 @@ use exposure_core::config::{WafCategory, WafConfig, WafMode};
 use exposure_core::crs::{
     builtin_crs_snapshot, WafRuleDescriptor, CRS_REGEX_SIZE_LIMIT, MAX_CRS_RULES,
 };
+use exposure_core::routing::normalize_path_for_match;
 use http::{header, HeaderMap, Method};
 use regex::{Regex, RegexBuilder};
 
 /// Hard ceiling on request body bytes buffered for WAF inspection (prevents OOM DoS).
 pub const WAF_HARD_MAX_BODY_BYTES: usize = 256 * 1024;
-/// Maximum UTF-8 bytes evaluated per field/target by the linear-time OWASP CRS regex engine.
+/// Maximum UTF-8 bytes evaluated per regex window by the linear-time OWASP CRS engine.
 const MAX_CRS_SCAN_BYTES: usize = 8192;
+/// Overlap between adjacent scan windows so multi-KiB bodies cannot split a signature across chunks.
+const CRS_SCAN_OVERLAP_BYTES: usize = 512;
 /// Iteration caps preventing CPU-amplification DoS via thousands of tiny query/cookie/form items.
 const MAX_WAF_QUERY_PARAMS: usize = 128;
 const MAX_WAF_COOKIE_ITEMS: usize = 64;
@@ -61,21 +64,25 @@ impl WafVerdict {
 }
 
 /// Checks whether a request path is exempt from WAF inspection.
-/// Prefix matching respects `/` segment boundaries unless the exempt prefix itself ends with `/`.
+/// Normalizes percent-encoding, backslashes, and dot segments before prefix matching at `/` boundaries
+/// so traversal attempts like `/api/webhooks/../../login` cannot bypass WAF inspection.
 pub fn is_path_exempt(path: &str, exempt_paths: &[String]) -> bool {
+    if exempt_paths.is_empty() {
+        return false;
+    }
+    let norm_path = normalize_path_for_match(path);
     for raw in exempt_paths {
         let p = raw.trim();
         if p.is_empty() {
             continue;
         }
-        if p == "/" {
+        let norm_p = normalize_path_for_match(p);
+        if norm_p == "/" {
             return true;
         }
-        if p.ends_with('/') {
-            if path.starts_with(p) {
-                return true;
-            }
-        } else if path == p || path.starts_with(&format!("{p}/")) {
+        if norm_path == norm_p
+            || (norm_path.starts_with(&norm_p) && norm_path.as_bytes().get(norm_p.len()) == Some(&b'/'))
+        {
             return true;
         }
     }
@@ -83,28 +90,29 @@ pub fn is_path_exempt(path: &str, exempt_paths: &[String]) -> bool {
 }
 
 /// Returns `Some(max_body_bytes)` when the request body should be buffered & inspected by WAF.
-/// WebSocket upgrades are skipped; all other bodies are bounded-inspected regardless of the
-/// client-supplied `Content-Type` (see security note below).
+/// All body-bearing HTTP methods (`POST`/`PUT`/`PATCH`/`DELETE`) are inspected regardless of
+/// `Upgrade` or `Content-Type` headers so attackers cannot bypass body inspection.
 pub fn should_inspect_body(
     cfg: &WafConfig,
     method: &Method,
     _headers: &HeaderMap,
-    is_upgrade: bool,
+    _is_upgrade: bool,
 ) -> Option<usize> {
-    if cfg.mode == WafMode::Off || !cfg.inspect_body || is_upgrade {
+    if cfg.mode == WafMode::Off || !cfg.inspect_body {
         return None;
     }
-    if !matches!(*method, Method::POST | Method::PUT | Method::PATCH) {
+    if !matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
         return None;
     }
     let limit = cfg.max_body_bytes.min(WAF_HARD_MAX_BODY_BYTES);
     if limit == 0 {
         return None;
     }
-    // SECURITY: Do NOT skip inspection based on the client-controlled `Content-Type`. A client
-    // could otherwise set `application/octet-stream` / `multipart/form-data` to bypass body
-    // inspection entirely. `CompiledCrsEngine::inspect_body` verifies multipart framing before
-    // part parsing and safely bounds binary payloads.
+    // SECURITY: Do NOT skip inspection based on the client-controlled `Content-Type` or `Upgrade`
+    // headers. A client could otherwise spoof them on a `POST` request to bypass body inspection.
     Some(limit)
 }
 
@@ -163,22 +171,6 @@ fn percent_decode_lossy(input: &str) -> Cow<'_, str> {
     cur
 }
 
-fn utf8_valid_prefix(bytes: &[u8]) -> Option<&str> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) if !s.is_empty() => Some(s),
-        Ok(_) => None,
-        Err(e) => {
-            let valid = e.valid_up_to();
-            if valid == 0 {
-                return None;
-            }
-            std::str::from_utf8(&bytes[..valid])
-                .ok()
-                .filter(|s| !s.is_empty())
-        }
-    }
-}
-
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -210,30 +202,51 @@ fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
     None
 }
 
+fn starts_with_ascii_icase(haystack: &str, prefix_lower: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let pb = prefix_lower.as_bytes();
+    hb.len() >= pb.len() && hb[..pb.len()].eq_ignore_ascii_case(pb)
+}
+
+fn ends_with_ascii_icase(haystack: &str, suffix_lower: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let sb = suffix_lower.as_bytes();
+    hb.len() >= sb.len() && hb[hb.len() - sb.len()..].eq_ignore_ascii_case(sb)
+}
+
+fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    let hb = haystack.as_bytes();
+    if hb.len() < nb.len() {
+        return false;
+    }
+    hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
+}
+
 fn is_binary_part_mime(ct: Option<&str>) -> bool {
     let Some(raw) = ct else {
         return false;
     };
-    let mime = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    mime.starts_with("image/")
-        || mime.starts_with("video/")
-        || mime.starts_with("audio/")
-        || mime.starts_with("font/")
-        || matches!(
-            mime.as_str(),
-            "application/octet-stream"
-                | "application/pdf"
-                | "application/zip"
-                | "application/gzip"
-                | "application/x-gzip"
-                | "application/x-tar"
-                | "application/x-bzip2"
-                | "application/x-7z-compressed"
-                | "application/wasm"
-        )
+    let mime = raw.split(';').next().unwrap_or("").trim();
+    starts_with_ascii_icase(mime, "image/")
+        || starts_with_ascii_icase(mime, "video/")
+        || starts_with_ascii_icase(mime, "audio/")
+        || starts_with_ascii_icase(mime, "font/")
+        || mime.eq_ignore_ascii_case("application/octet-stream")
+        || mime.eq_ignore_ascii_case("application/pdf")
+        || mime.eq_ignore_ascii_case("application/zip")
+        || mime.eq_ignore_ascii_case("application/gzip")
+        || mime.eq_ignore_ascii_case("application/x-gzip")
+        || mime.eq_ignore_ascii_case("application/x-tar")
+        || mime.eq_ignore_ascii_case("application/x-bzip2")
+        || mime.eq_ignore_ascii_case("application/x-7z-compressed")
+        || mime.eq_ignore_ascii_case("application/wasm")
 }
 
-fn extract_disposition_attr<'a>(disp_val: &'a str, key: &str) -> Option<&'a str> {
+fn extract_disposition_attr(disp_val: &str, key: &str) -> Option<String> {
     for param in disp_val.split(';').skip(1) {
         if let Some((k, v)) = param.split_once('=') {
             if k.trim().eq_ignore_ascii_case(key) {
@@ -242,24 +255,41 @@ fn extract_disposition_attr<'a>(disp_val: &'a str, key: &str) -> Option<&'a str>
                     .strip_prefix('"')
                     .and_then(|s| s.strip_suffix('"'))
                     .unwrap_or(raw);
-                return Some(clean);
+                return Some(clean.to_string());
             }
         }
     }
     None
 }
 
+fn extract_rfc5987_filename(disp_val: &str) -> Option<String> {
+    let raw = extract_disposition_attr(disp_val, "filename*")?;
+    // Strip `charset'lang'` prefix when present (e.g. `UTF-8''..%2fetc%2fpasswd`)
+    let val = if let Some((_, rest)) = raw.split_once("''") {
+        rest.to_string()
+    } else {
+        raw
+    };
+    Some(percent_decode_lossy(&val).into_owned())
+}
+
 struct MultipartPart<'a> {
-    name: Option<&'a str>,
-    filename: Option<&'a str>,
-    content_type: Option<&'a str>,
+    name: Option<String>,
+    filename: Option<String>,
+    filename_ext: Option<String>,
+    content_type: Option<String>,
     body: &'a [u8],
+}
+
+struct ParsedMultipart<'a> {
+    parts: Vec<MultipartPart<'a>>,
+    epilogue: &'a [u8],
 }
 
 /// Parse validated RFC 7578 `multipart/form-data` parts strictly.
 /// Returns `None` if `body` does not actually start with `--<boundary>`, preventing
 /// attackers from spoofing `Content-Type: multipart/form-data` on raw SQLi/CMDi payloads.
-fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<MultipartPart<'a>>> {
+fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<ParsedMultipart<'a>> {
     let mut dash_boundary = Vec::with_capacity(boundary.len() + 2);
     dash_boundary.extend_from_slice(b"--");
     dash_boundary.extend_from_slice(boundary.as_bytes());
@@ -274,7 +304,18 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
     } else if after_first.starts_with(b"\n") {
         pos += 1;
     } else if after_first.starts_with(b"--") {
-        return Some(Vec::new());
+        let tail = &after_first[2..];
+        if !tail.trim_ascii().is_empty() {
+            // Attacker stuffed SQLi/CMDi payload right after an immediate `--boundary--` close marker.
+            return Some(ParsedMultipart {
+                parts: Vec::new(),
+                epilogue: tail,
+            });
+        }
+        return Some(ParsedMultipart {
+            parts: Vec::new(),
+            epilogue: &[],
+        });
     } else {
         return None;
     }
@@ -284,6 +325,7 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
     lf_boundary.extend_from_slice(&dash_boundary);
 
     let mut parts = Vec::new();
+    let mut epilogue: &'a [u8] = &[];
     while pos < body.len() && parts.len() < MAX_WAF_FORM_PARAMS {
         let rest = &body[pos..];
         let (part_raw, next_pos, is_last) = if let Some(idx) = find_bytes(rest, &lf_boundary) {
@@ -293,7 +335,8 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
             }
             let after_marker = pos + idx + lf_boundary.len();
             let tail = &body[after_marker..];
-            if tail.starts_with(b"--") {
+            if let Some(after_close) = tail.strip_prefix(b"--") {
+                epilogue = after_close;
                 (&rest[..end], body.len(), true)
             } else if tail.starts_with(b"\r\n") {
                 (&rest[..end], after_marker + 2, false)
@@ -324,19 +367,20 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
 
         let mut name = None;
         let mut filename = None;
+        let mut filename_ext = None;
         let mut content_type = None;
-        if let Ok(hdr_str) = std::str::from_utf8(hdr_bytes) {
-            for line in hdr_str.lines() {
-                let l = line.trim_end_matches('\r');
-                if let Some((hk, hv)) = l.split_once(':') {
-                    let k = hk.trim();
-                    let v = hv.trim();
-                    if k.eq_ignore_ascii_case("content-disposition") {
-                        name = extract_disposition_attr(v, "name");
-                        filename = extract_disposition_attr(v, "filename");
-                    } else if k.eq_ignore_ascii_case("content-type") {
-                        content_type = Some(v);
-                    }
+        let hdr_str = String::from_utf8_lossy(hdr_bytes);
+        for line in hdr_str.lines() {
+            let l = line.trim_end_matches('\r');
+            if let Some((hk, hv)) = l.split_once(':') {
+                let k = hk.trim();
+                let v = hv.trim();
+                if k.eq_ignore_ascii_case("content-disposition") {
+                    name = extract_disposition_attr(v, "name");
+                    filename = extract_disposition_attr(v, "filename");
+                    filename_ext = extract_rfc5987_filename(v);
+                } else if k.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(v.to_string());
                 }
             }
         }
@@ -344,6 +388,7 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
         parts.push(MultipartPart {
             name,
             filename,
+            filename_ext,
             content_type,
             body: part_body,
         });
@@ -353,13 +398,16 @@ fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<Multi
             break;
         }
     }
+    if pos < body.len() && epilogue.is_empty() {
+        epilogue = &body[pos..];
+    }
 
-    Some(parts)
+    Some(ParsedMultipart { parts, epilogue })
 }
 
 /* ==================== Compiled OWASP CRS Runtime Engine ==================== */
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct CrsTargetFlags {
     uri: bool,
     args: bool,
@@ -368,6 +416,7 @@ struct CrsTargetFlags {
     all_headers: bool,
     user_agent: bool,
     referer: bool,
+    specific_headers: Vec<String>,
 }
 
 impl CrsTargetFlags {
@@ -380,6 +429,7 @@ impl CrsTargetFlags {
             all_headers: false,
             user_agent: false,
             referer: false,
+            specific_headers: Vec::new(),
         };
         for t in targets {
             let u = t.to_ascii_uppercase();
@@ -406,7 +456,10 @@ impl CrsTargetFlags {
                     f.referer = true;
                 }
                 _ if u.starts_with("REQUEST_HEADERS:") => {
-                    f.all_headers = true;
+                    let hname = t["REQUEST_HEADERS:".len()..].trim().to_ascii_lowercase();
+                    if !hname.is_empty() && !f.specific_headers.contains(&hname) {
+                        f.specific_headers.push(hname);
+                    }
                 }
                 _ => {}
             }
@@ -428,13 +481,10 @@ impl CompiledCrsMatcher {
         let slice = clamp_utf8_bytes(text, MAX_CRS_SCAN_BYTES);
         match self {
             Self::Regex(re) => re.is_match(slice),
-            Self::PhraseMatch(phrases) => {
-                let lower = slice.to_ascii_lowercase();
-                phrases.iter().any(|p| lower.contains(p.as_str()))
-            }
-            Self::Contains(needle) => slice.to_ascii_lowercase().contains(needle.as_str()),
-            Self::BeginsWith(prefix) => slice.to_ascii_lowercase().starts_with(prefix.as_str()),
-            Self::EndsWith(suffix) => slice.to_ascii_lowercase().ends_with(suffix.as_str()),
+            Self::PhraseMatch(phrases) => phrases.iter().any(|p| contains_ascii_icase(slice, p)),
+            Self::Contains(needle) => contains_ascii_icase(slice, needle),
+            Self::BeginsWith(prefix) => starts_with_ascii_icase(slice, prefix),
+            Self::EndsWith(suffix) => ends_with_ascii_icase(slice, suffix),
         }
     }
 }
@@ -448,6 +498,14 @@ fn clamp_utf8_bytes(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn snap_char_boundary_down(s: &str, idx: usize) -> usize {
+    let mut pos = idx.min(s.len());
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
 }
 
 fn crs_category_static(cat: &str) -> &'static str {
@@ -506,19 +564,39 @@ pub struct CompiledCrsEngine {
 }
 
 impl CompiledCrsEngine {
-    /// Compile rules from `descriptors` (falls back to built-in CRS baseline if empty).
+    /// Compile rules by always starting from the upgraded built-in CRS baseline first and appending
+    /// non-overlapping external `descriptors` up to `MAX_CRS_RULES`.
+    /// This guarantees upgraded built-in signatures (e.g. `942100`) remain active even when a node
+    /// loads older `crs_rules` persisted in `node.yaml`, while still honoring `global_disabled` and
+    /// any `!d.enabled` descriptor overrides.
     pub fn compile(descriptors: &[WafRuleDescriptor], global_disabled: &[u32]) -> Self {
-        let fallback;
-        let list = if descriptors.is_empty() {
-            fallback = builtin_crs_snapshot().rules;
-            &fallback[..]
-        } else {
-            descriptors
-        };
-        let disabled: HashSet<u32> = global_disabled.iter().copied().collect();
+        let mut disabled: HashSet<u32> = global_disabled.iter().copied().collect();
+        for d in descriptors {
+            if !d.enabled {
+                disabled.insert(d.id);
+            }
+        }
+
+        let builtin = builtin_crs_snapshot().rules;
+        let mut seen_ids = HashSet::with_capacity(builtin.len() + descriptors.len());
+        let mut ordered = Vec::with_capacity(builtin.len() + descriptors.len().min(MAX_CRS_RULES));
+        for d in builtin {
+            if seen_ids.insert(d.id) {
+                ordered.push(d);
+            }
+        }
+        for d in descriptors {
+            if ordered.len() >= MAX_CRS_RULES {
+                break;
+            }
+            if seen_ids.insert(d.id) {
+                ordered.push(d.clone());
+            }
+        }
+
         let mut compiled = Vec::new();
-        for d in list.iter().take(MAX_CRS_RULES) {
-            if !d.enabled || disabled.contains(&d.id) || d.operator == "sigil" {
+        for d in ordered.into_iter().take(MAX_CRS_RULES) {
+            if !d.enabled || disabled.contains(&d.id) {
                 continue;
             }
             let matcher = match d.operator.as_str() {
@@ -578,7 +656,7 @@ impl CompiledCrsEngine {
                 id: d.id,
                 paranoia_level: d.paranoia_level.clamp(1, 4),
                 category: crs_category_static(&d.category),
-                msg: d.msg.clone(),
+                msg: d.msg,
                 targets: CrsTargetFlags::from_targets(&d.targets),
                 matcher,
             });
@@ -630,18 +708,35 @@ impl CompiledCrsEngine {
         location: &'static str,
         raw: &str,
     ) -> Option<WafVerdict> {
-        let slice = clamp_utf8_bytes(raw, MAX_CRS_SCAN_BYTES);
-        if slice.is_empty() {
+        if raw.is_empty() {
             return None;
         }
-        let decoded = percent_decode_lossy(slice);
-        for rule in &self.rules {
-            if !(rule.targets.body || rule.targets.args) || !self.rule_active(cfg, rule, max_pl) {
-                continue;
+        let mut offset = 0usize;
+        loop {
+            let start = snap_char_boundary_down(raw, offset);
+            let slice = clamp_utf8_bytes(&raw[start..], MAX_CRS_SCAN_BYTES);
+            if slice.is_empty() {
+                break;
             }
-            if rule.matcher.is_match(slice) || rule.matcher.is_match(decoded.as_ref()) {
-                return Some(Self::make_verdict(cfg.mode, rule, location, decoded.as_ref()));
+            let decoded = percent_decode_lossy(slice);
+            let has_decoded = decoded.as_ref() != slice;
+            for rule in &self.rules {
+                if !(rule.targets.body || rule.targets.args) || !self.rule_active(cfg, rule, max_pl)
+                {
+                    continue;
+                }
+                if rule.matcher.is_match(slice)
+                    || (has_decoded && rule.matcher.is_match(decoded.as_ref()))
+                {
+                    return Some(Self::make_verdict(cfg.mode, rule, location, decoded.as_ref()));
+                }
             }
+            let consumed_end = start + slice.len();
+            if consumed_end >= raw.len() {
+                break;
+            }
+            let advance = slice.len().saturating_sub(CRS_SCAN_OVERLAP_BYTES).max(1);
+            offset = start + advance;
         }
         None
     }
@@ -681,35 +776,33 @@ impl CompiledCrsEngine {
                 out
             })
             .unwrap_or_default();
-        let ua = headers
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let referer = headers
-            .get(header::REFERER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let cookie_vals: Vec<Cow<'_, str>> = headers
-            .get(header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .map(|raw| {
-                raw.split(';')
-                    .take(MAX_WAF_COOKIE_ITEMS)
-                    .filter_map(|item| {
-                        let t = item.trim();
-                        if t.is_empty() {
-                            return None;
+
+        let cookie_items: Vec<Cow<'_, str>> = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|hv| hv.to_str().ok())
+            .flat_map(|raw| raw.split(';'))
+            .take(MAX_WAF_COOKIE_ITEMS)
+            .flat_map(|item| {
+                let t = item.trim();
+                let mut items = Vec::new();
+                if !t.is_empty() {
+                    if let Some((ck, cv)) = t.split_once('=') {
+                        let ck = ck.trim();
+                        let cv = cv.trim();
+                        if !ck.is_empty() {
+                            items.push(percent_decode_lossy(ck));
                         }
-                        let v = t.split_once('=').map(|(_, v)| v.trim()).unwrap_or(t);
-                        if v.is_empty() {
-                            None
-                        } else {
-                            Some(percent_decode_lossy(v))
+                        if !cv.is_empty() {
+                            items.push(percent_decode_lossy(cv));
                         }
-                    })
-                    .collect()
+                    } else {
+                        items.push(percent_decode_lossy(t));
+                    }
+                }
+                items
             })
-            .unwrap_or_default();
+            .collect();
 
         for rule in &self.rules {
             if !self.rule_active(cfg, rule, max_pl) {
@@ -735,20 +828,31 @@ impl CompiledCrsEngine {
                 }
             }
             if cfg.inspect_headers {
-                if (rule.targets.user_agent || rule.targets.all_headers)
-                    && !ua.is_empty()
-                    && rule.matcher.is_match(ua)
-                {
-                    return Self::make_verdict(cfg.mode, rule, "header:user-agent", ua);
+                if rule.targets.user_agent || rule.targets.all_headers {
+                    for hv in headers.get_all(header::USER_AGENT) {
+                        if let Ok(ua) = hv.to_str() {
+                            if !ua.is_empty() && rule.matcher.is_match(ua) {
+                                return Self::make_verdict(cfg.mode, rule, "header:user-agent", ua);
+                            }
+                        }
+                    }
                 }
-                if (rule.targets.referer || rule.targets.all_headers)
-                    && !referer.is_empty()
-                    && rule.matcher.is_match(referer)
-                {
-                    return Self::make_verdict(cfg.mode, rule, "header:referer", referer);
+                if rule.targets.referer || rule.targets.all_headers {
+                    for hv in headers.get_all(header::REFERER) {
+                        if let Ok(referer) = hv.to_str() {
+                            if !referer.is_empty() && rule.matcher.is_match(referer) {
+                                return Self::make_verdict(
+                                    cfg.mode,
+                                    rule,
+                                    "header:referer",
+                                    referer,
+                                );
+                            }
+                        }
+                    }
                 }
                 if rule.targets.cookies {
-                    for cv in &cookie_vals {
+                    for cv in &cookie_items {
                         if rule.matcher.is_match(cv.as_ref()) {
                             return Self::make_verdict(cfg.mode, rule, "header:cookie", cv.as_ref());
                         }
@@ -761,6 +865,10 @@ impl CompiledCrsEngine {
                         ("x-forwarded-for", "header:x-forwarded-for"),
                         ("x-forwarded-host", "header:x-forwarded-host"),
                         ("forwarded", "header:forwarded"),
+                        ("origin", "header:origin"),
+                        ("content-type", "header:content-type"),
+                        ("x-requested-with", "header:x-requested-with"),
+                        ("host", "header:host"),
                     ] {
                         for hv in headers.get_all(h_name) {
                             if let Ok(s) = hv.to_str() {
@@ -771,12 +879,21 @@ impl CompiledCrsEngine {
                         }
                     }
                 }
+                for h_name in &rule.targets.specific_headers {
+                    for hv in headers.get_all(h_name.as_str()) {
+                        if let Ok(s) = hv.to_str() {
+                            if rule.matcher.is_match(s) {
+                                return Self::make_verdict(cfg.mode, rule, "header:custom", s);
+                            }
+                        }
+                    }
+                }
             }
         }
         WafVerdict::Allow
     }
 
-    /// Inspect buffered HTTP request body (`POST`/`PUT`/`PATCH`) with Content-Type-aware
+    /// Inspect buffered HTTP request body (`POST`/`PUT`/`PATCH`/`DELETE`) with Content-Type-aware
     /// form/multipart parsing so MIME boundary framing never causes SQLi/XSS false positives.
     pub fn inspect_body(
         &self,
@@ -798,16 +915,16 @@ impl CompiledCrsEngine {
         // 1. Strict `multipart/form-data` inspection:
         //    Only activate when Content-Type specifies a boundary AND body starts with `--<boundary>`.
         if let Some(boundary) = content_type.and_then(extract_multipart_boundary) {
-            if let Some(parts) = parse_multipart_parts(boundary, bounded) {
-                for part in parts {
-                    if let Some(name) = part.name {
+            if let Some(parsed) = parse_multipart_parts(boundary, bounded) {
+                for part in parsed.parts {
+                    if let Some(ref name) = part.name {
                         if let Some(v) =
                             self.match_text_against_body_rules(cfg, max_pl, "body:multipart-name", name)
                         {
                             return v;
                         }
                     }
-                    if let Some(filename) = part.filename {
+                    if let Some(ref filename) = part.filename {
                         if let Some(v) = self.match_text_against_body_rules(
                             cfg,
                             max_pl,
@@ -817,18 +934,43 @@ impl CompiledCrsEngine {
                             return v;
                         }
                     }
-                    if is_binary_part_mime(part.content_type) || part.body.contains(&0) {
+                    if let Some(ref filename_ext) = part.filename_ext {
+                        if let Some(v) = self.match_text_against_body_rules(
+                            cfg,
+                            max_pl,
+                            "body:multipart-filename",
+                            filename_ext,
+                        ) {
+                            return v;
+                        }
+                    }
+                    // Skip raw binary payload ONLY when a real file upload (`filename` present)
+                    // carries binary MIME or binary NUL bytes. Plain form fields cannot exempt
+                    // themselves by spoofing `Content-Type: image/png` or injecting `\x00`.
+                    let is_binary_upload = (part.filename.is_some() || part.filename_ext.is_some())
+                        && (is_binary_part_mime(part.content_type.as_deref())
+                            || part.body.contains(&0));
+                    if is_binary_upload {
                         continue;
                     }
-                    if let Some(part_text) = utf8_valid_prefix(part.body) {
+                    if !part.body.is_empty() {
+                        let part_text = String::from_utf8_lossy(part.body);
                         if let Some(v) = self.match_text_against_body_rules(
                             cfg,
                             max_pl,
                             "body:multipart-field",
-                            part_text,
+                            part_text.as_ref(),
                         ) {
                             return v;
                         }
+                    }
+                }
+                if !parsed.epilogue.trim_ascii().is_empty() {
+                    let ep_text = String::from_utf8_lossy(parsed.epilogue);
+                    if let Some(v) =
+                        self.match_text_against_body_rules(cfg, max_pl, "body", ep_text.as_ref())
+                    {
+                        return v;
                     }
                 }
                 return WafVerdict::Allow;
@@ -846,10 +988,23 @@ impl CompiledCrsEngine {
             })
             .unwrap_or(false);
         if is_urlencoded {
-            let Some(text) = utf8_valid_prefix(bounded) else {
-                return WafVerdict::Allow;
-            };
-            for pair in text.split('&').take(MAX_WAF_FORM_PARAMS) {
+            let text = String::from_utf8_lossy(bounded);
+            let mut inspected_pairs = 0usize;
+            let mut consumed_bytes = 0usize;
+            for pair in text.split('&') {
+                if inspected_pairs >= MAX_WAF_FORM_PARAMS {
+                    // Do NOT drop trailing form parameters silently: scan remaining tail slice.
+                    if let Some(tail) = text.get(consumed_bytes..) {
+                        if let Some(verdict) =
+                            self.match_text_against_body_rules(cfg, max_pl, "body:form", tail)
+                        {
+                            return verdict;
+                        }
+                    }
+                    return WafVerdict::Allow;
+                }
+                inspected_pairs += 1;
+                consumed_bytes = consumed_bytes.saturating_add(pair.len()).saturating_add(1);
                 if pair.is_empty() {
                     continue;
                 }
@@ -873,11 +1028,10 @@ impl CompiledCrsEngine {
             return WafVerdict::Allow;
         }
 
-        // 3. Generic text/JSON/XML/fallback raw body inspection.
-        let Some(text) = utf8_valid_prefix(bounded) else {
-            return WafVerdict::Allow;
-        };
-        self.match_text_against_body_rules(cfg, max_pl, "body", text)
+        // 3. Generic text/JSON/XML/fallback raw body inspection (lossy UTF-8 so non-UTF8 bytes
+        //    never truncate inspection of trailing attack payloads).
+        let text = String::from_utf8_lossy(bounded);
+        self.match_text_against_body_rules(cfg, max_pl, "body", text.as_ref())
             .unwrap_or(WafVerdict::Allow)
     }
 }
@@ -1113,7 +1267,15 @@ mod tests {
             Some(32 * 1024)
         );
         assert!(should_inspect_body(&cfg, &Method::GET, &h_json, false).is_none());
-        assert!(should_inspect_body(&cfg, &Method::POST, &h_json, true).is_none());
+        // Upgrade header on POST/DELETE must NOT bypass WAF body inspection
+        assert_eq!(
+            should_inspect_body(&cfg, &Method::POST, &h_json, true),
+            Some(32 * 1024)
+        );
+        assert_eq!(
+            should_inspect_body(&cfg, &Method::DELETE, &h_json, false),
+            Some(32 * 1024)
+        );
     }
 
     #[test]
@@ -1430,5 +1592,120 @@ mod tests {
             let v = crs.inspect_head(&cfg, path, Some(*q), &empty);
             assert!(matches!(v, WafVerdict::Allow), "benign falsely flagged: {q:?} => {v:?}");
         }
+    }
+
+    #[test]
+    fn form_sqli_evasion_vectors_and_stale_node_rules_are_blocked() {
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+
+        // 1. Stale `crs_rules` (e.g. old `node.yaml` with old 942100 matching only single `=`)
+        //    must NOT shadow upgraded built-in `942100` (`={1,3}`).
+        let stale_old_rules = vec![WafRuleDescriptor {
+            id: 942100,
+            source: "owasp-crs".into(),
+            file: "REQUEST-942-APPLICATION-ATTACK-SQLI.conf".into(),
+            category: "sql-injection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "Old SQLi 942100".into(),
+            targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r"(?i)'\s+or\s+1=1\b".into(),
+            tags: vec!["attack-sqli".into()],
+            enabled: true,
+        }];
+        let merged_engine = CompiledCrsEngine::compile(&stale_old_rules, &[]);
+        let payload = b"username=zhouyitian2403&password=%27+or+1%3D%3D1+--";
+        assert!(
+            merged_engine
+                .inspect_body(&cfg, Some("application/x-www-form-urlencoded"), payload)
+                .is_block(),
+            "stale crs_rules must not shadow upgraded built-in 942100"
+        );
+
+        // Explicitly disabling 942100 via descriptor still disables it
+        let mut dis_rule = stale_old_rules;
+        dis_rule[0].enabled = false;
+        let disabled_engine = CompiledCrsEngine::compile(&dis_rule, &[]);
+        assert!(matches!(
+            disabled_engine.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), payload),
+            WafVerdict::Allow
+        ));
+
+        // 2. Across Content-Type variants (charset, JSON, raw/empty, multipart w/ spoofed binary MIME on non-file field)
+        assert!(crs
+            .inspect_body(
+                &cfg,
+                Some("application/x-www-form-urlencoded; charset=UTF-8"),
+                payload
+            )
+            .is_block());
+        assert!(crs.inspect_body(&cfg, None, payload).is_block());
+        assert!(crs
+            .inspect_body(
+                &cfg,
+                Some("application/json"),
+                br#"{"username":"zhouyitian2403","password":"' or 1==1 --"}"#
+            )
+            .is_block());
+
+        let mp_ct = "multipart/form-data; boundary=----B123";
+        let mp_spoof_mime = concat!(
+            "------B123\r\n",
+            "Content-Disposition: form-data; name=\"password\"\r\n",
+            "Content-Type: image/png\r\n\r\n",
+            "' or 1==1 --\r\n",
+            "------B123--\r\n"
+        );
+        assert!(crs
+            .inspect_body(&cfg, Some(mp_ct), mp_spoof_mime.as_bytes())
+            .is_block());
+
+        // 3. Preceded by invalid UTF-8 bytes must not truncate inspection
+        let invalid_utf8 = b"username=\xff\xfe&password=%27+or+1%3D%3D1+--";
+        assert!(crs
+            .inspect_body(&cfg, Some("application/x-www-form-urlencoded"), invalid_utf8)
+            .is_block());
+
+        // 4. Padded past 8 KiB (`MAX_CRS_SCAN_BYTES`) and past 256 form params (`MAX_WAF_FORM_PARAMS`)
+        let pad_8k = format!(
+            "username=zhouyitian2403&pad={}&password=%27+or+1%3D%3D1+--",
+            "a".repeat(12_000)
+        );
+        assert!(crs
+            .inspect_body(
+                &cfg,
+                Some("application/x-www-form-urlencoded"),
+                pad_8k.as_bytes()
+            )
+            .is_block());
+
+        let mut many_params = String::new();
+        for i in 0..270 {
+            many_params.push_str(&format!("k{i}=v{i}&"));
+        }
+        many_params.push_str("password=%27+or+1%3D%3D1+--");
+        assert!(crs
+            .inspect_body(
+                &cfg,
+                Some("application/x-www-form-urlencoded"),
+                many_params.as_bytes()
+            )
+            .is_block());
+
+        // 5. Comment obfuscation (`*/or/**/1==1`), path traversal exemption bypass, and multi-Cookie HTTP/2 headers
+        assert!(crs
+            .inspect_head(&cfg, "/login", Some("p=1/**/or/**/1==1--"), &HeaderMap::new())
+            .is_block());
+        assert!(!is_path_exempt(
+            "/api/webhooks/../../login",
+            &["/api/webhooks/".into()]
+        ));
+
+        let mut h2_cookies = HeaderMap::new();
+        h2_cookies.append(header::COOKIE, HeaderValue::from_static("session=abc"));
+        h2_cookies.append(header::COOKIE, HeaderValue::from_static("auth=' or 1==1 --"));
+        assert!(crs.inspect_head(&cfg, "/login", None, &h2_cookies).is_block());
     }
 }

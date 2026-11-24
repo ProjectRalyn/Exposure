@@ -19,7 +19,7 @@ const ESCALATION_MEMORY: Duration = Duration::from_secs(86_400);
 const BENIGN_FP_IDLE_TTL: Duration = Duration::from_secs(3600);
 const MAX_REASON_CHARS: usize = 128;
 
-fn evict_half<K, V>(map: &DashMap<K, V>)
+pub(crate) fn evict_half<K, V>(map: &DashMap<K, V>)
 where
     K: Eq + std::hash::Hash,
 {
@@ -31,6 +31,33 @@ where
     map.retain(|_, _| {
         if removed < to_remove {
             removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn evict_oldest_benign_half(map: &DashMap<String, BenignFpEntry>) {
+    let cur = map.len();
+    if cur < 2 {
+        return;
+    }
+    let mut entries: Vec<(bool, Instant)> = map
+        .iter()
+        .map(|e| (e.value().distinct_ips.len() >= 2, e.value().last_seen))
+        .collect();
+    let mid = entries.len() / 2;
+    let (_, mid_val, _) = entries.select_nth_unstable(mid);
+    let (cutoff_multi, cutoff_ts) = *mid_val;
+    let mut budget = cur / 2;
+    map.retain(|_, v| {
+        if budget == 0 {
+            return true;
+        }
+        let multi = v.distinct_ips.len() >= 2;
+        if (multi, v.last_seen) <= (cutoff_multi, cutoff_ts) {
+            budget -= 1;
             false
         } else {
             true
@@ -176,6 +203,7 @@ pub struct AutoBanManager {
     offenses: DashMap<IpAddr, OffenseTrackerEntry>,
     escalation_history: DashMap<IpAddr, (Instant, u8)>,
     benign_composite_fps: DashMap<String, BenignFpEntry>,
+    benign_js_fps: DashMap<String, BenignFpEntry>,
 
     total_auto_bans: AtomicU64,
     total_ban_drops: AtomicU64,
@@ -200,6 +228,7 @@ impl AutoBanManager {
             offenses: DashMap::new(),
             escalation_history: DashMap::new(),
             benign_composite_fps: DashMap::new(),
+            benign_js_fps: DashMap::new(),
             total_auto_bans: AtomicU64::new(0),
             total_ban_drops: AtomicU64::new(0),
         };
@@ -356,52 +385,84 @@ impl AutoBanManager {
         hit
     }
 
-    /// Record a clean, legitimate request so popular shared browser/SDK TLS+UA fingerprints
-    /// are protected from ever being auto-banned globally.
-    pub fn record_benign_request(&self, ip: IpAddr, tls_ja3: Option<&str>, ua: &str) {
-        if !self.enabled.load(Ordering::Relaxed) || !self.ban_fingerprints.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(comp) = build_composite_fp(tls_ja3, ua) else {
-            return;
-        };
-        let canon = canonical_ip(ip);
-        let now = Instant::now();
-        if self.benign_composite_fps.len() >= MAX_BENIGN_FPS
-            && !self.benign_composite_fps.contains_key(&comp)
-        {
-            self.benign_composite_fps
-                .retain(|_, v| now.duration_since(v.last_seen) < BENIGN_FP_IDLE_TTL);
-            if self.benign_composite_fps.len() >= MAX_BENIGN_FPS {
-                evict_half(&self.benign_composite_fps);
+    fn record_benign_fp_entry(
+        map: &DashMap<String, BenignFpEntry>,
+        key: String,
+        canon_ip: IpAddr,
+        now: Instant,
+    ) {
+        if map.len() >= MAX_BENIGN_FPS && !map.contains_key(&key) {
+            map.retain(|_, v| now.duration_since(v.last_seen) < BENIGN_FP_IDLE_TTL);
+            if map.len() >= MAX_BENIGN_FPS {
+                evict_oldest_benign_half(map);
             }
         }
-        let mut entry = self
-            .benign_composite_fps
-            .entry(comp)
-            .or_insert_with(|| BenignFpEntry {
-                last_seen: now,
-                hits: 0,
-                distinct_ips: Vec::new(),
-            });
+        let mut entry = map.entry(key).or_insert_with(|| BenignFpEntry {
+            last_seen: now,
+            hits: 0,
+            distinct_ips: Vec::new(),
+        });
         entry.last_seen = now;
         entry.hits = entry.hits.saturating_add(1);
-        if entry.distinct_ips.len() < 4 && !entry.distinct_ips.contains(&canon) {
-            entry.distinct_ips.push(canon);
+        if entry.distinct_ips.len() < 8 && !entry.distinct_ips.contains(&canon_ip) {
+            entry.distinct_ips.push(canon_ip);
         }
     }
 
-    fn is_composite_fp_shared_benign(&self, comp: &str, attacker_ip: IpAddr) -> bool {
-        let Some(entry) = self.benign_composite_fps.get(comp) else {
+    fn is_fp_shared_benign(
+        map: &DashMap<String, BenignFpEntry>,
+        key: &str,
+        attacker_ip: IpAddr,
+        min_other_ips: usize,
+    ) -> bool {
+        let Some(entry) = map.get(key) else {
             return false;
         };
         if Instant::now().duration_since(entry.last_seen) >= BENIGN_FP_IDLE_TTL {
             return false;
         }
-        // If any OTHER legitimate IP has used this exact TLS+UA fingerprint cleanly, OR if it has
-        // substantial benign history (>= 5 clean requests), never ban it globally.
-        let other_benign_ip = entry.distinct_ips.iter().any(|ip| *ip != attacker_ip);
-        other_benign_ip || entry.hits >= 5
+        // Require at least `min_other_ips` distinct benign IPs (different from the attacker)
+        // so a single attacker IP can NEVER self-seed benign immunity for its own fingerprint.
+        let other_ips = entry
+            .distinct_ips
+            .iter()
+            .filter(|ip| **ip != attacker_ip)
+            .count();
+        other_ips >= min_other_ips
+    }
+
+    /// Record a clean, legitimate request so popular shared browser/SDK TLS+UA and JS fingerprints
+    /// are protected from ever being auto-banned globally.
+    pub fn record_benign_request_with_js_fp(
+        &self,
+        ip: IpAddr,
+        tls_ja3: Option<&str>,
+        ua: &str,
+        js_fp_hash: Option<&str>,
+    ) {
+        if !self.enabled.load(Ordering::Relaxed) || !self.ban_fingerprints.load(Ordering::Relaxed) {
+            return;
+        }
+        let canon = canonical_ip(ip);
+        let now = Instant::now();
+        if let Some(comp) = build_composite_fp(tls_ja3, ua) {
+            Self::record_benign_fp_entry(&self.benign_composite_fps, comp, canon, now);
+        }
+        if let Some(js_h) = js_fp_hash.map(str::trim).filter(|s| !s.is_empty()) {
+            Self::record_benign_fp_entry(&self.benign_js_fps, js_h.to_string(), canon, now);
+        }
+    }
+
+    pub fn record_benign_request(&self, ip: IpAddr, tls_ja3: Option<&str>, ua: &str) {
+        self.record_benign_request_with_js_fp(ip, tls_ja3, ua, None);
+    }
+
+    fn is_composite_fp_shared_benign(&self, comp: &str, attacker_ip: IpAddr) -> bool {
+        Self::is_fp_shared_benign(&self.benign_composite_fps, comp, attacker_ip, 1)
+    }
+
+    fn is_js_fp_shared_benign(&self, js_h: &str, attacker_ip: IpAddr) -> bool {
+        Self::is_fp_shared_benign(&self.benign_js_fps, js_h, attacker_ip, 2)
     }
 
     /// Record an observed attack/abuse offense and auto-ban IP + safe fingerprints once confirmed.
@@ -480,26 +541,28 @@ impl AutoBanManager {
         // 2. Ban attacker fingerprints (strictly safeguarding benign shared fingerprints)
         if self.ban_fingerprints.load(Ordering::Relaxed) {
             if let Some(js_h) = ctx.js_fp_hash.filter(|s| !s.is_empty()) {
-                self.prune_if_needed(&self.banned_js_fps, MAX_BANNED_FPS, now);
-                let already = self
-                    .banned_js_fps
-                    .get(js_h)
-                    .map(|e| now < e.expires_at)
-                    .unwrap_or(false);
-                self.banned_js_fps.insert(
-                    js_h.to_string(),
-                    BanEntry {
-                        reason: reason.clone(),
-                        banned_at_unix: now_unix,
-                        expires_at,
-                        expires_at_unix,
-                        offense_level: level,
-                        hits_blocked: AtomicU64::new(0),
-                    },
-                );
-                if !already {
-                    outcome.newly_banned_js_fp = true;
-                    self.total_auto_bans.fetch_add(1, Ordering::Relaxed);
+                if !self.is_js_fp_shared_benign(js_h, ip) {
+                    self.prune_if_needed(&self.banned_js_fps, MAX_BANNED_FPS, now);
+                    let already = self
+                        .banned_js_fps
+                        .get(js_h)
+                        .map(|e| now < e.expires_at)
+                        .unwrap_or(false);
+                    self.banned_js_fps.insert(
+                        js_h.to_string(),
+                        BanEntry {
+                            reason: reason.clone(),
+                            banned_at_unix: now_unix,
+                            expires_at,
+                            expires_at_unix,
+                            offense_level: level,
+                            hits_blocked: AtomicU64::new(0),
+                        },
+                    );
+                    if !already {
+                        outcome.newly_banned_js_fp = true;
+                        self.total_auto_bans.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -865,5 +928,51 @@ mod tests {
         assert!(mgr.unban("composite_fp", &comp_target));
         assert!(mgr.unban("all", "*"));
         assert_eq!(mgr.snapshot().active_bans.len(), 0);
+    }
+
+    #[test]
+    fn single_attacker_cannot_self_seed_immunity_and_shared_js_fp_is_protected() {
+        let mgr = AutoBanManager::new(&AutoBanConfig {
+            enabled: true,
+            ban_ttl_secs: 600,
+            max_ban_ttl_secs: 3600,
+            confirm_hits: 2,
+            ban_fingerprints: true,
+            drop_at_tcp: true,
+        });
+        let attacker: IpAddr = "198.51.100.200".parse().unwrap();
+        let ja3 = "cafebabe00112233";
+        let ua = "CustomAttackerUA/1.0";
+
+        // Same IP sends 10 benign hits first — must NOT immunize its composite FP against itself
+        for _ in 0..10 {
+            mgr.record_benign_request(attacker, Some(ja3), ua);
+        }
+        let o1 = mgr.record_offense(OffenseContext {
+            client_ip: attacker,
+            tls_ja3: Some(ja3),
+            user_agent: ua,
+            js_fp_hash: None,
+            kind: OffenseKind::VerifiedExploit,
+            reason: "rce",
+        });
+        assert!(o1.newly_banned_ip);
+        assert!(o1.newly_banned_composite_fp);
+
+        // Popular shared JS FP across >= 2 distinct legitimate IPs is protected from global FP ban
+        let benign_a: IpAddr = "203.0.113.10".parse().unwrap();
+        let benign_b: IpAddr = "203.0.113.11".parse().unwrap();
+        mgr.record_benign_request_with_js_fp(benign_a, None, "Chrome", Some("shared-js-fp"));
+        mgr.record_benign_request_with_js_fp(benign_b, None, "Chrome", Some("shared-js-fp"));
+        let o2 = mgr.record_offense(OffenseContext {
+            client_ip: "198.51.100.201".parse().unwrap(),
+            tls_ja3: None,
+            user_agent: "Chrome",
+            js_fp_hash: Some("shared-js-fp"),
+            kind: OffenseKind::VerifiedExploit,
+            reason: "rce",
+        });
+        assert!(o2.newly_banned_ip);
+        assert!(!o2.newly_banned_js_fp);
     }
 }

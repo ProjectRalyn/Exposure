@@ -1,6 +1,8 @@
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -8,10 +10,14 @@ use dashmap::DashMap;
 use exposure_core::config::AbuseIpDbConfig;
 pub use exposure_core::routing::{canonical_ip, is_public_routable_ip};
 use serde::Deserialize;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, warn};
 
+use crate::ban::evict_half;
+
 const MAX_CACHE_ENTRIES: usize = 32_768;
+const MAX_CONCURRENT_BG_LOOKUPS: usize = 16;
+const MAX_ABUSEIPDB_RESP_BYTES: usize = 64 * 1024;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_BACKOFF_SECS: u64 = 600;
 const REQUEST_WAIT_BUDGET: Duration = Duration::from_millis(250);
@@ -56,16 +62,28 @@ struct AbuseApiData {
     total_reports: u32,
 }
 
+struct InFlightGuard {
+    map: Arc<DashMap<IpAddr, ()>>,
+    ip: IpAddr,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.ip);
+    }
+}
+
 /// Thread-safe, quota-guarded AbuseIPDB v2 lookup client with bounded LRU/TTL cache
 /// and single-flight per-IP deduplication.
 pub struct AbuseIpDbClient {
-    cfg: RwLock<AbuseIpDbConfig>,
+    enabled: AtomicBool,
+    cfg: RwLock<Arc<AbuseIpDbConfig>>,
     api_base: String,
     http: reqwest::Client,
     cache: DashMap<IpAddr, CachedAbuseEntry>,
-    in_flight: DashMap<IpAddr, ()>,
-    daily_day: AtomicU64,
-    daily_count: AtomicU32,
+    in_flight: Arc<DashMap<IpAddr, ()>>,
+    bg_sem: Arc<Semaphore>,
+    daily_quota: StdMutex<(u64, u32)>,
     backoff_until_unix: AtomicU64,
 }
 
@@ -80,24 +98,31 @@ impl AbuseIpDbClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let enabled = AtomicBool::new(cfg.enabled && !cfg.api_key.trim().is_empty());
         Arc::new(Self {
-            cfg: RwLock::new(cfg),
+            enabled,
+            cfg: RwLock::new(Arc::new(cfg)),
             api_base: endpoint.into(),
             http,
             cache: DashMap::new(),
-            in_flight: DashMap::new(),
-            daily_day: AtomicU64::new(current_utc_day()),
-            daily_count: AtomicU32::new(0),
+            in_flight: Arc::new(DashMap::new()),
+            bg_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_BG_LOOKUPS)),
+            daily_quota: StdMutex::new((current_utc_day(), 0)),
             backoff_until_unix: AtomicU64::new(0),
         })
     }
 
     pub async fn reconfigure(&self, cfg: AbuseIpDbConfig) {
         let mut g = self.cfg.write().await;
-        let disabled = !cfg.enabled || cfg.api_key.trim().is_empty();
-        *g = cfg;
-        if disabled {
+        let key_changed = g.api_key.trim() != cfg.api_key.trim();
+        let active = cfg.enabled && !cfg.api_key.trim().is_empty();
+        *g = Arc::new(cfg);
+        self.enabled.store(active, Ordering::Relaxed);
+        if !active {
             self.cache.clear();
+        }
+        if key_changed {
+            self.backoff_until_unix.store(0, Ordering::Relaxed);
         }
     }
 
@@ -118,12 +143,11 @@ impl AbuseIpDbClient {
         F: FnOnce(AbuseIpReport) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let ip = canonical_ip(raw_ip);
-        if !is_public_routable_ip(ip) {
+        if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
-        let cfg = self.cfg.read().await.clone();
-        if !cfg.enabled || cfg.api_key.trim().is_empty() {
+        let ip = canonical_ip(raw_ip);
+        if !is_public_routable_ip(ip) {
             return None;
         }
 
@@ -134,26 +158,38 @@ impl AbuseIpDbClient {
             }
         }
 
+        let cfg = Arc::clone(&*self.cfg.read().await);
+        if !cfg.enabled || cfg.api_key.trim().is_empty() {
+            return None;
+        }
+
         let now_unix = Utc::now().timestamp().max(0) as u64;
         if now_unix < self.backoff_until_unix.load(Ordering::Relaxed) {
             return None;
         }
 
-        // Single-flight deduplication per IP
+        // Single-flight deduplication per IP + concurrency cap for background lookups
         if self.in_flight.insert(ip, ()).is_some() {
             return None;
         }
+        let guard = InFlightGuard {
+            map: Arc::clone(&self.in_flight),
+            ip,
+        };
+        let Ok(bg_permit) = Arc::clone(&self.bg_sem).try_acquire_owned() else {
+            return None;
+        };
 
         // Daily lookup quota enforcement (preserves free-tier 1000/day API keys)
         if !self.consume_daily_quota(cfg.max_daily_lookups.max(1)) {
-            self.in_flight.remove(&ip);
             return None;
         }
 
         let this = Arc::clone(self);
         let handle = tokio::spawn(async move {
+            let _guard = guard;
+            let _bg_permit = bg_permit;
             let res = this.fetch_and_cache(ip, &cfg).await;
-            this.in_flight.remove(&ip);
             if let Some(ref rep) = res {
                 on_complete(rep.clone()).await;
             }
@@ -175,23 +211,24 @@ impl AbuseIpDbClient {
 
     fn consume_daily_quota(&self, limit: u32) -> bool {
         let today = current_utc_day();
-        let prev_day = self.daily_day.load(Ordering::Relaxed);
-        if prev_day != today
-            && self
-                .daily_day
-                .compare_exchange(prev_day, today, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            self.daily_count.store(0, Ordering::Release);
+        let mut q = self
+            .daily_quota
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if q.0 != today {
+            *q = (today, 0);
         }
-        let used = self.daily_count.fetch_add(1, Ordering::AcqRel);
-        used < limit
+        if q.1 >= limit {
+            return false;
+        }
+        q.1 = q.1.saturating_add(1);
+        true
     }
 
     async fn fetch_and_cache(&self, ip: IpAddr, cfg: &AbuseIpDbConfig) -> Option<AbuseIpReport> {
         let max_age = cfg.max_age_days.clamp(1, 365).to_string();
         let ip_str = ip.to_string();
-        let resp = match self
+        let mut resp = match self
             .http
             .get(&self.api_base)
             .query(&[("ipAddress", ip_str.as_str()), ("maxAgeInDays", max_age.as_str())])
@@ -222,7 +259,16 @@ impl AbuseIpDbClient {
             return None;
         }
 
-        let parsed = match resp.json::<AbuseApiResp>().await {
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if body.len().saturating_add(chunk.len()) > MAX_ABUSEIPDB_RESP_BYTES {
+                debug!(ip = %ip, "abuseipdb response exceeded byte cap");
+                self.insert_cache(ip, None, NEGATIVE_CACHE_TTL);
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let parsed = match serde_json::from_slice::<AbuseApiResp>(&body) {
             Ok(p) => p,
             Err(e) => {
                 debug!(ip = %ip, error = %e, "abuseipdb parse failed");
@@ -249,16 +295,7 @@ impl AbuseIpDbClient {
         if self.cache.len() >= MAX_CACHE_ENTRIES && !self.cache.contains_key(&ip) {
             self.cache.retain(|_, v| now < v.expires_at);
             if self.cache.len() >= MAX_CACHE_ENTRIES {
-                let to_remove = self.cache.len() / 2;
-                let mut removed = 0usize;
-                self.cache.retain(|_, _| {
-                    if removed < to_remove {
-                        removed += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
+                evict_half(&self.cache);
             }
         }
         self.cache.insert(

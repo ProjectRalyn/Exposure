@@ -230,9 +230,9 @@ fn main() {
     let stage_dir = out_dir.join("web_dist");
     let vite_ok = run_pnpm_build(&web_dir, &stage_dir);
 
-    let effective_dist = if vite_ok && stage_dir.join("control").exists() && stage_dir.join("challenge").exists() {
-        stage_dir
-    } else if build_with_native_esbuild(&web_dir, &stage_dir) {
+    let effective_dist = if (vite_ok && stage_dir.join("control").exists() && stage_dir.join("challenge").exists())
+        || build_with_native_esbuild(&web_dir, &stage_dir)
+    {
         stage_dir
     } else if env::var("EXPOSURE_USE_PREBUILT_WEB").ok().as_deref() == Some("1")
         && web_dir.join("dist").join("control").exists()
