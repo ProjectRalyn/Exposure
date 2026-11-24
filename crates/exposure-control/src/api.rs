@@ -966,6 +966,8 @@ fn aggregate_summaries(
     let mut total_challenges_passed: u64 = 0;
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
+    let mut total_cached_requests: u64 = 0;
+    let mut total_cached_bytes_out: u64 = 0;
     let mut client_fp_verified: u64 = 0;
     let mut merged_hll: Option<HyperLogLog> = None;
     let mut merged_hist: Option<LatencyHistogram> = None;
@@ -988,6 +990,8 @@ fn aggregate_summaries(
         total_challenges_passed = total_challenges_passed.saturating_add(s.challenges_passed);
         total_bytes_in = total_bytes_in.saturating_add(s.bytes_in);
         total_bytes_out = total_bytes_out.saturating_add(s.bytes_out);
+        total_cached_requests = total_cached_requests.saturating_add(s.cached_requests);
+        total_cached_bytes_out = total_cached_bytes_out.saturating_add(s.cached_bytes_out);
         client_fp_verified = client_fp_verified.saturating_add(s.client_fp_verified);
 
         for (k, v) in &s.device_counts {
@@ -1049,6 +1053,8 @@ fn aggregate_summaries(
                 "challenges_passed": s.challenges_passed,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
+                "cached_requests": s.cached_requests,
+                "cached_bytes_out": s.cached_bytes_out,
                 "uv_estimate": s.uv_estimate().round(),
                 "p50_ms": s.p50_ms(),
                 "p95_ms": s.p95_ms(),
@@ -1069,6 +1075,8 @@ fn aggregate_summaries(
                 "challenges_passed": s.challenges_passed,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
+                "cached_requests": s.cached_requests,
+                "cached_bytes_out": s.cached_bytes_out,
                 "uv_estimate": s.uv_estimate().round(),
                 "p50_ms": s.p50_ms(),
                 "p95_ms": s.p95_ms(),
@@ -1096,6 +1104,8 @@ fn aggregate_summaries(
                 "challenges_passed": s.challenges_passed,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
+                "cached_requests": s.cached_requests,
+                "cached_bytes_out": s.cached_bytes_out,
                 "uv_estimate": s.uv_estimate().round(),
                 "p50_ms": s.p50_ms(),
                 "p95_ms": s.p95_ms(),
@@ -1119,6 +1129,8 @@ fn aggregate_summaries(
         "total_challenges_passed": total_challenges_passed,
         "total_bytes_in": total_bytes_in,
         "total_bytes_out": total_bytes_out,
+        "total_cached_requests": total_cached_requests,
+        "total_cached_bytes_out": total_cached_bytes_out,
         "uv_estimate": uv_exact_or_hll,
         "p50_ms": merged_hist.as_ref().map(|h| h.quantile(0.50)).unwrap_or(0.0),
         "p95_ms": merged_hist.as_ref().map(|h| h.quantile(0.95)).unwrap_or(0.0),

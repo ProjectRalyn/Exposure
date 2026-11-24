@@ -203,7 +203,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           <h3>${esc(t("ana.svc_latency_title"))}</h3>
           <span class="muted-sm">${esc(t("ana.svc_latency_sub"))}</span>
         </div>
-        <div class="table-scroll" style="max-height:360px;">
+        <div class="table-scroll">
           <table class="table">
             <thead>
               <tr>
@@ -284,6 +284,8 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const totalChP = Number(tr.total_challenges_passed) || 0;
     const bytesIn = Number(tr.total_bytes_in) || 0;
     const bytesOut = Number(tr.total_bytes_out) || 0;
+    const cachedBytesOut = Number(tr.total_cached_bytes_out) || 0;
+    const cachedPct = bytesOut > 0 ? ((cachedBytesOut / bytesOut) * 100).toFixed(1) : "0.0";
     const p50 = Number(tr.p50_ms) || 0;
     const p95 = Number(tr.p95_ms) || 0;
     const p99 = Number(tr.p99_ms) || 0;
@@ -294,7 +296,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     el("cf-val-uv").textContent = formatCompact(totalUv);
     el("cf-sub-uv").textContent = totalUv > 0 ? `${(totalReq / totalUv).toFixed(1)} req / visitor` : "HLL union";
     el("cf-val-bandwidth").textContent = formatBytes(bytesIn + bytesOut);
-    el("cf-sub-bandwidth").textContent = `${formatBytes(bytesIn)} in · ${formatBytes(bytesOut)} out`;
+    el("cf-sub-bandwidth").textContent = `${formatBytes(cachedBytesOut)} cached (${cachedPct}%) · ${formatBytes(bytesIn)} in · ${formatBytes(bytesOut)} out`;
     el("cf-val-guard").textContent = formatCompact(totalChI + totalRl);
     el("cf-sub-guard").textContent = `${formatCompact(totalChI)} PoW · ${formatCompact(totalRl)} 429`;
     el("cf-val-latency").textContent = `${p95.toFixed(1)} ms`;
@@ -558,7 +560,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
         topPaths.length
           ? `<div class="panel">
               <div class="panel-header"><h3>${esc(t("logs.top_urls"))}</h3><span class="muted-sm">Click a path to filter</span></div>
-              <div class="table-scroll" style="max-height:220px;">
+              <div class="table-scroll">
                 <table class="table">
                   <thead><tr><th>Host</th><th>Path</th><th>Hits</th><th>Blocked</th><th>5xx</th></tr></thead>
                   <tbody>
@@ -586,7 +588,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           <h3>${esc(t("logs.explorer_title"))} (${totalMatched})</h3>
           <span class="muted-sm">Query strings redact secrets · Click row for full detail &amp; visitor correlation</span>
         </div>
-        <div class="table-scroll" style="max-height:560px;">
+        <div class="table-scroll">
           <table class="table">
             <thead>
               <tr>
@@ -839,7 +841,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           <h3>Visitor &amp; Fingerprint Directory (${totalMatched})</h3>
           <span class="muted-sm">Click any row for TLS, UA, WebRTC leak &amp; JS signals</span>
         </div>
-        <div class="table-scroll" style="max-height:540px;">
+        <div class="table-scroll">
           <table class="table">
             <thead><tr><th>IP / HMAC</th><th>Browser FP</th><th>Device · Browser · OS</th><th>JS &amp; WebRTC Signals</th><th>Host / Service</th><th>Risk &amp; Leaks</th><th>Traffic</th><th>Last Seen</th></tr></thead>
             <tbody>

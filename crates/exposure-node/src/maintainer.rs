@@ -4160,6 +4160,8 @@ mod tests {
             browser_counts: BTreeMap::new(),
             os_counts: BTreeMap::new(),
             client_fp_verified: 1,
+            cached_requests: 0,
+            cached_bytes_out: 0,
         };
         let expired_sum = MinuteSummary {
             minute_epoch: now_min - 48 * 3600, // older than 24h retention_hours -> MUST be pruned!

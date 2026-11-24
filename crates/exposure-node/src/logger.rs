@@ -855,6 +855,10 @@ impl NodeLogger {
             }
             entry.bytes_in = entry.bytes_in.saturating_add(bytes_in);
             entry.bytes_out = entry.bytes_out.saturating_add(bytes_out);
+            if meta.cache_status.as_deref() == Some("HIT") {
+                entry.cached_requests = entry.cached_requests.saturating_add(1);
+                entry.cached_bytes_out = entry.cached_bytes_out.saturating_add(bytes_out);
+            }
             entry.uv_hll.insert(&ip_tag);
             entry.latency_hist.observe(latency_ms);
         }

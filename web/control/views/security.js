@@ -1115,7 +1115,7 @@ export function createSecurityView({ api, store }) {
           </label>
         </div>
 
-        <div class="table-scroll" style="max-height:520px;">
+        <div class="table-scroll">
           <table class="table">
             <thead>
               <tr>

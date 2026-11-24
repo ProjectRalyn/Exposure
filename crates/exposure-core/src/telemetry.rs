@@ -542,6 +542,10 @@ pub struct MinuteSummary {
     pub os_counts: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     pub client_fp_verified: u64,
+    #[serde(default)]
+    pub cached_requests: u64,
+    #[serde(default)]
+    pub cached_bytes_out: u64,
 }
 
 impl MinuteSummary {
@@ -572,6 +576,8 @@ impl MinuteSummary {
             browser_counts: std::collections::BTreeMap::new(),
             os_counts: std::collections::BTreeMap::new(),
             client_fp_verified: 0,
+            cached_requests: 0,
+            cached_bytes_out: 0,
         }
     }
 
@@ -637,6 +643,8 @@ impl MinuteSummary {
         }
         self.bytes_in = self.bytes_in.saturating_add(other.bytes_in);
         self.bytes_out = self.bytes_out.saturating_add(other.bytes_out);
+        self.cached_requests = self.cached_requests.saturating_add(other.cached_requests);
+        self.cached_bytes_out = self.cached_bytes_out.saturating_add(other.cached_bytes_out);
         self.uv_hll.merge(&other.uv_hll);
         self.latency_hist.merge(&other.latency_hist);
     }
