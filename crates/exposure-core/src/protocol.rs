@@ -273,7 +273,9 @@ impl SpecialFrame {
             id: self.id.clone(),
             hops: rev,
             hop_index: 0,
-            ttl: 16,
+            // Size the reply TTL to the reversed hop count so long (≤ MAX_SPECIAL_HOPS) paths
+            // are not guaranteed to exhaust a hard-coded TTL of 16 before returning.
+            ttl: (self.hops.len().min(MAX_TTL as usize) as u8).max(1),
             payload,
         }
     }

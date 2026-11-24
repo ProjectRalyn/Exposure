@@ -85,11 +85,14 @@ impl<T: Serialize> SegmentWriter<T> {
         let ts = Utc::now().timestamp_millis();
         let filename = format!("{}-{}-{:06}.seg.jsonl", self.prefix, ts, self.seq);
         let final_path = Path::new(&self.cfg.dir).join(&filename);
-        let tmp_path = Path::new(&self.cfg.dir).join(format!(".{filename}.tmp"));
+        // Random suffix + `create_new` prevents symlink-follow/truncation in a shared directory.
+        let rand_suffix = crate::crypto::generate_random_secret_hex(8);
+        let tmp_path =
+            Path::new(&self.cfg.dir).join(format!(".{filename}.{rand_suffix}.tmp"));
 
         {
             let mut opts = OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
+            opts.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -188,10 +191,12 @@ pub fn write_json_snapshot_atomic<T: Serialize>(path: &Path, value: &T) -> Resul
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("state.json");
-    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    // Random suffix + `create_new` prevents symlink-follow/truncation in a shared directory.
+    let rand_suffix = crate::crypto::generate_random_secret_hex(8);
+    let tmp_path = path.with_file_name(format!(".{file_name}.{rand_suffix}.tmp"));
     {
         let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

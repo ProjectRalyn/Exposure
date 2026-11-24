@@ -3010,8 +3010,11 @@ impl MaintainerService {
                                 } else if let Some(ref exp_str) = info.expires_at {
                                     match DateTime::parse_from_rfc3339(exp_str) {
                                         Ok(exp_dt) => {
+                                            // Clamp to a sane range so a misconfigured value cannot
+                                            // panic (`ChronoDuration::days`) or overflow.
+                                            let renew_days = order.renew_before_days.clamp(1, 89) as i64;
                                             let renew_at = exp_dt.with_timezone(&Utc)
-                                                - ChronoDuration::days(order.renew_before_days as i64);
+                                                - ChronoDuration::days(renew_days);
                                             now >= renew_at
                                         }
                                         Err(_) => true,
@@ -3078,7 +3081,7 @@ fn load_valid_cached_cert(
         (iat, exp)
     };
 
-    let renew_at = expires_at - (renew_before_days as i64) * 86_400;
+    let renew_at = expires_at - (renew_before_days.clamp(1, 89) as i64) * 86_400;
     if now.timestamp() >= renew_at {
         return None;
     }

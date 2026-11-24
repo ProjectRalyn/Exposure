@@ -1395,9 +1395,25 @@ fn validate_dial_address(addr: &str) -> Result<(), &'static str> {
         if c.is_loopback() || c.is_unspecified() {
             return Err("loopback or unspecified IP address is not allowed");
         }
-        if let IpAddr::V4(v4) = c {
-            if v4.is_link_local() {
-                return Err("link-local metadata IP address is not allowed");
+        match c {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                // RFC1918, link-local, broadcast/multicast, documentation, and CGNAT (100.64/10).
+                let cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+                if v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || v4.is_multicast()
+                    || cgnat
+                {
+                    return Err("private/internal IP address is not allowed");
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_unique_local() || v6.is_unicast_link_local() || v6.is_multicast() {
+                    return Err("private/internal IP address is not allowed");
+                }
             }
         }
     }

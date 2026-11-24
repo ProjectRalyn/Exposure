@@ -100,6 +100,31 @@ fn escape_html(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Single-pass `{{key}}` substitution that never re-scans substituted values, so user-controlled
+/// content cannot inject placeholders that a later replacement would expand into raw markup.
+fn fill_template(tpl: &str, pairs: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    while let Some(pos) = rest.find("{{") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let key = &after[..end];
+        if let Some((_, val)) = pairs.iter().find(|(k, _)| *k == key) {
+            out.push_str(val);
+        } else {
+            out.push_str(&rest[pos..pos + 2 + end + 2]);
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Render an error page for 429 / 5xx responses, using a Control-provisioned custom HTML
@@ -131,14 +156,21 @@ pub fn render_exposure_error_html_with_template(
     if let Some(tpl) = template.map(str::trim).filter(|s| !s.is_empty()) {
         let status_str = status.to_string();
         let retry_str = retry_after_secs.map(|s| s.to_string()).unwrap_or_default();
-        return tpl
-            .replace("{{status}}", &status_str)
-            .replace("{{title}}", &escape_html(title))
-            .replace("{{detail}}", &escape_html(detail))
-            .replace("{{ray_id}}", &escape_html(ray_id))
-            .replace("{{retry_after}}", &retry_str)
-            .replace("{{accent}}", accent)
-            .replace("{{retry_note}}", &retry_note);
+        let escaped_title = escape_html(title);
+        let escaped_detail = escape_html(detail);
+        let escaped_ray = escape_html(ray_id);
+        return fill_template(
+            tpl,
+            &[
+                ("status", status_str.as_str()),
+                ("title", escaped_title.as_str()),
+                ("detail", escaped_detail.as_str()),
+                ("ray_id", escaped_ray.as_str()),
+                ("retry_after", retry_str.as_str()),
+                ("accent", accent),
+                ("retry_note", retry_note.as_str()),
+            ],
+        );
     }
 
     format!(

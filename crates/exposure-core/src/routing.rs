@@ -112,7 +112,9 @@ fn percent_decode_path_chars(input: &str) -> String {
             if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                 let decoded = (hi << 4) | lo;
                 if decoded.is_ascii_graphic() && decoded != b'?' && decoded != b'#' {
-                    out.push(decoded as char);
+                    // Treat a percent-encoded backslash as a path separator too, so `..%5c`
+                    // cannot be viewed differently by rule matching vs. a `\`-aware backend.
+                    out.push(if decoded == b'\\' { '/' } else { decoded as char });
                     i += 3;
                     continue;
                 }

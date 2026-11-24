@@ -520,20 +520,32 @@ impl ControlClient {
         let (tx, rx) = oneshot::channel();
         self.pending_replies.insert(id.clone(), tx);
 
+        // Remove the pending waiter even if this future is cancelled/dropped, preventing an
+        // unbounded leak of `pending_replies` entries on request cancellation.
+        struct PendingGuard {
+            map: Arc<DashMap<String, oneshot::Sender<SpecialFrame>>>,
+            id: String,
+        }
+        impl Drop for PendingGuard {
+            fn drop(&mut self) {
+                self.map.remove(&self.id);
+            }
+        }
+        let _pending_guard = PendingGuard {
+            map: Arc::clone(&self.pending_replies),
+            id: id.clone(),
+        };
+
         if let Err(e) = self.send_special(frame).await {
-            self.pending_replies.remove(&id);
             return Err(e);
         }
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Err(ExposureError::Link("control RPC cancelled".into())),
-            Err(_) => {
-                self.pending_replies.remove(&id);
-                Err(ExposureError::Link(format!(
-                    "control RPC {id} timed out"
-                )))
-            }
+            Err(_) => Err(ExposureError::Link(format!(
+                "control RPC {id} timed out"
+            ))),
         }
     }
 
@@ -1490,10 +1502,14 @@ impl ControlClient {
                 }
 
                 if flat_v4.is_empty() && flat_v6.is_empty() {
-                    return Err(ExposureError::Config(format!(
-                        "domain '{dom}' target_nodes ({}) have no external_ips configured",
-                        binding.target_nodes.join(", ")
-                    )));
+                    if explicitly_requested {
+                        return Err(ExposureError::Config(format!(
+                            "domain '{dom}' target_nodes ({}) have no external_ips configured",
+                            binding.target_nodes.join(", ")
+                        )));
+                    }
+                    // Don't let a single misconfigured, unrequested domain abort the whole sync.
+                    continue;
                 }
             }
 

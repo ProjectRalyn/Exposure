@@ -44,7 +44,18 @@ impl NonceReplayCache {
             let cutoff = now.saturating_sub(HELLO_MAX_SKEW_SECS as i64 * 2);
             self.seen.retain(|_, ts| *ts >= cutoff);
             if self.seen.len() >= MAX_NONCE_CACHE {
-                self.seen.clear();
+                // Evict ~half instead of wiping the whole replay cache (which would disable
+                // replay protection precisely under a nonce flood).
+                let to_remove = self.seen.len() / 2;
+                let mut removed = 0usize;
+                self.seen.retain(|_, _| {
+                    if removed < to_remove {
+                        removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
         let mut fresh = false;

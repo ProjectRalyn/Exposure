@@ -417,6 +417,11 @@ fn infer_crs_category(file_name: &str, tags: &[String]) -> String {
 /// (`@rx`, `@pm`, `@contains`, `@beginsWith`, `@endsWith`); skips chained sub-rules, TX-only control
 /// rules, and PCRE-only lookaround/backreference regexes cleanly (returning skipped count).
 pub fn parse_crs_conf(file_name: &str, conf_text: &str) -> (Vec<WafRuleDescriptor>, usize) {
+    // Bound memory for hostile/oversized upstream CRS bundles (auto-synced).
+    const MAX_CRS_CONF_BYTES: usize = 8 * 1024 * 1024;
+    if conf_text.len() > MAX_CRS_CONF_BYTES {
+        return (Vec::new(), 0);
+    }
     // 1. Join backslash-continued logical lines
     let mut logical_lines = Vec::new();
     let mut current = String::new();
@@ -442,6 +447,10 @@ pub fn parse_crs_conf(file_name: &str, conf_text: &str) -> (Vec<WafRuleDescripto
     let mut in_chain = false;
 
     for line in logical_lines {
+        if out.len() >= MAX_CRS_RULES {
+            // Enforce the documented rule cap to bound memory/CPU from hostile upstream bundles.
+            break;
+        }
         if !line.starts_with("SecRule ") {
             in_chain = false;
             continue;
