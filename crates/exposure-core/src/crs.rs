@@ -27,7 +27,7 @@ pub const CRS_RULE_FILES: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WafRuleDescriptor {
     pub id: u32,
-    /// `"sigil-filter"` or `"owasp-crs"`
+    /// Rule source identifier (e.g. `"owasp-crs"`).
     pub source: String,
     pub file: String,
     pub category: String,
@@ -36,7 +36,7 @@ pub struct WafRuleDescriptor {
     pub msg: String,
     #[serde(default)]
     pub targets: Vec<String>,
-    /// `"sigil"` | `"rx"` | `"pm"` | `"contains"` | `"beginsWith"` | `"endsWith"`
+    /// `"rx"` | `"pm"` | `"contains"` | `"beginsWith"` | `"endsWith"`
     pub operator: String,
     pub pattern: String,
     #[serde(default)]
@@ -62,123 +62,9 @@ pub struct CrsRulesetSnapshot {
     pub rules: Vec<WafRuleDescriptor>,
 }
 
-/// Built-in catalog describing all 12 `sigil-filter` zero-allocation heuristic engines
-/// so administrators can inspect every active built-in rule in the Control Panel.
-pub fn builtin_sigil_rules() -> Vec<WafRuleDescriptor> {
-    let entries: &[(u32, &str, &str, &str, &str)] = &[
-        (
-            100001,
-            "sql-injection",
-            "CRITICAL",
-            "Sigil SQL Injection Heuristic Engine",
-            "Boolean tautologies (' OR 1=1), UNION SELECT, stacked statements (; DROP TABLE), blind timing/error funcs (SLEEP/EXTRACTVALUE), catalog probing, MySQL /*!..*/",
-        ),
-        (
-            100002,
-            "xss",
-            "CRITICAL",
-            "Sigil Cross-Site Scripting (XSS) Engine",
-            "<script>/<iframe>/<svg> active tags, 20+ inline DOM event handlers (onerror=/onload=), javascript:/data:text/html pseudo-protocols, JS sinks (document.cookie/eval)",
-        ),
-        (
-            100003,
-            "path-traversal",
-            "CRITICAL",
-            "Sigil Path Traversal & LFI Engine",
-            "../, ..\\, ..;/, URL/double/overlong UTF-8 encodings (%2e%2e/%252e/%c0%af), null-byte truncation, /etc/passwd, .env, .git/config, php://filter wrappers",
-        ),
-        (
-            100004,
-            "command-injection",
-            "CRITICAL",
-            "Sigil OS Command Injection (RCE) Engine",
-            "/bin/sh, /bin/bash, cmd.exe, powershell, $(subshell), backticks, ${IFS} bypasses, shell separators (;/|/&&) chained with system/network commands",
-        ),
-        (
-            100005,
-            "nosql-injection",
-            "CRITICAL",
-            "Sigil NoSQL & Redis Injection Engine",
-            "MongoDB operators ($ne/$gt/$gte/$lt/$where/$regex/$exists/$nin), $where JS execution, Redis RESP CRLF commands (CONFIG SET/FLUSHALL/SLAVEOF)",
-        ),
-        (
-            100006,
-            "ssrf",
-            "CRITICAL",
-            "Sigil Server-Side Request Forgery (SSRF) Engine",
-            "Cloud IMDS (169.254.169.254, metadata.google.internal, 100.100.100.200), dangerous schemes (gopher://, dict://, redis://), loopback/integer-IP URLs",
-        ),
-        (
-            100007,
-            "ssti",
-            "CRITICAL",
-            "Sigil SSTI & Code Injection Engine",
-            "Python/Jinja2 dunders (__class__/__mro__/__subclasses__/__globals__/__import__), {{7*7}}/${...}/#{...}, Java SpEL/Runtime/ProcessBuilder execution",
-        ),
-        (
-            100008,
-            "xxe",
-            "CRITICAL",
-            "Sigil XXE & XML/XPath Injection Engine",
-            "XML <!ENTITY ... SYSTEM/PUBLIC>, <!DOCTYPE ...>, XPath axis & node-set injection ('] | //*, count(//)",
-        ),
-        (
-            100009,
-            "ldap-injection",
-            "ERROR",
-            "Sigil LDAP Filter Injection Engine",
-            "LDAP parenthesis & boolean wildcard manipulation (*)(uid=*))(|(uid=*, (objectClass=*, userPassword=*)",
-        ),
-        (
-            100010,
-            "crlf-injection",
-            "ERROR",
-            "Sigil CRLF & HTTP Response Splitting Engine",
-            "Raw or encoded CRLF (%0d%0a) followed by injected Set-Cookie, Location, HTTP/1.1, Content-Length, or SMTP Bcc headers",
-        ),
-        (
-            100011,
-            "deserialization",
-            "CRITICAL",
-            "Sigil Log4Shell / JNDI / Prototype Pollution / Deserialization",
-            "${jndi:ldap://...}, obfuscated ${lower:j}ndi:, JS __proto__/constructor.prototype, PHP O:4:\"User\", Java rO0AB/aced0005, Python Pickle",
-        ),
-        (
-            100012,
-            "buffer-overflow",
-            "WARNING",
-            "Sigil Buffer Overflow / NOP Sled / Format String Engine",
-            "x86/x64 NOP sleds (\\x90/%90), high-density hex shellcode, C format-string %n/%08x chains, massive identical-byte padding sleds, control floods",
-        ),
-    ];
-
-    entries
-        .iter()
-        .map(|&(id, cat, sev, msg, pat)| WafRuleDescriptor {
-            id,
-            source: "sigil-filter".into(),
-            file: "sigil-filter/analyzers.rs".into(),
-            category: cat.into(),
-            paranoia_level: 1,
-            severity: sev.into(),
-            msg: msg.into(),
-            targets: vec![
-                "REQUEST_URI".into(),
-                "ARGS".into(),
-                "REQUEST_HEADERS".into(),
-                "REQUEST_COOKIES".into(),
-                "REQUEST_BODY".into(),
-            ],
-            operator: "sigil".into(),
-            pattern: pat.into(),
-            tags: vec!["sigil-filter".into(), format!("attack-{cat}")],
-            enabled: true,
-        })
-        .collect()
-}
-
 /// Curated offline OWASP CRS 4.x baseline snapshot so CRS inspection works out-of-the-box
-/// before the first live sync from `coreruleset.org` / GitHub releases.
+/// across SQLi, XSS, LFI/Path Traversal, CMDi/RCE, PHP, SSTI, SSRF, XXE, NoSQL, CRLF,
+/// Deserialization/Log4Shell, and Scanner detection before live CRS sync completes.
 pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
     let rules = vec![
         WafRuleDescriptor {
@@ -210,6 +96,20 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             enabled: true,
         },
         WafRuleDescriptor {
+            id: 921110,
+            source: "owasp-crs".into(),
+            file: "REQUEST-921-PROTOCOL-ATTACK.conf".into(),
+            category: "crlf-injection".into(),
+            paranoia_level: 1,
+            severity: "ERROR".into(),
+            msg: "HTTP Request Smuggling / CRLF Header Injection".into(),
+            targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_HEADERS".into()],
+            operator: "rx".into(),
+            pattern: r"(?i)(?:%0d%0a|\r\n)\s*(?:set-cookie|location|content-length|transfer-encoding|http/1\.[01]|x-forwarded-host)\s*:".into(),
+            tags: vec!["OWASP_CRS".into(), "attack-protocol".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
             id: 930100,
             source: "owasp-crs".into(),
             file: "REQUEST-930-APPLICATION-ATTACK-LFI.conf".into(),
@@ -217,7 +117,7 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             paranoia_level: 1,
             severity: "CRITICAL".into(),
             msg: "Path Traversal Attack (/../) or (/..%2f)".into(),
-            targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_HEADERS".into()],
+            targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_HEADERS".into(), "REQUEST_BODY".into()],
             operator: "rx".into(),
             pattern: r"(?i)(?:^|[\\/]|%2f|%5c)\.\.(?:[\\/]|%2f|%5c|;|%3b)".into(),
             tags: vec!["OWASP_CRS".into(), "attack-lfi".into(), "paranoia-level/1".into()],
@@ -266,13 +166,55 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             enabled: true,
         },
         WafRuleDescriptor {
+            id: 934120,
+            source: "owasp-crs".into(),
+            file: "REQUEST-934-APPLICATION-ATTACK-GENERIC.conf".into(),
+            category: "ssrf".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "Server-Side Request Forgery (SSRF): Cloud Metadata or Dangerous Scheme".into(),
+            targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r"(?i)(?:\b169\.254\.169\.254\b|\bmetadata\.google\.internal\b|\b100\.100\.100\.200\b|\b(?:gopher|dict|file)://)".into(),
+            tags: vec!["OWASP_CRS".into(), "attack-ssrf".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
+            id: 934130,
+            source: "owasp-crs".into(),
+            file: "REQUEST-934-APPLICATION-ATTACK-GENERIC.conf".into(),
+            category: "xxe".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "XML External Entity (XXE) / DOCTYPE Declaration".into(),
+            targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r"(?i)<!(?:entity\s+[^>]{1,120}\b(?:system|public)\b|doctype\s+[^>]{1,120}\[)".into(),
+            tags: vec!["OWASP_CRS".into(), "attack-xxe".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
+            id: 934140,
+            source: "owasp-crs".into(),
+            file: "REQUEST-934-APPLICATION-ATTACK-GENERIC.conf".into(),
+            category: "nosql-injection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "NoSQL Query Operator Injection ($ne/$gt/$where/$regex)".into(),
+            targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r#"(?i)(?:["']\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists|expr)["']\s*:|\[\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists)\])"#.into(),
+            tags: vec!["OWASP_CRS".into(), "attack-nosql".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
             id: 941110,
             source: "owasp-crs".into(),
             file: "REQUEST-941-APPLICATION-ATTACK-XSS.conf".into(),
             category: "xss".into(),
             paranoia_level: 1,
             severity: "CRITICAL".into(),
-            msg: "XSS Filter - Category 1: Script Tag Vector".into(),
+            msg: "XSS Filter - Category 1: Script Tag / Event Handler / Pseudo-Protocol".into(),
             targets: vec!["ARGS".into(), "REQUEST_URI".into(), "REQUEST_BODY".into(), "REQUEST_COOKIES".into()],
             operator: "rx".into(),
             pattern: r"(?i)<\s*/?\s*script\b[^>]*>|\bjavascript\s*:|<\s*(?:svg|img|iframe|object|embed|body)\b[^>]*\bon[a-z]+\s*=".into(),
@@ -289,7 +231,12 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "SQL Injection Attack: Tautology, Boolean Comparison, or Comment Truncation".into(),
             targets: vec!["ARGS".into(), "REQUEST_URI".into(), "REQUEST_BODY".into(), "REQUEST_COOKIES".into()],
             operator: "rx".into(),
-            pattern: r#"(?i)(?:(?:^|[\s'"()0-9])(?:or|and)\s+(?:[0-9]+\s*(?:=|!=|<>|<|>|<=|>=)\s*[0-9]+|'[^']{0,32}'\s*(?:=|!=|<>)\s*'[^']{0,32}'|"[^"]{0,32}"\s*(?:=|!=|<>)\s*"[^"]{0,32}")|(?:['")]|\b\d+)\s+(?:or|and)\s+(?:true|false)\b|'\s*(?:--|#|/\*)|\border\s+by\s+\d+\s*(?:--|#|/\*|$))"#.into(),
+            // Covers classic tautologies incl. no-whitespace (`'or'a'='a`), parenthesised operands
+            // (`') OR ('1'='1`), hex literals (`0x31 OR 0x31=0x31`), string comparison operators
+            // (`' OR 'a'<'b`), `||` string concatenation tricks (`'||'1'='1`), block-comment
+            // obfuscation between operators (`or/**/1=1`), value-then-comment truncation (`' or 1#`),
+            // multi-column `ORDER BY`/`GROUP BY` (`order by 1,2,3--`) and `HAVING` tautologies.
+            pattern: r#"(?i)(?:(?:^|[\s'"\x28\x29 0-9])(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:\x28(?:\s|/\*[^*]*\*/|\+)*)?(?:(?:[0-9]+|0x[0-9a-f]+)\s*(?:=|!=|<>|<=|>=|<|>)\s*(?:[0-9]+|0x[0-9a-f]+)|'[^']*'\s*(?:=|!=|<>|<=|>=|<|>|\blike\b)\s*'[^']*(?:'|$|\s|\x29)|"[^"]*"\s*(?:=|!=|<>|<=|>=|<|>|\blike\b)\s*"[^"]*(?:"|$|\s|\x29)|(?:[0-9]+|'[^']*'|"[^"]*")\s*(?:--|#|/\*))|(?:['"\x29]|\d+)(?:\s|/\*[^*]*\*/|\+)+(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:true|false)\b|(?:'[^']*'|')\s*\|{1,2}\s*'[^']*'\s*(?:=|!=|<>|<=|>=|<|>)\s*'[^']*|'\s*(?:--|#|/\*)|\b(?:order|group)\s+by\s+[0-9]+(?:\s*,\s*[0-9]+)*\s*(?:--|#|/\*|$)|\bhaving\s+[0-9]+\s*(?:=|!=|<>|<=|>=|<|>))"#.into(),
             tags: vec!["OWASP_CRS".into(), "attack-sqli".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -303,7 +250,23 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "SQL Injection Attack: Common DB Names / UNION SELECT / Blind SQLi".into(),
             targets: vec!["ARGS".into(), "REQUEST_URI".into(), "REQUEST_BODY".into(), "REQUEST_COOKIES".into()],
             operator: "rx".into(),
-            pattern: r"(?i)(?:\bunion\s+(?:all\s+|distinct\s+)?select\b|\b(?:information_schema|sqlite_master|pg_catalog|mysql\.user)\b|\b(?:sleep|pg_sleep|benchmark|extractvalue|updatexml|load_file)\s*\(|\bwaitfor\s+delay\b)".into(),
+            // Also detects parenthesised / `EXISTS` subquery injection (`1 AND (SELECT ...)`,
+            // `AND EXISTS(SELECT ...)`) and comment-obfuscated keywords (`UNION/**/SELECT`).
+            pattern: r"(?i)(?:\bunion[\s/*]+(?:all[\s/*]+|distinct[\s/*]+)?select\b|\b(?:and|or)\s*\(\s*select\b|\bexists\s*\(\s*select\b|\b(?:information_schema|sqlite_master|pg_catalog|mysql\.user)\b|\b(?:sleep|pg_sleep|benchmark|extractvalue|updatexml|load_file)\s*\(|\bwaitfor\s+delay\b)".into(),
+            tags: vec!["OWASP_CRS".into(), "attack-sqli".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
+            id: 942150,
+            source: "owasp-crs".into(),
+            file: "REQUEST-942-APPLICATION-ATTACK-SQLI.conf".into(),
+            category: "sql-injection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "SQL Injection Attack: Stacked DDL/DML Query Statement".into(),
+            targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r"(?i);\s*(?:drop|truncate|alter|create|exec|execute)\s+(?:table|database|user|procedure)\b|\bxp_cmdshell\b".into(),
             tags: vec!["OWASP_CRS".into(), "attack-sqli".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -347,6 +310,30 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
     }
 }
 
+/// Merge a synced OWASP CRS snapshot with the curated built-in baseline.
+///
+/// The built-in baseline is placed first so it can never be truncated by the `MAX_CRS_RULES`
+/// compile cap, and every synced rule whose ID is not already provided by the baseline is appended.
+/// This is critical because the ModSecurity parser intentionally skips constructs the linear-time
+/// engine cannot evaluate safely (`@detectSQLi`, chained rules, PCRE lookarounds, anomaly-scoring
+/// `pass` rules). Without this union a partial sync could silently drop SQLi/XSS/RCE coverage and
+/// leave the node effectively unprotected.
+pub fn merge_crs_snapshots(mut synced: CrsRulesetSnapshot, builtin: CrsRulesetSnapshot) -> CrsRulesetSnapshot {
+    let mut merged: Vec<WafRuleDescriptor> = builtin.rules;
+    let mut seen: std::collections::HashSet<u32> = merged.iter().map(|r| r.id).collect();
+    for rule in synced.rules {
+        if merged.len() >= MAX_CRS_RULES {
+            break;
+        }
+        if seen.insert(rule.id) {
+            merged.push(rule);
+        }
+    }
+    synced.rules = merged;
+    synced.total_parsed = synced.total_parsed.max(synced.rules.len());
+    synced
+}
+
 /// Validate that a regex pattern compiles cleanly in linear-time Rust `regex` within strict size bounds.
 pub fn validate_crs_regex(pattern: &str) -> bool {
     if pattern.is_empty() || pattern.len() > MAX_CRS_PATTERN_LEN {
@@ -383,6 +370,15 @@ fn infer_crs_category(file_name: &str, tags: &[String]) -> String {
         }
         if tl.contains("attack-ssrf") {
             return "ssrf".into();
+        }
+        if tl.contains("attack-xxe") {
+            return "xxe".into();
+        }
+        if tl.contains("attack-nosql") {
+            return "nosql-injection".into();
+        }
+        if tl.contains("attack-ssti") {
+            return "ssti".into();
         }
         if tl.contains("attack-protocol") {
             return "protocol-attack".into();
@@ -713,13 +709,55 @@ SecRule ARGS "@rx (?<=foo)bar" \
     }
 
     #[test]
-    fn builtin_crs_and_sigil_rules_are_valid() {
-        let sigil = builtin_sigil_rules();
-        assert_eq!(sigil.len(), 12);
+    fn builtin_crs_rules_are_valid() {
         let crs = builtin_crs_snapshot();
-        assert!(!crs.rules.is_empty());
+        assert!(crs.rules.len() >= 14);
         for r in &crs.rules {
+            assert_eq!(r.source, "owasp-crs");
             assert!(validate_crs_regex(&r.pattern), "invalid builtin CRS regex id={}", r.id);
         }
+    }
+
+    #[test]
+    fn merge_snapshots_retains_builtin_coverage_without_duplicates() {
+        let builtin = builtin_crs_snapshot();
+        let mut synced = CrsRulesetSnapshot {
+            version: "v4-test".into(),
+            total_parsed: 1,
+            ..Default::default()
+        };
+        synced.rules.push(WafRuleDescriptor {
+            id: 949999,
+            source: "owasp-crs".into(),
+            file: "REQUEST-949-TEST.conf".into(),
+            category: "sql-injection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "synced test rule".into(),
+            targets: vec!["ARGS".into()],
+            operator: "contains".into(),
+            pattern: "synced-needle".into(),
+            tags: vec![],
+            enabled: true,
+        });
+
+        let merged = merge_crs_snapshots(synced, builtin.clone());
+
+        // Synced rule retained and every built-in rule still present (no silent SQLi loss).
+        assert!(merged.rules.iter().any(|r| r.id == 949999));
+        for b in &builtin.rules {
+            assert!(
+                merged.rules.iter().any(|r| r.id == b.id),
+                "built-in rule {} dropped by merge",
+                b.id
+            );
+        }
+
+        // No duplicate rule IDs.
+        let mut ids: Vec<u32> = merged.rules.iter().map(|r| r.id).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total);
     }
 }

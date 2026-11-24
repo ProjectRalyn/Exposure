@@ -4,6 +4,7 @@ pub mod ban;
 pub mod cache;
 pub mod egress;
 pub mod forwarder;
+pub mod geoip;
 pub mod guard;
 pub mod honeypot;
 pub mod ingress;

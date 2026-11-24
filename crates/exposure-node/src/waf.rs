@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 use exposure_core::config::{WafCategory, WafConfig, WafMode};
 use exposure_core::crs::{
@@ -8,18 +7,16 @@ use exposure_core::crs::{
 };
 use http::{header, HeaderMap, Method};
 use regex::{Regex, RegexBuilder};
-use sigil_filter::{AttackDetector, CategoryMask, DetectionResult, ScanInput, ViolationCategory};
 
 /// Hard ceiling on request body bytes buffered for WAF inspection (prevents OOM DoS).
 pub const WAF_HARD_MAX_BODY_BYTES: usize = 256 * 1024;
-/// Header/URI buffer length thresholds (high enough for JWT cookies/long query strings,
-/// while still catching NOP sleds, format strings, repeated padding, and oversized floods).
-const HEAD_OVERFLOW_WARN_LEN: usize = 4096;
-const HEAD_OVERFLOW_CRIT_LEN: usize = 8192;
+/// Maximum UTF-8 bytes evaluated per field/target by the linear-time OWASP CRS regex engine.
+const MAX_CRS_SCAN_BYTES: usize = 8192;
 /// Iteration caps preventing CPU-amplification DoS via thousands of tiny query/cookie/form items.
 const MAX_WAF_QUERY_PARAMS: usize = 128;
 const MAX_WAF_COOKIE_ITEMS: usize = 64;
 const MAX_WAF_FORM_PARAMS: usize = 256;
+const MAX_CAPTURED_PAYLOAD_CHARS: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct WafFinding {
@@ -29,9 +26,9 @@ pub struct WafFinding {
     pub reasons: Vec<&'static str>,
     /// Bounded snippet (<= 512 chars) of the matched input, used by `evilpot` deception/analysis.
     pub matched_payload: Option<String>,
-    /// Optional matched OWASP CRS rule ID (e.g. `942140`), `None` for `sigil-filter` heuristic hits.
+    /// Matched OWASP CRS rule ID (e.g. `942140`).
     pub rule_id: Option<u32>,
-    /// Optional human-readable OWASP CRS rule message.
+    /// Human-readable OWASP CRS rule message.
     pub rule_msg: Option<String>,
 }
 
@@ -61,82 +58,6 @@ impl WafVerdict {
     pub fn is_evilpot(&self) -> bool {
         matches!(self, WafVerdict::Evilpot(_))
     }
-}
-
-pub fn category_to_sigil(cat: WafCategory) -> ViolationCategory {
-    match cat {
-        WafCategory::SqlInjection => ViolationCategory::SqlInjection,
-        WafCategory::Xss => ViolationCategory::Xss,
-        WafCategory::PathTraversal => ViolationCategory::PathTraversal,
-        WafCategory::CommandInjection => ViolationCategory::CommandInjection,
-        WafCategory::NoSqlInjection => ViolationCategory::NoSqlInjection,
-        WafCategory::Ssrf => ViolationCategory::Ssrf,
-        WafCategory::Ssti => ViolationCategory::SstiAndCodeInjection,
-        WafCategory::Xxe => ViolationCategory::XxeAndXmlInjection,
-        WafCategory::LdapInjection => ViolationCategory::LdapInjection,
-        WafCategory::CrlfInjection => ViolationCategory::CrlfAndHeaderInjection,
-        WafCategory::Deserialization => ViolationCategory::DeserializationAndPrototypePollution,
-        WafCategory::BufferOverflow => ViolationCategory::BufferOverflow,
-    }
-}
-
-pub fn sigil_category_label(cat: ViolationCategory) -> &'static str {
-    match cat {
-        ViolationCategory::BufferOverflow => "buffer-overflow",
-        ViolationCategory::PathTraversal => "path-traversal",
-        ViolationCategory::SqlInjection => "sql-injection",
-        ViolationCategory::NoSqlInjection => "nosql-injection",
-        ViolationCategory::Xss => "xss",
-        ViolationCategory::CommandInjection => "command-injection",
-        ViolationCategory::LdapInjection => "ldap-injection",
-        ViolationCategory::XxeAndXmlInjection => "xxe",
-        ViolationCategory::SstiAndCodeInjection => "ssti",
-        ViolationCategory::Ssrf => "ssrf",
-        ViolationCategory::CrlfAndHeaderInjection => "crlf-injection",
-        ViolationCategory::DeserializationAndPrototypePollution => "deserialization",
-        ViolationCategory::Custom(name) => name,
-    }
-}
-
-fn sigil_rule_id_to_category(id: u32) -> Option<ViolationCategory> {
-    match id {
-        100001 => Some(ViolationCategory::SqlInjection),
-        100002 => Some(ViolationCategory::Xss),
-        100003 => Some(ViolationCategory::PathTraversal),
-        100004 => Some(ViolationCategory::CommandInjection),
-        100005 => Some(ViolationCategory::NoSqlInjection),
-        100006 => Some(ViolationCategory::Ssrf),
-        100007 => Some(ViolationCategory::SstiAndCodeInjection),
-        100008 => Some(ViolationCategory::XxeAndXmlInjection),
-        100009 => Some(ViolationCategory::LdapInjection),
-        100010 => Some(ViolationCategory::CrlfAndHeaderInjection),
-        100011 => Some(ViolationCategory::DeserializationAndPrototypePollution),
-        100012 => Some(ViolationCategory::BufferOverflow),
-        _ => None,
-    }
-}
-
-fn build_category_mask(categories: &[WafCategory], disabled_rule_ids: &[u32]) -> CategoryMask {
-    let mut mask = if categories.is_empty() {
-        CategoryMask::ALL.0
-    } else {
-        let mut m = 0u16;
-        for &c in categories {
-            m |= category_to_sigil(c).bit();
-        }
-        m
-    };
-    for &id in disabled_rule_ids {
-        if let Some(cat) = sigil_rule_id_to_category(id) {
-            mask &= !cat.bit();
-        }
-    }
-    CategoryMask(mask)
-}
-
-#[inline]
-fn mask_without(mask: CategoryMask, excluded: ViolationCategory) -> CategoryMask {
-    CategoryMask(mask.0 & !excluded.bit())
 }
 
 /// Checks whether a request path is exempt from WAF inspection.
@@ -182,55 +103,9 @@ pub fn should_inspect_body(
     }
     // SECURITY: Do NOT skip inspection based on the client-controlled `Content-Type`. A client
     // could otherwise set `application/octet-stream` / `multipart/form-data` to bypass body
-    // inspection entirely. `inspect_request_body` is UTF-8-safe (falls back to the valid prefix)
-    // and bounded by `limit`, so binary bodies are safe to scan.
+    // inspection entirely. `CompiledCrsEngine::inspect_body` verifies multipart framing before
+    // part parsing and safely bounds binary payloads.
     Some(limit)
-}
-
-const MAX_CAPTURED_PAYLOAD_CHARS: usize = 512;
-
-#[inline]
-fn verdict_from_result(
-    mode: WafMode,
-    location: &'static str,
-    sample: &str,
-    res: DetectionResult,
-) -> Option<WafVerdict> {
-    let cat = res.violation?;
-    let reasons = res
-        .violations
-        .first()
-        .map(|v| v.reasons.clone())
-        .unwrap_or_default();
-    let matched_payload = if sample.is_empty() {
-        None
-    } else {
-        Some(sample.chars().take(MAX_CAPTURED_PAYLOAD_CHARS).collect())
-    };
-    let finding = WafFinding {
-        category: sigil_category_label(cat),
-        location,
-        confidence: res.confidence,
-        reasons,
-        matched_payload,
-        rule_id: None,
-        rule_msg: None,
-    };
-    Some(match mode {
-        WafMode::Off => WafVerdict::Allow,
-        WafMode::Monitor => WafVerdict::Monitor(finding),
-        WafMode::Block => WafVerdict::Block(finding),
-        WafMode::Evilpot => WafVerdict::Evilpot(finding),
-    })
-}
-
-#[inline]
-fn replace_plus_with_space(s: &str) -> Cow<'_, str> {
-    if s.as_bytes().contains(&b'+') {
-        Cow::Owned(s.replace('+', " "))
-    } else {
-        Cow::Borrowed(s)
-    }
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -242,7 +117,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn percent_decode_lossy(input: &str) -> Cow<'_, str> {
+fn percent_decode_once(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
     if !bytes.contains(&b'%') && !bytes.contains(&b'+') {
         return Cow::Borrowed(input);
@@ -269,323 +144,220 @@ fn percent_decode_lossy(input: &str) -> Cow<'_, str> {
     Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
-fn sqli_tautology_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        RegexBuilder::new(
-            r#"(?i)(?:(?:^|[\s'"()0-9])(?:or|and)\s+(?:[0-9]+\s*(?:=|!=|<>|<|>|<=|>=)\s*[0-9]+|'[^']{0,32}'\s*(?:=|!=|<>)\s*'[^']{0,32}'|"[^"]{0,32}"\s*(?:=|!=|<>)\s*"[^"]{0,32}")|(?:['")]|\b\d+)\s+(?:or|and)\s+(?:true|false)\b|'\s*(?:--|#|/\*)|\border\s+by\s+\d+\s*(?:--|#|/\*|$))"#,
-        )
-        .size_limit(CRS_REGEX_SIZE_LIMIT)
-        .dfa_size_limit(CRS_REGEX_SIZE_LIMIT)
-        .build()
-        .expect("valid supplemental SQLi regex")
-    })
-}
-
-fn cmdi_supplemental_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        RegexBuilder::new(
-            r"(?i)(?:;|\|\|?|&&|\r|\n|\$\(\s*|\`\s*)(?:\$\{ifs\}|\$ifs\b|\s)*(?:/(?:usr/)?(?:local/)?(?:s?bin)/)?(?:sh|bash|dash|zsh|ash|ksh|csh|fish|busybox|cmd(?:\.exe)?|powershell|pwsh|cat|tac|nl|head|tail|ls|ll|dir|pwd|echo|printf|env|printenv|id|whoami|who|last|lastlog|groups|uname|hostname|hostnamectl|lsb_release|uptime|ps|htop|pgrep|netstat|ss|ip|ifconfig|route|iptables|ping|traceroute|nslookup|dig|curl|wget|fetch|tftp|nc|ncat|netcat|socat|telnet|ssh|scp|sftp|python[23]?|perl|ruby|php|node|awk|sed|grep|egrep|fgrep|find|which|whereis|base64|xxd|tar|gzip|unzip|chmod|chown|rm\s+-rf|sudo|su|crontab|systemctl|service|docker|kubectl|nvidia-smi|sleep)\b",
-        )
-        .size_limit(CRS_REGEX_SIZE_LIMIT)
-        .dfa_size_limit(CRS_REGEX_SIZE_LIMIT)
-        .build()
-        .expect("valid supplemental CMDi regex")
-    })
-}
-
-fn supplemental_detect(
-    cfg: &WafConfig,
-    mask: CategoryMask,
-    location: &'static str,
-    sample: &str,
-) -> Option<WafVerdict> {
-    let decoded = percent_decode_lossy(sample);
-    let s = clamp_utf8_bytes(decoded.as_ref(), MAX_CRS_SCAN_BYTES);
-    if mask.contains(ViolationCategory::SqlInjection)
-        && !cfg.disabled_rule_ids.contains(&942100)
-        && sqli_tautology_regex().is_match(s)
-    {
-        let finding = WafFinding {
-            category: "sql-injection",
-            location,
-            confidence: 0.90,
-            reasons: vec!["sql-tautology-or-comment-injection"],
-            matched_payload: Some(s.chars().take(MAX_CAPTURED_PAYLOAD_CHARS).collect()),
-            rule_id: None,
-            rule_msg: None,
-        };
-        return Some(match cfg.mode {
-            WafMode::Off => WafVerdict::Allow,
-            WafMode::Monitor => WafVerdict::Monitor(finding),
-            WafMode::Block => WafVerdict::Block(finding),
-            WafMode::Evilpot => WafVerdict::Evilpot(finding),
-        });
+/// Decode percent-encoding repeatedly (bounded) so double/triple-encoded payloads such as
+/// `%2527%2520OR%25201%253D1` are still normalised before matching. Stops as soon as a pass
+/// makes no further change or no `%` remains, keeping the cost linear in the input size.
+fn percent_decode_lossy(input: &str) -> Cow<'_, str> {
+    const MAX_DECODE_PASSES: usize = 3;
+    let mut cur = percent_decode_once(input);
+    for _ in 0..MAX_DECODE_PASSES {
+        if !cur.contains('%') {
+            break;
+        }
+        let next = percent_decode_once(cur.as_ref());
+        if next.as_ref() == cur.as_ref() {
+            break;
+        }
+        cur = Cow::Owned(next.into_owned());
     }
-    if mask.contains(ViolationCategory::CommandInjection)
-        && !cfg.disabled_rule_ids.contains(&932100)
-        && cmdi_supplemental_regex().is_match(s)
-    {
-        let finding = WafFinding {
-            category: "command-injection",
-            location,
-            confidence: 0.92,
-            reasons: vec!["shell-separator-with-unix-command"],
-            matched_payload: Some(s.chars().take(MAX_CAPTURED_PAYLOAD_CHARS).collect()),
-            rule_id: None,
-            rule_msg: None,
-        };
-        return Some(match cfg.mode {
-            WafMode::Off => WafVerdict::Allow,
-            WafMode::Monitor => WafVerdict::Monitor(finding),
-            WafMode::Block => WafVerdict::Block(finding),
-            WafMode::Evilpot => WafVerdict::Evilpot(finding),
-        });
+    cur
+}
+
+fn utf8_valid_prefix(bytes: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => {
+            let valid = e.valid_up_to();
+            if valid == 0 {
+                return None;
+            }
+            std::str::from_utf8(&bytes[..valid])
+                .ok()
+                .filter(|s| !s.is_empty())
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
+    let mut parts = content_type.split(';');
+    let mime = parts.next()?.trim();
+    if !mime.eq_ignore_ascii_case("multipart/form-data") {
+        return None;
+    }
+    for param in parts {
+        if let Some((k, v)) = param.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("boundary") {
+                let raw = v.trim();
+                let unquoted = raw
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(raw)
+                    .trim();
+                if !unquoted.is_empty() && unquoted.len() <= 128 {
+                    return Some(unquoted);
+                }
+            }
+        }
     }
     None
 }
 
-/// Inspect HTTP request head (URI path, query string, and selected request headers) using `sigil-filter`.
-pub fn inspect_request_head(
-    cfg: &WafConfig,
-    path: &str,
-    query: Option<&str>,
-    headers: &HeaderMap,
-) -> WafVerdict {
-    if cfg.mode == WafMode::Off || is_path_exempt(path, &cfg.exempt_paths) {
-        return WafVerdict::Allow;
-    }
-
-    let min_c = cfg.min_confidence.clamp(0.1, 1.0);
-    let detector = AttackDetector::new()
-        .with_min_confidence(min_c)
-        .with_buffer_limits(HEAD_OVERFLOW_WARN_LEN, HEAD_OVERFLOW_CRIT_LEN);
-    let mask = build_category_mask(&cfg.categories, &cfg.disabled_rule_ids);
-    if mask.0 == 0 {
-        return WafVerdict::Allow;
-    }
-
-    // 1. URI path
-    if !path.is_empty() && path != "/" {
-        let res = detector.detect(ScanInput::new(path).with_mask(mask));
-        if let Some(v) = verdict_from_result(cfg.mode, "path", path, res) {
-            return v;
-        }
-        if let Some(v) = supplemental_detect(cfg, mask, "path", path) {
-            return v;
-        }
-    }
-
-    // 2. Query string (scan bounded individual key/value pairs + raw query)
-    if let Some(q) = query.filter(|q| !q.is_empty()) {
-        for pair in q.split('&').take(MAX_WAF_QUERY_PARAMS) {
-            if pair.is_empty() {
-                continue;
-            }
-            let (k, v_opt) = match pair.split_once('=') {
-                Some((k, v)) => (k, Some(v)),
-                None => (pair, None),
-            };
-            let k_norm = replace_plus_with_space(k);
-            let res = detector.detect(ScanInput::new(k_norm.as_ref()).with_mask(mask));
-            if let Some(verdict) = verdict_from_result(cfg.mode, "query", k_norm.as_ref(), res) {
-                return verdict;
-            }
-            if let Some(v) = v_opt.filter(|v| !v.is_empty()) {
-                let v_norm = replace_plus_with_space(v);
-                let res = detector.detect(ScanInput::new(v_norm.as_ref()).with_mask(mask));
-                if let Some(verdict) = verdict_from_result(cfg.mode, "query", v_norm.as_ref(), res) {
-                    return verdict;
-                }
-                if let Some(verdict) = supplemental_detect(cfg, mask, "query", v_norm.as_ref()) {
-                    return verdict;
-                }
-            } else if let Some(verdict) = supplemental_detect(cfg, mask, "query", k_norm.as_ref()) {
-                return verdict;
-            }
-            // Also scan the full `key=value` pair (catches MongoDB `user[$ne]=admin`, etc.)
-            let pair_norm = replace_plus_with_space(pair);
-            let res = detector.detect(ScanInput::new(pair_norm.as_ref()).with_mask(mask));
-            if let Some(verdict) = verdict_from_result(cfg.mode, "query", pair_norm.as_ref(), res) {
-                return verdict;
-            }
-        }
-        // Catch cross-param/oversized query payloads
-        let q_norm = replace_plus_with_space(q);
-        let res = detector.detect(ScanInput::new(q_norm.as_ref()).with_mask(mask));
-        if let Some(verdict) = verdict_from_result(cfg.mode, "query", q_norm.as_ref(), res) {
-            return verdict;
-        }
-    }
-
-    // 3. Selected HTTP headers (with HTTP-aware category masks to avoid false positives on benign browsers)
-    if cfg.inspect_headers {
-        // User-Agent: exclude PathTraversal because standard Windows browser UAs contain `/` + `Windows`
-        let ua_mask = mask_without(mask, ViolationCategory::PathTraversal);
-        for hv in headers.get_all(header::USER_AGENT) {
-            if let Ok(s) = hv.to_str() {
-                let res = detector.detect(ScanInput::new(s).with_mask(ua_mask));
-                if let Some(v) = verdict_from_result(cfg.mode, "header:user-agent", s, res) {
-                    return v;
-                }
-            }
-        }
-
-        // Referer: exclude Ssrf because browsing from localhost/127.0.0.1 sets `Referer: http://127.0.0.1/...`
-        let referer_mask = mask_without(mask, ViolationCategory::Ssrf);
-        for hv in headers.get_all(header::REFERER) {
-            if let Ok(s) = hv.to_str() {
-                let res = detector.detect(ScanInput::new(s).with_mask(referer_mask));
-                if let Some(v) = verdict_from_result(cfg.mode, "header:referer", s, res) {
-                    return v;
-                }
-            }
-        }
-
-        // Cookie: split on `;` (capped) so standard `a=1; id=2` cookie delimiters don't look like shell `; id` chains
-        for hv in headers.get_all(header::COOKIE) {
-            if let Ok(raw_cookie) = hv.to_str() {
-                for item in raw_cookie.split(';').take(MAX_WAF_COOKIE_ITEMS) {
-                    let trimmed = item.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let val = trimmed
-                        .split_once('=')
-                        .map(|(_, v)| v.trim())
-                        .unwrap_or(trimmed);
-                    if val.is_empty() {
-                        continue;
-                    }
-                    let res = detector.detect(ScanInput::new(val).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, "header:cookie", val, res) {
-                        return v;
-                    }
-                    if let Some(v) = supplemental_detect(cfg, mask, "header:cookie", val) {
-                        return v;
-                    }
-                }
-            }
-        }
-
-        // Proxy / rewrite headers frequently targeted by Log4Shell, SSRF, CRLF, or path-override attacks
-        for (h_name, loc) in [
-            ("x-original-url", "header:x-original-url"),
-            ("x-rewrite-url", "header:x-rewrite-url"),
-            ("x-forwarded-for", "header:x-forwarded-for"),
-            ("x-forwarded-host", "header:x-forwarded-host"),
-            ("forwarded", "header:forwarded"),
-        ] {
-            for hv in headers.get_all(h_name) {
-                if let Ok(s) = hv.to_str() {
-                    let res = detector.detect(ScanInput::new(s).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, loc, s, res) {
-                        return v;
-                    }
-                    if let Some(v) = supplemental_detect(cfg, mask, loc, s) {
-                        return v;
-                    }
-                }
-            }
-        }
-    }
-
-    WafVerdict::Allow
+fn is_binary_part_mime(ct: Option<&str>) -> bool {
+    let Some(raw) = ct else {
+        return false;
+    };
+    let mime = raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    mime.starts_with("image/")
+        || mime.starts_with("video/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("font/")
+        || matches!(
+            mime.as_str(),
+            "application/octet-stream"
+                | "application/pdf"
+                | "application/zip"
+                | "application/gzip"
+                | "application/x-gzip"
+                | "application/x-tar"
+                | "application/x-bzip2"
+                | "application/x-7z-compressed"
+                | "application/wasm"
+        )
 }
 
-/// Inspect buffered HTTP request body bytes (`POST`/`PUT`/`PATCH`) using `sigil-filter`.
-pub fn inspect_request_body(
-    cfg: &WafConfig,
-    content_type: Option<&str>,
-    body: &[u8],
-) -> WafVerdict {
-    if cfg.mode == WafMode::Off || !cfg.inspect_body || body.is_empty() {
-        return WafVerdict::Allow;
-    }
-
-    let limit = cfg.max_body_bytes.min(WAF_HARD_MAX_BODY_BYTES);
-    if limit == 0 {
-        return WafVerdict::Allow;
-    }
-    let slice = &body[..body.len().min(limit)];
-    let text = match std::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(e) => {
-            // If truncated mid-UTF8 codepoint at `limit`, inspect the valid prefix
-            let valid = e.valid_up_to();
-            if valid == 0 {
-                return WafVerdict::Allow;
-            }
-            match std::str::from_utf8(&slice[..valid]) {
-                Ok(s) => s,
-                Err(_) => return WafVerdict::Allow,
+fn extract_disposition_attr<'a>(disp_val: &'a str, key: &str) -> Option<&'a str> {
+    for param in disp_val.split(';').skip(1) {
+        if let Some((k, v)) = param.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                let raw = v.trim();
+                let clean = raw
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(raw);
+                return Some(clean);
             }
         }
-    };
+    }
+    None
+}
 
-    let min_c = cfg.min_confidence.clamp(0.1, 1.0);
-    // Raise length-only overflow thresholds above `limit` so benign JSON/form payloads within
-    // `max_body_bytes` do not trip length warnings, while NOP sleds, format strings, and huge
-    // repeated byte runs are still caught.
-    let body_warn = limit.saturating_add(1).max(HEAD_OVERFLOW_WARN_LEN);
-    let body_crit = body_warn.saturating_add(1);
-    let detector = AttackDetector::new()
-        .with_min_confidence(min_c)
-        .with_buffer_limits(body_warn, body_crit);
-    let mask = build_category_mask(&cfg.categories, &cfg.disabled_rule_ids);
-    if mask.0 == 0 {
-        return WafVerdict::Allow;
+struct MultipartPart<'a> {
+    name: Option<&'a str>,
+    filename: Option<&'a str>,
+    content_type: Option<&'a str>,
+    body: &'a [u8],
+}
+
+/// Parse validated RFC 7578 `multipart/form-data` parts strictly.
+/// Returns `None` if `body` does not actually start with `--<boundary>`, preventing
+/// attackers from spoofing `Content-Type: multipart/form-data` on raw SQLi/CMDi payloads.
+fn parse_multipart_parts<'a>(boundary: &str, body: &'a [u8]) -> Option<Vec<MultipartPart<'a>>> {
+    let mut dash_boundary = Vec::with_capacity(boundary.len() + 2);
+    dash_boundary.extend_from_slice(b"--");
+    dash_boundary.extend_from_slice(boundary.as_bytes());
+
+    if !body.starts_with(&dash_boundary) {
+        return None;
+    }
+    let after_first = &body[dash_boundary.len()..];
+    let mut pos = dash_boundary.len();
+    if after_first.starts_with(b"\r\n") {
+        pos += 2;
+    } else if after_first.starts_with(b"\n") {
+        pos += 1;
+    } else if after_first.starts_with(b"--") {
+        return Some(Vec::new());
+    } else {
+        return None;
     }
 
-    let is_form = content_type
-        .map(|ct| {
-            ct.split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-        })
-        .unwrap_or(false);
+    let mut lf_boundary = Vec::with_capacity(dash_boundary.len() + 1);
+    lf_boundary.push(b'\n');
+    lf_boundary.extend_from_slice(&dash_boundary);
 
-    if is_form {
-        for pair in text.split('&').take(MAX_WAF_FORM_PARAMS) {
-            if pair.is_empty() {
-                continue;
+    let mut parts = Vec::new();
+    while pos < body.len() && parts.len() < MAX_WAF_FORM_PARAMS {
+        let rest = &body[pos..];
+        let (part_raw, next_pos, is_last) = if let Some(idx) = find_bytes(rest, &lf_boundary) {
+            let mut end = idx;
+            if end > 0 && rest[end - 1] == b'\r' {
+                end -= 1;
             }
-            let pair_norm = replace_plus_with_space(pair);
-            let res = detector.detect(ScanInput::new(pair_norm.as_ref()).with_mask(mask));
-            if let Some(v) = verdict_from_result(cfg.mode, "body", pair_norm.as_ref(), res) {
-                return v;
+            let after_marker = pos + idx + lf_boundary.len();
+            let tail = &body[after_marker..];
+            if tail.starts_with(b"--") {
+                (&rest[..end], body.len(), true)
+            } else if tail.starts_with(b"\r\n") {
+                (&rest[..end], after_marker + 2, false)
+            } else if tail.starts_with(b"\n") {
+                (&rest[..end], after_marker + 1, false)
+            } else {
+                // Unexpected trailing delimiter noise: treat rest of buffer as opaque so payloads aren't hidden
+                return None;
             }
-            if let Some((_, val)) = pair.split_once('=') {
-                if !val.is_empty() {
-                    let val_norm = replace_plus_with_space(val);
-                    let res = detector.detect(ScanInput::new(val_norm.as_ref()).with_mask(mask));
-                    if let Some(v) = verdict_from_result(cfg.mode, "body", val_norm.as_ref(), res) {
-                        return v;
-                    }
-                    if let Some(v) = supplemental_detect(cfg, mask, "body", val_norm.as_ref()) {
-                        return v;
+        } else {
+            (rest, body.len(), true)
+        };
+
+        let sep_crlf = find_bytes(part_raw, b"\r\n\r\n");
+        let sep_lf = find_bytes(part_raw, b"\n\n");
+        let (hdr_bytes, part_body) = match (sep_crlf, sep_lf) {
+            (Some(c), Some(l)) => {
+                if c <= l {
+                    (&part_raw[..c], &part_raw[c + 4..])
+                } else {
+                    (&part_raw[..l], &part_raw[l + 2..])
+                }
+            }
+            (Some(c), None) => (&part_raw[..c], &part_raw[c + 4..]),
+            (None, Some(l)) => (&part_raw[..l], &part_raw[l + 2..]),
+            (None, None) => (&b""[..], part_raw),
+        };
+
+        let mut name = None;
+        let mut filename = None;
+        let mut content_type = None;
+        if let Ok(hdr_str) = std::str::from_utf8(hdr_bytes) {
+            for line in hdr_str.lines() {
+                let l = line.trim_end_matches('\r');
+                if let Some((hk, hv)) = l.split_once(':') {
+                    let k = hk.trim();
+                    let v = hv.trim();
+                    if k.eq_ignore_ascii_case("content-disposition") {
+                        name = extract_disposition_attr(v, "name");
+                        filename = extract_disposition_attr(v, "filename");
+                    } else if k.eq_ignore_ascii_case("content-type") {
+                        content_type = Some(v);
                     }
                 }
-            } else if let Some(v) = supplemental_detect(cfg, mask, "body", pair_norm.as_ref()) {
-                return v;
             }
         }
-        return WafVerdict::Allow;
+
+        parts.push(MultipartPart {
+            name,
+            filename,
+            content_type,
+            body: part_body,
+        });
+
+        pos = next_pos;
+        if is_last {
+            break;
+        }
     }
 
-    let res = detector.detect(ScanInput::new(text).with_mask(mask));
-    if let Some(v) = verdict_from_result(cfg.mode, "body", text, res) {
-        return v;
-    }
-    supplemental_detect(cfg, mask, "body", text).unwrap_or(WafVerdict::Allow)
+    Some(parts)
 }
 
 /* ==================== Compiled OWASP CRS Runtime Engine ==================== */
-
-const MAX_CRS_SCAN_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy)]
 struct CrsTargetFlags {
@@ -699,6 +471,26 @@ fn crs_category_static(cat: &str) -> &'static str {
     }
 }
 
+fn crs_category_enabled(rule_cat: &'static str, enabled: &[WafCategory]) -> bool {
+    if enabled.is_empty() {
+        return true;
+    }
+    enabled.iter().any(|c| match c {
+        WafCategory::SqlInjection => rule_cat == "sql-injection",
+        WafCategory::Xss => rule_cat == "xss",
+        WafCategory::PathTraversal => rule_cat == "path-traversal",
+        WafCategory::CommandInjection => rule_cat == "command-injection" || rule_cat == "php-attack",
+        WafCategory::NoSqlInjection => rule_cat == "nosql-injection",
+        WafCategory::Ssrf => rule_cat == "ssrf",
+        WafCategory::Ssti => rule_cat == "ssti" || rule_cat == "deserialization",
+        WafCategory::Xxe => rule_cat == "xxe",
+        WafCategory::LdapInjection => rule_cat == "ldap-injection",
+        WafCategory::CrlfInjection => rule_cat == "crlf-injection" || rule_cat == "protocol-attack",
+        WafCategory::Deserialization => rule_cat == "deserialization",
+        WafCategory::BufferOverflow => rule_cat == "buffer-overflow",
+    })
+}
+
 struct CompiledCrsRule {
     id: u32,
     paranoia_level: u8,
@@ -726,7 +518,7 @@ impl CompiledCrsEngine {
         let disabled: HashSet<u32> = global_disabled.iter().copied().collect();
         let mut compiled = Vec::new();
         for d in list.iter().take(MAX_CRS_RULES) {
-            if !d.enabled || disabled.contains(&d.id) || d.source == "sigil-filter" {
+            if !d.enabled || disabled.contains(&d.id) || d.operator == "sigil" {
                 continue;
             }
             let matcher = match d.operator.as_str() {
@@ -736,7 +528,16 @@ impl CompiledCrsEngine {
                     .build()
                 {
                     Ok(re) => CompiledCrsMatcher::Regex(re),
-                    Err(_) => continue,
+                    Err(e) => {
+                        // Never fail silently: a dropped rule means lost attack coverage.
+                        tracing::warn!(
+                            rule_id = d.id,
+                            category = %d.category,
+                            error = %e,
+                            "skipping WAF rule whose regex failed to compile"
+                        );
+                        continue;
+                    }
                 },
                 "pm" => {
                     let phrases: Vec<String> = d
@@ -789,6 +590,12 @@ impl CompiledCrsEngine {
         self.rules.len()
     }
 
+    fn rule_active(&self, cfg: &WafConfig, rule: &CompiledCrsRule, max_pl: u8) -> bool {
+        rule.paranoia_level <= max_pl
+            && !cfg.disabled_rule_ids.contains(&rule.id)
+            && crs_category_enabled(rule.category, &cfg.categories)
+    }
+
     fn make_verdict(
         mode: WafMode,
         rule: &CompiledCrsRule,
@@ -816,6 +623,29 @@ impl CompiledCrsEngine {
         }
     }
 
+    fn match_text_against_body_rules(
+        &self,
+        cfg: &WafConfig,
+        max_pl: u8,
+        location: &'static str,
+        raw: &str,
+    ) -> Option<WafVerdict> {
+        let slice = clamp_utf8_bytes(raw, MAX_CRS_SCAN_BYTES);
+        if slice.is_empty() {
+            return None;
+        }
+        let decoded = percent_decode_lossy(slice);
+        for rule in &self.rules {
+            if !(rule.targets.body || rule.targets.args) || !self.rule_active(cfg, rule, max_pl) {
+                continue;
+            }
+            if rule.matcher.is_match(slice) || rule.matcher.is_match(decoded.as_ref()) {
+                return Some(Self::make_verdict(cfg.mode, rule, location, decoded.as_ref()));
+            }
+        }
+        None
+    }
+
     pub fn inspect_head(
         &self,
         cfg: &WafConfig,
@@ -824,7 +654,6 @@ impl CompiledCrsEngine {
         headers: &HeaderMap,
     ) -> WafVerdict {
         if cfg.mode == WafMode::Off
-            || !cfg.crs_enabled
             || is_path_exempt(path, &cfg.exempt_paths)
             || self.rules.is_empty()
         {
@@ -833,15 +662,23 @@ impl CompiledCrsEngine {
         let max_pl = cfg.crs_paranoia_level.clamp(1, 4);
         let decoded_path = percent_decode_lossy(path);
         let decoded_query = query.filter(|q| !q.is_empty()).map(percent_decode_lossy);
-        let query_vals: Vec<Cow<'_, str>> = query
+        let query_tokens: Vec<Cow<'_, str>> = query
             .filter(|q| !q.is_empty())
             .map(|q| {
-                q.split('&')
-                    .take(MAX_WAF_QUERY_PARAMS)
-                    .filter_map(|p| p.split_once('=').map(|(_, v)| v).or(Some(p)))
-                    .filter(|v| !v.is_empty())
-                    .map(percent_decode_lossy)
-                    .collect()
+                let mut out = Vec::new();
+                for p in q.split('&').take(MAX_WAF_QUERY_PARAMS) {
+                    if let Some((k, v)) = p.split_once('=') {
+                        if !k.is_empty() {
+                            out.push(percent_decode_lossy(k));
+                        }
+                        if !v.is_empty() {
+                            out.push(percent_decode_lossy(v));
+                        }
+                    } else if !p.is_empty() {
+                        out.push(percent_decode_lossy(p));
+                    }
+                }
+                out
             })
             .unwrap_or_default();
         let ua = headers
@@ -875,7 +712,7 @@ impl CompiledCrsEngine {
             .unwrap_or_default();
 
         for rule in &self.rules {
-            if rule.paranoia_level > max_pl || cfg.disabled_rule_ids.contains(&rule.id) {
+            if !self.rule_active(cfg, rule, max_pl) {
                 continue;
             }
             if rule.targets.uri
@@ -886,7 +723,7 @@ impl CompiledCrsEngine {
                 return Self::make_verdict(cfg.mode, rule, "path", decoded_path.as_ref());
             }
             if rule.targets.args {
-                for val in &query_vals {
+                for val in &query_tokens {
                     if rule.matcher.is_match(val.as_ref()) {
                         return Self::make_verdict(cfg.mode, rule, "query", val.as_ref());
                     }
@@ -939,36 +776,109 @@ impl CompiledCrsEngine {
         WafVerdict::Allow
     }
 
-    pub fn inspect_body(&self, cfg: &WafConfig, body: &[u8]) -> WafVerdict {
-        if cfg.mode == WafMode::Off
-            || !cfg.crs_enabled
-            || !cfg.inspect_body
-            || body.is_empty()
-            || self.rules.is_empty()
+    /// Inspect buffered HTTP request body (`POST`/`PUT`/`PATCH`) with Content-Type-aware
+    /// form/multipart parsing so MIME boundary framing never causes SQLi/XSS false positives.
+    pub fn inspect_body(
+        &self,
+        cfg: &WafConfig,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> WafVerdict {
+        if cfg.mode == WafMode::Off || !cfg.inspect_body || body.is_empty() || self.rules.is_empty()
         {
             return WafVerdict::Allow;
         }
-        let slice = &body[..body.len().min(MAX_CRS_SCAN_BYTES)];
-        let text = match std::str::from_utf8(slice) {
-            Ok(s) => s,
-            Err(e) => match std::str::from_utf8(&slice[..e.valid_up_to()]) {
-                Ok(s) if !s.is_empty() => s,
-                _ => return WafVerdict::Allow,
-            },
-        };
-        let decoded_text = percent_decode_lossy(text);
+        let max_bytes = cfg.max_body_bytes.min(WAF_HARD_MAX_BODY_BYTES);
+        if max_bytes == 0 {
+            return WafVerdict::Allow;
+        }
+        let bounded = &body[..body.len().min(max_bytes)];
         let max_pl = cfg.crs_paranoia_level.clamp(1, 4);
-        for rule in &self.rules {
-            if rule.paranoia_level > max_pl || cfg.disabled_rule_ids.contains(&rule.id) {
-                continue;
-            }
-            if (rule.targets.body || rule.targets.args)
-                && (rule.matcher.is_match(text) || rule.matcher.is_match(decoded_text.as_ref()))
-            {
-                return Self::make_verdict(cfg.mode, rule, "body", decoded_text.as_ref());
+
+        // 1. Strict `multipart/form-data` inspection:
+        //    Only activate when Content-Type specifies a boundary AND body starts with `--<boundary>`.
+        if let Some(boundary) = content_type.and_then(extract_multipart_boundary) {
+            if let Some(parts) = parse_multipart_parts(boundary, bounded) {
+                for part in parts {
+                    if let Some(name) = part.name {
+                        if let Some(v) =
+                            self.match_text_against_body_rules(cfg, max_pl, "body:multipart-name", name)
+                        {
+                            return v;
+                        }
+                    }
+                    if let Some(filename) = part.filename {
+                        if let Some(v) = self.match_text_against_body_rules(
+                            cfg,
+                            max_pl,
+                            "body:multipart-filename",
+                            filename,
+                        ) {
+                            return v;
+                        }
+                    }
+                    if is_binary_part_mime(part.content_type) || part.body.contains(&0) {
+                        continue;
+                    }
+                    if let Some(part_text) = utf8_valid_prefix(part.body) {
+                        if let Some(v) = self.match_text_against_body_rules(
+                            cfg,
+                            max_pl,
+                            "body:multipart-field",
+                            part_text,
+                        ) {
+                            return v;
+                        }
+                    }
+                }
+                return WafVerdict::Allow;
             }
         }
-        WafVerdict::Allow
+
+        // 2. `application/x-www-form-urlencoded`: inspect each parameter key and value individually.
+        let is_urlencoded = content_type
+            .map(|ct| {
+                ct.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
+            .unwrap_or(false);
+        if is_urlencoded {
+            let Some(text) = utf8_valid_prefix(bounded) else {
+                return WafVerdict::Allow;
+            };
+            for pair in text.split('&').take(MAX_WAF_FORM_PARAMS) {
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = pair.split_once('=') {
+                    if let Some(verdict) =
+                        self.match_text_against_body_rules(cfg, max_pl, "body:form", k)
+                    {
+                        return verdict;
+                    }
+                    if let Some(verdict) =
+                        self.match_text_against_body_rules(cfg, max_pl, "body:form", v)
+                    {
+                        return verdict;
+                    }
+                } else if let Some(verdict) =
+                    self.match_text_against_body_rules(cfg, max_pl, "body:form", pair)
+                {
+                    return verdict;
+                }
+            }
+            return WafVerdict::Allow;
+        }
+
+        // 3. Generic text/JSON/XML/fallback raw body inspection.
+        let Some(text) = utf8_valid_prefix(bounded) else {
+            return WafVerdict::Allow;
+        };
+        self.match_text_against_body_rules(cfg, max_pl, "body", text)
+            .unwrap_or(WafVerdict::Allow)
     }
 }
 
@@ -984,9 +894,14 @@ mod tests {
         }
     }
 
+    fn builtin_engine() -> CompiledCrsEngine {
+        CompiledCrsEngine::compile(&[], &[])
+    }
+
     #[test]
     fn benign_browser_and_api_requests_pass_without_false_positives() {
         let cfg = block_cfg();
+        let crs = builtin_engine();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::USER_AGENT,
@@ -1005,7 +920,7 @@ mod tests {
             ),
         );
 
-        let v = inspect_request_head(
+        let v = crs.inspect_head(
             &cfg,
             "/api/v1/services/web-main",
             Some("page=2&limit=50&sort=updated_at&q=hello+world"),
@@ -1021,48 +936,49 @@ mod tests {
                 .join(",")
         );
         assert!(large_json.len() > 2500);
-        let bv = inspect_request_body(&cfg, Some("application/json"), large_json.as_bytes());
+        let bv = crs.inspect_body(&cfg, Some("application/json"), large_json.as_bytes());
         assert!(matches!(bv, WafVerdict::Allow), "unexpected body verdict: {bv:?}");
     }
 
     #[test]
     fn blocks_common_web_attacks_across_path_query_headers_and_body() {
         let cfg = block_cfg();
+        let crs = builtin_engine();
         let empty = HeaderMap::new();
 
         // SQLi in query (both %20 and + space encoding)
-        assert!(inspect_request_head(&cfg, "/search", Some("q=admin'+OR+'1'='1'+--"), &empty).is_block());
-        assert!(inspect_request_head(
-            &cfg,
-            "/items",
-            Some("id=1%20UNION%20SELECT%20username,password%20FROM%20users"),
-            &empty
-        )
-        .is_block());
+        assert!(crs.inspect_head(&cfg, "/search", Some("q=admin'+OR+'1'='1'+--"), &empty).is_block());
+        assert!(crs
+            .inspect_head(
+                &cfg,
+                "/items",
+                Some("id=1%20UNION%20SELECT%20username,password%20FROM%20users"),
+                &empty
+            )
+            .is_block());
 
         // Path Traversal in path
-        assert!(inspect_request_head(&cfg, "/files/../../../../etc/passwd", None, &empty).is_block());
+        assert!(crs.inspect_head(&cfg, "/files/../../../../etc/passwd", None, &empty).is_block());
 
         // XSS in query
-        assert!(inspect_request_head(
-            &cfg,
-            "/profile",
-            Some("bio=%3Csvg%20onload%3Dalert(1)%3E"),
-            &empty
-        )
-        .is_block());
+        assert!(crs
+            .inspect_head(&cfg, "/profile", Some("bio=%3Csvg%20onload%3Dalert(1)%3E"), &empty)
+            .is_block());
 
         // Command Injection in query
-        assert!(inspect_request_head(&cfg, "/ping", Some("host=1.1.1.1;cat${IFS}/etc/passwd"), &empty).is_block());
+        assert!(crs
+            .inspect_head(&cfg, "/ping", Some("host=1.1.1.1;cat${IFS}/etc/passwd"), &empty)
+            .is_block());
 
         // SSRF in query
-        assert!(inspect_request_head(
-            &cfg,
-            "/fetch",
-            Some("url=http://169.254.169.254/latest/meta-data/"),
-            &empty
-        )
-        .is_block());
+        assert!(crs
+            .inspect_head(
+                &cfg,
+                "/fetch",
+                Some("url=http://169.254.169.254/latest/meta-data/"),
+                &empty
+            )
+            .is_block());
 
         // Log4Shell / JNDI in User-Agent
         let mut log4j_hdrs = HeaderMap::new();
@@ -1070,7 +986,7 @@ mod tests {
             header::USER_AGENT,
             HeaderValue::from_static("${jndi:ldap://evil.example/Exploit}"),
         );
-        match inspect_request_head(&cfg, "/", None, &log4j_hdrs) {
+        match crs.inspect_head(&cfg, "/", None, &log4j_hdrs) {
             WafVerdict::Block(f) => {
                 assert_eq!(f.category, "deserialization");
                 assert_eq!(f.location, "header:user-agent");
@@ -1080,7 +996,7 @@ mod tests {
 
         // NoSQL injection in JSON body
         let nosql = br#"{"username":{"$ne":null},"password":{"$gt":""}}"#;
-        match inspect_request_body(&cfg, Some("application/json"), nosql) {
+        match crs.inspect_body(&cfg, Some("application/json"), nosql) {
             WafVerdict::Block(f) => {
                 assert_eq!(f.category, "nosql-injection");
                 assert_eq!(f.location, "body");
@@ -1090,15 +1006,16 @@ mod tests {
 
         // SQLi in form-urlencoded body with `+` spaces
         let form = b"user=admin'+OR+'1'='1'+--&pass=123";
-        assert!(inspect_request_body(&cfg, Some("application/x-www-form-urlencoded"), form).is_block());
+        assert!(crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form).is_block());
 
         // XXE in XML body
         let xxe = br#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>"#;
-        assert!(inspect_request_body(&cfg, Some("application/xml"), xxe).is_block());
+        assert!(crs.inspect_body(&cfg, Some("application/xml"), xxe).is_block());
     }
 
     #[test]
     fn respects_modes_categories_and_exempt_paths() {
+        let crs = builtin_engine();
         let empty = HeaderMap::new();
 
         // Off mode allows everything
@@ -1107,7 +1024,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            inspect_request_head(&off, "/../../etc/passwd", None, &empty),
+            crs.inspect_head(&off, "/../../etc/passwd", None, &empty),
             WafVerdict::Allow
         ));
 
@@ -1117,7 +1034,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            inspect_request_head(&mon, "/search", Some("q=<script>alert(1)</script>"), &empty),
+            crs.inspect_head(&mon, "/search", Some("q=<script>alert(1)</script>"), &empty),
             WafVerdict::Monitor(f) if f.category == "xss"
         ));
 
@@ -1128,10 +1045,12 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            inspect_request_head(&sqli_only, "/search", Some("q=<script>alert(1)</script>"), &empty),
+            crs.inspect_head(&sqli_only, "/search", Some("q=<script>alert(1)</script>"), &empty),
             WafVerdict::Allow
         ));
-        assert!(inspect_request_head(&sqli_only, "/search", Some("q=' OR '1'='1"), &empty).is_block());
+        assert!(crs
+            .inspect_head(&sqli_only, "/search", Some("q=' OR '1'='1"), &empty)
+            .is_block());
 
         // Exempt path respects segment boundary
         let exempt = WafConfig {
@@ -1140,19 +1059,17 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            inspect_request_head(&exempt, "/api/webhooks/stripe", Some("q=' OR '1'='1"), &empty),
+            crs.inspect_head(&exempt, "/api/webhooks/stripe", Some("q=' OR '1'='1"), &empty),
             WafVerdict::Allow
         ));
-        assert!(
-            inspect_request_head(&exempt, "/api/webhooks-other", Some("q=' OR '1'='1"), &empty)
-                .is_block()
-        );
+        assert!(crs
+            .inspect_head(&exempt, "/api/webhooks-other", Some("q=' OR '1'='1"), &empty)
+            .is_block());
     }
 
     #[test]
     fn inspects_bodies_regardless_of_spoofable_content_type() {
         let cfg = block_cfg();
-        // A client-controlled Content-Type must not disable body inspection (WAF bypass).
         let mut h_multi = HeaderMap::new();
         h_multi.insert(
             header::CONTENT_TYPE,
@@ -1185,8 +1102,8 @@ mod tests {
 
     #[test]
     fn compiled_crs_engine_matches_and_respects_disabled_ids() {
-        let engine = CompiledCrsEngine::compile(&[], &[]);
-        assert!(engine.rule_count() >= 8);
+        let engine = builtin_engine();
+        assert!(engine.rule_count() >= 14);
 
         let cfg = block_cfg();
         let mut h_scan = HeaderMap::new();
@@ -1211,7 +1128,7 @@ mod tests {
     #[test]
     fn closes_sqli_tautology_cmdi_and_encoded_crs_gaps_without_false_positives() {
         let cfg = block_cfg();
-        let crs = CompiledCrsEngine::compile(&[], &[]);
+        let crs = builtin_engine();
         let empty = HeaderMap::new();
 
         for (path, q) in [
@@ -1225,11 +1142,10 @@ mod tests {
             ("/oauth/authorize", "client_id=%3Bls%20-la"),
             ("/oauth/authorize", "client_id=;echo%20hi"),
         ] {
-            let v_head = inspect_request_head(&cfg, path, Some(q), &empty);
             let v_crs = crs.inspect_head(&cfg, path, Some(q), &empty);
             assert!(
-                v_head.is_block() || v_crs.is_block(),
-                "expected block on `{path}?{q}`, head={v_head:?}, crs={v_crs:?}"
+                v_crs.is_block(),
+                "expected block on `{path}?{q}`, crs={v_crs:?}"
             );
         }
 
@@ -1241,22 +1157,201 @@ mod tests {
         );
         h_benign.insert(header::COOKIE, HeaderValue::from_static("a=1; id=2; session=ok"));
         assert!(matches!(
-            inspect_request_head(&cfg, "/oauth/authorize", Some("client_id=web-portal&state=xyz"), &h_benign),
-            WafVerdict::Allow
-        ));
-        assert!(matches!(
             crs.inspect_head(&cfg, "/oauth/authorize", Some("client_id=web-portal&state=xyz"), &h_benign),
-            WafVerdict::Allow
-        ));
-        let benign_json = br##"{"bio":"#rust","note":"please select or check","items":[{"id":1,"name":"a"}]}"##;
-        assert!(matches!(
-            inspect_request_body(&cfg, Some("application/json"), benign_json),
             WafVerdict::Allow
         ));
         let benign_json_dash = br##"{"bio":"#rust","flag":"--help","note":"please select or check"}"##;
         assert!(matches!(
-            crs.inspect_body(&cfg, benign_json_dash),
+            crs.inspect_body(&cfg, Some("application/json"), benign_json_dash),
             WafVerdict::Allow
         ));
+    }
+
+    #[test]
+    fn multipart_form_password_change_is_not_flagged_as_sqli() {
+        let ct = "multipart/form-data; boundary=----WebKitFormBoundaryj6JLA4PBd9AdFCsM";
+        let body = concat!(
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM\r\n",
+            "Content-Disposition: form-data; name=\"old_password\"\r\n\r\n",
+            "upxg5lky@\r\n",
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM\r\n",
+            "Content-Disposition: form-data; name=\"new_password\"\r\n\r\n",
+            "12345678\r\n",
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM--\r\n",
+        );
+
+        let evilpot_cfg = WafConfig {
+            mode: WafMode::Evilpot,
+            ..Default::default()
+        };
+        let builtin = builtin_engine();
+        assert!(matches!(
+            builtin.inspect_body(&evilpot_cfg, Some(ct), body.as_bytes()),
+            WafVerdict::Allow
+        ));
+
+        // Simulate synced OWASP CRS SQL comment rule (942440) that matches `--` on raw framing
+        let mut with_942440 = builtin_crs_snapshot().rules;
+        with_942440.push(WafRuleDescriptor {
+            id: 942440,
+            source: "owasp-crs".into(),
+            file: "REQUEST-942-APPLICATION-ATTACK-SQLI.conf".into(),
+            category: "sql-injection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "SQL Comment Sequence Detected".into(),
+            targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            pattern: r"/\*!?|\*/|--|#".into(),
+            tags: vec!["attack-sqli".into()],
+            enabled: true,
+        });
+        let synced_engine = CompiledCrsEngine::compile(&with_942440, &[]);
+        assert!(
+            matches!(synced_engine.inspect_body(&evilpot_cfg, Some(ct), body.as_bytes()), WafVerdict::Allow),
+            "legitimate WebKitFormBoundary password submission must NOT trigger SQL comment/SQLi rule"
+        );
+    }
+
+    #[test]
+    fn multipart_form_real_sqli_inside_field_is_still_caught() {
+        let ct = "multipart/form-data; boundary=----WebKitFormBoundaryj6JLA4PBd9AdFCsM";
+        let body = concat!(
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM\r\n",
+            "Content-Disposition: form-data; name=\"old_password\"\r\n\r\n",
+            "' OR 1=1 --\r\n",
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM\r\n",
+            "Content-Disposition: form-data; name=\"new_password\"\r\n\r\n",
+            "12345678\r\n",
+            "------WebKitFormBoundaryj6JLA4PBd9AdFCsM--\r\n",
+        );
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        match crs.inspect_body(&cfg, Some(ct), body.as_bytes()) {
+            WafVerdict::Block(f) => {
+                assert_eq!(f.category, "sql-injection");
+                assert_eq!(f.location, "body:multipart-field");
+            }
+            other => panic!("expected Block for real SQLi inside multipart field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multipart_form_malicious_filename_is_caught() {
+        let ct = "multipart/form-data; boundary=----WebKitFormBoundaryUpload1";
+        let body = concat!(
+            "------WebKitFormBoundaryUpload1\r\n",
+            "Content-Disposition: form-data; name=\"avatar\"; filename=\"../../etc/passwd\"\r\n",
+            "Content-Type: application/octet-stream\r\n\r\n",
+            "\x00\x01\x02BINARYDATA\r\n",
+            "------WebKitFormBoundaryUpload1--\r\n",
+        );
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        match crs.inspect_body(&cfg, Some(ct), body.as_bytes()) {
+            WafVerdict::Block(f) => {
+                assert_eq!(f.category, "path-traversal");
+                assert_eq!(f.location, "body:multipart-filename");
+            }
+            other => panic!("expected Block for malicious multipart filename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spoofed_multipart_content_type_without_boundary_prefix_cannot_bypass() {
+        let ct = "multipart/form-data; boundary=fakeboundary";
+        let raw_sqli = b"' UNION SELECT username, password FROM users --";
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        match crs.inspect_body(&cfg, Some(ct), raw_sqli) {
+            WafVerdict::Block(f) => {
+                assert_eq!(f.category, "sql-injection");
+                assert_eq!(f.location, "body");
+            }
+            other => panic!("spoofed multipart Content-Type must not bypass WAF, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detects_advanced_sqli_and_double_encoded_payloads() {
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        let empty = HeaderMap::new();
+
+        // Regression set: classic tautologies, no-whitespace/comment obfuscation, parenthesised
+        // operands, hex literals, string comparison operators, `||` concatenation and subqueries.
+        let payloads = [
+            "' OR '1'='1",
+            "1' OR '1'='1' --",
+            "admin'--",
+            "' OR 1=1#",
+            "1 OR 1=1",
+            "1' AND 1=1--",
+            "\" OR \"\"=\"",
+            "' OR 'x'='x",
+            "1)) OR 1=1--",
+            "' or sleep(5)--",
+            "1;WAITFOR DELAY '0:0:5'--",
+            "' UNION SELECT NULL--",
+            "-1 UNION SELECT 1,2,3",
+            "1 AND (SELECT 1 FROM dual)",
+            "'or'a'='a",
+            "'||'1'='1",
+            "') OR ('1'='1",
+            "1'||pg_sleep(5)--",
+            "' OR 1=1 LIMIT 1--",
+            "1' ORDER BY 1--",
+            "' OR '1'='1' /*",
+            "0x31 OR 0x31=0x31",
+            "1 OR 1=1 -- -",
+            "' OR 2>1--",
+            "' OR 'a'<'b",
+            "' OR TRUE--",
+            "') OR 1=1--",
+            "1) OR 1=1--",
+            "UNION/**/SELECT username FROM users",
+            // Regression: previously missed by the built-in SQLi rule.
+            "1' order by 1,2,3--",
+            "1 group by 1 having 1=1--",
+            "' or 1#",
+            "1' or/**/1=1--",
+            "1 and exists(select * from users)",
+            "1\" or \"1\"=\"1",
+            "1' %0b or %0b 1=1--",
+        ];
+        for p in payloads {
+            let q = format!("q={p}");
+            let hv = crs.inspect_head(&cfg, "/search", Some(&q), &empty);
+            assert!(hv.is_block(), "query SQLi missed: {p:?} => {hv:?}");
+            let bv = crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), q.as_bytes());
+            assert!(bv.is_block(), "body SQLi missed: {p:?} => {bv:?}");
+        }
+
+        // Double / triple percent-encoded tautology must still be normalised and blocked.
+        for enc in [
+            "%2527%2520OR%25201%253D1",
+            "%252527%252520OR%2525201%25253D1",
+            "%2531%2520AND%2520%2528SELECT%25201%2520FROM%2520dual%2529",
+        ] {
+            let q = format!("q={enc}");
+            assert!(
+                crs.inspect_head(&cfg, "/search", Some(&q), &empty).is_block(),
+                "double-encoded SQLi missed: {enc}"
+            );
+        }
+
+        // Natural-language use of `or`/`and` must not be flagged as SQLi tautology.
+        for benign in [
+            "choose true or false",
+            "the value is 5 or 6",
+            "please select or check the box",
+            "search or browse items",
+        ] {
+            let q = format!("q={benign}");
+            assert!(
+                matches!(crs.inspect_head(&cfg, "/search", Some(&q), &empty), WafVerdict::Allow),
+                "benign phrase falsely flagged: {benign:?}"
+            );
+        }
     }
 }

@@ -14,15 +14,16 @@ use exposure_core::crypto::{
 };
 use exposure_core::protocol::{
     dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, dns_manage_req_signing_bytes,
-    dns_sync_req_signing_bytes, read_json_frame, write_json_frame, DnsLineSyncEntry, DnsManageOp,
+    dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes, read_json_frame,
+    unban_req_signing_bytes, write_json_frame, DnsLineSyncEntry, DnsManageOp,
     DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult,
     DnsSyncRecordSpec, MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame,
     SpecialPayload, StreamKind,
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
-    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
-    LogProtectionStats, MinuteSummary, SessionSummary,
+    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, GeoIpStatusSnapshot,
+    LinkStatusSnapshot, LogProtectionStats, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -34,7 +35,7 @@ use uuid::Uuid;
 
 use crate::compiler::{compile_topology_full, compute_control_hops, inject_crs_rules, CompileReport};
 use crate::db::ControlDb;
-use exposure_core::crs::{builtin_crs_snapshot, CrsRulesetSnapshot};
+use exposure_core::crs::{builtin_crs_snapshot, merge_crs_snapshots, CrsRulesetSnapshot};
 
 const KV_TELEMETRY_CACHE: &str = "telemetry_cache_json";
 pub const KV_CRS_RULESET: &str = "crs_ruleset_json";
@@ -80,6 +81,8 @@ pub struct CachedTelemetry {
     pub log_stats: HashMap<String, LogProtectionStats>,
     #[serde(default)]
     pub evilpot_reports: Vec<EvilpotNodeReport>,
+    #[serde(default)]
+    pub geoip_status: HashMap<String, GeoIpStatusSnapshot>,
     #[serde(default)]
     pub last_pulled_at: Option<String>,
 }
@@ -187,10 +190,14 @@ impl ControlClient {
         }
     }
 
-    /// Return the active OWASP CRS ruleset snapshot (synced from GitHub or built-in baseline).
+    /// Return the active OWASP CRS ruleset snapshot (synced from GitHub merged with the built-in
+    /// baseline). The built-in rules are always unioned in so a partial/limited upstream sync can
+    /// never silently remove SQLi/XSS/RCE detection coverage.
     pub async fn active_crs_snapshot(&self) -> CrsRulesetSnapshot {
         match self.db.get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET).await {
-            Ok(Some(snap)) if !snap.rules.is_empty() => snap,
+            Ok(Some(snap)) if !snap.rules.is_empty() => {
+                merge_crs_snapshots(snap, builtin_crs_snapshot())
+            }
             _ => builtin_crs_snapshot(),
         }
     }
@@ -1098,10 +1105,14 @@ impl ControlClient {
                     links,
                     alerts,
                     evilpot,
+                    geoip,
                     log_stats,
                     ..
                 } = snap;
                 cache.node_uptimes.insert(node_tag.clone(), uptime_secs);
+                if let Some(gs) = geoip {
+                    cache.geoip_status.insert(node_tag.clone(), gs);
+                }
                 cache.log_stats.insert(node_tag, log_stats);
                 cache.links.extend(links);
                 cache.alerts.extend(alerts);
@@ -1807,6 +1818,435 @@ impl ControlClient {
                 Err(ExposureError::Protocol(message))
             }
             _ => Err(ExposureError::Protocol("unexpected DnsManage reply".into())),
+        }
+    }
+
+    async fn resolve_target_ingress_hops(
+        &self,
+        target_node: Option<&str>,
+    ) -> Result<Vec<(String, Vec<String>)>> {
+        let boot = self
+            .active_bootstrap_tag()
+            .await
+            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let yaml = self.db.get_topology_yaml().await.unwrap_or_default();
+        let topo: TopologySpec = if yaml.trim().is_empty() {
+            TopologySpec::default()
+        } else {
+            serde_yaml::from_str(&yaml)
+                .map_err(|e| ExposureError::Config(format!("parse topology yaml: {e}")))?
+        };
+
+        let mut tags: Vec<String> = Vec::new();
+        if let Some(specific) = target_node.map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
+            tags.push(specific.to_string());
+        } else {
+            for (tag, spec) in &topo.nodes {
+                if spec.roles.ingress {
+                    tags.push(tag.clone());
+                }
+            }
+            if tags.is_empty() {
+                if let Ok(db_nodes) = self.db.list_nodes().await {
+                    for n in db_nodes {
+                        if n.online && n.roles.iter().any(|r| r == "ingress") {
+                            tags.push(n.node_tag);
+                        }
+                    }
+                }
+            }
+        }
+        if tags.is_empty() {
+            return Err(ExposureError::Config("no ingress nodes found in topology".into()));
+        }
+        let mut out = Vec::with_capacity(tags.len());
+        for tag in tags {
+            if let Some(hops) = compute_control_hops(&self.cfg.control_id, &boot, &tag, &topo) {
+                out.push((tag, hops));
+            }
+        }
+        if out.is_empty() {
+            return Err(ExposureError::Routing(format!(
+                "no reachable hop path from bootstrap '{boot}' to target ingress node(s)"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Issue a Control-signed `UnbanReq` to the specified or all online Ingress node(s),
+    /// and prune unbanned entries from the cached Evilpot/AutoBan telemetry immediately.
+    pub async fn unban_target(
+        self: &Arc<Self>,
+        actor: &str,
+        ban_kind: &str,
+        target: &str,
+        node_tag: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let kind_norm = ban_kind.trim().to_ascii_lowercase();
+        if !matches!(
+            kind_norm.as_str(),
+            "ip" | "js_fp" | "composite_fp" | "all"
+        ) {
+            return Err(ExposureError::Config(format!(
+                "unsupported unban kind '{ban_kind}' (expected ip, js_fp, composite_fp, all)"
+            )));
+        }
+        let clean_target = if kind_norm == "ip" {
+            let ip: IpAddr = target
+                .trim()
+                .parse()
+                .map_err(|_| ExposureError::Config(format!("invalid IP address '{target}'")))?;
+            canonical_ip(ip).to_string()
+        } else if kind_norm == "all" {
+            "*".to_string()
+        } else {
+            let t = target.trim();
+            if t.is_empty() {
+                return Err(ExposureError::Config("unban target must not be empty".into()));
+            }
+            t.to_string()
+        };
+
+        let targets = self.resolve_target_ingress_hops(node_tag).await?;
+        let mut futs = FuturesUnordered::new();
+        for (tag, hops) in targets {
+            let this = Arc::clone(self);
+            let k = kind_norm.clone();
+            let t = clean_target.clone();
+            futs.push(tokio::spawn(async move {
+                let now = Utc::now().timestamp();
+                let expires_at = now + 60;
+                let request_id = Uuid::new_v4().to_string();
+                let signing =
+                    unban_req_signing_bytes(&request_id, now, expires_at, &tag, &k, &t);
+                let control_signature = this.signing_kp.sign_b64(&signing);
+                let frame = SpecialFrame::new(
+                    Uuid::new_v4().to_string(),
+                    hops,
+                    16,
+                    SpecialPayload::UnbanReq {
+                        request_id: request_id.clone(),
+                        issued_at: now,
+                        expires_at,
+                        target_node_tag: tag.clone(),
+                        ban_kind: k,
+                        target: t,
+                        control_signature,
+                    },
+                );
+                match this.send_special_rpc(frame, Duration::from_secs(8)).await {
+                    Ok(SpecialFrame {
+                        payload:
+                            SpecialPayload::UnbanResp {
+                                request_id: resp_id,
+                                node_tag: resp_node,
+                                ok,
+                                removed,
+                                error,
+                            },
+                        ..
+                    }) => {
+                        if resp_id != request_id {
+                            (tag, false, false, Some("UnbanResp request_id mismatch".into()))
+                        } else {
+                            (resp_node, ok, removed, error)
+                        }
+                    }
+                    Ok(SpecialFrame {
+                        payload: SpecialPayload::ErrorReply { message },
+                        ..
+                    }) => (tag, false, false, Some(message)),
+                    Ok(_) => (tag, false, false, Some("unexpected UnbanReq reply".into())),
+                    Err(e) => (tag, false, false, Some(e.to_string())),
+                }
+            }));
+        }
+
+        let mut results = Vec::new();
+        let mut succeeded_nodes = HashSet::new();
+        let mut any_removed = false;
+        while let Some(res) = futs.next().await {
+            if let Ok((ntag, ok, removed, err)) = res {
+                if ok {
+                    succeeded_nodes.insert(ntag.clone());
+                }
+                if removed {
+                    any_removed = true;
+                }
+                results.push(serde_json::json!({
+                    "node_tag": ntag,
+                    "ok": ok,
+                    "removed": removed,
+                    "error": err,
+                }));
+            }
+        }
+
+        if !succeeded_nodes.is_empty() {
+            let mut guard = self.telemetry_cache.write().await;
+            for rep in &mut guard.evilpot_reports {
+                if !succeeded_nodes.contains(&rep.node_tag) {
+                    continue;
+                }
+                if kind_norm == "all" {
+                    rep.active_bans.clear();
+                    rep.active_ip_bans = 0;
+                    rep.active_fp_bans = 0;
+                } else {
+                    rep.active_bans.retain(|b| {
+                        !(b.kind == kind_norm && b.target == clean_target)
+                    });
+                    rep.active_ip_bans = rep
+                        .active_bans
+                        .iter()
+                        .filter(|b| b.kind == "ip")
+                        .count();
+                    rep.active_fp_bans = rep
+                        .active_bans
+                        .iter()
+                        .filter(|b| b.kind != "ip")
+                        .count();
+                }
+            }
+        }
+
+        let all_ok = !results.is_empty()
+            && results
+                .iter()
+                .all(|r| r["ok"].as_bool().unwrap_or(false));
+        self.db
+            .append_audit(
+                actor,
+                "security.unban",
+                &format!("{kind_norm}:{clean_target}"),
+                all_ok,
+                &format!(
+                    "dispatched to {} ingress node(s), removed={any_removed}",
+                    results.len()
+                ),
+            )
+            .await;
+
+        Ok(serde_json::json!({
+            "ok": all_ok,
+            "kind": kind_norm,
+            "target": clean_target,
+            "removed": any_removed,
+            "nodes": results,
+        }))
+    }
+
+    pub async fn geoip_status(&self) -> serde_json::Value {
+        let yaml = self.db.get_topology_yaml().await.unwrap_or_default();
+        let topo: TopologySpec = serde_yaml::from_str(&yaml).unwrap_or_default();
+        let cache = self.telemetry_cache.read().await.clone();
+
+        let mut node_tags: BTreeSet<String> = topo
+            .nodes
+            .iter()
+            .filter(|(_, s)| s.roles.ingress)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in cache.geoip_status.keys() {
+            node_tags.insert(k.clone());
+        }
+
+        let mut nodes_out = Vec::new();
+        let mut loaded_nodes = 0usize;
+        let mut max_v4 = 0usize;
+        let mut max_v6 = 0usize;
+        for tag in &node_tags {
+            let st = cache.geoip_status.get(tag).cloned().unwrap_or_default();
+            if st.loaded {
+                loaded_nodes += 1;
+            }
+            max_v4 = max_v4.max(st.ipv4_ranges);
+            max_v6 = max_v6.max(st.ipv6_ranges);
+            nodes_out.push(serde_json::json!({
+                "node_tag": tag,
+                "enabled": st.enabled,
+                "loaded": st.loaded,
+                "ipv4_ranges": st.ipv4_ranges,
+                "ipv6_ranges": st.ipv6_ranges,
+                "updated_at": st.updated_at,
+                "source": st.source,
+                "last_error": st.last_error,
+            }));
+        }
+
+        serde_json::json!({
+            "last_pulled_at": cache.last_pulled_at,
+            "summary": {
+                "total_ingress_nodes": node_tags.len(),
+                "loaded_nodes": loaded_nodes,
+                "max_ipv4_ranges": max_v4,
+                "max_ipv6_ranges": max_v6,
+            },
+            "nodes": nodes_out,
+        })
+    }
+
+    pub async fn sync_geoip_nodes(
+        self: &Arc<Self>,
+        actor: &str,
+        node_tag: Option<&str>,
+        force: bool,
+    ) -> Result<serde_json::Value> {
+        let targets = self.resolve_target_ingress_hops(node_tag).await?;
+        let mut futs = FuturesUnordered::new();
+        for (tag, hops) in targets {
+            let this = Arc::clone(self);
+            futs.push(tokio::spawn(async move {
+                let now = Utc::now().timestamp();
+                let expires_at = now + 90;
+                let request_id = Uuid::new_v4().to_string();
+                let signing =
+                    geoip_sync_req_signing_bytes(&request_id, now, expires_at, &tag, force);
+                let control_signature = this.signing_kp.sign_b64(&signing);
+                let frame = SpecialFrame::new(
+                    Uuid::new_v4().to_string(),
+                    hops,
+                    16,
+                    SpecialPayload::GeoIpSyncReq {
+                        request_id: request_id.clone(),
+                        issued_at: now,
+                        expires_at,
+                        target_node_tag: tag.clone(),
+                        force,
+                        control_signature,
+                    },
+                );
+                match this.send_special_rpc(frame, Duration::from_secs(35)).await {
+                    Ok(SpecialFrame {
+                        payload:
+                            SpecialPayload::GeoIpSyncResp {
+                                request_id: resp_id,
+                                node_tag: resp_node,
+                                ok,
+                                status,
+                                error,
+                            },
+                        ..
+                    }) => {
+                        if resp_id != request_id {
+                            (tag, false, None, Some("GeoIpSyncResp request_id mismatch".into()))
+                        } else {
+                            (resp_node, ok, status, error)
+                        }
+                    }
+                    Ok(SpecialFrame {
+                        payload: SpecialPayload::ErrorReply { message },
+                        ..
+                    }) => (tag, false, None, Some(message)),
+                    Ok(_) => (tag, false, None, Some("unexpected GeoIpSyncReq reply".into())),
+                    Err(e) => (tag, false, None, Some(e.to_string())),
+                }
+            }));
+        }
+
+        let mut results = Vec::new();
+        let mut updates: Vec<(String, GeoIpStatusSnapshot)> = Vec::new();
+        while let Some(res) = futs.next().await {
+            if let Ok((ntag, ok, st_opt, err)) = res {
+                if let Some(ref st) = st_opt {
+                    updates.push((ntag.clone(), st.clone()));
+                }
+                results.push(serde_json::json!({
+                    "node_tag": ntag,
+                    "ok": ok,
+                    "status": st_opt,
+                    "error": err,
+                }));
+            }
+        }
+        if !updates.is_empty() {
+            let mut guard = self.telemetry_cache.write().await;
+            for (k, v) in updates {
+                guard.geoip_status.insert(k, v);
+            }
+        }
+        let all_ok = !results.is_empty()
+            && results
+                .iter()
+                .all(|r| r["ok"].as_bool().unwrap_or(false));
+        self.db
+            .append_audit(
+                actor,
+                "security.geoip_sync",
+                node_tag.unwrap_or("all"),
+                all_ok,
+                &format!("force={force}, synced {} node(s)", results.len()),
+            )
+            .await;
+
+        Ok(serde_json::json!({
+            "ok": all_ok,
+            "nodes": results,
+        }))
+    }
+
+    pub async fn lookup_geoip_on_node(
+        &self,
+        ip: &str,
+        node_tag: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let addr: IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|_| ExposureError::Config(format!("invalid IP address '{ip}'")))?;
+        let canon = canonical_ip(addr).to_string();
+        let targets = self.resolve_target_ingress_hops(node_tag).await?;
+
+        let cache = self.telemetry_cache.read().await;
+        let (chosen_tag, hops) = targets
+            .iter()
+            .find(|(t, _)| {
+                cache
+                    .geoip_status
+                    .get(t)
+                    .map(|s| s.loaded)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .unwrap_or_else(|| targets[0].clone());
+        drop(cache);
+
+        let frame = SpecialFrame::new(
+            Uuid::new_v4().to_string(),
+            hops,
+            16,
+            SpecialPayload::GeoIpLookupReq { ip: canon.clone() },
+        );
+        match self.send_special_rpc(frame, Duration::from_secs(8)).await? {
+            SpecialFrame {
+                payload:
+                    SpecialPayload::GeoIpLookupResp {
+                        node_tag,
+                        ip,
+                        country,
+                        continent,
+                        is_private,
+                        db_loaded,
+                        error,
+                    },
+                ..
+            } => Ok(serde_json::json!({
+                "ok": error.is_none(),
+                "node_tag": node_tag,
+                "ip": ip,
+                "country": country,
+                "continent": continent,
+                "is_private": is_private,
+                "db_loaded": db_loaded,
+                "error": error,
+            })),
+            SpecialFrame {
+                payload: SpecialPayload::ErrorReply { message },
+                ..
+            } => Err(ExposureError::Protocol(format!(
+                "GeoIP lookup on '{chosen_tag}' failed: {message}"
+            ))),
+            _ => Err(ExposureError::Protocol("unexpected GeoIpLookupReq reply".into())),
         }
     }
 }

@@ -2,16 +2,18 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, AbuseIpDbConfig, AutoBanConfig, CertOrderConfig, CrsUpdateConfig,
-    CustomPagesConfig, DomainLineRecordType, EgressConfig, EgressDefaults, EgressServiceConfig,
-    EvilpotNodeConfig, GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule,
-    LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig,
-    PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
-    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
-    TunnelDirection,
+    resolve_domain_binding, AbuseIpDbConfig, AntibotMode, AntibotProfile, AutoBanConfig,
+    CertOrderConfig, CrsUpdateConfig, CustomPagesConfig, DomainLineRecordType, EgressConfig,
+    EgressDefaults, EgressServiceConfig, EvilpotNodeConfig, GeoIpConfig, GeoPolicyConfig,
+    GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
+    LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig, PeerConfig,
+    ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode,
+    ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection, WafConfig,
+    WafMode,
 };
 use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
+use exposure_core::geoip::is_valid_region_token;
 use exposure_core::routing::canonical_ip;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
@@ -101,6 +103,33 @@ fn resolve_link_listener(
     }
 }
 
+fn opt_non_empty(v: &Option<String>) -> Option<String> {
+    v.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_waf_config(mut waf: WafConfig) -> WafConfig {
+    waf.min_confidence = waf.min_confidence.clamp(0.1, 1.0);
+    waf.max_body_bytes = waf.max_body_bytes.min(256 * 1024);
+    waf.crs_paranoia_level = waf.crs_paranoia_level.clamp(1, 4);
+    waf
+}
+
+fn resolve_antibot_profile(ab: &AntibotProfile, defs: &GuardDefaults) -> AntibotProfile {
+    let mut out = ab.clone();
+    out.bind_ua = Some(out.bind_ua.unwrap_or(defs.bind_ua));
+    out.bind_ip_prefix = Some(out.bind_ip_prefix.unwrap_or(defs.bind_ip_prefix));
+    out.block_bots = Some(out.block_bots.unwrap_or(defs.block_bots));
+    out.browser_only = Some(out.browser_only.unwrap_or(defs.browser_only));
+    out.block_headless = Some(out.block_headless.unwrap_or(defs.block_headless));
+    out.require_client_fp = Some(out.require_client_fp.unwrap_or(defs.require_client_fp));
+    out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(defs.js_fp_beacon));
+    out.js_fp_ttl_secs = Some(out.js_fp_ttl_secs.unwrap_or(defs.js_fp_ttl_secs).max(60));
+    out
+}
+
 fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile {
     let mut out = g.clone();
     if out.rate_limit_bucket.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -114,12 +143,131 @@ fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile
     out.require_client_fp = Some(out.require_client_fp.unwrap_or(defs.require_client_fp));
     out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(defs.js_fp_beacon));
     out.js_fp_ttl_secs = Some(out.js_fp_ttl_secs.unwrap_or(defs.js_fp_ttl_secs).max(60));
-    let mut waf = out.waf.unwrap_or_else(|| defs.waf.clone());
-    waf.min_confidence = waf.min_confidence.clamp(0.1, 1.0);
-    waf.max_body_bytes = waf.max_body_bytes.min(256 * 1024);
-    waf.crs_paranoia_level = waf.crs_paranoia_level.clamp(1, 4);
-    out.waf = Some(waf);
+    let waf = out.waf.unwrap_or_else(|| defs.waf.clone());
+    out.waf = Some(normalize_waf_config(waf));
     out
+}
+
+fn synthesize_guard_from_sets(
+    antibot_set: Option<&AntibotProfile>,
+    legacy_guard: Option<&GuardProfile>,
+    eff_bucket: Option<&str>,
+    waf_set: Option<&WafConfig>,
+    defs: &GuardDefaults,
+) -> GuardProfile {
+    let mut out = if let Some(ab) = antibot_set {
+        let ab = resolve_antibot_profile(ab, defs);
+        GuardProfile {
+            antibot: ab.antibot,
+            rate_limit_bucket: None,
+            allow_cidrs: ab.allow_cidrs,
+            deny_cidrs: ab.deny_cidrs,
+            challenge_threshold: ab.challenge_threshold,
+            reject_threshold: ab.reject_threshold,
+            pow_difficulty: ab.pow_difficulty,
+            clearance_ttl_secs: ab.clearance_ttl_secs,
+            bind_ua: ab.bind_ua,
+            bind_ip_prefix: ab.bind_ip_prefix,
+            api_bypass_headers: ab.api_bypass_headers,
+            block_bots: ab.block_bots,
+            browser_only: ab.browser_only,
+            block_headless: ab.block_headless,
+            require_client_fp: ab.require_client_fp,
+            js_fp_beacon: ab.js_fp_beacon,
+            js_fp_ttl_secs: ab.js_fp_ttl_secs,
+            waf: Some(WafConfig {
+                mode: WafMode::Off,
+                ..Default::default()
+            }),
+            geo: ab.geo,
+        }
+    } else if let Some(lg) = legacy_guard {
+        resolve_guard_profile(lg, defs)
+    } else {
+        // Pure bucket and/or WAF binding without an antibot set must keep antibot Off.
+        GuardProfile {
+            antibot: AntibotMode::Off,
+            rate_limit_bucket: None,
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            challenge_threshold: defs.challenge_threshold,
+            reject_threshold: defs.reject_threshold,
+            pow_difficulty: defs.pow_difficulty,
+            clearance_ttl_secs: defs.clearance_ttl_secs,
+            bind_ua: Some(defs.bind_ua),
+            bind_ip_prefix: Some(defs.bind_ip_prefix),
+            api_bypass_headers: Vec::new(),
+            block_bots: Some(defs.block_bots),
+            browser_only: Some(defs.browser_only),
+            block_headless: Some(defs.block_headless),
+            require_client_fp: Some(defs.require_client_fp),
+            js_fp_beacon: Some(defs.js_fp_beacon),
+            js_fp_ttl_secs: Some(defs.js_fp_ttl_secs.max(60)),
+            waf: Some(WafConfig {
+                mode: WafMode::Off,
+                ..Default::default()
+            }),
+            geo: None,
+        }
+    };
+    if let Some(b) = eff_bucket {
+        out.rate_limit_bucket = Some(b.to_string());
+    }
+    if let Some(w) = waf_set {
+        out.waf = Some(normalize_waf_config(w.clone()));
+    } else if legacy_guard.is_none() {
+        out.waf = Some(WafConfig {
+            mode: WafMode::Off,
+            ..Default::default()
+        });
+    }
+    out
+}
+
+fn validate_geo_policy_cfg(
+    geo: &GeoPolicyConfig,
+    label: &str,
+    errors: &mut Vec<String>,
+) {
+    for tok in &geo.allow_regions {
+        if !is_valid_region_token(tok) {
+            errors.push(format!(
+                "{label}.allow_regions contains invalid Geo region token '{tok}' (use 2-letter ISO country code, CONTINENT:AS|EU|NA|SA|AF|OC|AN, or *)"
+            ));
+        }
+    }
+    for tok in &geo.deny_regions {
+        if !is_valid_region_token(tok) {
+            errors.push(format!(
+                "{label}.deny_regions contains invalid Geo region token '{tok}'"
+            ));
+        }
+    }
+    for (ri, r) in geo.rules.iter().enumerate() {
+        for tok in &r.regions {
+            if !is_valid_region_token(tok) {
+                errors.push(format!(
+                    "{label}.rules[{ri}].regions contains invalid Geo region token '{tok}'"
+                ));
+            }
+        }
+        if !(-100..=100).contains(&r.suspicion_boost) {
+            errors.push(format!(
+                "{label}.rules[{ri}].suspicion_boost ({}) must be within -100..=100",
+                r.suspicion_boost
+            ));
+        }
+    }
+}
+
+fn validate_geoip_config(cfg: &GeoIpConfig, label: &str, errors: &mut Vec<String>) {
+    for (field, url_opt) in [("ipv4_url", &cfg.ipv4_url), ("ipv6_url", &cfg.ipv6_url)] {
+        if let Some(raw) = url_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !raw.starts_with("https://") {
+                errors.push(format!("{label}.{field} ('{raw}') must use https://"));
+            }
+        }
+    }
 }
 
 fn resolve_bucket(b: &RateLimitBucket) -> RateLimitBucket {
@@ -157,6 +305,7 @@ fn validate_custom_pages(pages: &CustomPagesConfig, label: &str, errors: &mut Ve
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_ingress_config(
     src: &IngressConfig,
     ingress_defs: &IngressDefaults,
@@ -164,6 +313,8 @@ fn resolve_ingress_config(
     page_defs: &CustomPagesConfig,
     global_guards: &BTreeMap<String, GuardProfile>,
     global_buckets: &BTreeMap<String, RateLimitBucket>,
+    global_antibots: &BTreeMap<String, AntibotProfile>,
+    global_wafs: &BTreeMap<String, WafConfig>,
 ) -> IngressConfig {
     let mut out = src.clone();
 
@@ -177,7 +328,27 @@ fn resolve_ingress_config(
     }
     out.rate_limit_buckets = eff_buckets;
 
-    // Merge global guard templates + node-local overrides, resolving tri-state defaults
+    // Merge global antibot sets + node-local overrides
+    let mut eff_antibots: BTreeMap<String, AntibotProfile> = global_antibots
+        .iter()
+        .map(|(k, v)| (k.clone(), resolve_antibot_profile(v, guard_defs)))
+        .collect();
+    for (k, v) in &src.antibot_sets {
+        eff_antibots.insert(k.clone(), resolve_antibot_profile(v, guard_defs));
+    }
+    out.antibot_sets = eff_antibots;
+
+    // Merge global WAF sets + node-local overrides
+    let mut eff_wafs: BTreeMap<String, WafConfig> = global_wafs
+        .iter()
+        .map(|(k, v)| (k.clone(), normalize_waf_config(v.clone())))
+        .collect();
+    for (k, v) in &src.waf_sets {
+        eff_wafs.insert(k.clone(), normalize_waf_config(v.clone()));
+    }
+    out.waf_sets = eff_wafs;
+
+    // Merge global guard templates + node-local overrides, resolving tri-state defaults (legacy)
     let mut eff_guards: BTreeMap<String, GuardProfile> = global_guards
         .iter()
         .map(|(k, v)| (k.clone(), resolve_guard_profile(v, guard_defs)))
@@ -186,6 +357,22 @@ fn resolve_ingress_config(
         eff_guards.insert(k.clone(), resolve_guard_profile(v, guard_defs));
     }
     out.guards = eff_guards;
+
+    if out.default_bucket.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        out.default_bucket = opt_non_empty(&ingress_defs.default_bucket);
+    } else {
+        out.default_bucket = opt_non_empty(&out.default_bucket);
+    }
+    if out.default_antibot.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        out.default_antibot = opt_non_empty(&ingress_defs.default_antibot);
+    } else {
+        out.default_antibot = opt_non_empty(&out.default_antibot);
+    }
+    if out.default_waf.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        out.default_waf = opt_non_empty(&ingress_defs.default_waf);
+    } else {
+        out.default_waf = opt_non_empty(&out.default_waf);
+    }
 
     if out.clearance_secret.trim().is_empty() && !ingress_defs.clearance_secret.trim().is_empty() {
         out.clearance_secret = ingress_defs.clearance_secret.clone();
@@ -199,10 +386,91 @@ fn resolve_ingress_config(
     out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(ingress_defs.js_fp_beacon));
     out.js_fp_ttl_secs = Some(out.js_fp_ttl_secs.unwrap_or(ingress_defs.js_fp_ttl_secs).max(60));
 
-    for rule in &mut out.rules {
-        if rule.guard.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            rule.guard = ingress_defs.default_guard.clone();
+    if out.geoip == GeoIpConfig::default() {
+        out.geoip = ingress_defs.geoip.clone();
+    }
+    out.geoip.update_interval_hours = out.geoip.update_interval_hours.clamp(6, 720);
+
+    if out.crs == CrsUpdateConfig::default() {
+        out.crs = ingress_defs.crs.clone();
+    }
+    out.crs.paranoia_level = out.crs.paranoia_level.clamp(1, 4);
+    out.crs.update_interval_hours = out.crs.update_interval_hours.clamp(1, 720);
+    // Merge cluster-wide disabled rule IDs into both legacy guards and modular WAF sets.
+    if !out.crs.disabled_rule_ids.is_empty() {
+        for g in out.guards.values_mut() {
+            if let Some(ref mut waf) = g.waf {
+                for &id in &out.crs.disabled_rule_ids {
+                    if !waf.disabled_rule_ids.contains(&id) {
+                        waf.disabled_rule_ids.push(id);
+                    }
+                }
+            }
         }
+        for waf in out.waf_sets.values_mut() {
+            for &id in &out.crs.disabled_rule_ids {
+                if !waf.disabled_rule_ids.contains(&id) {
+                    waf.disabled_rule_ids.push(id);
+                }
+            }
+        }
+    }
+
+    for rule in &mut out.rules {
+        let eff_bucket = opt_non_empty(&rule.bucket).or_else(|| out.default_bucket.clone());
+        let eff_antibot = opt_non_empty(&rule.antibot).or_else(|| out.default_antibot.clone());
+        let eff_waf = opt_non_empty(&rule.waf).or_else(|| out.default_waf.clone());
+        let raw_guard = opt_non_empty(&rule.guard);
+
+        if eff_bucket.is_some() || eff_antibot.is_some() || eff_waf.is_some() {
+            rule.bucket = eff_bucket.clone();
+            rule.antibot = eff_antibot.clone();
+            rule.waf = eff_waf.clone();
+
+            let ab_ok = eff_antibot
+                .as_deref()
+                .map(|k| out.antibot_sets.contains_key(k))
+                .unwrap_or(true);
+            let waf_ok = eff_waf
+                .as_deref()
+                .map(|k| out.waf_sets.contains_key(k))
+                .unwrap_or(true);
+            let bk_ok = eff_bucket
+                .as_deref()
+                .map(|k| out.rate_limit_buckets.contains_key(k))
+                .unwrap_or(true);
+            let lg_ok = raw_guard
+                .as_deref()
+                .map(|k| out.guards.contains_key(k))
+                .unwrap_or(true);
+
+            if ab_ok && waf_ok && bk_ok && lg_ok {
+                let synth_key = format!(
+                    "__sec:b={}|a={}|w={}|g={}",
+                    eff_bucket.as_deref().unwrap_or("-"),
+                    eff_antibot.as_deref().unwrap_or("-"),
+                    eff_waf.as_deref().unwrap_or("-"),
+                    raw_guard.as_deref().unwrap_or("-")
+                );
+                if !out.guards.contains_key(&synth_key) {
+                    let ab_ref = eff_antibot.as_deref().and_then(|k| out.antibot_sets.get(k));
+                    let waf_ref = eff_waf.as_deref().and_then(|k| out.waf_sets.get(k));
+                    let lg_ref = raw_guard.as_deref().and_then(|k| out.guards.get(k));
+                    let synth = synthesize_guard_from_sets(
+                        ab_ref,
+                        lg_ref,
+                        eff_bucket.as_deref(),
+                        waf_ref,
+                        guard_defs,
+                    );
+                    out.guards.insert(synth_key.clone(), synth);
+                }
+                rule.guard = Some(synth_key);
+            }
+        } else if raw_guard.is_none() {
+            rule.guard = opt_non_empty(&ingress_defs.default_guard);
+        }
+
         rule.intercept_errors = Some(
             rule.intercept_errors
                 .unwrap_or(ingress_defs.intercept_errors),
@@ -233,24 +501,6 @@ fn resolve_ingress_config(
     out.auto_ban.confirm_hits = out.auto_ban.confirm_hits.clamp(1, 50);
     if out.abuseipdb == AbuseIpDbConfig::default() {
         out.abuseipdb = ingress_defs.abuseipdb.clone();
-    }
-    if out.crs == CrsUpdateConfig::default() {
-        out.crs = ingress_defs.crs.clone();
-    }
-    out.crs.paranoia_level = out.crs.paranoia_level.clamp(1, 4);
-    out.crs.update_interval_hours = out.crs.update_interval_hours.clamp(1, 720);
-    // Merge cluster-wide disabled rule IDs into every guard's WAF config so both
-    // `sigil-filter` (100001..100012) and OWASP CRS rules honor global toggles.
-    if !out.crs.disabled_rule_ids.is_empty() {
-        for g in out.guards.values_mut() {
-            if let Some(ref mut waf) = g.waf {
-                for &id in &out.crs.disabled_rule_ids {
-                    if !waf.disabled_rule_ids.contains(&id) {
-                        waf.disabled_rule_ids.push(id);
-                    }
-                }
-            }
-        }
     }
     out
 }
@@ -675,6 +925,15 @@ fn expand_declarative_services(
             let eff_guard = ov
                 .and_then(|o| o.guard.clone())
                 .or_else(|| svc.guard.clone());
+            let eff_bucket = ov
+                .and_then(|o| o.bucket.clone())
+                .or_else(|| svc.bucket.clone());
+            let eff_antibot = ov
+                .and_then(|o| o.antibot.clone())
+                .or_else(|| svc.antibot.clone());
+            let eff_waf = ov
+                .and_then(|o| o.waf.clone())
+                .or_else(|| svc.waf.clone());
             let eff_cidrs = ov
                 .filter(|o| !o.source_cidrs.is_empty())
                 .map(|o| o.source_cidrs.clone())
@@ -705,6 +964,9 @@ fn expand_declarative_services(
                         service_tag: svc_name.clone(),
                         next_peer: next_peer.clone(),
                         guard: eff_guard.clone(),
+                        bucket: eff_bucket.clone(),
+                        antibot: eff_antibot.clone(),
+                        waf: eff_waf.clone(),
                         intercept_errors: eff_intercept,
                         js_fp_beacon: eff_beacon,
                         cache: eff_cache.clone(),
@@ -835,6 +1097,8 @@ pub fn compile_topology_full(
                     &topo.defaults.pages,
                     &topo.guard_templates,
                     &topo.bucket_templates,
+                    &topo.antibot_templates,
+                    &topo.waf_templates,
                 ),
             )
         })
@@ -868,6 +1132,43 @@ pub fn compile_topology_full(
             "defaults.ingress.clearance_secret uses a weak or default secret; set a high-entropy random secret (>=16 chars)".into(),
         );
     }
+    validate_geoip_config(&topo.defaults.ingress.geoip, "defaults.ingress.geoip", &mut errors);
+    if let Some(ref bname) = opt_non_empty(&topo.defaults.ingress.default_bucket) {
+        if !topo.bucket_templates.contains_key(bname) {
+            warnings.push(format!(
+                "defaults.ingress.default_bucket '{bname}' not found in bucket_templates (must exist on each ingress node)"
+            ));
+        }
+    }
+    if let Some(ref aname) = opt_non_empty(&topo.defaults.ingress.default_antibot) {
+        if !topo.antibot_templates.contains_key(aname) {
+            warnings.push(format!(
+                "defaults.ingress.default_antibot '{aname}' not found in antibot_templates (must exist on each ingress node)"
+            ));
+        }
+    }
+    if let Some(ref wname) = opt_non_empty(&topo.defaults.ingress.default_waf) {
+        if !topo.waf_templates.contains_key(wname) {
+            warnings.push(format!(
+                "defaults.ingress.default_waf '{wname}' not found in waf_templates (must exist on each ingress node)"
+            ));
+        }
+    }
+    for (a_name, ab) in &topo.antibot_templates {
+        validate_cidr_list(
+            &ab.allow_cidrs,
+            &format!("antibot_templates '{a_name}'.allow_cidrs"),
+            &mut errors,
+        );
+        validate_cidr_list(
+            &ab.deny_cidrs,
+            &format!("antibot_templates '{a_name}'.deny_cidrs"),
+            &mut errors,
+        );
+        if let Some(ref geo) = ab.geo {
+            validate_geo_policy_cfg(geo, &format!("antibot_templates '{a_name}'.geo"), &mut errors);
+        }
+    }
     for (g_name, g) in &topo.guard_templates {
         let resolved_g = resolve_guard_profile(g, &topo.defaults.guard);
         validate_cidr_list(
@@ -880,6 +1181,9 @@ pub fn compile_topology_full(
             &format!("guard_templates '{g_name}'.deny_cidrs"),
             &mut errors,
         );
+        if let Some(ref geo) = resolved_g.geo {
+            validate_geo_policy_cfg(geo, &format!("guard_templates '{g_name}'.geo"), &mut errors);
+        }
         if let Some(ref bname) = resolved_g.rate_limit_bucket {
             if !bname.trim().is_empty() && !topo.bucket_templates.contains_key(bname) {
                 warnings.push(format!(
@@ -1035,18 +1339,63 @@ pub fn compile_topology_full(
             }
         }
         if let Some(ing) = resolved_ingress.get(node_tag) {
+            validate_geoip_config(&ing.geoip, &format!("ingress '{node_tag}'.geoip"), &mut errors);
+            if let Some(ref bname) = ing.default_bucket {
+                if !ing.rate_limit_buckets.contains_key(bname) {
+                    errors.push(format!(
+                        "ingress '{node_tag}' default_bucket references undefined bucket '{bname}'"
+                    ));
+                }
+            }
+            if let Some(ref aname) = ing.default_antibot {
+                if !ing.antibot_sets.contains_key(aname) {
+                    errors.push(format!(
+                        "ingress '{node_tag}' default_antibot references undefined antibot set '{aname}'"
+                    ));
+                }
+            }
+            if let Some(ref wname) = ing.default_waf {
+                if !ing.waf_sets.contains_key(wname) {
+                    errors.push(format!(
+                        "ingress '{node_tag}' default_waf references undefined waf set '{wname}'"
+                    ));
+                }
+            }
             let uses_any_guard = ing.rules.iter().any(|r| {
                 r.guard
                     .as_deref()
                     .map(|g| !g.trim().is_empty())
                     .unwrap_or(false)
+                    || r.antibot
+                        .as_deref()
+                        .map(|a| !a.trim().is_empty())
+                        .unwrap_or(false)
             });
-            if (uses_any_guard || !spec.ingress.guards.is_empty())
+            if (uses_any_guard || !spec.ingress.guards.is_empty() || !ing.antibot_sets.is_empty())
                 && is_weak_secret(&ing.clearance_secret)
             {
                 warnings.push(format!(
                     "ingress node '{node_tag}' uses a weak or default clearance_secret; set a high-entropy random secret (>=16 chars) on the node or in defaults.ingress"
                 ));
+            }
+            for (a_name, ab) in &ing.antibot_sets {
+                validate_cidr_list(
+                    &ab.allow_cidrs,
+                    &format!("ingress '{node_tag}' antibot_set '{a_name}'.allow_cidrs"),
+                    &mut errors,
+                );
+                validate_cidr_list(
+                    &ab.deny_cidrs,
+                    &format!("ingress '{node_tag}' antibot_set '{a_name}'.deny_cidrs"),
+                    &mut errors,
+                );
+                if let Some(ref geo) = ab.geo {
+                    validate_geo_policy_cfg(
+                        geo,
+                        &format!("ingress '{node_tag}' antibot_set '{a_name}'.geo"),
+                        &mut errors,
+                    );
+                }
             }
             for (g_name, g) in &ing.guards {
                 validate_cidr_list(
@@ -1059,6 +1408,13 @@ pub fn compile_topology_full(
                     &format!("ingress '{node_tag}' guard '{g_name}'.deny_cidrs"),
                     &mut errors,
                 );
+                if let Some(ref geo) = g.geo {
+                    validate_geo_policy_cfg(
+                        geo,
+                        &format!("ingress '{node_tag}' guard '{g_name}'.geo"),
+                        &mut errors,
+                    );
+                }
                 if let Some(ref bname) = g.rate_limit_bucket {
                     if !bname.trim().is_empty() && !ing.rate_limit_buckets.contains_key(bname) {
                         errors.push(format!(
@@ -1084,6 +1440,30 @@ pub fn compile_topology_full(
                     &format!("ingress '{node_tag}' rule '{}' source_cidrs", rule.service_tag),
                     &mut errors,
                 );
+                if let Some(ref bname) = rule.bucket {
+                    if !bname.trim().is_empty() && !ing.rate_limit_buckets.contains_key(bname) {
+                        errors.push(format!(
+                            "ingress '{node_tag}' rule '{}' references undefined bucket '{bname}'",
+                            rule.service_tag
+                        ));
+                    }
+                }
+                if let Some(ref aname) = rule.antibot {
+                    if !aname.trim().is_empty() && !ing.antibot_sets.contains_key(aname) {
+                        errors.push(format!(
+                            "ingress '{node_tag}' rule '{}' references undefined antibot set '{aname}'",
+                            rule.service_tag
+                        ));
+                    }
+                }
+                if let Some(ref wname) = rule.waf {
+                    if !wname.trim().is_empty() && !ing.waf_sets.contains_key(wname) {
+                        errors.push(format!(
+                            "ingress '{node_tag}' rule '{}' references undefined waf set '{wname}'",
+                            rule.service_tag
+                        ));
+                    }
+                }
                 if let Some(ref gname) = rule.guard {
                     if !gname.trim().is_empty() && !ing.guards.contains_key(gname) {
                         errors.push(format!(
@@ -1917,6 +2297,7 @@ mod tests {
                         intercept_errors: None,
                         js_fp_beacon: None,
                         cache: None,
+                        ..Default::default()
                     }],
                     ..Default::default()
                 },
@@ -2356,5 +2737,148 @@ mod tests {
         assert_eq!(rw.mode, WafMode::Block);
         assert!((rw.min_confidence - 0.1).abs() < 1e-6);
         assert_eq!(rw.max_body_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn modular_bucket_antibot_waf_sets_compile_per_ingress_without_accidental_pow() {
+        use exposure_core::config::{GeoPolicyConfig, GeoRule, GeoRuleAction};
+
+        let mut topo = TopologySpec::default();
+        topo.defaults.ingress.clearance_secret = "super-secret-global-clearance-key-0123456789".into();
+        topo.defaults.ingress.default_bucket = Some("std-rate".into());
+        topo.defaults.ingress.default_waf = Some("strict-crs".into());
+
+        topo.bucket_templates.insert(
+            "std-rate".into(),
+            RateLimitBucket { capacity: 120.0, refill_per_sec: 20.0, per_ip: Some(true) },
+        );
+        topo.bucket_templates.insert(
+            "tight-rate".into(),
+            RateLimitBucket { capacity: 20.0, refill_per_sec: 2.0, per_ip: Some(true) },
+        );
+        topo.antibot_templates.insert(
+            "cn-challenge".into(),
+            AntibotProfile {
+                antibot: AntibotMode::Challenge,
+                geo: Some(GeoPolicyConfig {
+                    enabled: true,
+                    deny_regions: vec!["CONTINENT:AF".into()],
+                    rules: vec![GeoRule {
+                        regions: vec!["CN".into()],
+                        action: GeoRuleAction::Allow,
+                        suspicion_boost: 0,
+                        note: None,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        topo.waf_templates.insert(
+            "strict-crs".into(),
+            WafConfig {
+                mode: WafMode::Evilpot,
+                crs_paranoia_level: 2,
+                ..Default::default()
+            },
+        );
+
+        topo.nodes.insert(
+            "ingress-cn".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles { ingress: true, ..Default::default() },
+                ingress: IngressConfig {
+                    // ingress-cn leaves default_antibot unset (should stay AntibotMode::Off!)
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        topo.nodes.insert(
+            "ingress-us".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles { ingress: true, ..Default::default() },
+                ingress: IngressConfig {
+                    default_bucket: Some("tight-rate".into()),
+                    default_antibot: Some("cn-challenge".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        topo.nodes.insert(
+            "egress-us".into(),
+            TopologyNodeSpec {
+                roles: NodeRoles { egress: true, ..Default::default() },
+                link_listener: Some(LinkListenConfig {
+                    listen_addr: "0.0.0.0:9443".into(),
+                    allow_on_demand: Some(true),
+                    allow_tunnel: Some(true),
+                    allow_bootstrap: Some(false),
+                }),
+                ..Default::default()
+            },
+        );
+        for from in ["ingress-cn", "ingress-us"] {
+            topo.links.push(TopologyLinkSpec {
+                from: from.into(),
+                to: "egress-us".into(),
+                peer_tag: None,
+                mode: LinkMode::OnDemand,
+                tunnel_direction: None,
+                bidirectional: false,
+                endpoints: vec![PeerEndpoint { address: "198.51.100.2:9443".into(), priority: 10, weight: 100 }],
+                reverse_endpoints: vec![],
+                expected_client_addr: None,
+            });
+        }
+        topo.services.insert(
+            "api".into(),
+            exposure_core::config::ServiceSpec {
+                hosts: vec!["api.example.com".into()],
+                egress: exposure_core::config::ServiceEgressTarget {
+                    node: "egress-us".into(),
+                    backend: "127.0.0.1:3000".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut pubkeys = HashMap::new();
+        for tag in ["ingress-cn", "ingress-us", "egress-us"] {
+            pubkeys.insert(tag.into(), format!("pk-{tag}"));
+        }
+        let (rep, compiled) = compile_topology(&topo, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(rep.valid, "errors: {:?}", rep.errors);
+
+        // ingress-cn gets std-rate + Evilpot WAF, with antibot strictly Off (no accidental Challenge!)
+        let cn_ing = &compiled["ingress-cn"].ingress;
+        let cn_g = cn_ing.guards.get(cn_ing.rules[0].guard.as_ref().unwrap()).unwrap();
+        assert_eq!(cn_g.antibot, AntibotMode::Off);
+        assert_eq!(cn_g.rate_limit_bucket.as_deref(), Some("std-rate"));
+        assert_eq!(cn_g.waf.as_ref().unwrap().mode, WafMode::Evilpot);
+
+        // ingress-us gets per-ingress tight-rate + cn-challenge + cluster strict-crs WAF
+        let us_ing = &compiled["ingress-us"].ingress;
+        let us_g = us_ing.guards.get(us_ing.rules[0].guard.as_ref().unwrap()).unwrap();
+        assert_eq!(us_g.antibot, AntibotMode::Challenge);
+        assert_eq!(us_g.rate_limit_bucket.as_deref(), Some("tight-rate"));
+        assert_eq!(us_g.waf.as_ref().unwrap().mode, WafMode::Evilpot);
+        assert!(us_g.geo.as_ref().unwrap().enabled);
+
+        // Invalid Geo region token fails validation
+        let mut bad_geo = topo.clone();
+        bad_geo.antibot_templates.get_mut("cn-challenge").unwrap().geo.as_mut().unwrap().deny_regions.push("INVALID_REGION".into());
+        let (bad_rep, _) = compile_topology(&bad_geo, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!bad_rep.valid);
+        assert!(bad_rep.errors.iter().any(|e| e.contains("Geo region token")));
+
+        // Unknown WAF set reference fails validation
+        let mut bad_waf = topo;
+        bad_waf.nodes.get_mut("ingress-cn").unwrap().ingress.default_waf = Some("missing-waf".into());
+        let (bad_waf_rep, _) = compile_topology(&bad_waf, "ctrl-pk", &pubkeys, &HashMap::new());
+        assert!(!bad_waf_rep.valid);
+        assert!(bad_waf_rep.errors.iter().any(|e| e.contains("missing-waf")));
     }
 }

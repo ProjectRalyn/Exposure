@@ -326,6 +326,7 @@ mod tests {
                 intercept_errors: Some(false),
                 js_fp_beacon: None,
                 cache: None,
+                ..Default::default()
             },
             IngressRule {
                 name: Some("default".into()),
@@ -341,6 +342,7 @@ mod tests {
                 intercept_errors: Some(false),
                 js_fp_beacon: None,
                 cache: None,
+                ..Default::default()
             },
         ];
 
@@ -377,6 +379,7 @@ mod tests {
             intercept_errors: None,
             js_fp_beacon: None,
             cache: None,
+            ..Default::default()
         }];
         assert!(match_ingress_rule(&hostless, "anything.test", "/", mapped_v6, None).is_none());
         let explicit_wildcard = vec![IngressRule {

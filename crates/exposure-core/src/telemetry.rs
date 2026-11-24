@@ -323,6 +323,25 @@ fn sanitize_opt(opt: &mut Option<String>, max_chars: usize) {
     }
 }
 
+/// GeoIP database sync status snapshot reported by Ingress nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GeoIpStatusSnapshot {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
+    pub ipv4_ranges: usize,
+    #[serde(default)]
+    pub ipv6_ranges: usize,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// Individual session / HTTP access log record written to segment files (production layer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -337,6 +356,9 @@ pub struct SessionSummary {
     pub ip_hmac: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_ip: Option<String>,
+    /// Locally resolved ISO-3166-1 alpha-2 country code from Node GeoIP DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_country: Option<String>,
     #[serde(default)]
     pub rate_limited: bool,
     #[serde(default)]
@@ -400,6 +422,7 @@ impl Default for SessionSummary {
             bytes_out: 0,
             ip_hmac: String::new(),
             raw_ip: None,
+            client_country: None,
             rate_limited: false,
             challenged: false,
             challenge_passed: false,
@@ -437,6 +460,7 @@ impl SessionSummary {
         self.service_tag = sanitize_log_text(&self.service_tag, 128);
         self.ip_hmac = sanitize_log_text(&self.ip_hmac, 64);
         sanitize_opt(&mut self.raw_ip, 64);
+        sanitize_opt(&mut self.client_country, 8);
         sanitize_opt(&mut self.error, 256);
         sanitize_opt(&mut self.device_type, 32);
         sanitize_opt(&mut self.browser_family, 32);
@@ -1060,6 +1084,12 @@ pub struct FingerprintObservation {
     pub abuse_isp: Option<String>,
     #[serde(default)]
     pub abuse_is_tor: bool,
+    /// Locally resolved ISO-3166-1 alpha-2 country code from Node GeoIP DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo_country: Option<String>,
+    /// Locally resolved continent code (`AS|EU|NA|SA|AF|OC|AN`) from Node GeoIP DB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo_continent: Option<String>,
     #[serde(default)]
     pub js_fp: Option<ClientJsFingerprint>,
     pub first_seen_ts: i64,
@@ -1095,6 +1125,12 @@ impl FingerprintObservation {
         }
         if let Some(ref mut isp) = self.abuse_isp {
             *isp = clean_fp_str(isp, 96);
+        }
+        if let Some(ref mut gc) = self.geo_country {
+            *gc = clean_fp_str(gc, 8);
+        }
+        if let Some(ref mut gct) = self.geo_continent {
+            *gct = clean_fp_str(gct, 8);
         }
         if let Some(ref mut js) = self.js_fp {
             js.sanitize();
@@ -1155,6 +1191,12 @@ impl FingerprintObservation {
             self.abuse_isp = other.abuse_isp.clone();
         }
         self.abuse_is_tor |= other.abuse_is_tor;
+        if other.geo_country.is_some() {
+            self.geo_country = other.geo_country.clone();
+        }
+        if other.geo_continent.is_some() {
+            self.geo_continent = other.geo_continent.clone();
+        }
         if other.js_verified {
             self.js_verified = true;
             if other.fp_source == "pow" || self.fp_source.is_empty() || self.fp_source == "none" {

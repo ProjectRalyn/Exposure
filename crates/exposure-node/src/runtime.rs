@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,10 +16,12 @@ use exposure_core::crypto::{
 };
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
-    dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, DiscoveryNeighbor, DnsManageOp,
-    DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem,
-    PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
+    dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes,
+    unban_req_signing_bytes, DiscoveryNeighbor, DnsManageOp, DnsProviderCapabilities,
+    DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem, PreflightReport, SpecialFrame,
+    SpecialPayload, StreamKind,
 };
+use exposure_core::routing::is_public_routable_ip;
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
 use rand::RngCore;
@@ -249,6 +251,9 @@ impl NodeRuntime {
         }
 
         let mut ingress_addrs = Vec::new();
+        if cfg.roles.ingress {
+            Arc::clone(self.ingress.geoip()).spawn_updater();
+        }
         if cfg.roles.ingress && !cfg.roles.maintainer {
             for listener in &cfg.ingress.listeners {
                 let bound = self.ingress.start_listener(listener.clone()).await?;
@@ -505,6 +510,11 @@ impl NodeRuntime {
                     let (ok, err) = self.last_reload_status.read().await.clone();
                     let alerts = self.logger.recent_alerts().await;
                     let evilpot = self.ingress.evilpot_report().await;
+                    let geoip = if cfg.roles.ingress {
+                        Some(self.ingress.geoip().status())
+                    } else {
+                        None
+                    };
                     let log_stats = self.logger.protection_stats();
                     Some(SpecialPayload::StatusResp(NodeStatusSnapshot {
                         node_tag: cfg.node_tag,
@@ -516,6 +526,7 @@ impl NodeRuntime {
                         links,
                         alerts,
                         evilpot,
+                        geoip,
                         log_stats,
                     }))
                 }
@@ -675,6 +686,63 @@ impl NodeRuntime {
                         )
                         .await,
                     )
+                }
+            }
+            SpecialPayload::UnbanReq {
+                request_id,
+                issued_at,
+                expires_at,
+                target_node_tag,
+                ban_kind,
+                target,
+                control_signature,
+            } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    Some(
+                        self.handle_unban_req(
+                            request_id,
+                            issued_at,
+                            expires_at,
+                            target_node_tag,
+                            ban_kind,
+                            target,
+                            control_signature,
+                        )
+                        .await,
+                    )
+                }
+            }
+            SpecialPayload::GeoIpSyncReq {
+                request_id,
+                issued_at,
+                expires_at,
+                target_node_tag,
+                force,
+                control_signature,
+            } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    Some(
+                        self.handle_geoip_sync_req(
+                            request_id,
+                            issued_at,
+                            expires_at,
+                            target_node_tag,
+                            force,
+                            control_signature,
+                        )
+                        .await,
+                    )
+                }
+            }
+            SpecialPayload::GeoIpLookupReq { ip } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    Some(self.handle_geoip_lookup_req(&ip))
                 }
             }
             SpecialPayload::BootstrapReply {
@@ -1094,6 +1162,187 @@ impl NodeRuntime {
                 error: None,
             },
             Err(e) => reject(e.to_string()),
+        }
+    }
+
+    async fn verify_control_signed_cmd(
+        &self,
+        cmd_name: &str,
+        request_id: &str,
+        issued_at: i64,
+        expires_at: i64,
+        target_node_tag: &str,
+        signing_bytes: &[u8],
+        control_signature: &str,
+    ) -> std::result::Result<(), String> {
+        if target_node_tag != self.node_tag() {
+            return Err(format!(
+                "{cmd_name} target '{target_node_tag}' != local node '{}'",
+                self.node_tag()
+            ));
+        }
+        let local_ctrl_pk = self
+            .config
+            .read()
+            .await
+            .control_public_key
+            .clone()
+            .ok_or_else(|| "node has no Control public key configured".to_string())?;
+        let now = Utc::now().timestamp();
+        if now > expires_at || issued_at > now + 60 {
+            return Err(format!("{cmd_name} expired or invalid timestamp"));
+        }
+        verify_signature_b64(&local_ctrl_pk, signing_bytes, control_signature)
+            .map_err(|e| format!("{cmd_name} signature invalid: {e}"))?;
+        if self.used_dns_sync_ids.len() > 4096 {
+            self.used_dns_sync_ids.retain(|_, exp| *exp >= now);
+        }
+        let mut is_new = false;
+        self.used_dns_sync_ids
+            .entry(request_id.to_string())
+            .or_insert_with(|| {
+                is_new = true;
+                expires_at
+            });
+        if !is_new {
+            return Err(format!("{cmd_name} replay rejected"));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_unban_req(
+        &self,
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        target_node_tag: String,
+        kind: String,
+        target: String,
+        control_signature: String,
+    ) -> SpecialPayload {
+        let signing = unban_req_signing_bytes(
+            &request_id,
+            issued_at,
+            expires_at,
+            &target_node_tag,
+            &kind,
+            &target,
+        );
+        if let Err(err) = self
+            .verify_control_signed_cmd(
+                "UnbanReq",
+                &request_id,
+                issued_at,
+                expires_at,
+                &target_node_tag,
+                &signing,
+                &control_signature,
+            )
+            .await
+        {
+            return SpecialPayload::UnbanResp {
+                request_id,
+                node_tag: self.node_tag(),
+                ok: false,
+                removed: false,
+                error: Some(err),
+            };
+        }
+        let removed = self.ingress.auto_ban().unban(&kind, &target);
+        info!(
+            node = %self.node_tag(),
+            kind = %kind,
+            target = %target,
+            removed,
+            "processed dashboard unban request"
+        );
+        SpecialPayload::UnbanResp {
+            request_id,
+            node_tag: self.node_tag(),
+            ok: true,
+            removed,
+            error: None,
+        }
+    }
+
+    async fn handle_geoip_sync_req(
+        &self,
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        target_node_tag: String,
+        force: bool,
+        control_signature: String,
+    ) -> SpecialPayload {
+        let signing = geoip_sync_req_signing_bytes(
+            &request_id,
+            issued_at,
+            expires_at,
+            &target_node_tag,
+            force,
+        );
+        if let Err(err) = self
+            .verify_control_signed_cmd(
+                "GeoIpSyncReq",
+                &request_id,
+                issued_at,
+                expires_at,
+                &target_node_tag,
+                &signing,
+                &control_signature,
+            )
+            .await
+        {
+            return SpecialPayload::GeoIpSyncResp {
+                request_id,
+                node_tag: self.node_tag(),
+                ok: false,
+                status: None,
+                error: Some(err),
+            };
+        }
+        match self.ingress.geoip().sync_now(force).await {
+            Ok(status) => SpecialPayload::GeoIpSyncResp {
+                request_id,
+                node_tag: self.node_tag(),
+                ok: true,
+                status: Some(status),
+                error: None,
+            },
+            Err(err) => SpecialPayload::GeoIpSyncResp {
+                request_id,
+                node_tag: self.node_tag(),
+                ok: false,
+                status: Some(self.ingress.geoip().status()),
+                error: Some(err),
+            },
+        }
+    }
+
+    fn handle_geoip_lookup_req(&self, raw_ip: &str) -> SpecialPayload {
+        let trimmed = raw_ip.trim();
+        let Ok(addr) = trimmed.parse::<IpAddr>() else {
+            return SpecialPayload::GeoIpLookupResp {
+                node_tag: self.node_tag(),
+                ip: trimmed.to_string(),
+                country: None,
+                continent: None,
+                is_private: false,
+                db_loaded: self.ingress.geoip().is_loaded(),
+                error: Some(format!("invalid IP address '{trimmed}'")),
+            };
+        };
+        let is_priv = !is_public_routable_ip(addr);
+        let res = self.ingress.geoip().lookup(addr);
+        SpecialPayload::GeoIpLookupResp {
+            node_tag: self.node_tag(),
+            ip: addr.to_string(),
+            country: res.as_ref().map(|r| r.country_str().to_string()),
+            continent: res.as_ref().map(|r| r.continent.to_string()),
+            is_private: is_priv,
+            db_loaded: self.ingress.geoip().is_loaded(),
+            error: None,
         }
     }
 

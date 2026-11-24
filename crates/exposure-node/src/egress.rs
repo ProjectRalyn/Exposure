@@ -419,6 +419,7 @@ impl EgressHandler {
             waf_rule_id: None,
             waf_category: None,
             suspicion_score: None,
+            client_country: None,
         };
 
         if !self.is_local_backend_healthy(&hdr.service_tag) {

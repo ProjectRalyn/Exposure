@@ -24,14 +24,74 @@ function downloadJson(filename, payload) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function renderPaginationBar(prefix, { total, offset, limit }) {
+  const tot = Math.max(0, Number(total) || 0);
+  const lim = Math.max(1, Number(limit) || 50);
+  const off = Math.max(0, Number(offset) || 0);
+  const page = Math.floor(off / lim) + 1;
+  const totalPages = Math.max(1, Math.ceil(tot / lim));
+  const start = tot === 0 ? 0 : Math.min(tot, off + 1);
+  const end = Math.min(tot, off + lim);
+  const atStart = off <= 0;
+  const atEnd = off + lim >= tot;
+  return `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px;">
+      <div class="muted-sm">${esc(t("logs.page.showing", { start, end, total: tot }))}</div>
+      <div class="btn-row">
+        <label style="display:flex;align-items:center;gap:6px;">
+          <span class="muted-sm">${esc(t("logs.page.per_page"))}</span>
+          <select id="${prefix}-pg-limit" class="select-sm">
+            ${[25, 50, 100].map((n) => `<option value="${n}" ${lim === n ? "selected" : ""}>${n}</option>`).join("")}
+          </select>
+        </label>
+        <button type="button" id="${prefix}-pg-first" class="btn sm" ${atStart ? "disabled" : ""}>&laquo;</button>
+        <button type="button" id="${prefix}-pg-prev" class="btn sm" ${atStart ? "disabled" : ""}>&lsaquo;</button>
+        <span class="muted-sm">${esc(t("logs.page.of", { page, pages: totalPages }))}</span>
+        <button type="button" id="${prefix}-pg-next" class="btn sm" ${atEnd ? "disabled" : ""}>&rsaquo;</button>
+        <button type="button" id="${prefix}-pg-last" class="btn sm" ${atEnd ? "disabled" : ""}>&raquo;</button>
+      </div>
+    </div>
+  `;
+}
+
+function wirePaginationBar(prefix, state, total, onChange) {
+  const lim = Math.max(1, Number(state.limit) || 50);
+  const tot = Math.max(0, Number(total) || 0);
+  const lastOff = Math.max(0, (Math.max(1, Math.ceil(tot / lim)) - 1) * lim);
+  el(`${prefix}-pg-limit`)?.addEventListener("change", (ev) => {
+    state.limit = Number(ev.target.value) || 50;
+    state.offset = 0;
+    onChange();
+  });
+  el(`${prefix}-pg-first`)?.addEventListener("click", () => {
+    state.offset = 0;
+    onChange();
+  });
+  el(`${prefix}-pg-prev`)?.addEventListener("click", () => {
+    state.offset = Math.max(0, (state.offset || 0) - lim);
+    onChange();
+  });
+  el(`${prefix}-pg-next`)?.addEventListener("click", () => {
+    if ((state.offset || 0) + lim < tot) {
+      state.offset = (state.offset || 0) + lim;
+      onChange();
+    }
+  });
+  el(`${prefix}-pg-last`)?.addEventListener("click", () => {
+    state.offset = lastOff;
+    onChange();
+  });
+}
+
 export function createAnalyticsViews({ api, store, navigate }) {
   let obsHeroMetric = "requests";
   let obsNode = "all";
   let obsSvc = "all";
   let obsWin = 0;
+  let bucketPageState = { offset: 0, limit: 50 };
 
   let loggingSubTab = "access"; // access | visitors
-  let logFilters = {
+  const defaultLogFilters = () => ({
     q: "",
     ip: "",
     host: "",
@@ -41,11 +101,27 @@ export function createAnalyticsViews({ api, store, navigate }) {
     method: "all",
     status: "all",
     action: "all",
+    country: "all",
     window_secs: 0,
-  };
+    offset: 0,
+    limit: 50,
+  });
+  let logFilters = defaultLogFilters();
   let logData = null;
 
-  let fpFilters = { q: "", ip: "", fp: "", node: "all", service: "all", verified: "all", risk: "all" };
+  const defaultFpFilters = () => ({
+    q: "",
+    ip: "",
+    fp: "",
+    node: "all",
+    service: "all",
+    country: "all",
+    verified: "all",
+    risk: "all",
+    offset: 0,
+    limit: 50,
+  });
+  let fpFilters = defaultFpFilters();
   let fpData = null;
 
   /* ==================== ANALYTICS ==================== */
@@ -174,12 +250,13 @@ export function createAnalyticsViews({ api, store, navigate }) {
             <tbody id="stats-tbody"></tbody>
           </table>
         </div>
+        <div id="stats-pagination"></div>
       </details>
     `;
 
-    el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; refreshAnalytics(); });
-    el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; refreshAnalytics(); });
-    el("obs-window-filter")?.addEventListener("change", (ev) => { obsWin = Number(ev.target.value) || 0; refreshAnalytics(); });
+    el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
+    el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
+    el("obs-window-filter")?.addEventListener("change", (ev) => { obsWin = Number(ev.target.value) || 0; bucketPageState.offset = 0; refreshAnalytics(); });
     el("btn-open-access-logs")?.addEventListener("click", () => navigate("logging", { subTab: "access", service: obsSvc !== "all" ? obsSvc : undefined }));
     el("btn-open-fp-explorer")?.addEventListener("click", () => navigate("logging", { subTab: "visitors", service: obsSvc !== "all" ? obsSvc : undefined }));
     root.querySelectorAll("[data-cf-metric]").forEach((btn) => {
@@ -314,10 +391,14 @@ export function createAnalyticsViews({ api, store, navigate }) {
       renderFpCol("Browsers", data.browser_counts, "#009F6B") +
       renderFpCol("OS", data.os_counts, "#6A5ACD");
 
+    const allBuckets = (data.summaries || []).slice().reverse();
+    if (bucketPageState.offset >= allBuckets.length) bucketPageState.offset = 0;
+    const pagedBuckets = allBuckets.slice(
+      bucketPageState.offset,
+      bucketPageState.offset + bucketPageState.limit
+    );
     el("stats-tbody").innerHTML =
-      (data.summaries || [])
-        .slice()
-        .reverse()
+      pagedBuckets
         .map(
           (s) => `
         <tr>
@@ -335,6 +416,15 @@ export function createAnalyticsViews({ api, store, navigate }) {
         </tr>`
         )
         .join("") || `<tr><td colspan="11" class="muted">No telemetry buckets</td></tr>`;
+    const pgHost = el("stats-pagination");
+    if (pgHost) {
+      pgHost.innerHTML = renderPaginationBar("stats", {
+        total: allBuckets.length,
+        offset: bucketPageState.offset,
+        limit: bucketPageState.limit,
+      });
+      wirePaginationBar("stats", bucketPageState, allBuckets.length, renderAnalyticsCharts);
+    }
   }
 
   async function refreshAnalytics() {
@@ -394,10 +484,12 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const topPaths = data.top_paths || [];
     const nodes = (data.available_nodes || []).slice().sort();
     const svcs = (data.available_services || []).slice().sort();
+    const countries = (data.available_countries || []).slice().sort();
+    const totalMatched = Number(data.total_matched ?? items.length) || 0;
 
     const actionPillCls = (act, status) => {
-      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "guard_reject" || act === "abuseipdb" || status >= 500) return "err";
-      if (act === "rate_limit" || act === "challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
+      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "geo_evilpot" || status >= 500) return "err";
+      if (act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
       if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass") return "info";
       return "ok";
     };
@@ -427,7 +519,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             ${["all", "2xx", "3xx", "4xx", "5xx"].map((st) => `<button type="button" class="fp-chip ${logFilters.status === st ? "active" : ""}" data-log-st="${st}">${st.toUpperCase()}</button>`).join("")}
           </div>
           <div class="fp-chip-group">
-            ${["all", "allow", "blocked", "waf_block", "evilpot", "autoban", "rate_limit", "cache_hit", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
+            ${["all", "allow", "blocked", "waf_block", "evilpot", "autoban", "rate_limit", "geo_block", "geo_challenge", "geo_evilpot", "cache_hit", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
           </div>
           <div class="btn-row">
             <select id="log-method-filter" class="select-sm">
@@ -446,6 +538,10 @@ export function createAnalyticsViews({ api, store, navigate }) {
             <select id="log-svc-filter" class="select-sm">
               <option value="all">${esc(t("ana.all_services"))}</option>
               ${svcs.map((s) => `<option value="${esc(s)}" ${logFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
+            </select>
+            <select id="log-country-filter" class="select-sm">
+              <option value="all">${esc(t("logs.all_countries"))}</option>
+              ${countries.map((c) => `<option value="${esc(c)}" ${logFilters.country === c ? "selected" : ""}>${esc(c)}</option>`).join("")}
             </select>
             <select id="log-window-filter" class="select-sm">
               <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>Global Window</option>
@@ -487,7 +583,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
 
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("logs.explorer_title"))} (${items.length})</h3>
+          <h3>${esc(t("logs.explorer_title"))} (${totalMatched})</h3>
           <span class="muted-sm">Query strings redact secrets · Click row for full detail &amp; visitor correlation</span>
         </div>
         <div class="table-scroll" style="max-height:560px;">
@@ -530,7 +626,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
                       </div>
                       ${r.waf_category || r.error ? `<div class="muted-sm">${esc(r.waf_category || r.error || "")}</div>` : ""}
                     </td>
-                    <td><div>${esc(r.raw_ip || "-")}</div><div class="muted-sm"><span class="fp-code">${esc((r.ip_hmac || "").slice(0, 14))}</span></div></td>
+                    <td><div>${esc(r.raw_ip || "-")} ${r.client_country ? `<span class="pill info">${esc(r.client_country)}</span>` : ""}</div><div class="muted-sm"><span class="fp-code">${esc((r.ip_hmac || "").slice(0, 14))}</span></div></td>
                     <td><div><code>${esc(r.service_tag)}</code></div><div class="muted-sm">${esc(r.node_tag)} · ${esc(r.role)}</div></td>
                     <td><div>${(Number(r.latency_ms) || 0).toFixed(1)} ms</div><div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div></td>
                   </tr>`;
@@ -540,10 +636,12 @@ export function createAnalyticsViews({ api, store, navigate }) {
             </tbody>
           </table>
         </div>
+        ${renderPaginationBar("log", { total: totalMatched, offset: logFilters.offset, limit: logFilters.limit })}
       </div>
     `;
 
     wireLoggingSubtabs(root);
+    wirePaginationBar("log", logFilters, totalMatched, refreshLogs);
     const triggerLogSearch = () => {
       logFilters.q = el("log-search-q")?.value.trim() || "";
       logFilters.ip = el("log-search-ip")?.value.trim() || "";
@@ -552,7 +650,9 @@ export function createAnalyticsViews({ api, store, navigate }) {
       logFilters.role = el("log-role-filter")?.value || "all";
       logFilters.node = el("log-node-filter")?.value || "all";
       logFilters.service = el("log-svc-filter")?.value || "all";
+      logFilters.country = el("log-country-filter")?.value || "all";
       logFilters.window_secs = Number(el("log-window-filter")?.value || 0);
+      logFilters.offset = 0;
       refreshLogs();
     };
     el("btn-log-search")?.addEventListener("click", triggerLogSearch);
@@ -561,11 +661,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
         if (ev.key === "Enter") { ev.preventDefault(); triggerLogSearch(); }
       });
     });
-    ["log-method-filter", "log-role-filter", "log-node-filter", "log-svc-filter", "log-window-filter"].forEach((id) => {
+    ["log-method-filter", "log-role-filter", "log-node-filter", "log-svc-filter", "log-country-filter", "log-window-filter"].forEach((id) => {
       el(id)?.addEventListener("change", triggerLogSearch);
     });
     el("btn-log-clear")?.addEventListener("click", () => {
-      logFilters = { q: "", ip: "", host: "", node: "all", service: "all", role: "all", method: "all", status: "all", action: "all", window_secs: 0 };
+      logFilters = defaultLogFilters();
       refreshLogs();
     });
     el("btn-log-export")?.addEventListener("click", () => {
@@ -574,12 +674,14 @@ export function createAnalyticsViews({ api, store, navigate }) {
     root.querySelectorAll("[data-log-st]").forEach((btn) => {
       btn.addEventListener("click", () => {
         logFilters.status = btn.dataset.logSt;
+        logFilters.offset = 0;
         refreshLogs();
       });
     });
     root.querySelectorAll("[data-log-act]").forEach((btn) => {
       btn.addEventListener("click", () => {
         logFilters.action = btn.dataset.logAct;
+        logFilters.offset = 0;
         refreshLogs();
       });
     });
@@ -589,6 +691,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
         if (!tp) return;
         logFilters.q = tp.path || "";
         if (tp.host) logFilters.host = tp.host;
+        logFilters.offset = 0;
         refreshLogs();
       });
     });
@@ -605,6 +708,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             cls: "ghost",
             onClick: () => {
               logFilters.ip = ipKey;
+              logFilters.offset = 0;
               refreshLogs();
             },
           });
@@ -613,7 +717,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             cls: "ghost",
             onClick: () => {
               loggingSubTab = "visitors";
-              fpFilters = { q: "", ip: ipKey, fp: "", node: "all", service: "all", verified: "all", risk: "all" };
+              fpFilters = { ...defaultFpFilters(), ip: ipKey };
               refreshVisitors();
             },
           });
@@ -624,6 +728,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             cls: "ghost",
             onClick: () => {
               logFilters.q = r.path;
+              logFilters.offset = 0;
               refreshLogs();
             },
           });
@@ -640,7 +745,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
               <div class="fp-kv"><div class="fp-kv-lbl">Query (Redacted)</div><div class="fp-kv-val"><code>${esc(r.query || "-")}</code></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Action · Cache · Repeat</div><div class="fp-kv-val"><strong>${esc(r.action || "allow")}</strong> · cache: ${esc(r.cache_status || "-")} · count: ${Number(r.repeat_count) || 1}</div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">WAF / Suspicion</div><div class="fp-kv-val">rule: ${esc(r.waf_rule_id != null ? String(r.waf_rule_id) : "-")} · cat: ${esc(r.waf_category || "-")}<br/><span class="muted-sm">suspicion: ${esc(r.suspicion_score != null ? String(r.suspicion_score) : "-")} · JA3: ${esc(r.tls_ja3 || "-")}</span></div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">Client IP / HMAC</div><div class="fp-kv-val">${esc(r.raw_ip || "-")}<br/><code>${esc(r.ip_hmac || "-")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Client IP / HMAC</div><div class="fp-kv-val">${esc(r.raw_ip || "-")} ${r.client_country ? `<span class="pill info">${esc(r.client_country)}</span>` : ""}<br/><code>${esc(r.ip_hmac || "-")}</code></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Node · Service · Perf</div><div class="fp-kv-val">${esc(r.node_tag)} (${esc(r.role)}) → <code>${esc(r.service_tag)}</code><br/><span class="muted-sm">${(Number(r.latency_ms) || 0).toFixed(2)} ms · in ${formatBytes(r.bytes_in || 0)} · out ${formatBytes(r.bytes_out || 0)}</span></div></div>
             </div>
             <div style="margin-top:8px;"><strong>Referer:</strong> <code>${esc(r.referer || "-")}</code></div>
@@ -664,6 +769,9 @@ export function createAnalyticsViews({ api, store, navigate }) {
     if (logFilters.method !== "all") qs.set("method", logFilters.method);
     if (logFilters.status !== "all") qs.set("status", logFilters.status);
     if (logFilters.action !== "all") qs.set("action", logFilters.action);
+    if (logFilters.country && logFilters.country !== "all") qs.set("country", logFilters.country);
+    qs.set("offset", String(logFilters.offset || 0));
+    qs.set("limit", String(logFilters.limit || 50));
     const winSec = logFilters.window_secs > 0 ? logFilters.window_secs : Number(el("sel-time-window")?.value || 0);
     if (winSec > 0) qs.set("window_secs", String(winSec));
     logData = await api(`/api/logs${qs.toString() ? `?${qs}` : ""}`);
@@ -678,7 +786,9 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const sum = data.summary || {};
     const nodes = (data.available_nodes || []).slice().sort();
     const svcs = (data.available_services || []).slice().sort();
+    const countries = (data.available_countries || []).slice().sort();
     const items = data.items || [];
+    const totalMatched = Number(data.total_matched ?? items.length) || 0;
 
     root.innerHTML = `
       ${renderLoggingSubtabsBar()}
@@ -716,13 +826,17 @@ export function createAnalyticsViews({ api, store, navigate }) {
               <option value="all">${esc(t("ana.all_services"))}</option>
               ${svcs.map((s) => `<option value="${esc(s)}" ${fpFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
             </select>
+            <select id="fp-country-filter" class="select-sm">
+              <option value="all">${esc(t("logs.all_countries"))}</option>
+              ${countries.map((c) => `<option value="${esc(c)}" ${fpFilters.country === c ? "selected" : ""}>${esc(c)}</option>`).join("")}
+            </select>
           </div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-header">
-          <h3>Visitor &amp; Fingerprint Directory (${items.length})</h3>
+          <h3>Visitor &amp; Fingerprint Directory (${totalMatched})</h3>
           <span class="muted-sm">Click any row for TLS, UA, WebRTC leak &amp; JS signals</span>
         </div>
         <div class="table-scroll" style="max-height:540px;">
@@ -760,9 +874,12 @@ export function createAnalyticsViews({ api, store, navigate }) {
                     const ja3Line = obs.tls_ja3
                       ? `<div class="muted-sm">JA3: <span class="fp-code">${esc(obs.tls_ja3.slice(0, 12))}</span>${obs.tls_grease ? " · GREASE" : ""}</div>`
                       : "";
+                    const geoBadge = obs.geo_country
+                      ? `<span class="pill info">${esc(obs.geo_country)}${obs.geo_continent ? ` · ${esc(obs.geo_continent)}` : ""}</span>`
+                      : "";
                     return `
                   <tr class="fp-table-row" data-fp-idx="${idx}">
-                    <td><div><strong>${esc(ipPrimary)}</strong></div><div class="muted-sm"><span class="fp-code">${esc(obs.ip_hmac)}</span></div></td>
+                    <td><div><strong>${esc(ipPrimary)}</strong> ${geoBadge}</div><div class="muted-sm"><span class="fp-code">${esc(obs.ip_hmac)}</span></div></td>
                     <td><div><span class="fp-code">${esc(obs.fp_hash)}</span> ${srcBadge}</div>${ja3Line}</td>
                     <td><div><strong>${esc(obs.browser_family || "-")}</strong> · ${esc(obs.os_family || "-")}</div><div class="muted-sm">${esc(obs.device_type || "-")}</div></td>
                     <td><span class="muted-sm">${esc(jsSum)}</span></td>
@@ -777,19 +894,22 @@ export function createAnalyticsViews({ api, store, navigate }) {
             </tbody>
           </table>
         </div>
+        ${renderPaginationBar("fp", { total: totalMatched, offset: fpFilters.offset, limit: fpFilters.limit })}
       </div>
     `;
 
     wireLoggingSubtabs(root);
+    wirePaginationBar("fp", fpFilters, totalMatched, refreshVisitors);
     const triggerSearch = () => {
       fpFilters.q = el("fp-search-q")?.value.trim() || "";
       fpFilters.ip = el("fp-search-ip")?.value.trim() || "";
       fpFilters.fp = el("fp-search-fp")?.value.trim() || "";
+      fpFilters.offset = 0;
       refreshVisitors();
     };
     el("btn-fp-search")?.addEventListener("click", triggerSearch);
     el("btn-fp-clear")?.addEventListener("click", () => {
-      fpFilters = { q: "", ip: "", fp: "", node: "all", service: "all", verified: "all", risk: "all" };
+      fpFilters = defaultFpFilters();
       refreshVisitors();
     });
     el("btn-fp-export")?.addEventListener("click", () => {
@@ -798,10 +918,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
     ["fp-search-q", "fp-search-ip", "fp-search-fp"].forEach((id) => {
       el(id)?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); triggerSearch(); } });
     });
-    el("fp-node-filter")?.addEventListener("change", (ev) => { fpFilters.node = ev.target.value; refreshVisitors(); });
-    el("fp-svc-filter")?.addEventListener("change", (ev) => { fpFilters.service = ev.target.value; refreshVisitors(); });
-    root.querySelectorAll("[data-fp-ver]").forEach((b) => b.addEventListener("click", () => { fpFilters.verified = b.dataset.fpVer; refreshVisitors(); }));
-    root.querySelectorAll("[data-fp-risk]").forEach((b) => b.addEventListener("click", () => { fpFilters.risk = b.dataset.fpRisk; refreshVisitors(); }));
+    el("fp-node-filter")?.addEventListener("change", (ev) => { fpFilters.node = ev.target.value; fpFilters.offset = 0; refreshVisitors(); });
+    el("fp-svc-filter")?.addEventListener("change", (ev) => { fpFilters.service = ev.target.value; fpFilters.offset = 0; refreshVisitors(); });
+    el("fp-country-filter")?.addEventListener("change", (ev) => { fpFilters.country = ev.target.value; fpFilters.offset = 0; refreshVisitors(); });
+    root.querySelectorAll("[data-fp-ver]").forEach((b) => b.addEventListener("click", () => { fpFilters.verified = b.dataset.fpVer; fpFilters.offset = 0; refreshVisitors(); }));
+    root.querySelectorAll("[data-fp-risk]").forEach((b) => b.addEventListener("click", () => { fpFilters.risk = b.dataset.fpRisk; fpFilters.offset = 0; refreshVisitors(); }));
     root.querySelectorAll("[data-fp-idx]").forEach((tr) => {
       tr.addEventListener("click", () => {
         const obs = items[Number(tr.dataset.fpIdx)];
@@ -840,7 +961,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             cls: "ghost",
             onClick: () => {
               loggingSubTab = "access";
-              logFilters = { q: "", ip: ipKey, host: "", node: "all", service: "all", role: "all", method: "all", status: "all", action: "all", window_secs: 0 };
+              logFilters = { ...defaultLogFilters(), ip: ipKey };
               refreshLogs();
             },
           });
@@ -852,7 +973,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           bodyHtml: `
             <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--accent);">${esc(t("fp.sec.server"))}</div>
             <div class="fp-detail-grid">
-              <div class="fp-kv"><div class="fp-kv-lbl">IP / HMAC</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")}<br/><code>${esc(obs.ip_hmac)}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">IP / GeoIP / HMAC</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")} ${obs.geo_country ? `<span class="pill info">${esc(obs.geo_country)}${obs.geo_continent ? ` · ${esc(obs.geo_continent)}` : ""}</span>` : ""}<br/><code>${esc(obs.ip_hmac)}</code></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Route / Host</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}<br/><span class="muted-sm">${esc(obs.host || "-")}</span></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.server_score"))}</div><div class="fp-kv-val"><strong>${Number(obs.suspicion_score) || 0}/100</strong> · bot:${obs.is_bot ? "yes" : "no"} · headless:${obs.is_headless ? "yes" : "no"}</div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.tls_ja3"))}</div><div class="fp-kv-val"><code>${esc(obs.tls_ja3 || "-")}</code><br/><span class="muted-sm">ciphers: ${Number(obs.tls_cipher_count) || 0} · GREASE: ${obs.tls_grease ? "yes" : "no"}</span></div></div>
@@ -888,8 +1009,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
     if (fpFilters.fp) qs.set("fp", fpFilters.fp);
     if (fpFilters.node !== "all") qs.set("node", fpFilters.node);
     if (fpFilters.service !== "all") qs.set("service", fpFilters.service);
+    if (fpFilters.country && fpFilters.country !== "all") qs.set("country", fpFilters.country);
     if (fpFilters.verified !== "all") qs.set("verified", fpFilters.verified);
     if (fpFilters.risk !== "all") qs.set("risk", fpFilters.risk);
+    qs.set("offset", String(fpFilters.offset || 0));
+    qs.set("limit", String(fpFilters.limit || 50));
     const winSec = Number(el("sel-time-window")?.value || 0);
     if (winSec > 0) qs.set("window_secs", String(winSec));
     fpData = await api(`/api/fingerprints${qs.toString() ? `?${qs}` : ""}`);
@@ -907,16 +1031,16 @@ export function createAnalyticsViews({ api, store, navigate }) {
       loggingSubTab = opts.subTab;
     }
     if (opts?.service) {
-      if (loggingSubTab === "visitors") fpFilters.service = opts.service;
-      else logFilters.service = opts.service;
+      if (loggingSubTab === "visitors") { fpFilters.service = opts.service; fpFilters.offset = 0; }
+      else { logFilters.service = opts.service; logFilters.offset = 0; }
     }
     if (opts?.ip) {
-      if (loggingSubTab === "visitors") fpFilters.ip = opts.ip;
-      else logFilters.ip = opts.ip;
+      if (loggingSubTab === "visitors") { fpFilters.ip = opts.ip; fpFilters.offset = 0; }
+      else { logFilters.ip = opts.ip; logFilters.offset = 0; }
     }
     if (opts?.q) {
-      if (loggingSubTab === "visitors") fpFilters.q = opts.q;
-      else logFilters.q = opts.q;
+      if (loggingSubTab === "visitors") { fpFilters.q = opts.q; fpFilters.offset = 0; }
+      else { logFilters.q = opts.q; logFilters.offset = 0; }
     }
     if (loggingSubTab === "visitors") return refreshVisitors();
     return refreshLogs();

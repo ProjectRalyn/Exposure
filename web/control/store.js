@@ -39,16 +39,90 @@ export const WAF_CATEGORIES = [
   "buffer-overflow",
 ];
 
+export const GEO_RULE_ACTIONS = ["allow", "off", "monitor", "challenge", "block", "evilpot"];
+
+export function defaultGeoIpConfig() {
+  return {
+    enabled: true,
+    auto_update: true,
+    update_interval_hours: 168,
+    ipv4_url: null,
+    ipv6_url: null,
+    cache_dir: null,
+  };
+}
+
+export function normalizeGeoIpConfig(raw) {
+  const b = defaultGeoIpConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const hours = Number(s.update_interval_hours ?? b.update_interval_hours);
+  const strOrNull = (v) => {
+    const t = v != null ? String(v).trim() : "";
+    return t ? t : null;
+  };
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    auto_update: Boolean(s.auto_update ?? b.auto_update),
+    update_interval_hours: Number.isFinite(hours)
+      ? Math.min(720, Math.max(6, Math.round(hours)))
+      : b.update_interval_hours,
+    ipv4_url: strOrNull(s.ipv4_url),
+    ipv6_url: strOrNull(s.ipv6_url),
+    cache_dir: strOrNull(s.cache_dir),
+  };
+}
+
+export function defaultGeoPolicyConfig() {
+  return {
+    enabled: false,
+    allow_regions: [],
+    deny_regions: [],
+    deny_action: "block",
+    default_action: "allow",
+    unknown_action: "off",
+    rules: [],
+  };
+}
+
+export function normalizeGeoPolicyConfig(raw) {
+  const b = defaultGeoPolicyConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const normAction = (a, fb) => (GEO_RULE_ACTIONS.includes(a) ? a : fb);
+  const normRegions = (arr) =>
+    Array.isArray(arr)
+      ? [...new Set(arr.map((x) => String(x).trim().toUpperCase()).filter(Boolean))]
+      : [];
+  const rules = Array.isArray(s.rules)
+    ? s.rules.map((r) => {
+        const boost = Number(r?.suspicion_boost ?? 0);
+        const noteStr = r?.note != null ? String(r.note).trim() : "";
+        return {
+          regions: normRegions(r?.regions),
+          action: normAction(r?.action, "allow"),
+          suspicion_boost: Number.isFinite(boost) ? Math.min(100, Math.max(-50, Math.round(boost))) : 0,
+          note: noteStr || null,
+        };
+      })
+    : [];
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    allow_regions: normRegions(s.allow_regions),
+    deny_regions: normRegions(s.deny_regions),
+    deny_action: normAction(s.deny_action, b.deny_action),
+    default_action: normAction(s.default_action, b.default_action),
+    unknown_action: normAction(s.unknown_action, b.unknown_action),
+    rules,
+  };
+}
+
 export function defaultWafConfig() {
   return {
     mode: "off",
-    min_confidence: 0.65,
     categories: [],
     inspect_headers: true,
     inspect_body: true,
     max_body_bytes: 32 * 1024,
     exempt_paths: [],
-    crs_enabled: true,
     crs_paranoia_level: 1,
     disabled_rule_ids: [],
   };
@@ -166,10 +240,8 @@ export function normalizeWafConfig(raw) {
     s.mode === "block" || s.mode === "monitor" || s.mode === "evilpot" || s.mode === "off"
       ? s.mode
       : b.mode;
-  const conf = Number(s.min_confidence ?? b.min_confidence);
   return {
     mode,
-    min_confidence: Number.isFinite(conf) ? Math.min(1, Math.max(0.1, Math.round(conf * 100) / 100)) : b.min_confidence,
     categories: Array.isArray(s.categories)
       ? s.categories.map(String).filter((c) => WAF_CATEGORIES.includes(c))
       : [],
@@ -177,7 +249,6 @@ export function normalizeWafConfig(raw) {
     inspect_body: Boolean(s.inspect_body ?? b.inspect_body),
     max_body_bytes: Math.min(256 * 1024, Math.max(0, Number(s.max_body_bytes ?? b.max_body_bytes) || b.max_body_bytes)),
     exempt_paths: Array.isArray(s.exempt_paths) ? s.exempt_paths.map((x) => String(x).trim()).filter(Boolean) : [],
-    crs_enabled: Boolean(s.crs_enabled ?? b.crs_enabled),
     crs_paranoia_level: Math.min(4, Math.max(1, Number(s.crs_paranoia_level ?? b.crs_paranoia_level) || b.crs_paranoia_level)),
     disabled_rule_ids: Array.isArray(s.disabled_rule_ids)
       ? [...new Set(s.disabled_rule_ids.map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0))]
@@ -280,6 +351,9 @@ export function defaultTopologyDefaults() {
       clearance_secret: "",
       cert_store_dir: null,
       default_guard: null,
+      default_bucket: null,
+      default_antibot: null,
+      default_waf: null,
       intercept_errors: false,
       js_fp_beacon: true,
       js_fp_ttl_secs: 3600,
@@ -288,6 +362,7 @@ export function defaultTopologyDefaults() {
       auto_ban: defaultAutoBanConfig(),
       abuseipdb: defaultAbuseIpDbConfig(),
       crs: defaultCrsUpdateConfig(),
+      geoip: defaultGeoIpConfig(),
     },
     guard: {
       antibot: "challenge",
@@ -328,17 +403,16 @@ export function defaultTopologyDefaults() {
   };
 }
 
-export function defaultGuardProfile(defs = null) {
+export function defaultAntibotProfile(defs = null) {
   const gd = defs || defaultTopologyDefaults().guard;
   return {
     antibot: gd.antibot || "challenge",
-    rate_limit_bucket: null,
     allow_cidrs: [],
     deny_cidrs: [],
-    challenge_threshold: gd.challenge_threshold ?? 50,
-    reject_threshold: gd.reject_threshold ?? 85,
-    pow_difficulty: gd.pow_difficulty ?? 16,
-    clearance_ttl_secs: gd.clearance_ttl_secs ?? 1800,
+    challenge_threshold: gd.challenge_threshold ?? 35,
+    reject_threshold: gd.reject_threshold ?? 80,
+    pow_difficulty: gd.pow_difficulty ?? 18,
+    clearance_ttl_secs: gd.clearance_ttl_secs ?? 3600,
     bind_ua: null,
     bind_ip_prefix: null,
     api_bypass_headers: [],
@@ -348,21 +422,20 @@ export function defaultGuardProfile(defs = null) {
     require_client_fp: null,
     js_fp_beacon: null,
     js_fp_ttl_secs: null,
-    waf: null,
+    geo: null,
   };
 }
 
-export function normalizeGuardProfile(g) {
-  const src = g && typeof g === "object" ? g : {};
+export function normalizeAntibotProfile(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
   return {
     antibot: src.antibot || "off",
-    rate_limit_bucket: src.rate_limit_bucket || null,
     allow_cidrs: Array.isArray(src.allow_cidrs) ? src.allow_cidrs : [],
     deny_cidrs: Array.isArray(src.deny_cidrs) ? src.deny_cidrs : [],
-    challenge_threshold: src.challenge_threshold ?? 50,
-    reject_threshold: src.reject_threshold ?? 85,
-    pow_difficulty: src.pow_difficulty ?? 16,
-    clearance_ttl_secs: src.clearance_ttl_secs ?? 1800,
+    challenge_threshold: src.challenge_threshold ?? 35,
+    reject_threshold: src.reject_threshold ?? 80,
+    pow_difficulty: src.pow_difficulty ?? 18,
+    clearance_ttl_secs: src.clearance_ttl_secs ?? 3600,
     bind_ua: normalizeTri(src.bind_ua),
     bind_ip_prefix: normalizeTri(src.bind_ip_prefix),
     api_bypass_headers: Array.isArray(src.api_bypass_headers) ? src.api_bypass_headers : [],
@@ -372,6 +445,23 @@ export function normalizeGuardProfile(g) {
     require_client_fp: normalizeTri(src.require_client_fp),
     js_fp_beacon: normalizeTri(src.js_fp_beacon),
     js_fp_ttl_secs: src.js_fp_ttl_secs != null && src.js_fp_ttl_secs !== "" ? Number(src.js_fp_ttl_secs) : null,
+    geo: src.geo && typeof src.geo === "object" ? normalizeGeoPolicyConfig(src.geo) : null,
+  };
+}
+
+export function defaultGuardProfile(defs = null) {
+  return {
+    ...defaultAntibotProfile(defs),
+    rate_limit_bucket: null,
+    waf: null,
+  };
+}
+
+export function normalizeGuardProfile(g) {
+  const src = g && typeof g === "object" ? g : {};
+  return {
+    ...normalizeAntibotProfile(src),
+    rate_limit_bucket: src.rate_limit_bucket || null,
     waf: src.waf && typeof src.waf === "object" ? normalizeWafConfig(src.waf) : null,
   };
 }
@@ -409,6 +499,9 @@ export function defaultServiceSpec(egressNode = "") {
     source_cidrs: [],
     ingress: { mode: "all", nodes: [], overrides: {} },
     guard: null,
+    bucket: null,
+    antibot: null,
+    waf: null,
     intercept_errors: null,
     js_fp_beacon: null,
     cache: null,
@@ -436,6 +529,9 @@ export function normalizeServiceSpec(raw) {
   for (const [k, ov] of Object.entries(rawOverrides)) {
     overrides[k] = {
       guard: ov?.guard || null,
+      bucket: ov?.bucket || null,
+      antibot: ov?.antibot || null,
+      waf: ov?.waf || null,
       source_cidrs: Array.isArray(ov?.source_cidrs) ? ov.source_cidrs.map(String).filter(Boolean) : [],
       intercept_errors: normalizeTri(ov?.intercept_errors),
       js_fp_beacon: normalizeTri(ov?.js_fp_beacon),
@@ -457,6 +553,9 @@ export function normalizeServiceSpec(raw) {
       overrides,
     },
     guard: src.guard || null,
+    bucket: src.bucket || null,
+    antibot: src.antibot || null,
+    waf: src.waf || null,
     intercept_errors: normalizeTri(src.intercept_errors),
     js_fp_beacon: normalizeTri(src.js_fp_beacon),
     cache: normalizeRuleCacheConfig(src.cache),
@@ -496,13 +595,20 @@ export function defaultNodeSpec() {
       listeners: [],
       rules: [],
       guards: {},
+      antibot_sets: {},
+      waf_sets: {},
       rate_limit_buckets: {},
       tls_certs: [],
       clearance_secret: "",
       cert_store_dir: null,
+      default_guard: null,
+      default_bucket: null,
+      default_antibot: null,
+      default_waf: null,
       server_header: "",
       js_fp_beacon: null,
       js_fp_ttl_secs: null,
+      geoip: null,
       pages: { error_html: null, challenge_html: null, challenge_css: null },
     },
     egress: { services: {}, pages: { error_html: null, challenge_html: null, challenge_css: null } },
@@ -546,11 +652,19 @@ export function normalizeNode(n) {
   }
   out.ingress = { ...base.ingress, ...(n?.ingress || {}) };
   out.ingress.clearance_secret = n?.ingress?.clearance_secret || "";
+  out.ingress.default_guard = n?.ingress?.default_guard || null;
+  out.ingress.default_bucket = n?.ingress?.default_bucket || null;
+  out.ingress.default_antibot = n?.ingress?.default_antibot || null;
+  out.ingress.default_waf = n?.ingress?.default_waf || null;
   out.ingress.server_header = n?.ingress?.server_header ?? "";
   out.ingress.js_fp_beacon = normalizeTri(n?.ingress?.js_fp_beacon);
   out.ingress.js_fp_ttl_secs =
     n?.ingress?.js_fp_ttl_secs != null && n?.ingress?.js_fp_ttl_secs !== ""
       ? Number(n.ingress.js_fp_ttl_secs)
+      : null;
+  out.ingress.geoip =
+    n?.ingress?.geoip && typeof n.ingress.geoip === "object"
+      ? normalizeGeoIpConfig(n.ingress.geoip)
       : null;
   out.ingress.listeners = Array.isArray(out.ingress.listeners)
     ? out.ingress.listeners.map((l) => ({
@@ -566,6 +680,9 @@ export function normalizeNode(n) {
         service_tag: r.service_tag || "",
         next_peer: r.next_peer || "",
         guard: r.guard || null,
+        bucket: r.bucket || null,
+        antibot: r.antibot || null,
+        waf: r.waf || null,
         intercept_errors: normalizeTri(r.intercept_errors),
         js_fp_beacon: normalizeTri(r.js_fp_beacon),
       }))
@@ -573,6 +690,12 @@ export function normalizeNode(n) {
   const rawGuards = sanitizeRecord(out.ingress.guards);
   out.ingress.guards = {};
   for (const [k, v] of Object.entries(rawGuards)) out.ingress.guards[k] = normalizeGuardProfile(v);
+  const rawAntibots = sanitizeRecord(out.ingress.antibot_sets);
+  out.ingress.antibot_sets = {};
+  for (const [k, v] of Object.entries(rawAntibots)) out.ingress.antibot_sets[k] = normalizeAntibotProfile(v);
+  const rawWafs = sanitizeRecord(out.ingress.waf_sets);
+  out.ingress.waf_sets = {};
+  for (const [k, v] of Object.entries(rawWafs)) out.ingress.waf_sets[k] = normalizeWafConfig(v);
   const rawBuckets = sanitizeRecord(out.ingress.rate_limit_buckets);
   out.ingress.rate_limit_buckets = {};
   for (const [k, v] of Object.entries(rawBuckets)) out.ingress.rate_limit_buckets[k] = normalizeBucket(v);
@@ -618,6 +741,9 @@ export function normalizeDefaults(raw) {
       ...(src.ingress || {}),
       cert_store_dir: src.ingress?.cert_store_dir || null,
       default_guard: src.ingress?.default_guard || null,
+      default_bucket: src.ingress?.default_bucket || null,
+      default_antibot: src.ingress?.default_antibot || null,
+      default_waf: src.ingress?.default_waf || null,
       intercept_errors: Boolean(src.ingress?.intercept_errors ?? base.ingress.intercept_errors),
       js_fp_beacon: Boolean(src.ingress?.js_fp_beacon ?? base.ingress.js_fp_beacon),
       js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
@@ -626,6 +752,7 @@ export function normalizeDefaults(raw) {
       auto_ban: normalizeAutoBanConfig(src.ingress?.auto_ban),
       abuseipdb: normalizeAbuseIpDbConfig(src.ingress?.abuseipdb),
       crs: normalizeCrsUpdateConfig(src.ingress?.crs),
+      geoip: normalizeGeoIpConfig(src.ingress?.geoip),
     },
     guard: {
       ...base.guard,
@@ -677,6 +804,16 @@ export function normalizeSpec(raw) {
   const bucket_templates = {};
   for (const [k, v] of Object.entries(rawBucketTpls)) {
     bucket_templates[k] = normalizeBucket(v);
+  }
+  const rawAntibotTpls = sanitizeRecord(raw?.antibot_templates);
+  const antibot_templates = {};
+  for (const [k, v] of Object.entries(rawAntibotTpls)) {
+    antibot_templates[k] = normalizeAntibotProfile(v);
+  }
+  const rawWafTpls = sanitizeRecord(raw?.waf_templates);
+  const waf_templates = {};
+  for (const [k, v] of Object.entries(rawWafTpls)) {
+    waf_templates[k] = normalizeWafConfig(v);
   }
   const nodes = {};
   if (raw && raw.nodes && typeof raw.nodes === "object") {
@@ -747,6 +884,8 @@ export function normalizeSpec(raw) {
     defaults,
     guard_templates,
     bucket_templates,
+    antibot_templates,
+    waf_templates,
     dns_providers,
     domains,
     services,
@@ -964,8 +1103,10 @@ export function createControlStore({ api }) {
       compareMap("services", "Service", store.savedSpec.services, store.spec.services);
       compareMap("domains", "Domain", store.savedSpec.domains, store.spec.domains);
       compareMap("dns_providers", "DNS Provider", store.savedSpec.dns_providers, store.spec.dns_providers);
-      compareMap("guards", "Guard", store.savedSpec.guard_templates, store.spec.guard_templates);
-      compareMap("buckets", "Bucket", store.savedSpec.bucket_templates, store.spec.bucket_templates);
+      compareMap("guards", "Guard (Legacy)", store.savedSpec.guard_templates, store.spec.guard_templates);
+      compareMap("buckets", "Bucket Set", store.savedSpec.bucket_templates, store.spec.bucket_templates);
+      compareMap("antibot", "Antibot Set", store.savedSpec.antibot_templates, store.spec.antibot_templates);
+      compareMap("waf", "WAF Set", store.savedSpec.waf_templates, store.spec.waf_templates);
       compareMap("maintainers", "Maintainer Template", store.savedSpec.maintainer_templates, store.spec.maintainer_templates);
       if (JSON.stringify(store.savedSpec.links) !== JSON.stringify(store.spec.links)) {
         changes.push({

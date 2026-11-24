@@ -5,8 +5,8 @@ use crate::config::{NodeRoles, SignedConfigBundle};
 use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
 use crate::telemetry::{
-    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
-    LogProtectionStats, MinuteSummary, SessionSummary,
+    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, GeoIpStatusSnapshot,
+    LinkStatusSnapshot, LogProtectionStats, MinuteSummary, SessionSummary,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -302,6 +302,8 @@ pub struct NodeStatusSnapshot {
     pub alerts: Vec<AlertRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evilpot: Option<EvilpotNodeReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip: Option<GeoIpStatusSnapshot>,
     #[serde(default)]
     pub log_stats: LogProtectionStats,
 }
@@ -609,6 +611,57 @@ pub enum SpecialPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Control-signed command to immediately unban an IP, JS FP, composite FP, or clear all bans on an Ingress node.
+    UnbanReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        target_node_tag: String,
+        ban_kind: String,
+        target: String,
+        control_signature: String,
+    },
+    UnbanResp {
+        request_id: String,
+        node_tag: String,
+        ok: bool,
+        removed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Control-signed command instructing an Ingress node to download/refresh free GeoIP CSV DBs immediately.
+    GeoIpSyncReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        target_node_tag: String,
+        force: bool,
+        control_signature: String,
+    },
+    GeoIpSyncResp {
+        request_id: String,
+        node_tag: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<GeoIpStatusSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    GeoIpLookupReq {
+        ip: String,
+    },
+    GeoIpLookupResp {
+        node_tag: String,
+        ip: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        country: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continent: Option<String>,
+        is_private: bool,
+        db_loaded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     ErrorReply {
         message: String,
     },
@@ -715,6 +768,42 @@ pub fn dns_manage_req_signing_bytes(
     out.extend_from_slice(&expires_at.to_be_bytes());
     push_len_prefixed(&mut out, maintainer_tag.as_bytes());
     push_len_prefixed(&mut out, &op_json);
+    out
+}
+
+pub fn unban_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    target_node_tag: &str,
+    ban_kind: &str,
+    target: &str,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(192);
+    out.extend_from_slice(b"exposure-unban-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, target_node_tag.as_bytes());
+    push_len_prefixed(&mut out, ban_kind.as_bytes());
+    push_len_prefixed(&mut out, target.as_bytes());
+    out
+}
+
+pub fn geoip_sync_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    target_node_tag: &str,
+    force: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(160);
+    out.extend_from_slice(b"exposure-geoip-sync-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, target_node_tag.as_bytes());
+    out.push(u8::from(force));
     out
 }
 

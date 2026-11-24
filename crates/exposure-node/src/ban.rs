@@ -587,6 +587,40 @@ impl AutoBanManager {
         }
     }
 
+    /// Manually unban an IP, JS fingerprint, composite TLS+UA fingerprint, or `"all"`.
+    /// Also resets accumulated offense points & escalation history for an unbanned IP so a
+    /// cleared legitimate user does not immediately inherit escalated TTLs.
+    pub fn unban(&self, kind: &str, target: &str) -> bool {
+        let t = target.trim();
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "ip" => {
+                let Ok(ip) = t.parse::<IpAddr>() else {
+                    return false;
+                };
+                let canon = canonical_ip(ip);
+                let removed_ban = self.banned_ips.remove(&canon).is_some();
+                let removed_off = self.offenses.remove(&canon).is_some();
+                self.escalation_history.remove(&canon);
+                removed_ban || removed_off
+            }
+            "js_fp" => !t.is_empty() && self.banned_js_fps.remove(t).is_some(),
+            "composite_fp" => !t.is_empty() && self.banned_composite_fps.remove(t).is_some(),
+            "all" => {
+                let had_any = !self.banned_ips.is_empty()
+                    || !self.banned_js_fps.is_empty()
+                    || !self.banned_composite_fps.is_empty()
+                    || !self.offenses.is_empty();
+                self.banned_ips.clear();
+                self.banned_js_fps.clear();
+                self.banned_composite_fps.clear();
+                self.offenses.clear();
+                self.escalation_history.clear();
+                had_any
+            }
+            _ => false,
+        }
+    }
+
     pub fn snapshot(&self) -> AutoBanSnapshot {
         let now = Instant::now();
         self.banned_ips.retain(|_, e| now < e.expires_at);
@@ -777,5 +811,59 @@ mod tests {
         });
         assert_eq!(o2.offense_level, 2);
         assert_eq!(o2.ban_ttl_secs, 600);
+    }
+
+    #[test]
+    fn unban_removes_ip_js_fp_composite_and_resets_escalation() {
+        let mgr = AutoBanManager::new(&AutoBanConfig {
+            enabled: true,
+            ban_ttl_secs: 300,
+            max_ban_ttl_secs: 2400,
+            confirm_hits: 2,
+            ban_fingerprints: true,
+            drop_at_tcp: true,
+        });
+        let ip: IpAddr = "198.51.100.44".parse().unwrap();
+        let o1 = mgr.record_offense(OffenseContext {
+            client_ip: ip,
+            tls_ja3: Some("ja3bad"),
+            user_agent: "BadBot/1.0",
+            js_fp_hash: Some("jsfpdeadbeef"),
+            kind: OffenseKind::VerifiedExploit,
+            reason: "rce",
+        });
+        assert!(o1.newly_banned_ip);
+        assert!(o1.newly_banned_js_fp);
+        assert!(o1.newly_banned_composite_fp);
+        assert!(mgr.is_ip_banned_for_tcp(ip));
+        assert!(mgr.unban("ip", "::ffff:198.51.100.44"));
+        assert!(!mgr.is_ip_banned_for_tcp(ip));
+
+        // Next offense starts back at level 1 (escalation history was reset)
+        let o2 = mgr.record_offense(OffenseContext {
+            client_ip: ip,
+            tls_ja3: None,
+            user_agent: "BadBot/1.0",
+            js_fp_hash: None,
+            kind: OffenseKind::VerifiedExploit,
+            reason: "rce-2",
+        });
+        assert_eq!(o2.offense_level, 1);
+
+        assert!(mgr.unban("js_fp", "jsfpdeadbeef"));
+        assert!(mgr
+            .check_request("198.51.100.99".parse().unwrap(), None, "Mozilla", Some("jsfpdeadbeef"))
+            .is_none());
+
+        let snap = mgr.snapshot();
+        let comp_target = snap
+            .active_bans
+            .iter()
+            .find(|b| b.kind == "composite_fp")
+            .map(|b| b.target.clone())
+            .expect("composite ban present");
+        assert!(mgr.unban("composite_fp", &comp_target));
+        assert!(mgr.unban("all", "*"));
+        assert_eq!(mgr.snapshot().active_bans.len(), 0);
     }
 }

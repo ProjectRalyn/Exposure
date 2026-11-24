@@ -67,6 +67,8 @@ pub struct FpServerExtras<'a> {
     pub abuse_country: Option<&'a str>,
     pub abuse_isp: Option<&'a str>,
     pub abuse_is_tor: bool,
+    pub geo_country: Option<&'a str>,
+    pub geo_continent: Option<&'a str>,
 }
 
 /// Rich HTTP request/security metadata recorded with each access log entry.
@@ -87,6 +89,7 @@ pub struct AccessLogMeta<'a> {
     pub waf_rule_id: Option<u32>,
     pub waf_category: Option<&'a str>,
     pub suspicion_score: Option<u8>,
+    pub client_country: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +591,13 @@ impl NodeLogger {
         self.dos_guard.stats()
     }
 
+    pub fn segment_dir(&self) -> PathBuf {
+        self.cfg
+            .try_read()
+            .map(|c| PathBuf::from(&c.segment.dir))
+            .unwrap_or_else(|_| PathBuf::from("./data/segments"))
+    }
+
     /// Rate-limited warning check preventing stdout log flooding under DDoS.
     /// Returns `Some(suppressed_since_last)` when logging is permitted, `None` when throttled.
     pub fn should_log_warn(&self, key: &str) -> Option<u64> {
@@ -750,6 +760,7 @@ impl NodeLogger {
             } else {
                 None
             },
+            client_country: meta.client_country.map(|s| sanitize_log_text(s, 8)),
             rate_limited,
             challenged,
             challenge_passed,
@@ -1092,6 +1103,8 @@ impl NodeLogger {
             abuse_country: extras.abuse_country.map(str::to_string),
             abuse_isp: extras.abuse_isp.map(str::to_string),
             abuse_is_tor: extras.abuse_is_tor,
+            geo_country: extras.geo_country.map(str::to_string),
+            geo_continent: extras.geo_continent.map(str::to_string),
             js_fp,
             first_seen_ts: now_ts,
             last_seen_ts: now_ts,

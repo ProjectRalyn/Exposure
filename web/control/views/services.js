@@ -273,7 +273,10 @@ export function createServicesView({ store, navigate }) {
                             : svc.ingress?.mode === "exclude"
                             ? t("svc.scope.exclude", { count: (svc.ingress?.nodes || []).length })
                             : t("svc.scope.all", { count: targetIngs.length });
-                        const effGuard = svc.guard || igDefs.default_guard || t("common.none");
+                        const effBucket = svc.bucket || igDefs.default_bucket || "";
+                        const effAntibot = svc.antibot || igDefs.default_antibot || "";
+                        const effWaf = svc.waf || igDefs.default_waf || "";
+                        const effGuard = svc.guard || igDefs.default_guard || "";
                         const hostPills = (svc.hosts || [])
                           .map((h) => {
                             const cov = findCertCoverage(h);
@@ -306,7 +309,11 @@ export function createServicesView({ store, navigate }) {
                         </td>
                         <td>
                           <div class="tag-list">
-                            <span class="pill">${esc(effGuard)}</span>
+                            ${effBucket ? `<span class="pill">B: ${esc(effBucket)}</span>` : ""}
+                            ${effAntibot ? `<span class="pill info">A: ${esc(effAntibot)}</span>` : ""}
+                            ${effWaf ? `<span class="pill warn">W: ${esc(effWaf)}</span>` : ""}
+                            ${!effBucket && !effAntibot && !effWaf && !effGuard ? `<span class="pill">${esc(t("common.none"))}</span>` : ""}
+                            ${effGuard ? `<span class="pill warn">guard: ${esc(effGuard)}</span>` : ""}
                             ${svc.auto_tls ? `<span class="pill ok">Auto-TLS</span>` : ""}
                             ${(svc.cache?.enabled ?? igDefs.cache?.enabled) ? `<span class="pill info">Cache</span>` : ""}
                           </div>
@@ -437,6 +444,9 @@ export function createServicesView({ store, navigate }) {
       .map(([k]) => k)
       .sort();
     const guardNames = Object.keys(store.spec.guard_templates || {});
+    const bucketNames = Object.keys(store.spec.bucket_templates || {}).sort();
+    const antibotNames = Object.keys(store.spec.antibot_templates || {}).sort();
+    const wafNames = Object.keys(store.spec.waf_templates || {}).sort();
     const defs = store.spec.defaults || defaultTopologyDefaults();
 
     // Work on a local working copy, apply cleanly on Save
@@ -485,19 +495,55 @@ export function createServicesView({ store, navigate }) {
       const overridesHtml = targetIngs
         .map((ig) => {
           const ov = draft.ingress.overrides?.[ig] || {};
-          const hasOv = Boolean(ov.guard || (ov.source_cidrs && ov.source_cidrs.length) || ov.intercept_errors != null || ov.js_fp_beacon != null);
+          const igSpec = store.spec.nodes?.[ig]?.ingress || {};
+          const igBuckets = [...new Set([...bucketNames, ...Object.keys(igSpec.rate_limit_buckets || {})])].sort();
+          const igAntibots = [...new Set([...antibotNames, ...Object.keys(igSpec.antibot_sets || {})])].sort();
+          const igWafs = [...new Set([...wafNames, ...Object.keys(igSpec.waf_sets || {})])].sort();
+          const hasOv = Boolean(
+            ov.bucket ||
+              ov.antibot ||
+              ov.waf ||
+              ov.guard ||
+              (ov.source_cidrs && ov.source_cidrs.length) ||
+              ov.intercept_errors != null ||
+              ov.js_fp_beacon != null
+          );
           return `
             <details class="subcard" ${hasOv ? "open" : ""}>
               <summary style="cursor:pointer;font-weight:600;font-size:12.5px;">
                 <code>${esc(ig)}</code> ${hasOv ? `<span class="pill warn">Overridden</span>` : `<span class="muted-sm">(inherits service defaults)</span>`}
               </summary>
               <div class="inspector-row" style="margin-top:8px;">
-                <label><span>Guard Override</span>
-                  <select data-sd-ov-guard="${esc(ig)}">
-                    <option value="">(Inherit service guard)</option>
-                    ${guardNames.map((g) => `<option value="${esc(g)}" ${ov.guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+                <label><span>Bucket Override</span>
+                  <select data-sd-ov-set="bucket" data-ig="${esc(ig)}">
+                    <option value="">(Inherit)</option>
+                    ${igBuckets.map((k) => `<option value="${esc(k)}" ${ov.bucket === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
                   </select>
                 </label>
+                <label><span>Antibot Override</span>
+                  <select data-sd-ov-set="antibot" data-ig="${esc(ig)}">
+                    <option value="">(Inherit)</option>
+                    ${igAntibots.map((k) => `<option value="${esc(k)}" ${ov.antibot === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+                  </select>
+                </label>
+                <label><span>WAF Override</span>
+                  <select data-sd-ov-set="waf" data-ig="${esc(ig)}">
+                    <option value="">(Inherit)</option>
+                    ${igWafs.map((k) => `<option value="${esc(k)}" ${ov.waf === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+                  </select>
+                </label>
+              </div>
+              <div class="inspector-row" style="margin-top:6px;">
+                ${
+                  ov.guard || guardNames.length
+                    ? `<label><span>Guard Override (Legacy)</span>
+                        <select data-sd-ov-guard="${esc(ig)}">
+                          <option value="">(Inherit service)</option>
+                          ${guardNames.map((g) => `<option value="${esc(g)}" ${ov.guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+                        </select>
+                      </label>`
+                    : ""
+                }
                 <label><span>Source CIDRs Override</span>
                   <input data-sd-ov-cidrs="${esc(ig)}" value="${esc((ov.source_cidrs || []).join(", "))}" placeholder="203.0.113.0/24" />
                 </label>
@@ -599,18 +645,42 @@ export function createServicesView({ store, navigate }) {
         <div class="step-card">
           <div class="step-card-head"><span>${esc(t("svc.step.routing"))}</span></div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.guard"))}</span>
-              <select id="sd-guard">
-                <option value="">(Default: ${esc(defs.ingress.default_guard || "none")})</option>
-                ${guardNames.map((g) => `<option value="${esc(g)}" ${draft.guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+            <label><span>${esc(t("svc.field.bucket_set"))}</span>
+              <select id="sd-bucket">
+                <option value="">(Default: ${esc(defs.ingress.default_bucket || "none")})</option>
+                ${bucketNames.map((b) => `<option value="${esc(b)}" ${draft.bucket === b ? "selected" : ""}>${esc(b)}</option>`).join("")}
               </select>
             </label>
+            <label><span>${esc(t("svc.field.antibot_set"))}</span>
+              <select id="sd-antibot">
+                <option value="">(Default: ${esc(defs.ingress.default_antibot || "none")})</option>
+                ${antibotNames.map((a) => `<option value="${esc(a)}" ${draft.antibot === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
+              </select>
+            </label>
+            <label><span>${esc(t("svc.field.waf_set"))}</span>
+              <select id="sd-waf">
+                <option value="">(Default: ${esc(defs.ingress.default_waf || "none")})</option>
+                ${wafNames.map((w) => `<option value="${esc(w)}" ${draft.waf === w ? "selected" : ""}>${esc(w)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+          <div class="inspector-row">
             <label><span>${esc(t("svc.field.routing_mode"))}</span>
               <select id="sd-route-mode">
                 <option value="auto" ${draft.routing.mode !== "pinned" ? "selected" : ""}>${esc(t("svc.field.routing_auto"))}</option>
                 <option value="pinned" ${draft.routing.mode === "pinned" ? "selected" : ""}>${esc(t("svc.field.routing_pinned"))}</option>
               </select>
             </label>
+            ${
+              draft.guard || guardNames.length
+                ? `<label><span>${esc(t("svc.field.guard"))} (Legacy)</span>
+                    <select id="sd-guard">
+                      <option value="">(None / Use modular sets)</option>
+                      ${guardNames.map((g) => `<option value="${esc(g)}" ${draft.guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+                    </select>
+                  </label>`
+                : ""
+            }
           </div>
           <div class="tri-stack">
             ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "auto_tls", label: t("svc.field.auto_tls"), sub: t("svc.field.auto_tls_sub"), val: draft.auto_tls })}
@@ -671,18 +741,25 @@ export function createServicesView({ store, navigate }) {
           renderDrawerContent();
         });
       });
+      const ensureOv = (ig) => {
+        if (!draft.ingress.overrides[ig]) {
+          draft.ingress.overrides[ig] = { guard: null, bucket: null, antibot: null, waf: null, source_cidrs: [], intercept_errors: null, js_fp_beacon: null };
+        }
+        return draft.ingress.overrides[ig];
+      };
+      drawer.body.querySelectorAll("[data-sd-ov-set]").forEach((sel) => {
+        sel.addEventListener("change", () => {
+          ensureOv(sel.dataset.ig)[sel.dataset.sdOvSet] = sel.value || null;
+        });
+      });
       drawer.body.querySelectorAll("[data-sd-ov-guard]").forEach((sel) => {
         sel.addEventListener("change", () => {
-          const ig = sel.dataset.sdOvGuard;
-          if (!draft.ingress.overrides[ig]) draft.ingress.overrides[ig] = { guard: null, source_cidrs: [], intercept_errors: null, js_fp_beacon: null };
-          draft.ingress.overrides[ig].guard = sel.value || null;
+          ensureOv(sel.dataset.sdOvGuard).guard = sel.value || null;
         });
       });
       drawer.body.querySelectorAll("[data-sd-ov-cidrs]").forEach((inp) => {
         inp.addEventListener("input", () => {
-          const ig = inp.dataset.sdOvCidrs;
-          if (!draft.ingress.overrides[ig]) draft.ingress.overrides[ig] = { guard: null, source_cidrs: [], intercept_errors: null, js_fp_beacon: null };
-          draft.ingress.overrides[ig].source_cidrs = inp.value.split(",").map((s) => s.trim()).filter(Boolean);
+          ensureOv(inp.dataset.sdOvCidrs).source_cidrs = inp.value.split(",").map((s) => s.trim()).filter(Boolean);
         });
       });
 
@@ -698,6 +775,9 @@ export function createServicesView({ store, navigate }) {
         if (f === "tls") renderDrawerContent();
       });
 
+      el("sd-bucket")?.addEventListener("change", (ev) => { draft.bucket = ev.target.value || null; });
+      el("sd-antibot")?.addEventListener("change", (ev) => { draft.antibot = ev.target.value || null; });
+      el("sd-waf")?.addEventListener("change", (ev) => { draft.waf = ev.target.value || null; });
       el("sd-guard")?.addEventListener("change", (ev) => { draft.guard = ev.target.value || null; });
       el("sd-route-mode")?.addEventListener("change", (ev) => {
         draft.routing.mode = ev.target.value;
@@ -746,7 +826,7 @@ export function createServicesView({ store, navigate }) {
         }
         // Prune empty per-ingress overrides
         for (const [k, ov] of Object.entries(draft.ingress.overrides)) {
-          if (!ov.guard && !(ov.source_cidrs || []).length && ov.intercept_errors == null && ov.js_fp_beacon == null) {
+          if (!ov.guard && !ov.bucket && !ov.antibot && !ov.waf && !(ov.source_cidrs || []).length && ov.intercept_errors == null && ov.js_fp_beacon == null) {
             delete draft.ingress.overrides[k];
           }
         }

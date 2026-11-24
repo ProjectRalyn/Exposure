@@ -108,6 +108,10 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/waf/rules", get(get_waf_rules))
         .route("/api/waf/crs/sync", post(sync_waf_crs))
         .route("/api/security/abuseipdb/test", post(test_abuseipdb_key))
+        .route("/api/security/unban", post(unban_security_target))
+        .route("/api/security/geoip/status", get(get_geoip_status))
+        .route("/api/security/geoip/sync", post(sync_geoip))
+        .route("/api/security/geoip/lookup", get(lookup_geoip))
         .route("/api/fingerprints", get(list_fingerprints))
         .route("/api/logs", get(list_logs))
         .route("/api/audit", get(list_audit))
@@ -370,6 +374,30 @@ fn restore_dns_provider_account(
     }
 }
 
+fn redact_api_bypass_headers(headers: &mut [String]) {
+    for h in headers {
+        if let Some((name, _)) = h.split_once(':') {
+            *h = format!("{}: {REDACTED_SECRET}", name.trim());
+        }
+    }
+}
+
+fn restore_api_bypass_headers(new_headers: &mut [String], old_headers: &[String]) {
+    for h in new_headers {
+        if let Some((name, val)) = h.split_once(':') {
+            if val.trim() == REDACTED_SECRET {
+                if let Some(old_h) = old_headers.iter().find(|oh| {
+                    oh.split_once(':')
+                        .map(|(on, _)| on.trim().eq_ignore_ascii_case(name.trim()))
+                        .unwrap_or(false)
+                }) {
+                    *h = old_h.clone();
+                }
+            }
+        }
+    }
+}
+
 /// Redact all sensitive fields in `TopologySpec` before returning to API callers.
 fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
     if !spec.defaults.ingress.clearance_secret.is_empty() {
@@ -379,11 +407,10 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
         spec.defaults.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
     }
     for g in spec.guard_templates.values_mut() {
-        for h in &mut g.api_bypass_headers {
-            if let Some((name, _)) = h.split_once(':') {
-                *h = format!("{}: {REDACTED_SECRET}", name.trim());
-            }
-        }
+        redact_api_bypass_headers(&mut g.api_bypass_headers);
+    }
+    for ab in spec.antibot_templates.values_mut() {
+        redact_api_bypass_headers(&mut ab.api_bypass_headers);
     }
     if let Some(ref mut gl) = spec.global_logger {
         if !gl.hmac_key.is_empty() {
@@ -398,11 +425,10 @@ fn redact_topology_spec(mut spec: TopologySpec) -> TopologySpec {
             node.ingress.abuseipdb.api_key = REDACTED_SECRET.into();
         }
         for g in node.ingress.guards.values_mut() {
-            for h in &mut g.api_bypass_headers {
-                if let Some((name, _)) = h.split_once(':') {
-                    *h = format!("{}: {REDACTED_SECRET}", name.trim());
-                }
-            }
+            redact_api_bypass_headers(&mut g.api_bypass_headers);
+        }
+        for ab in node.ingress.antibot_sets.values_mut() {
+            redact_api_bypass_headers(&mut ab.api_bypass_headers);
         }
     }
     for prov in spec.dns_providers.values_mut() {
@@ -434,19 +460,12 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
     }
     for (g_name, new_g) in &mut incoming.guard_templates {
         if let Some(old_g) = existing.guard_templates.get(g_name) {
-            for h in &mut new_g.api_bypass_headers {
-                if let Some((name, val)) = h.split_once(':') {
-                    if val.trim() == REDACTED_SECRET {
-                        if let Some(old_h) = old_g.api_bypass_headers.iter().find(|oh| {
-                            oh.split_once(':')
-                                .map(|(on, _)| on.trim().eq_ignore_ascii_case(name.trim()))
-                                .unwrap_or(false)
-                        }) {
-                            *h = old_h.clone();
-                        }
-                    }
-                }
-            }
+            restore_api_bypass_headers(&mut new_g.api_bypass_headers, &old_g.api_bypass_headers);
+        }
+    }
+    for (ab_name, new_ab) in &mut incoming.antibot_templates {
+        if let Some(old_ab) = existing.antibot_templates.get(ab_name) {
+            restore_api_bypass_headers(&mut new_ab.api_bypass_headers, &old_ab.api_bypass_headers);
         }
     }
     if let (Some(new_gl), Some(old_gl)) =
@@ -466,19 +485,18 @@ fn restore_redacted_secrets(mut incoming: TopologySpec, existing: &TopologySpec)
             }
             for (g_name, new_g) in &mut new_node.ingress.guards {
                 if let Some(old_g) = old_node.ingress.guards.get(g_name) {
-                    for h in &mut new_g.api_bypass_headers {
-                        if let Some((name, val)) = h.split_once(':') {
-                            if val.trim() == REDACTED_SECRET {
-                                if let Some(old_h) = old_g.api_bypass_headers.iter().find(|oh| {
-                                    oh.split_once(':')
-                                        .map(|(on, _)| on.trim().eq_ignore_ascii_case(name.trim()))
-                                        .unwrap_or(false)
-                                }) {
-                                    *h = old_h.clone();
-                                }
-                            }
-                        }
-                    }
+                    restore_api_bypass_headers(
+                        &mut new_g.api_bypass_headers,
+                        &old_g.api_bypass_headers,
+                    );
+                }
+            }
+            for (ab_name, new_ab) in &mut new_node.ingress.antibot_sets {
+                if let Some(old_ab) = old_node.ingress.antibot_sets.get(ab_name) {
+                    restore_api_bypass_headers(
+                        &mut new_ab.api_bypass_headers,
+                        &old_ab.api_bypass_headers,
+                    );
                 }
             }
         }
@@ -2055,6 +2073,24 @@ async fn get_telemetry(
     .into_response()
 }
 
+fn paginate_items<T>(
+    mut items: Vec<T>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> (Vec<T>, usize, usize, usize, bool) {
+    let total_matched = items.len();
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let offset = offset.unwrap_or(0);
+    let end = offset.saturating_add(limit).min(total_matched);
+    let has_more = end < total_matched;
+    let page = if offset >= total_matched {
+        Vec::new()
+    } else {
+        items.drain(offset..end).collect()
+    };
+    (page, total_matched, offset, limit, has_more)
+}
+
 #[derive(Deserialize, Default)]
 struct FingerprintQuery {
     #[serde(default)]
@@ -2067,6 +2103,8 @@ struct FingerprintQuery {
     node: Option<String>,
     #[serde(default)]
     service: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
     /// `"all" | "js" | "ua" | "beacon" | "pow"`
     #[serde(default)]
     verified: Option<String>,
@@ -2075,6 +2113,8 @@ struct FingerprintQuery {
     risk: Option<String>,
     #[serde(default)]
     window_secs: Option<i64>,
+    #[serde(default)]
+    offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -2124,6 +2164,7 @@ async fn list_fingerprints(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "all");
+    let country_f = clean_filter_opt(q.country.as_deref()).map(|s| s.to_ascii_uppercase());
     let verified_f = q
         .verified
         .as_deref()
@@ -2163,9 +2204,19 @@ async fn list_fingerprints(
     let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut available_services: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+    let mut available_countries: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for obs in &tel.fingerprints {
         available_nodes.insert(obs.node_tag.clone());
         available_services.insert(obs.service_tag.clone());
+        if let Some(cc) = obs
+            .geo_country
+            .as_deref()
+            .or(obs.abuse_country.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            available_countries.insert(cc.to_ascii_uppercase());
+        }
     }
 
     let mut matched = Vec::new();
@@ -2193,6 +2244,16 @@ async fn list_fingerprints(
         }
         if let Some(sf) = svc_f {
             if obs.service_tag != sf {
+                continue;
+            }
+        }
+        if let Some(ref cf) = country_f {
+            let obs_cc = obs
+                .geo_country
+                .as_deref()
+                .or(obs.abuse_country.as_deref())
+                .unwrap_or("");
+            if !obs_cc.eq_ignore_ascii_case(cf) {
                 continue;
             }
         }
@@ -2294,6 +2355,16 @@ async fn list_fingerprints(
                     .map(|v| v.to_ascii_lowercase().contains(qs))
                     .unwrap_or(false)
                 || obs
+                    .geo_country
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || obs
+                    .geo_continent
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || obs
                     .abuse_isp
                     .as_deref()
                     .map(|v| v.to_ascii_lowercase().contains(qs))
@@ -2366,15 +2437,17 @@ async fn list_fingerprints(
         matched.push(obs);
     }
 
-    let total_matched = matched.len();
-    let limit = q.limit.unwrap_or(150).clamp(1, 500);
-    matched.truncate(limit);
+    let (matched, total_matched, offset, limit, has_more) =
+        paginate_items(matched, q.offset, q.limit);
 
     let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
 
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
         "total_matched": total_matched,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
         "store_raw_ip_enabled": store_raw_ip_enabled,
         "summary": {
             "total_visitors": total_matched,
@@ -2393,6 +2466,7 @@ async fn list_fingerprints(
         "os_counts": os_counts,
         "available_nodes": available_nodes.into_iter().collect::<Vec<_>>(),
         "available_services": available_services.into_iter().collect::<Vec<_>>(),
+        "available_countries": available_countries.into_iter().collect::<Vec<_>>(),
         "items": matched,
     }))
     .into_response()
@@ -2420,7 +2494,11 @@ struct LogQuery {
     #[serde(default)]
     ip: Option<String>,
     #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
     window_secs: Option<i64>,
+    #[serde(default)]
+    offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -2455,6 +2533,7 @@ async fn list_logs(
     let status_f = clean_filter_opt(q.status.as_deref()).map(|s| s.to_ascii_lowercase());
     let host_f = clean_filter_opt(q.host.as_deref()).map(|s| s.to_ascii_lowercase());
     let ip_str = clean_filter_opt(q.ip.as_deref()).map(|s| s.to_ascii_lowercase());
+    let country_f = clean_filter_opt(q.country.as_deref()).map(|s| s.to_ascii_uppercase());
     let q_str = clean_filter_opt(q.q.as_deref()).map(|s| s.to_ascii_lowercase());
 
     let q_ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), q_str.as_deref());
@@ -2465,6 +2544,8 @@ async fn list_logs(
         std::collections::BTreeSet::new();
     let mut available_hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut available_actions: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut available_countries: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     for rec in &tel.recent_logs {
         available_nodes.insert(rec.node_tag.clone());
@@ -2477,6 +2558,11 @@ async fn list_logs(
         if let Some(ref a) = rec.action {
             if !a.is_empty() {
                 available_actions.insert(a.clone());
+            }
+        }
+        if let Some(ref cc) = rec.client_country {
+            if !cc.is_empty() {
+                available_countries.insert(cc.to_ascii_uppercase());
             }
         }
     }
@@ -2511,6 +2597,16 @@ async fn list_logs(
                 continue;
             }
         }
+        if let Some(ref cf) = country_f {
+            if !rec
+                .client_country
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case(cf))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
         if let Some(ref rf) = role_f {
             if !rec.role.eq_ignore_ascii_case(rf) {
                 continue;
@@ -2541,6 +2637,9 @@ async fn list_logs(
                             | "abuseipdb"
                             | "rate_limit"
                             | "challenge"
+                            | "geo_block"
+                            | "geo_challenge"
+                            | "geo_evilpot"
                     )
                 })
                 .unwrap_or(false)
@@ -2653,6 +2752,11 @@ async fn list_logs(
                     .as_deref()
                     .map(|v| v.to_ascii_lowercase().contains(qs))
                     .unwrap_or(false)
+                || rec
+                    .client_country
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
                 || rec.ip_hmac.to_ascii_lowercase().contains(qs)
                 || rec.service_tag.to_ascii_lowercase().contains(qs)
                 || rec.node_tag.to_ascii_lowercase().contains(qs);
@@ -2728,15 +2832,17 @@ async fn list_logs(
             .saturating_add(st.warn_suppressed);
     }
 
-    let total_matched = matched.len();
-    let limit = q.limit.unwrap_or(200).clamp(1, 500);
-    matched.truncate(limit);
+    let (matched, total_matched, offset, limit, has_more) =
+        paginate_items(matched, q.offset, q.limit);
 
     let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
 
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
         "total_matched": total_matched,
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
         "store_raw_ip_enabled": store_raw_ip_enabled,
         "summary": {
             "total_events": total_matched,
@@ -2757,6 +2863,7 @@ async fn list_logs(
         "available_services": available_services.into_iter().collect::<Vec<_>>(),
         "available_hosts": available_hosts.into_iter().collect::<Vec<_>>(),
         "available_actions": available_actions.into_iter().collect::<Vec<_>>(),
+        "available_countries": available_countries.into_iter().collect::<Vec<_>>(),
         "items": matched,
     }))
     .into_response()
@@ -2786,14 +2893,13 @@ async fn list_audit(State(state): State<ApiState>, headers: HeaderMap) -> Respon
     Json(serde_json::json!({ "logs": logs })).into_response()
 }
 
-/// `GET /api/waf/rules`: return both built-in `sigil-filter` engines and active OWASP CRS rules,
-/// along with CRS sync metadata and current cluster CRS configuration.
+/// `GET /api/waf/rules`: return active OWASP CRS ruleset metadata, rules, and cluster CRS configuration.
 async fn get_waf_rules(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Err(r) = verify_admin_auth(&state, &headers) {
         return r;
     }
     let crs_snap = state.client.active_crs_snapshot().await;
-    let builtin_rules = exposure_core::crs::builtin_sigil_rules();
+    let builtin_rules: Vec<exposure_core::crs::WafRuleDescriptor> = Vec::new();
     let crs_cfg = state
         .client
         .db()
@@ -2816,6 +2922,7 @@ async fn get_waf_rules(State(state): State<ApiState>, headers: HeaderMap) -> Res
         "crs_config": crs_cfg,
         "builtin_rules": builtin_rules,
         "crs_rules": crs_snap.rules,
+        "rules": crs_snap.rules,
     }))
     .into_response()
 }
@@ -2957,6 +3064,118 @@ async fn test_abuseipdb_key(
         "total_reports": d["totalReports"].as_u64().unwrap_or(0),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct UnbanTargetReq {
+    #[serde(alias = "ban_kind")]
+    kind: String,
+    target: String,
+    #[serde(default)]
+    node_tag: Option<String>,
+}
+
+/// `POST /api/security/unban`: remove an active ban on one or all ingress nodes and update cached telemetry.
+async fn unban_security_target(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<UnbanTargetReq>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let kind = req.kind.trim();
+    let target = req.target.trim();
+    let node_tag = req
+        .node_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    match state.client.unban_target(&actor, kind, target, node_tag).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
+/// `GET /api/security/geoip/status`: return per-ingress GeoIP database status and defaults.
+async fn get_geoip_status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let status = state.client.geoip_status().await;
+    Json(status).into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct SyncGeoIpReq {
+    #[serde(default)]
+    node_tag: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /api/security/geoip/sync`: ask one or all ingress nodes to pull/refresh their local GeoIP DB.
+async fn sync_geoip(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<SyncGeoIpReq>>,
+) -> Response {
+    let actor = match verify_admin_auth(&state, &headers) {
+        Ok(u) => u,
+        Err(r) => return r,
+    };
+    if let Err(r) = require_active_role(&state) {
+        return r;
+    }
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let node_tag = req
+        .node_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    match state
+        .client
+        .sync_geoip_nodes(&actor, node_tag, req.force)
+        .await
+    {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct LookupGeoIpQuery {
+    ip: String,
+    #[serde(default, alias = "node_tag")]
+    node: Option<String>,
+}
+
+/// `GET /api/security/geoip/lookup`: query an ingress node's local GeoIP database for an IP.
+async fn lookup_geoip(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<LookupGeoIpQuery>,
+) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let ip = q.ip.trim();
+    if ip.is_empty() {
+        return json_err(StatusCode::BAD_REQUEST, "ip query parameter is required");
+    }
+    let node = q
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
+    match state.client.lookup_geoip_on_node(ip, node).await {
+        Ok(val) => Json(val).into_response(),
+        Err(e) => json_err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
 }
 
 /// Serve Control Web Panel static files (returning JSON 404 for unknown `/api/*` paths).

@@ -458,7 +458,7 @@ impl GuardEngine {
         )
     }
 
-    /// Evaluate ONLY antibot / suspicion / PoW clearance policy (after CIDR, rate-limit, and WAF/Evilpot).
+    /// Evaluate ONLY antibot / suspicion / PoW clearance policy (after CIDR, rate-limit, GeoIP, and WAF/Evilpot).
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_antibot_only(
         &self,
@@ -470,6 +470,32 @@ impl GuardEngine {
         headers: &HeaderMap,
         tls_signal: Option<&ClientHelloSignal>,
         abuse_score: Option<u8>,
+    ) -> GuardDecision {
+        self.evaluate_antibot_only_with_boost(
+            profile,
+            clearance_secret,
+            client_ip,
+            host,
+            path_and_query,
+            headers,
+            tls_signal,
+            abuse_score,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_antibot_only_with_boost(
+        &self,
+        profile: &GuardProfile,
+        clearance_secret: &str,
+        client_ip: IpAddr,
+        host: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        tls_signal: Option<&ClientHelloSignal>,
+        abuse_score: Option<u8>,
+        score_boost: i16,
     ) -> GuardDecision {
         let client_ip = canonical_ip(client_ip);
 
@@ -535,12 +561,13 @@ impl GuardEngine {
         // Defaults to non-browser-safe mode (`browser_only = false`) so APIs/CLIs/SDKs behind Egress
         // are not blindly blocked; browser impersonators, offensive scanners, headless browsers, and
         // high AbuseIPDB IPs still score high.
-        let score = compute_server_suspicion_score_for_mode(
+        let base_score = compute_server_suspicion_score_for_mode(
             headers,
             tls_signal,
             abuse_score,
             profile.effective_browser_only(),
         );
+        let score = (i32::from(base_score) + i32::from(score_boost)).clamp(0, 100) as u8;
 
         if profile.reject_threshold > 0 && score >= profile.reject_threshold {
             return GuardDecision::Reject {
@@ -813,6 +840,20 @@ impl GuardEngine {
                 expires_at
             });
         inserted
+    }
+
+    /// Returns `true` if the client presents a valid, non-expired clearance cookie matching policy binding rules.
+    pub fn has_valid_clearance(
+        &self,
+        profile: &GuardProfile,
+        secret: &str,
+        host: &str,
+        client_ip: IpAddr,
+        headers: &HeaderMap,
+    ) -> bool {
+        self.valid_clearance_claims(profile, secret, host, canonical_ip(client_ip), headers)
+            .map(|claims| !profile.effective_require_client_fp() || claims.fp_hash.is_some())
+            .unwrap_or(false)
     }
 
     fn valid_clearance_claims(
@@ -1802,7 +1843,7 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
     }
 }
 
-fn url_encode(input: &str) -> String {
+pub(crate) fn url_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

@@ -583,12 +583,13 @@ impl Default for CrsUpdateConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WafConfig {
+    /// WAF evaluation mode (`off | monitor | block | evilpot`).
     #[serde(default)]
     pub mode: WafMode,
-    /// Minimum `sigil-filter` confidence score in `[0.1, 1.0]` to trigger an alert/block.
+    /// Legacy confidence field preserved for YAML backwards compatibility.
     #[serde(default = "default_waf_min_confidence")]
     pub min_confidence: f32,
-    /// Enabled attack categories; empty means all 12 built-in `sigil-filter` categories.
+    /// Enabled attack categories; empty means all OWASP CRS categories.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub categories: Vec<WafCategory>,
     /// Inspect HTTP headers (`User-Agent`, `Referer`, `Cookie`, `X-Original-URL`, `X-Rewrite-URL`, `Forwarded`, `X-Forwarded-*`).
@@ -603,13 +604,13 @@ pub struct WafConfig {
     /// URL path prefixes exempt from WAF inspection (e.g. `"/api/webhooks/"`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exempt_paths: Vec<String>,
-    /// Also evaluate synced OWASP Core Rule Set (CRS) rules alongside `sigil-filter` (default true).
+    /// Legacy toggle preserved for YAML backwards compatibility (OWASP CRS is always active when `mode != off`).
     #[serde(default = "default_true")]
     pub crs_enabled: bool,
-    /// OWASP CRS Paranoia Level for this guard (1..=4, default 1).
+    /// OWASP CRS Paranoia Level for this WAF set (1..=4, default 1).
     #[serde(default = "default_waf_paranoia_level")]
     pub crs_paranoia_level: u8,
-    /// Rule IDs disabled for this guard (in addition to global disabled IDs).
+    /// Rule IDs disabled for this WAF set (in addition to global disabled IDs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_rule_ids: Vec<u32>,
 }
@@ -653,6 +654,179 @@ pub struct RateLimitBucket {
 impl RateLimitBucket {
     pub fn effective_per_ip(&self) -> bool {
         self.per_ip.unwrap_or(true)
+    }
+}
+
+fn default_geoip_update_interval_hours() -> u64 {
+    168
+}
+
+/// Automatic free CC0 GeoIP database sync & local lookup configuration per Ingress node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeoIpConfig {
+    /// Enable local IP-to-country/continent GeoIP lookup & enforcement (default true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Periodically download free CC0 IPv4/IPv6 CSV databases in the background (default true).
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+    /// Refresh interval in hours (default 168h = 7 days, clamped 6..=720).
+    #[serde(default = "default_geoip_update_interval_hours")]
+    pub update_interval_hours: u64,
+    /// Optional custom HTTPS URL for IPv4 range/CIDR CSV (`None` = built-in free CC0 mirrors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4_url: Option<String>,
+    /// Optional custom HTTPS URL for IPv6 range/CIDR CSV (`None` = built-in free CC0 mirrors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_url: Option<String>,
+    /// Optional local directory for persisted binary cache `geoip.bin` (`None` = `<segment_dir>/geoip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_update: true,
+            update_interval_hours: default_geoip_update_interval_hours(),
+            ipv4_url: None,
+            ipv6_url: None,
+            cache_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GeoRuleAction {
+    #[default]
+    Allow,
+    Off,
+    Monitor,
+    Challenge,
+    Block,
+    Evilpot,
+}
+
+fn default_geo_deny_action() -> GeoRuleAction {
+    GeoRuleAction::Block
+}
+fn default_geo_unknown_action() -> GeoRuleAction {
+    GeoRuleAction::Off
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeoRule {
+    /// Region tokens (`"CN"`, `"US"`, `"CONTINENT:AS"`, `"*"`).
+    #[serde(default)]
+    pub regions: Vec<String>,
+    #[serde(default)]
+    pub action: GeoRuleAction,
+    /// Signed adjustment (-50..=100) added to the server suspicion score when this rule matches.
+    #[serde(default)]
+    pub suspicion_boost: i16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Per-policy GeoIP region-targeting ruleset attached to an `AntibotProfile` or `GuardProfile`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeoPolicyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit allowlist (when non-empty, regions NOT matching trigger `deny_action`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_regions: Vec<String>,
+    /// Explicit denylist triggering `deny_action`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_regions: Vec<String>,
+    #[serde(default = "default_geo_deny_action")]
+    pub deny_action: GeoRuleAction,
+    #[serde(default)]
+    pub default_action: GeoRuleAction,
+    /// Action when GeoIP DB is not loaded or IP is unallocated (defaults fail-open to `off`).
+    #[serde(default = "default_geo_unknown_action")]
+    pub unknown_action: GeoRuleAction,
+    /// Ordered per-region override rules evaluated first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<GeoRule>,
+}
+
+impl Default for GeoPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_regions: Vec::new(),
+            deny_regions: Vec::new(),
+            deny_action: GeoRuleAction::Block,
+            default_action: GeoRuleAction::Allow,
+            unknown_action: GeoRuleAction::Off,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// Reusable Antibot / Edge Access / GeoIP Region-Targeting policy set (decoupled from Buckets and WAF).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntibotProfile {
+    #[serde(default)]
+    pub antibot: AntibotMode,
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
+    #[serde(default = "default_challenge_threshold")]
+    pub challenge_threshold: u8,
+    #[serde(default = "default_reject_threshold")]
+    pub reject_threshold: u8,
+    #[serde(default = "default_pow_difficulty")]
+    pub pow_difficulty: u8,
+    #[serde(default = "default_clearance_ttl_secs")]
+    pub clearance_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_ua: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_ip_prefix: Option<bool>,
+    #[serde(default)]
+    pub api_bypass_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_bots: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_headless: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_client_fp: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_beacon: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub js_fp_ttl_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<GeoPolicyConfig>,
+}
+
+impl Default for AntibotProfile {
+    fn default() -> Self {
+        Self {
+            antibot: AntibotMode::Off,
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            challenge_threshold: default_challenge_threshold(),
+            reject_threshold: default_reject_threshold(),
+            pow_difficulty: default_pow_difficulty(),
+            clearance_ttl_secs: default_clearance_ttl_secs(),
+            bind_ua: None,
+            bind_ip_prefix: None,
+            api_bypass_headers: Vec::new(),
+            block_bots: None,
+            browser_only: None,
+            block_headless: None,
+            require_client_fp: None,
+            js_fp_beacon: None,
+            js_fp_ttl_secs: None,
+            geo: None,
+        }
     }
 }
 
@@ -703,9 +877,12 @@ pub struct GuardProfile {
     /// Cooldown TTL in seconds before re-collecting passive JS fingerprint from the same browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_ttl_secs: Option<u64>,
-    /// Optional lightweight WAF powered by `sigil-filter` (`None` inherits `GuardDefaults.waf`).
+    /// Optional OWASP CRS WAF configuration (`None` inherits `GuardDefaults.waf`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waf: Option<WafConfig>,
+    /// Optional GeoIP region-targeting policy (`None` = disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo: Option<GeoPolicyConfig>,
 }
 
 impl GuardProfile {
@@ -759,6 +936,7 @@ impl Default for GuardProfile {
             js_fp_beacon: None,
             js_fp_ttl_secs: None,
             waf: None,
+            geo: None,
         }
     }
 }
@@ -782,7 +960,7 @@ pub struct RuleMatch {
     pub sni: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IngressRule {
     #[serde(default)]
     pub name: Option<String>,
@@ -792,6 +970,12 @@ pub struct IngressRule {
     pub next_peer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antibot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intercept_errors: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -868,6 +1052,18 @@ pub struct IngressConfig {
     pub guards: BTreeMap<String, GuardProfile>,
     #[serde(default)]
     pub rate_limit_buckets: BTreeMap<String, RateLimitBucket>,
+    /// Per-Ingress reusable Antibot / Access / GeoIP profile sets (overrides/extends `antibot_templates`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub antibot_sets: BTreeMap<String, AntibotProfile>,
+    /// Per-Ingress reusable OWASP CRS WAF sets (overrides/extends `waf_templates`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub waf_sets: BTreeMap<String, WafConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_antibot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_waf: Option<String>,
     #[serde(default)]
     pub tls_certs: Vec<TlsCertEntry>,
     /// HMAC signing secret for Entry Guard challenges & clearance cookies (must be high-entropy random).
@@ -898,6 +1094,9 @@ pub struct IngressConfig {
     /// Optional AbuseIPDB IP reputation integration.
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
+    /// Free CC0 GeoIP auto-sync and local country/continent database config.
+    #[serde(default)]
+    pub geoip: GeoIpConfig,
     /// OWASP CRS global settings (auto-update, paranoia level, globally disabled rule IDs).
     #[serde(default)]
     pub crs: CrsUpdateConfig,
@@ -922,6 +1121,11 @@ impl Default for IngressConfig {
             rules: Vec::new(),
             guards: BTreeMap::new(),
             rate_limit_buckets: BTreeMap::new(),
+            antibot_sets: BTreeMap::new(),
+            waf_sets: BTreeMap::new(),
+            default_bucket: None,
+            default_antibot: None,
+            default_waf: None,
             tls_certs: Vec::new(),
             clearance_secret: String::new(),
             cert_store_dir: None,
@@ -933,6 +1137,7 @@ impl Default for IngressConfig {
             evilpot: EvilpotNodeConfig::default(),
             auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
+            geoip: GeoIpConfig::default(),
             crs: CrsUpdateConfig::default(),
             crs_rules: Vec::new(),
         }
@@ -1636,6 +1841,12 @@ pub struct IngressDefaults {
     pub cert_store_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_antibot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_waf: Option<String>,
     #[serde(default)]
     pub intercept_errors: bool,
     #[serde(default = "default_true")]
@@ -1651,6 +1862,8 @@ pub struct IngressDefaults {
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
     #[serde(default)]
+    pub geoip: GeoIpConfig,
+    #[serde(default)]
     pub crs: CrsUpdateConfig,
 }
 
@@ -1661,6 +1874,9 @@ impl Default for IngressDefaults {
             clearance_secret: String::new(),
             cert_store_dir: None,
             default_guard: None,
+            default_bucket: None,
+            default_antibot: None,
+            default_waf: None,
             intercept_errors: false,
             js_fp_beacon: true,
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
@@ -1668,6 +1884,7 @@ impl Default for IngressDefaults {
             evilpot: EvilpotNodeConfig::default(),
             auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
+            geoip: GeoIpConfig::default(),
             crs: CrsUpdateConfig::default(),
         }
     }
@@ -1811,6 +2028,12 @@ pub enum ServiceIngressMode {
 pub struct ServiceIngressOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antibot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1886,6 +2109,12 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antibot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intercept_errors: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_beacon: Option<bool>,
@@ -1912,6 +2141,9 @@ impl Default for ServiceSpec {
             source_cidrs: Vec::new(),
             ingress: ServiceIngressScope::default(),
             guard: None,
+            bucket: None,
+            antibot: None,
+            waf: None,
             intercept_errors: None,
             js_fp_beacon: None,
             cache: None,
@@ -1928,12 +2160,18 @@ impl Default for ServiceSpec {
 pub struct TopologySpec {
     #[serde(default)]
     pub defaults: TopologyDefaults,
-    /// Globally reusable Guard profile templates selectable on any Ingress node/rule or Service.
+    /// Globally reusable Guard profile templates selectable on any Ingress node/rule or Service (legacy unified).
     #[serde(default)]
     pub guard_templates: BTreeMap<String, GuardProfile>,
-    /// Globally reusable Rate-Limit bucket templates selectable by any Guard template or Ingress node.
+    /// Globally reusable Rate-Limit bucket templates selectable per Ingress, Service, or Guard.
     #[serde(default)]
     pub bucket_templates: BTreeMap<String, RateLimitBucket>,
+    /// Globally reusable Antibot / Access / GeoIP templates selectable per Ingress or Service.
+    #[serde(default)]
+    pub antibot_templates: BTreeMap<String, AntibotProfile>,
+    /// Globally reusable OWASP CRS WAF templates selectable per Ingress or Service.
+    #[serde(default)]
+    pub waf_templates: BTreeMap<String, WafConfig>,
     /// Separated DNS provider credentials (supports multiple accounts per provider).
     #[serde(default)]
     pub dns_providers: BTreeMap<String, DnsProviderAccountConfig>,

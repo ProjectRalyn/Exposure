@@ -94,7 +94,9 @@ export function createSystemView({ api, store }) {
     const seg = gl.segment || {};
     const prot = { ...defaultLogProtectionConfig(), ...(gl.protection || {}) };
     const guardNames = Object.keys(store.spec.guard_templates || {});
-    const bucketNames = Object.keys(store.spec.bucket_templates || {});
+    const bucketNames = Object.keys(store.spec.bucket_templates || {}).sort();
+    const antibotNames = Object.keys(store.spec.antibot_templates || {}).sort();
+    const wafNames = Object.keys(store.spec.waf_templates || {}).sort();
 
     container.innerHTML = `
       <div class="defaults-grid">
@@ -107,13 +109,37 @@ export function createSystemView({ api, store }) {
                 <option value="exposure" ${ig.server_header === "exposure" ? "selected" : ""}>exposure</option>
               </select>
             </label>
-            <label><span>Default Guard Template</span>
-              <select id="sd-ig-gd">
+            <label><span>Default Bucket Set</span>
+              <select id="sd-ig-dbk">
                 <option value="">(none)</option>
-                ${guardNames.map((g) => `<option value="${esc(g)}" ${ig.default_guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+                ${bucketNames.map((b) => `<option value="${esc(b)}" ${ig.default_bucket === b ? "selected" : ""}>${esc(b)}</option>`).join("")}
               </select>
             </label>
           </div>
+          <div class="inspector-row">
+            <label><span>Default Antibot Set</span>
+              <select id="sd-ig-dab">
+                <option value="">(none)</option>
+                ${antibotNames.map((a) => `<option value="${esc(a)}" ${ig.default_antibot === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
+              </select>
+            </label>
+            <label><span>Default WAF Set</span>
+              <select id="sd-ig-dwf">
+                <option value="">(none)</option>
+                ${wafNames.map((w) => `<option value="${esc(w)}" ${ig.default_waf === w ? "selected" : ""}>${esc(w)}</option>`).join("")}
+              </select>
+            </label>
+          </div>
+          ${
+            ig.default_guard
+              ? `<label><span>Legacy Default Guard</span>
+                  <select id="sd-ig-gd">
+                    <option value="">(none — use modular sets)</option>
+                    ${guardNames.map((g) => `<option value="${esc(g)}" ${ig.default_guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
+                  </select>
+                </label>`
+              : ""
+          }
           <div class="inspector-row">
             <label><span>Cert Store Dir</span><input id="sd-ig-cdir" value="${esc(ig.cert_store_dir || "")}" placeholder="./data/ingress-certs" /></label>
             <label><span>JS FP TTL (s)</span><input id="sd-ig-ttl" type="number" min="60" value="${ig.js_fp_ttl_secs ?? 3600}" /></label>
@@ -170,7 +196,6 @@ export function createSystemView({ api, store }) {
                   <option value="evilpot" ${dwaf.mode === "evilpot" ? "selected" : ""}>${esc(t("waf.mode.evilpot"))}</option>
                 </select>
               </label>
-              <label><span>${esc(t("waf.min_conf"))}</span><input id="sd-waf-conf" type="number" step="0.05" min="0.1" max="1" value="${dwaf.min_confidence ?? 0.65}" /></label>
               <label><span>${esc(t("waf.max_body_kb"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
               <label><span>${esc(t("waf.crs.paranoia"))}</span>
                 <select id="sd-waf-pl">
@@ -181,7 +206,6 @@ export function createSystemView({ api, store }) {
             <div class="tri-stack" style="margin-top:6px;">
               ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: dwaf.inspect_headers !== false })}
               ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("waf.inspect_body"), val: dwaf.inspect_body !== false })}
-              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "crs_enabled", label: t("waf.crs.enabled"), val: dwaf.crs_enabled !== false })}
             </div>
           </div>
         </div>
@@ -325,6 +349,9 @@ export function createSystemView({ api, store }) {
     `;
 
     el("sd-ig-srv")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.ingress.server_header = ev.target.value; }, false));
+    el("sd-ig-dbk")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.ingress.default_bucket = ev.target.value || null; }, false));
+    el("sd-ig-dab")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.ingress.default_antibot = ev.target.value || null; }, false));
+    el("sd-ig-dwf")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.ingress.default_waf = ev.target.value || null; }, false));
     el("sd-ig-gd")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.ingress.default_guard = ev.target.value || null; }, false));
     el("sd-ig-cdir")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.ingress.cert_store_dir = ev.target.value.trim() || null; }, false));
     el("sd-ig-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.ingress.js_fp_ttl_secs = parseNum(ev.target.value, 3600, 60); }, false));
@@ -348,7 +375,6 @@ export function createSystemView({ api, store }) {
       return s.defaults.guard.waf;
     };
     el("sd-waf-mode")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).mode = ev.target.value; }, false));
-    el("sd-waf-conf")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).min_confidence = parseNum(ev.target.value, 0.65, 0.1, 1.0); }, false));
     el("sd-waf-bodykb")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).max_body_bytes = parseNum(ev.target.value, 32, 0, 256) * 1024; }, false));
     el("sd-waf-pl")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).crs_paranoia_level = parseNum(ev.target.value, 1, 1, 4); }, false));
     wireBinSliders(container, "data-sd-waf-bin", (f, v) => store.mutate((s) => { ensureWaf(s)[f] = v; }, false));

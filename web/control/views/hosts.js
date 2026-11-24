@@ -450,6 +450,26 @@ export function createHostsView({ api, store, navigate }) {
                   <input id="hd-ig-fpttl" type="number" min="60" value="${node.ingress.js_fp_ttl_secs ?? ""}" placeholder="Default (${igDefs.js_fp_ttl_secs ?? 3600})" />
                 </label>
               </div>
+              <div class="inspector-row">
+                <label><span>Default Bucket Set</span>
+                  <select id="hd-ig-def-bucket">
+                    <option value="">(Inherit: ${esc(igDefs.default_bucket || "none")})</option>
+                    ${[...new Set([...Object.keys(store.spec.bucket_templates || {}), ...Object.keys(node.ingress.rate_limit_buckets || {})])].sort().map((k) => `<option value="${esc(k)}" ${node.ingress.default_bucket === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+                  </select>
+                </label>
+                <label><span>Default Antibot Set</span>
+                  <select id="hd-ig-def-antibot">
+                    <option value="">(Inherit: ${esc(igDefs.default_antibot || "none")})</option>
+                    ${[...new Set([...Object.keys(store.spec.antibot_templates || {}), ...Object.keys(node.ingress.antibot_sets || {})])].sort().map((k) => `<option value="${esc(k)}" ${node.ingress.default_antibot === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+                  </select>
+                </label>
+                <label><span>Default WAF Set</span>
+                  <select id="hd-ig-def-waf">
+                    <option value="">(Inherit: ${esc(igDefs.default_waf || "none")})</option>
+                    ${[...new Set([...Object.keys(store.spec.waf_templates || {}), ...Object.keys(node.ingress.waf_sets || {})])].sort().map((k) => `<option value="${esc(k)}" ${node.ingress.default_waf === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
+                  </select>
+                </label>
+              </div>
               ${renderTriSlider({
                 attrName: "data-hd-ig-tri",
                 attrVal: "js_fp_beacon",
@@ -621,6 +641,15 @@ export function createHostsView({ api, store, navigate }) {
       store.mutate((s) => {
         s.nodes[tag].ingress.js_fp_ttl_secs = ev.target.value.trim() ? parseNum(ev.target.value, 3600, 60) : null;
       }, false);
+    });
+    el("hd-ig-def-bucket")?.addEventListener("change", (ev) => {
+      store.mutate((s) => { s.nodes[tag].ingress.default_bucket = ev.target.value || null; }, false);
+    });
+    el("hd-ig-def-antibot")?.addEventListener("change", (ev) => {
+      store.mutate((s) => { s.nodes[tag].ingress.default_antibot = ev.target.value || null; }, false);
+    });
+    el("hd-ig-def-waf")?.addEventListener("change", (ev) => {
+      store.mutate((s) => { s.nodes[tag].ingress.default_waf = ev.target.value || null; }, false);
     });
     wireTriSliders(drawer.body, "data-hd-ig-tri", (field, val) => {
       store.mutate((s) => { s.nodes[tag].ingress[field] = val; }, false);
