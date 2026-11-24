@@ -734,6 +734,21 @@ pub struct ClientJsFingerprint {
     pub speech_voices: u16,
     #[serde(default)]
     pub tamper_flags: Vec<String>,
+    /// WebRTC ICE leak status: `"" | "unsupported" | "blocked" | "no_candidates" | "mdns_only" | "leaked"`.
+    #[serde(default)]
+    pub webrtc_status: String,
+    /// Public IPv4/IPv6 addresses (or masked `/24` `/48` subnets when `store_raw_ip: false`) discovered via WebRTC ICE.
+    #[serde(default)]
+    pub webrtc_public_ips: Vec<String>,
+    /// Private/LAN IP addresses exposed via WebRTC host ICE candidates.
+    #[serde(default)]
+    pub webrtc_local_ips: Vec<String>,
+    /// Whether mDNS `.local` host candidates were observed instead of raw LAN IPs.
+    #[serde(default)]
+    pub webrtc_mdns: bool,
+    /// Server-authoritative verdict: `true` iff public WebRTC ICE IP(s) do not match the observed client IP.
+    #[serde(default)]
+    pub webrtc_ip_mismatch: bool,
 }
 
 fn clean_fp_str(raw: &str, max_len: usize) -> String {
@@ -743,6 +758,46 @@ fn clean_fp_str(raw: &str, max_len: usize) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+fn format_public_ip_cidr(ip: std::net::IpAddr) -> String {
+    match crate::routing::canonical_ip(ip) {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+    }
+}
+
+fn normalize_webrtc_public_entry(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        let canon = crate::routing::canonical_ip(ip);
+        return crate::routing::is_public_routable_ip(canon).then(|| canon.to_string());
+    }
+    if let Some((addr_s, pref_s)) = s.split_once('/') {
+        let ip = addr_s.trim().parse::<std::net::IpAddr>().ok()?;
+        let canon = crate::routing::canonical_ip(ip);
+        if !crate::routing::is_public_routable_ip(canon) {
+            return None;
+        }
+        let valid_prefix = (canon.is_ipv4() && pref_s.trim() == "24")
+            || (canon.is_ipv6() && pref_s.trim() == "48");
+        if valid_prefix {
+            return Some(format_public_ip_cidr(canon));
+        }
+    }
+    None
+}
+
+fn push_unique_bounded(list: &mut Vec<String>, val: String, max_len: usize) {
+    if list.len() < max_len && !list.iter().any(|x| x == &val) {
+        list.push(val);
+    }
 }
 
 impl ClientJsFingerprint {
@@ -771,6 +826,66 @@ impl ClientJsFingerprint {
             .map(|f| clean_fp_str(f, 32))
             .filter(|f| !f.is_empty())
             .collect();
+        self.webrtc_status = match self.webrtc_status.trim() {
+            "unsupported" | "blocked" | "no_candidates" | "mdns_only" | "leaked" => {
+                self.webrtc_status.trim().to_string()
+            }
+            _ => String::new(),
+        };
+        let mut clean_pubs = Vec::new();
+        for raw in &self.webrtc_public_ips {
+            if let Some(norm) = normalize_webrtc_public_entry(raw) {
+                push_unique_bounded(&mut clean_pubs, norm, 4);
+            }
+        }
+        self.webrtc_public_ips = clean_pubs;
+        let mut clean_locals = Vec::new();
+        for raw in &self.webrtc_local_ips {
+            if let Ok(ip) = raw.trim().parse::<std::net::IpAddr>() {
+                let canon = crate::routing::canonical_ip(ip);
+                if !crate::routing::is_public_routable_ip(canon) {
+                    push_unique_bounded(&mut clean_locals, canon.to_string(), 4);
+                }
+            }
+        }
+        self.webrtc_local_ips = clean_locals;
+    }
+
+    /// Recomputes `webrtc_ip_mismatch` server-side from validated `webrtc_public_ips` against
+    /// the real TCP peer IP and records `webrtc_ip_leak` / `webrtc_lan_leak` advisory flags.
+    pub fn evaluate_webrtc_against_client_ip(&mut self, observed_ip: std::net::IpAddr) {
+        self.webrtc_ip_mismatch = false;
+        let canon_obs = crate::routing::canonical_ip(observed_ip);
+        if crate::routing::is_public_routable_ip(canon_obs) && !self.webrtc_public_ips.is_empty() {
+            let raw_pubs: Vec<std::net::IpAddr> = self
+                .webrtc_public_ips
+                .iter()
+                .filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(crate::routing::canonical_ip))
+                .collect();
+            if !raw_pubs.is_empty() && !raw_pubs.iter().any(|ip| *ip == canon_obs) {
+                self.webrtc_ip_mismatch = true;
+                push_unique_bounded(&mut self.tamper_flags, "webrtc_ip_leak".into(), 12);
+            }
+        }
+        if !self.webrtc_local_ips.is_empty() {
+            push_unique_bounded(&mut self.tamper_flags, "webrtc_lan_leak".into(), 12);
+        }
+    }
+
+    /// Masks raw public IPv4/IPv6 strings in `webrtc_public_ips` into `/24` / `/48` prefixes
+    /// when `store_raw_ip` is disabled.
+    pub fn mask_raw_ips(&mut self) {
+        let mut masked = Vec::new();
+        for entry in &self.webrtc_public_ips {
+            if let Some(norm) = normalize_webrtc_public_entry(entry) {
+                let cidr = norm
+                    .parse::<std::net::IpAddr>()
+                    .map(format_public_ip_cidr)
+                    .unwrap_or(norm);
+                push_unique_bounded(&mut masked, cidr, 4);
+            }
+        }
+        self.webrtc_public_ips = masked;
     }
 
     pub fn canonical_hash(&self) -> String {
@@ -1272,5 +1387,54 @@ mod tests {
         let parsed: SessionSummary = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(parsed.repeat_count, 1);
         assert!(parsed.path.is_none());
+    }
+
+    #[test]
+    fn webrtc_leak_detection_validates_ips_detects_mismatch_and_respects_privacy() {
+        let mut fp = ClientJsFingerprint {
+            webgl: "ANGLE (NVIDIA)".into(),
+            canvas_hash: "a1b2c3d4".into(),
+            screen: "1920x1080x24".into(),
+            webrtc_status: "leaked".into(),
+            webrtc_public_ips: vec![
+                "9.9.9.9".into(),
+                "127.0.0.1".into(), // private/loopback rejected from public list
+                "not-an-ip".into(), // junk rejected
+                "9.9.9.9".into(),   // duplicate collapsed
+            ],
+            webrtc_local_ips: vec![
+                "192.168.1.42".into(),
+                "8.8.8.8".into(), // public IP rejected from local list
+            ],
+            webrtc_ip_mismatch: true, // client-spoofed value must NOT be blindly trusted
+            ..Default::default()
+        };
+
+        fp.sanitize();
+        assert_eq!(fp.webrtc_public_ips, vec!["9.9.9.9"]);
+        assert_eq!(fp.webrtc_local_ips, vec!["192.168.1.42"]);
+
+        // Same public IP as HTTP peer -> spoofed webrtc_ip_mismatch is cleared
+        let base_hash = fp.canonical_hash();
+        fp.evaluate_webrtc_against_client_ip("9.9.9.9".parse().unwrap());
+        assert!(!fp.webrtc_ip_mismatch);
+        assert!(!fp.tamper_flags.iter().any(|f| f == "webrtc_ip_leak"));
+        assert!(fp.tamper_flags.iter().any(|f| f == "webrtc_lan_leak"));
+        // VPN/network leak never triggers false headless rejection
+        assert!(!fp.detect_headless("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0"));
+        // Canonical fingerprint hash stays invariant across network IPs
+        assert_eq!(fp.canonical_hash(), base_hash);
+
+        // HTTP peer differs from WebRTC public IP -> server marks webrtc_ip_mismatch
+        fp.evaluate_webrtc_against_client_ip("1.1.1.1".parse().unwrap());
+        assert!(fp.webrtc_ip_mismatch);
+        assert!(fp.tamper_flags.iter().any(|f| f == "webrtc_ip_leak"));
+
+        // Privacy masking for store_raw_ip = false preserves mismatch flag & masked /24 CIDR across re-sanitize
+        fp.mask_raw_ips();
+        assert_eq!(fp.webrtc_public_ips, vec!["9.9.9.0/24"]);
+        fp.sanitize();
+        assert_eq!(fp.webrtc_public_ips, vec!["9.9.9.0/24"]);
+        assert!(fp.webrtc_ip_mismatch);
     }
 }

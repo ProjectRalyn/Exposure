@@ -16,7 +16,7 @@ const CONFIG_TABS = new Set(["hosts", "services", "domains", "security", "topolo
 const VALID_TABS = new Set([
   "overview",
   "analytics",
-  "fingerprints",
+  "logging",
   "hosts",
   "services",
   "domains",
@@ -28,6 +28,8 @@ const LEGACY_TAB_MAP = {
   nodes: { tab: "hosts" },
   onboarding: { tab: "hosts", subTab: "onboarding" },
   observability: { tab: "analytics" },
+  fingerprints: { tab: "logging", subTab: "visitors" },
+  logs: { tab: "logging", subTab: "access" },
   audit: { tab: "system", subTab: "audit" },
 };
 
@@ -242,7 +244,7 @@ function renderActiveTabOnly() {
   else if (tab === "security") securityView.render();
   else if (tab === "topology") topologyView.render();
   else if (tab === "analytics") analyticsViews.renderAnalytics();
-  else if (tab === "fingerprints") analyticsViews.renderFingerprints();
+  else if (tab === "logging") analyticsViews.renderLogging();
   else if (tab === "system") systemView.render();
 }
 
@@ -273,8 +275,8 @@ async function refreshCurrentTab(opts = {}) {
     } else if (tab === "analytics") {
       const data = await analyticsViews.refreshAnalytics();
       if (data) updateTopbarTimestamp(data.last_pulled_at);
-    } else if (tab === "fingerprints") {
-      const data = await analyticsViews.refreshFingerprints();
+    } else if (tab === "logging") {
+      const data = await analyticsViews.refreshLogging(opts);
       if (data) updateTopbarTimestamp(data.last_pulled_at);
     } else if (tab === "system") {
       await systemView.refresh(opts);

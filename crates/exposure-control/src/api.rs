@@ -825,6 +825,10 @@ fn aggregate_summaries(
                 "requests": s.requests,
                 "errors": s.errors,
                 "rate_limited": s.rate_limited,
+                "challenges_issued": s.challenges_issued,
+                "challenges_passed": s.challenges_passed,
+                "bytes_in": s.bytes_in,
+                "bytes_out": s.bytes_out,
                 "uv_estimate": s.uv_estimate().round(),
                 "p50_ms": s.p50_ms(),
                 "p95_ms": s.p95_ms(),
@@ -848,6 +852,10 @@ fn aggregate_summaries(
                 "requests": s.requests,
                 "errors": s.errors,
                 "rate_limited": s.rate_limited,
+                "challenges_issued": s.challenges_issued,
+                "challenges_passed": s.challenges_passed,
+                "bytes_in": s.bytes_in,
+                "bytes_out": s.bytes_out,
                 "uv_estimate": s.uv_estimate().round(),
                 "p50_ms": s.p50_ms(),
                 "p95_ms": s.p95_ms(),
@@ -2168,6 +2176,8 @@ async fn list_fingerprints(
     let mut pow_count: usize = 0;
     let mut bot_count: usize = 0;
     let mut headless_count: usize = 0;
+    let mut webrtc_leak_count: usize = 0;
+    let mut webrtc_lan_leak_count: usize = 0;
     let mut device_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut browser_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut os_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
@@ -2196,6 +2206,15 @@ async fn list_fingerprints(
         match risk_f.as_str() {
             "bot" if !obs.is_bot => continue,
             "headless" if !obs.is_headless => continue,
+            "webrtc_leak"
+                if !obs
+                    .js_fp
+                    .as_ref()
+                    .map(|j| j.webrtc_ip_mismatch || !j.webrtc_local_ips.is_empty())
+                    .unwrap_or(false) =>
+            {
+                continue
+            }
             "suspicious" if obs.suspicion_score < 40 && !obs.is_bot && !obs.is_headless => continue,
             "clean" if obs.is_bot || obs.is_headless || obs.suspicion_score >= 40 => continue,
             _ => {}
@@ -2212,7 +2231,17 @@ async fn list_fingerprints(
                 .as_deref()
                 .map(|h| obs.ip_hmac.eq_ignore_ascii_case(h))
                 .unwrap_or(false);
-            if !(raw_match || prefix_match || hmac_sub_match || hmac_exact_match) {
+            let webrtc_match = obs
+                .js_fp
+                .as_ref()
+                .map(|j| {
+                    j.webrtc_public_ips
+                        .iter()
+                        .chain(j.webrtc_local_ips.iter())
+                        .any(|w| w.to_ascii_lowercase().contains(ipq))
+                })
+                .unwrap_or(false);
+            if !(raw_match || prefix_match || hmac_sub_match || hmac_exact_match || webrtc_match) {
                 continue;
             }
         }
@@ -2289,6 +2318,11 @@ async fn list_fingerprints(
                             || j.platform.to_ascii_lowercase().contains(qs)
                             || j.tz.to_ascii_lowercase().contains(qs)
                             || j.screen.to_ascii_lowercase().contains(qs)
+                            || j.webrtc_status.to_ascii_lowercase().contains(qs)
+                            || j.webrtc_public_ips
+                                .iter()
+                                .chain(j.webrtc_local_ips.iter())
+                                .any(|w| w.to_ascii_lowercase().contains(qs))
                     })
                     .unwrap_or(false);
             if !hit {
@@ -2311,6 +2345,14 @@ async fn list_fingerprints(
         }
         if obs.is_headless {
             headless_count += 1;
+        }
+        if let Some(ref js) = obs.js_fp {
+            if js.webrtc_ip_mismatch {
+                webrtc_leak_count += 1;
+            }
+            if !js.webrtc_local_ips.is_empty() {
+                webrtc_lan_leak_count += 1;
+            }
         }
         if !obs.device_type.is_empty() {
             *device_counts.entry(obs.device_type.clone()).or_insert(0) += 1;
@@ -2343,6 +2385,8 @@ async fn list_fingerprints(
             "pow_count": pow_count,
             "bots": bot_count,
             "headless": headless_count,
+            "webrtc_leaks": webrtc_leak_count,
+            "webrtc_lan_leaks": webrtc_lan_leak_count,
         },
         "device_counts": device_counts,
         "browser_counts": browser_counts,

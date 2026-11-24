@@ -251,11 +251,165 @@ function collectTamperFlags() {
   return flags.slice(0, 12);
 }
 
+function parseCandidateHostIps(rawLine, publicIps, localIps, state) {
+  if (!rawLine || typeof rawLine !== "string") return;
+  const tokens = rawLine.trim().split(/\s+/);
+  const candidates = [];
+  if (tokens.length >= 5 && (tokens[0].startsWith("candidate:") || tokens[0].startsWith("a=candidate:"))) {
+    candidates.push(tokens[4]);
+  }
+  const raddrIdx = tokens.indexOf("raddr");
+  if (raddrIdx !== -1 && tokens[raddrIdx + 1]) {
+    candidates.push(tokens[raddrIdx + 1]);
+  }
+  if (!candidates.length) candidates.push(rawLine.trim());
+
+  for (const rawHost of candidates) {
+    const host = String(rawHost || "").trim().replace(/^\[|\]$/g, "").split("%")[0];
+    if (!host) continue;
+    if (host.endsWith(".local")) {
+      state.mdns = true;
+      continue;
+    }
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    if (ipv4) {
+      const oct = [Number(ipv4[1]), Number(ipv4[2]), Number(ipv4[3]), Number(ipv4[4])];
+      if (oct.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) continue;
+      const isPriv =
+        oct[0] === 0 ||
+        oct[0] === 10 ||
+        oct[0] === 127 ||
+        (oct[0] === 169 && oct[1] === 254) ||
+        (oct[0] === 172 && oct[1] >= 16 && oct[1] <= 31) ||
+        (oct[0] === 192 && oct[1] === 168) ||
+        (oct[0] === 100 && oct[1] >= 64 && oct[1] <= 127) ||
+        oct[0] >= 224;
+      const norm = oct.join(".");
+      const target = isPriv ? localIps : publicIps;
+      if (target.length < 4 && !target.includes(norm)) target.push(norm);
+      continue;
+    }
+    if (host.includes(":") && /^[0-9a-fA-F:]+$/.test(host)) {
+      const low = host.toLowerCase();
+      const isPrivV6 =
+        low === "::1" ||
+        low === "::" ||
+        low.startsWith("fe80:") ||
+        low.startsWith("fc") ||
+        low.startsWith("fd") ||
+        low.startsWith("ff") ||
+        low.startsWith("::ffff:");
+      const target = isPrivV6 ? localIps : publicIps;
+      if (target.length < 4 && !target.includes(low)) target.push(low);
+    }
+  }
+}
+
+async function collectWebRtcLeak() {
+  const empty = (status) => ({
+    webrtc_status: status,
+    webrtc_public_ips: [],
+    webrtc_local_ips: [],
+    webrtc_mdns: false,
+  });
+  let RTC;
+  try {
+    RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+  } catch {
+    return empty("blocked");
+  }
+  if (typeof RTC !== "function") {
+    return empty("unsupported");
+  }
+
+  return new Promise((resolve) => {
+    let pc = null;
+    let settled = false;
+    let hardTimer = null;
+    let earlyTimer = null;
+    const publicIps = [];
+    const localIps = [];
+    const state = { mdns: false };
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      if (earlyTimer) clearTimeout(earlyTimer);
+      try {
+        if (pc && pc.localDescription && pc.localDescription.sdp) {
+          for (const line of pc.localDescription.sdp.split(/\r?\n/)) {
+            if (line.startsWith("a=candidate:")) {
+              parseCandidateHostIps(line, publicIps, localIps, state);
+            }
+          }
+        }
+      } catch {}
+      try {
+        if (pc) {
+          pc.onicecandidate = null;
+          pc.onicegatheringstatechange = null;
+          pc.close();
+        }
+      } catch {}
+      let status = "no_candidates";
+      if (publicIps.length || localIps.length) status = "leaked";
+      else if (state.mdns) status = "mdns_only";
+      resolve({
+        webrtc_status: status,
+        webrtc_public_ips: publicIps,
+        webrtc_local_ips: localIps,
+        webrtc_mdns: state.mdns,
+      });
+    };
+
+    try {
+      pc = new RTC({
+        iceServers: [
+          { urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"] },
+        ],
+      });
+      hardTimer = setTimeout(finish, 1200);
+      pc.onicecandidate = (ev) => {
+        if (!ev || !ev.candidate) {
+          finish();
+          return;
+        }
+        const cand = ev.candidate;
+        if (cand.address) parseCandidateHostIps(cand.address, publicIps, localIps, state);
+        if (cand.candidate) parseCandidateHostIps(cand.candidate, publicIps, localIps, state);
+        if (publicIps.length > 0 && !earlyTimer) {
+          earlyTimer = setTimeout(finish, 150);
+        }
+      };
+      pc.onicegatheringstatechange = () => {
+        if (pc && pc.iceGatheringState === "complete") finish();
+      };
+      pc.createDataChannel("p");
+      pc.createOffer()
+        .then((offer) => pc.setLocalDescription(offer))
+        .catch(() => {
+          settled = true;
+          if (hardTimer) clearTimeout(hardTimer);
+          if (earlyTimer) clearTimeout(earlyTimer);
+          try { pc.close(); } catch {}
+          resolve(empty("blocked"));
+        });
+    } catch {
+      settled = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      if (earlyTimer) clearTimeout(earlyTimer);
+      try { if (pc) pc.close(); } catch {}
+      resolve(empty("blocked"));
+    }
+  });
+}
+
 export async function collectBrowserLeaksFingerprint() {
   const gl = collectWebGl();
   const canvas_hash = collectCanvasHash();
   const fonts = collectFonts();
-  const audio_hash = await collectAudioHash();
+  const [audio_hash, webrtc] = await Promise.all([collectAudioHash(), collectWebRtcLeak()]);
 
   let tz = "";
   let intl_locale = "";
@@ -326,5 +480,9 @@ export async function collectBrowserLeaksFingerprint() {
     plugins_count: Math.max(0, Math.round(Number(plugins_count || 0))),
     speech_voices: Math.max(0, Math.round(Number(speech_voices || 0))),
     tamper_flags: collectTamperFlags(),
+    webrtc_status: webrtc.webrtc_status,
+    webrtc_public_ips: webrtc.webrtc_public_ips,
+    webrtc_local_ips: webrtc.webrtc_local_ips,
+    webrtc_mdns: webrtc.webrtc_mdns,
   };
 }

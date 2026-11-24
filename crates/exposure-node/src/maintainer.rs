@@ -537,6 +537,11 @@ impl MaintainerService {
                             fp.client_ip = None;
                         }
                         fp.sanitize();
+                        if !cfg.logger.store_raw_ip {
+                            if let Some(ref mut js) = fp.js_fp {
+                                js.mask_raw_ips();
+                            }
+                        }
                         if !fp.id.is_empty() {
                             init_fps
                                 .entry(fp.id.clone())
@@ -783,6 +788,11 @@ impl MaintainerService {
                     fp.client_ip = None;
                 }
                 fp.sanitize();
+                if !store_raw_ip {
+                    if let Some(ref mut js) = fp.js_fp {
+                        js.mask_raw_ips();
+                    }
+                }
                 if fp.id.is_empty() {
                     continue;
                 }

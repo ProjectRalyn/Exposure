@@ -29,6 +29,30 @@ pub fn canonical_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
 
+/// Returns `true` for globally routable unicast IPv4/IPv6 addresses (excluding loopback,
+/// RFC1918 private, CGNAT `100.64.0.0/10`, link-local, documentation, ULA, multicast, etc.).
+pub fn is_public_routable_ip(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64))
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 pub fn ip_matches_cidrs(ip: IpAddr, cidrs: &[String]) -> bool {
     if cidrs.is_empty() {
         return true;

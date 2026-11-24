@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::AbuseIpDbConfig;
-use exposure_core::routing::canonical_ip;
+pub use exposure_core::routing::{canonical_ip, is_public_routable_ip};
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 const MAX_CACHE_ENTRIES: usize = 32_768;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_BACKOFF_SECS: u64 = 600;
-const REQUEST_WAIT_BUDGET: Duration = Duration::from_millis(200);
+const REQUEST_WAIT_BUDGET: Duration = Duration::from_millis(250);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 const DEFAULT_API_BASE: &str = "https://api.abuseipdb.com/api/v2/check";
 
@@ -54,28 +54,6 @@ struct AbuseApiData {
     is_tor: bool,
     #[serde(default)]
     total_reports: u32,
-}
-
-pub fn is_public_routable_ip(ip: IpAddr) -> bool {
-    match canonical_ip(ip) {
-        IpAddr::V4(v4) => {
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64))
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
-        }
-    }
 }
 
 /// Thread-safe, quota-guarded AbuseIPDB v2 lookup client with bounded LRU/TTL cache
@@ -124,8 +102,22 @@ impl AbuseIpDbClient {
     }
 
     /// Look up IP reputation. Returns immediately on cache hit; on cache miss, awaits up to
-    /// `REQUEST_WAIT_BUDGET` (750ms) while letting the lookup complete in background if slow.
+    /// `REQUEST_WAIT_BUDGET` (250ms) while letting the lookup complete in background if slow.
     pub async fn lookup(self: &Arc<Self>, raw_ip: IpAddr) -> Option<AbuseIpReport> {
+        self.lookup_with_backfill(raw_ip, |_| async {}).await
+    }
+
+    /// Look up IP reputation with an asynchronous backfill hook invoked when the spawned
+    /// background fetch completes (even if `REQUEST_WAIT_BUDGET` timed out on the caller).
+    pub async fn lookup_with_backfill<F, Fut>(
+        self: &Arc<Self>,
+        raw_ip: IpAddr,
+        on_complete: F,
+    ) -> Option<AbuseIpReport>
+    where
+        F: FnOnce(AbuseIpReport) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let ip = canonical_ip(raw_ip);
         if !is_public_routable_ip(ip) {
             return None;
@@ -162,6 +154,9 @@ impl AbuseIpDbClient {
         let handle = tokio::spawn(async move {
             let res = this.fetch_and_cache(ip, &cfg).await;
             this.in_flight.remove(&ip);
+            if let Some(ref rep) = res {
+                on_complete(rep.clone()).await;
+            }
             res
         });
 
@@ -172,7 +167,7 @@ impl AbuseIpDbClient {
             Ok(Ok(report)) => report,
             Ok(Err(_)) => None,
             Err(_) => {
-                // Keep task running in background to populate cache for subsequent requests
+                // Keep task running in background to populate cache and run backfill hook
                 None
             }
         }

@@ -925,9 +925,23 @@ impl IngressServer {
         }
 
         // Proactively look up client IP reputation (cache hit -> immediate, miss -> AbuseIPDB v2 API)
-        // for non-banned public IPs.
+        // for non-banned public IPs, with background backfill when upstream API exceeds REQUEST_WAIT_BUDGET.
         let abuse_rep = if cfg.abuseipdb.enabled && !cfg.abuseipdb.api_key.trim().is_empty() {
-            self.abuseipdb.lookup(client_ip).await
+            let logger_bf = Arc::clone(&self.logger);
+            let ip_str_bf = client_ip.to_string();
+            self.abuseipdb
+                .lookup_with_backfill(client_ip, move |rep| async move {
+                    logger_bf
+                        .backfill_abuse_report(
+                            &ip_str_bf,
+                            rep.abuse_confidence_score,
+                            rep.country_code.as_deref(),
+                            rep.isp.as_deref(),
+                            rep.is_tor,
+                        )
+                        .await;
+                })
+                .await
         } else {
             None
         };

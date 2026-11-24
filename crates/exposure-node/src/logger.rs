@@ -27,6 +27,8 @@ const MINUTE_BUCKET_RETENTION_SECS: i64 = 3600;
 const MAX_FP_OBSERVATIONS: usize = 4096;
 const FP_RETENTION_SECS: i64 = 3600 * 6;
 const MAX_ALERT_MSG_LEN: usize = 512;
+const MAX_ABUSE_BACKFILLS: usize = 1024;
+const ABUSE_BACKFILL_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 const MAX_RECENT_RECORDS: usize = 4096;
 const MAX_PENDING_DISK_RECORDS: usize = 8192;
 const MAX_PER_IP_LOG_BUCKETS: usize = 16_384;
@@ -519,6 +521,7 @@ pub struct NodeLogger {
     writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
     minute_buckets: Arc<Mutex<HashMap<(i64, String, String), MinuteSummary>>>,
     fp_observations: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
+    recent_abuse_backfills: Mutex<HashMap<String, (Instant, u8, Option<String>, Option<String>, bool)>>,
     pending_disk_records: Arc<Mutex<Vec<SessionSummary>>>,
     pending_disk_bytes: Arc<Mutex<usize>>,
     recent_records: Arc<Mutex<Vec<SessionSummary>>>,
@@ -565,6 +568,7 @@ impl NodeLogger {
             writer: Arc::new(StdMutex::new(writer)),
             minute_buckets: Arc::new(Mutex::new(init_buckets)),
             fp_observations: Arc::new(Mutex::new(init_fps)),
+            recent_abuse_backfills: Mutex::new(HashMap::new()),
             pending_disk_records: Arc::new(Mutex::new(Vec::new())),
             pending_disk_bytes: Arc::new(Mutex::new(0)),
             recent_records: Arc::new(Mutex::new(Vec::new())),
@@ -1095,7 +1099,30 @@ impl NodeLogger {
             challenge_count: challenge_inc,
             rate_limited_count: rate_limited_inc,
         };
+        if obs.abuse_score.is_none() {
+            let mut bf = self.recent_abuse_backfills.lock().await;
+            let now_inst = Instant::now();
+            if let Some((ts, score, cc, isp, is_tor)) = bf.get(&obs.ip_hmac).cloned() {
+                if now_inst.saturating_duration_since(ts) < ABUSE_BACKFILL_TTL {
+                    obs.abuse_score = Some(score);
+                    if obs.abuse_country.is_none() {
+                        obs.abuse_country = cc;
+                    }
+                    if obs.abuse_isp.is_none() {
+                        obs.abuse_isp = isp;
+                    }
+                    obs.abuse_is_tor |= is_tor;
+                } else {
+                    bf.remove(&obs.ip_hmac);
+                }
+            }
+        }
         obs.sanitize();
+        if !cfg.store_raw_ip {
+            if let Some(ref mut js) = obs.js_fp {
+                js.mask_raw_ips();
+            }
+        }
 
         let mut map = self.fp_observations.lock().await;
         if map.len() >= MAX_FP_OBSERVATIONS && !map.contains_key(&obs.id) {
@@ -1114,6 +1141,64 @@ impl NodeLogger {
         map.entry(obs.id.clone())
             .and_modify(|existing| existing.merge_from(&obs))
             .or_insert(obs);
+    }
+
+    /// Asynchronously backfills AbuseIPDB reputation into matching `FingerprintObservation` entries
+    /// (by `ip_hmac`) when an initially slow lookup finishes in the background after `REQUEST_WAIT_BUDGET`.
+    pub async fn backfill_abuse_report(
+        &self,
+        client_ip: &str,
+        abuse_score: u8,
+        abuse_country: Option<&str>,
+        abuse_isp: Option<&str>,
+        abuse_is_tor: bool,
+    ) {
+        let hmac_key = {
+            let cfg = Arc::clone(&*self.cfg.read().await);
+            cfg.hmac_key.clone()
+        };
+        let canon_ip = canonical_ip_str(client_ip);
+        let ip_tag = hmac_ip(&hmac_key, &canon_ip);
+        let cc_owned = abuse_country.map(str::to_string);
+        let isp_owned = abuse_isp.map(str::to_string);
+
+        {
+            let now_inst = Instant::now();
+            let mut bf = self.recent_abuse_backfills.lock().await;
+            if bf.len() >= MAX_ABUSE_BACKFILLS && !bf.contains_key(&ip_tag) {
+                bf.retain(|_, (ts, _, _, _, _)| {
+                    now_inst.saturating_duration_since(*ts) < ABUSE_BACKFILL_TTL
+                });
+                if bf.len() >= MAX_ABUSE_BACKFILLS {
+                    if let Some(oldest_k) = bf
+                        .iter()
+                        .min_by_key(|(_, (ts, _, _, _, _))| *ts)
+                        .map(|(k, _)| k.clone())
+                    {
+                        bf.remove(&oldest_k);
+                    }
+                }
+            }
+            bf.insert(
+                ip_tag.clone(),
+                (now_inst, abuse_score, cc_owned.clone(), isp_owned.clone(), abuse_is_tor),
+            );
+        }
+
+        let mut map = self.fp_observations.lock().await;
+        for obs in map.values_mut() {
+            if obs.ip_hmac == ip_tag {
+                obs.abuse_score = Some(obs.abuse_score.map_or(abuse_score, |old| old.max(abuse_score)));
+                if obs.abuse_country.is_none() {
+                    obs.abuse_country = cc_owned.clone();
+                }
+                if obs.abuse_isp.is_none() {
+                    obs.abuse_isp = isp_owned.clone();
+                }
+                obs.abuse_is_tor |= abuse_is_tor;
+                obs.sanitize();
+            }
+        }
     }
 
     /// Drain pending minute summaries, sampled records, and fingerprint observations to send to Maintainer.
@@ -1505,6 +1590,157 @@ mod tests {
         assert_eq!(sums[0].requests, 30);
         assert!(recs.len() < 15, "byte budget should cap emitted rows, got {}", recs.len());
         assert!(logger.protection_stats().dropped_records > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn slow_abuseipdb_lookup_backfills_fingerprint_observations_without_stalling() {
+        use crate::abuseipdb::AbuseIpDbClient;
+        use exposure_core::config::AbuseIpDbConfig;
+        use std::net::IpAddr;
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let dir = std::env::temp_dir().join(format!("exposure-nlog-abbf-{}", uuid::Uuid::new_v4()));
+        let logger = NodeLogger::new(
+            "edge-abbf",
+            LoggerConfig {
+                hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
+                segment: SegmentConfig {
+                    dir: dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    // Exceeds REQUEST_WAIT_BUDGET (250ms) so initial lookup returns None non-blockingly
+                    tokio::time::sleep(Duration::from_millis(320)).await;
+                    let body = r#"{"data":{"ipAddress":"9.9.9.9","abuseConfidenceScore":91,"countryCode":"DE","isp":"TestHost GmbH","usageType":"Data Center","isTor":true,"totalReports":17}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let ab_client = AbuseIpDbClient::with_endpoint(
+            AbuseIpDbConfig {
+                enabled: true,
+                api_key: "test-key".into(),
+                max_daily_lookups: 50,
+                cache_ttl_secs: 3600,
+                ..Default::default()
+            },
+            format!("http://{addr}/api/v2/check"),
+        );
+
+        let peer_ip: IpAddr = "9.9.9.9".parse().unwrap();
+        let logger_bf = Arc::clone(&logger);
+        let t0 = Instant::now();
+        let immediate = ab_client
+            .lookup_with_backfill(peer_ip, move |rep| async move {
+                logger_bf
+                    .backfill_abuse_report(
+                        "9.9.9.9",
+                        rep.abuse_confidence_score,
+                        rep.country_code.as_deref(),
+                        rep.isp.as_deref(),
+                        rep.is_tor,
+                    )
+                    .await;
+            })
+            .await;
+        assert!(immediate.is_none());
+        assert!(t0.elapsed() < Duration::from_millis(310));
+
+        // Ordering 1: record fingerprint BEFORE background lookup completes
+        logger
+            .record_fingerprint(
+                "svc-web",
+                "app.example.com",
+                "9.9.9.9",
+                "fp-before-complete",
+                false,
+                "none",
+                "curl/8.5",
+                "en-US",
+                "API/CLI",
+                "CLI/Script",
+                "Other",
+                true,
+                false,
+                60,
+                0,
+                false,
+                None,
+                1,
+                0,
+                0,
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+
+        // Ordering 2: record fingerprint AFTER backfill (with None extras -> filled from recent_abuse_backfills)
+        logger
+            .record_fingerprint(
+                "svc-web",
+                "app.example.com",
+                "9.9.9.9",
+                "fp-after-complete",
+                true,
+                "pow",
+                "Mozilla/5.0",
+                "en-US",
+                "Desktop",
+                "Chrome",
+                "Linux",
+                false,
+                false,
+                0,
+                10,
+                true,
+                None,
+                1,
+                0,
+                0,
+            )
+            .await;
+
+        let (_, _, fps) = logger.drain_for_maintainer().await;
+        let obs1 = fps
+            .iter()
+            .find(|f| f.fp_hash == "fp-before-complete")
+            .expect("missing before-complete observation");
+        assert_eq!(obs1.abuse_score, Some(91));
+        assert_eq!(obs1.abuse_country.as_deref(), Some("DE"));
+        assert_eq!(obs1.abuse_isp.as_deref(), Some("TestHost GmbH"));
+        assert!(obs1.abuse_is_tor);
+
+        let obs2 = fps
+            .iter()
+            .find(|f| f.fp_hash == "fp-after-complete")
+            .expect("missing after-complete observation");
+        assert_eq!(obs2.abuse_score, Some(91));
+        assert_eq!(obs2.abuse_country.as_deref(), Some("DE"));
+        assert!(obs2.abuse_is_tor);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

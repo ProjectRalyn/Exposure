@@ -149,12 +149,14 @@ async function run() {
     metaDifficulty.textContent = `Difficulty: ${difficulty} bits`;
     statusText.textContent = "Computing verification proof…";
 
+    // Start BrowserLeaks + WebRTC ICE collection concurrently so it overlaps PoW solving (0ms extra wait).
+    const fpPromise = collectBrowserLeaksFingerprint();
     const solved = await solveChallenge(data.token, difficulty, expiresAt);
     metaHashes.textContent = `Hashes: ${solved.hashes}`;
     progressBar.style.width = "100%";
     statusText.textContent = "Proof accepted, issuing clearance…";
 
-    const clientFp = await collectBrowserLeaksFingerprint();
+    const clientFp = await fpPromise;
     const verifyResp = await fetch("/cdn-cgi/verify", {
       method: "POST",
       credentials: "same-origin",

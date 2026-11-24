@@ -356,7 +356,9 @@ export function renderBarList(container, items = [], emptyText = "No traffic rec
       const label = it.service_tag || it.node_tag || it.label || "-";
       const req = finiteVal(it.requests);
       const err = finiteVal(it.errors);
+      const p50 = finiteVal(it.p50_ms);
       const p95 = finiteVal(it.p95_ms);
+      const p99 = finiteVal(it.p99_ms);
       const pct = Math.max(4, Math.round((req / maxVal) * 100));
       const share = ((req / totalReqs) * 100).toFixed(1);
       const errRate = req > 0 ? ((err / req) * 100).toFixed(1) : "0.0";
@@ -368,7 +370,7 @@ export function renderBarList(container, items = [], emptyText = "No traffic rec
             <span class="bar-item-metrics">
               <strong>${formatCompact(req)}</strong> req
               · <span class="pill ${errCls}">${errRate}% err</span>
-              · <span class="muted">p95 ${p95.toFixed(1)}ms</span>
+              · <span class="muted">p50 ${p50.toFixed(1)} · p95 ${p95.toFixed(1)} · p99 ${p99.toFixed(1)}ms</span>
             </span>
           </div>
           <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>

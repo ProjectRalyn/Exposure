@@ -1,4 +1,4 @@
-// Analytics & Visitor Fingerprints Views
+// Analytics & Unified Logging (Access URL Explorer + Visitors & Fingerprints) Views
 import {
   formatBytes,
   formatCompact,
@@ -12,13 +12,25 @@ import {
 import { t } from "../i18n.js";
 import { el, esc, openModal } from "../ui.js";
 
+function downloadJson(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function createAnalyticsViews({ api, store, navigate }) {
-  let anaSubTab = "overview"; // overview | logs
   let obsHeroMetric = "requests";
   let obsNode = "all";
   let obsSvc = "all";
   let obsWin = 0;
 
+  let loggingSubTab = "access"; // access | visitors
   let logFilters = {
     q: "",
     ip: "",
@@ -38,39 +50,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
 
   /* ==================== ANALYTICS ==================== */
 
-  function renderAnaSubtabsBar() {
-    const logCnt = logData ? Number(logData.total_matched ?? (logData.items || []).length ?? 0) : null;
-    return `
-      <div class="subtabs-bar">
-        <div class="subtabs-list">
-          <button type="button" class="subtab-btn ${anaSubTab === "overview" ? "active" : ""}" data-ana-sub="overview">
-            ${esc(t("ana.tab.overview"))}
-          </button>
-          <button type="button" class="subtab-btn ${anaSubTab === "logs" ? "active" : ""}" data-ana-sub="logs">
-            ${esc(t("ana.tab.logs"))} ${logCnt != null ? `<span class="subtab-count">${logCnt}</span>` : ""}
-          </button>
-        </div>
-      </div>
-    `;
-  }
-
-  function wireAnaSubtabs(root) {
-    root.querySelectorAll("[data-ana-sub]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const next = btn.dataset.anaSub;
-        if (next === anaSubTab) return;
-        anaSubTab = next;
-        if (anaSubTab === "logs") {
-          renderLogs();
-          refreshLogs();
-        } else {
-          renderAnalyticsCharts();
-          refreshAnalytics();
-        }
-      });
-    });
-  }
-
   function renderAnalyticsShell() {
     const root = el("tab-analytics");
     if (!root) return;
@@ -79,7 +58,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const svcs = (data.available_services || []).slice().sort();
 
     root.innerHTML = `
-      ${renderAnaSubtabsBar()}
       <div class="filter-bar">
         <label class="filter-inline">
           <span>Host</span>
@@ -144,6 +122,33 @@ export function createAnalyticsViews({ api, store, navigate }) {
         <div class="panel"><div class="panel-header"><h3>Traffic by Host</h3></div><div id="obs-node-bars"></div></div>
       </div>
 
+      <div class="panel">
+        <div class="panel-header">
+          <h3>${esc(t("ana.svc_latency_title"))}</h3>
+          <span class="muted-sm">${esc(t("ana.svc_latency_sub"))}</span>
+        </div>
+        <div class="table-scroll" style="max-height:360px;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Service</th>
+                <th>Requests</th>
+                <th>UV</th>
+                <th>5xx Err</th>
+                <th>429</th>
+                <th>Bytes (In / Out)</th>
+                <th>p50</th>
+                <th>p95</th>
+                <th>p99</th>
+                <th>Latency Spread</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="obs-svc-latency-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="dashboard-grid-2">
         <div class="panel"><div class="panel-header"><h3>Guard Funnel</h3></div><div id="obs-guard-funnel"></div></div>
         <div class="panel"><div class="panel-header"><h3>Outcome Mix</h3></div><div id="obs-outcome-donut"></div></div>
@@ -154,6 +159,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           <h3>Client Fingerprints (Devices · Browsers · OS)</h3>
           <div class="btn-row">
             <span id="obs-fp-verified-badge" class="muted-sm"></span>
+            <button type="button" id="btn-open-access-logs" class="btn sm">${esc(t("logging.tab.access"))} →</button>
             <button type="button" id="btn-open-fp-explorer" class="btn sm">${esc(t("ana.fp_explorer"))}</button>
           </div>
         </div>
@@ -171,11 +177,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
       </details>
     `;
 
-    wireAnaSubtabs(root);
     el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; refreshAnalytics(); });
     el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; refreshAnalytics(); });
     el("obs-window-filter")?.addEventListener("change", (ev) => { obsWin = Number(ev.target.value) || 0; refreshAnalytics(); });
-    el("btn-open-fp-explorer")?.addEventListener("click", () => navigate("fingerprints"));
+    el("btn-open-access-logs")?.addEventListener("click", () => navigate("logging", { subTab: "access", service: obsSvc !== "all" ? obsSvc : undefined }));
+    el("btn-open-fp-explorer")?.addEventListener("click", () => navigate("logging", { subTab: "visitors", service: obsSvc !== "all" ? obsSvc : undefined }));
     root.querySelectorAll("[data-cf-metric]").forEach((btn) => {
       btn.addEventListener("click", () => {
         obsHeroMetric = btn.dataset.cfMetric;
@@ -185,17 +191,10 @@ export function createAnalyticsViews({ api, store, navigate }) {
   }
 
   function renderAnalyticsCharts() {
-    if (anaSubTab === "logs") {
-      renderLogs();
-      return;
-    }
     const data = store.telemetry;
     if (!data) {
       const root = el("tab-analytics");
-      if (root) {
-        root.innerHTML = renderAnaSubtabsBar() + `<div class="panel muted">Loading telemetry…</div>`;
-        wireAnaSubtabs(root);
-      }
+      if (root) root.innerHTML = `<div class="panel muted">Loading telemetry…</div>`;
       return;
     }
     renderAnalyticsShell();
@@ -235,8 +234,56 @@ export function createAnalyticsViews({ api, store, navigate }) {
     };
     const active = cfgs[obsHeroMetric] || cfgs.requests;
     renderAreaLineChart(el("obs-hero-chart"), { labels, height: 260, unit: active.unit, series: active.series });
-    renderBarList(el("obs-service-bars"), data.service_breakdown || []);
+
+    const svcsList = data.service_breakdown || [];
+    renderBarList(el("obs-service-bars"), svcsList);
     renderBarList(el("obs-node-bars"), data.node_breakdown || []);
+
+    const maxP99 = Math.max(1, ...svcsList.map((s) => Number(s.p99_ms) || 0));
+    const svcLatBody = el("obs-svc-latency-tbody");
+    if (svcLatBody) {
+      svcLatBody.innerHTML =
+        svcsList
+          .map((s) => {
+            const req = Number(s.requests) || 0;
+            const err = Number(s.errors) || 0;
+            const sp50 = Number(s.p50_ms) || 0;
+            const sp95 = Number(s.p95_ms) || 0;
+            const sp99 = Number(s.p99_ms) || 0;
+            const ePct = req > 0 ? ((err / req) * 100).toFixed(1) : "0.0";
+            const eCls = err > 0 ? "err" : "ok";
+            const barW = Math.max(3, Math.round((sp99 / maxP99) * 100));
+            const barColor = sp99 >= 500 ? "#C40233" : sp99 >= 150 ? "#FAC800" : "#009F6B";
+            return `
+          <tr>
+            <td><button type="button" class="btn sm ghost" data-obs-filter-svc="${esc(s.service_tag)}"><code>${esc(s.service_tag)}</code></button></td>
+            <td><strong>${formatCompact(req)}</strong></td>
+            <td>${formatCompact(Math.round(s.uv_estimate || 0))}</td>
+            <td>${formatCompact(err)} <span class="pill ${eCls}">${ePct}%</span></td>
+            <td>${formatCompact(s.rate_limited || 0)}</td>
+            <td class="muted-sm">${formatBytes(s.bytes_in || 0)} / ${formatBytes(s.bytes_out || 0)}</td>
+            <td><strong>${sp50.toFixed(1)}</strong> ms</td>
+            <td>${sp95.toFixed(1)} ms</td>
+            <td><span class="pill ${sp99 >= 500 ? "err" : sp99 >= 150 ? "warn" : "ok"}">${sp99.toFixed(1)} ms</span></td>
+            <td style="min-width:110px;"><div class="bar-track"><div class="bar-fill" style="width:${barW}%;background:${barColor};"></div></div></td>
+            <td><button type="button" class="btn sm" data-obs-svc-logs="${esc(s.service_tag)}">Logs →</button></td>
+          </tr>`;
+          })
+          .join("") || `<tr><td colspan="11" class="muted">No service telemetry recorded</td></tr>`;
+
+      svcLatBody.querySelectorAll("[data-obs-filter-svc]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          obsSvc = btn.dataset.obsFilterSvc;
+          refreshAnalytics();
+        });
+      });
+      svcLatBody.querySelectorAll("[data-obs-svc-logs]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          navigate("logging", { subTab: "access", service: btn.dataset.obsSvcLogs });
+        });
+      });
+    }
+
     renderGuardFunnel(el("obs-guard-funnel"), tr);
 
     const cleanReqs = Math.max(0, totalReq - totalErr - totalRl - totalChI);
@@ -290,8 +337,55 @@ export function createAnalyticsViews({ api, store, navigate }) {
         .join("") || `<tr><td colspan="11" class="muted">No telemetry buckets</td></tr>`;
   }
 
+  async function refreshAnalytics() {
+    const qs = new URLSearchParams();
+    if (obsNode !== "all") qs.set("node", obsNode);
+    if (obsSvc !== "all") qs.set("service", obsSvc);
+    if (obsWin > 0) qs.set("window_secs", String(obsWin));
+    const data = await api(`/api/telemetry${qs.toString() ? `?${qs}` : ""}`);
+    store.telemetry = data;
+    renderAnalyticsCharts();
+    return data;
+  }
+
+  /* ==================== UNIFIED LOGGING WORKSPACE ==================== */
+
+  function renderLoggingSubtabsBar() {
+    const logCnt = logData ? Number(logData.total_matched ?? (logData.items || []).length ?? 0) : null;
+    const fpCnt = fpData ? Number(fpData.total_matched ?? (fpData.items || []).length ?? 0) : null;
+    return `
+      <div class="subtabs-bar">
+        <div class="subtabs-list">
+          <button type="button" class="subtab-btn ${loggingSubTab === "access" ? "active" : ""}" data-log-sub="access">
+            ${esc(t("logging.tab.access"))} ${logCnt != null ? `<span class="subtab-count">${logCnt}</span>` : ""}
+          </button>
+          <button type="button" class="subtab-btn ${loggingSubTab === "visitors" ? "active" : ""}" data-log-sub="visitors">
+            ${esc(t("logging.tab.visitors"))} ${fpCnt != null ? `<span class="subtab-count">${fpCnt}</span>` : ""}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function wireLoggingSubtabs(root) {
+    root.querySelectorAll("[data-log-sub]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.logSub;
+        if (next === loggingSubTab) return;
+        loggingSubTab = next;
+        if (loggingSubTab === "access") {
+          renderLogs();
+          refreshLogs();
+        } else {
+          renderVisitors();
+          refreshVisitors();
+        }
+      });
+    });
+  }
+
   function renderLogs() {
-    const root = el("tab-analytics");
+    const root = el("tab-logging");
     if (!root) return;
     const data = logData || {};
     const sum = data.summary || {};
@@ -309,7 +403,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     };
 
     root.innerHTML = `
-      ${renderAnaSubtabsBar()}
+      ${renderLoggingSubtabsBar()}
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.requests"))}</div><div class="kpi-val">${formatCompact(sum.total_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.total_events || items.length)} events · ${formatCompact(sum.unique_ips || 0)} unique IPs</div></div>
         <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.blocked"))}</div><div class="kpi-val">${formatCompact(sum.blocked_requests || 0)}</div><div class="kpi-sub">cache hits: ${formatCompact(sum.cache_hits || 0)} · folded: ${formatCompact(sum.folded_requests || 0)}</div></div>
@@ -325,6 +419,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
           <div class="btn-row">
             <button type="button" id="btn-log-search" class="btn primary">${esc(t("common.search"))}</button>
             <button type="button" id="btn-log-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+            <button type="button" id="btn-log-export" class="btn sm">${esc(t("logging.export_json"))}</button>
           </div>
         </div>
         <div class="fp-filter-row">
@@ -339,6 +434,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
               <option value="all" ${logFilters.method === "all" ? "selected" : ""}>All Methods</option>
               ${["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"].map((m) => `<option value="${m}" ${logFilters.method === m ? "selected" : ""}>${m}</option>`).join("")}
             </select>
+            <select id="log-role-filter" class="select-sm">
+              <option value="all" ${logFilters.role === "all" ? "selected" : ""}>All Roles</option>
+              <option value="ingress" ${logFilters.role === "ingress" ? "selected" : ""}>ingress</option>
+              <option value="egress" ${logFilters.role === "egress" ? "selected" : ""}>egress</option>
+            </select>
             <select id="log-node-filter" class="select-sm">
               <option value="all">${esc(t("ana.all_nodes"))}</option>
               ${nodes.map((n) => `<option value="${esc(n)}" ${logFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
@@ -348,7 +448,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
               ${svcs.map((s) => `<option value="${esc(s)}" ${logFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
             </select>
             <select id="log-window-filter" class="select-sm">
-              <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>All</option>
+              <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>Global Window</option>
               <option value="300" ${logFilters.window_secs === 300 ? "selected" : ""}>5m</option>
               <option value="900" ${logFilters.window_secs === 900 ? "selected" : ""}>15m</option>
               <option value="3600" ${logFilters.window_secs === 3600 ? "selected" : ""}>1h</option>
@@ -388,7 +488,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
       <div class="panel">
         <div class="panel-header">
           <h3>${esc(t("logs.explorer_title"))} (${items.length})</h3>
-          <span class="muted-sm">Query strings redact secrets · Click row for full detail</span>
+          <span class="muted-sm">Query strings redact secrets · Click row for full detail &amp; visitor correlation</span>
         </div>
         <div class="table-scroll" style="max-height:560px;">
           <table class="table">
@@ -443,12 +543,13 @@ export function createAnalyticsViews({ api, store, navigate }) {
       </div>
     `;
 
-    wireAnaSubtabs(root);
+    wireLoggingSubtabs(root);
     const triggerLogSearch = () => {
       logFilters.q = el("log-search-q")?.value.trim() || "";
       logFilters.ip = el("log-search-ip")?.value.trim() || "";
       logFilters.host = el("log-search-host")?.value.trim() || "";
       logFilters.method = el("log-method-filter")?.value || "all";
+      logFilters.role = el("log-role-filter")?.value || "all";
       logFilters.node = el("log-node-filter")?.value || "all";
       logFilters.service = el("log-svc-filter")?.value || "all";
       logFilters.window_secs = Number(el("log-window-filter")?.value || 0);
@@ -457,15 +558,18 @@ export function createAnalyticsViews({ api, store, navigate }) {
     el("btn-log-search")?.addEventListener("click", triggerLogSearch);
     ["log-search-q", "log-search-ip", "log-search-host"].forEach((id) => {
       el(id)?.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter") triggerLogSearch();
+        if (ev.key === "Enter") { ev.preventDefault(); triggerLogSearch(); }
       });
     });
-    ["log-method-filter", "log-node-filter", "log-svc-filter", "log-window-filter"].forEach((id) => {
+    ["log-method-filter", "log-role-filter", "log-node-filter", "log-svc-filter", "log-window-filter"].forEach((id) => {
       el(id)?.addEventListener("change", triggerLogSearch);
     });
     el("btn-log-clear")?.addEventListener("click", () => {
       logFilters = { q: "", ip: "", host: "", node: "all", service: "all", role: "all", method: "all", status: "all", action: "all", window_secs: 0 };
       refreshLogs();
+    });
+    el("btn-log-export")?.addEventListener("click", () => {
+      downloadJson("exposure-access-logs.json", items);
     });
     root.querySelectorAll("[data-log-st]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -493,6 +597,39 @@ export function createAnalyticsViews({ api, store, navigate }) {
         const r = items[Number(row.dataset.logIdx)];
         if (!r) return;
         const tsSec = Math.floor((Number(r.timestamp_ms) || 0) / 1000);
+        const ipKey = r.raw_ip || r.ip_hmac || "";
+        const modalActions = [];
+        if (ipKey) {
+          modalActions.push({
+            label: t("logging.cross.filter_ip"),
+            cls: "ghost",
+            onClick: () => {
+              logFilters.ip = ipKey;
+              refreshLogs();
+            },
+          });
+          modalActions.push({
+            label: t("logging.cross.view_visitor"),
+            cls: "ghost",
+            onClick: () => {
+              loggingSubTab = "visitors";
+              fpFilters = { q: "", ip: ipKey, fp: "", node: "all", service: "all", verified: "all", risk: "all" };
+              refreshVisitors();
+            },
+          });
+        }
+        if (r.path) {
+          modalActions.push({
+            label: t("logging.cross.filter_path"),
+            cls: "ghost",
+            onClick: () => {
+              logFilters.q = r.path;
+              refreshLogs();
+            },
+          });
+        }
+        modalActions.push({ label: t("common.close"), cls: "primary" });
+
         openModal({
           title: `${r.method || "HTTP"} ${r.path || "/"} (${r.status || 0})`,
           bodyHtml: `
@@ -510,7 +647,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             <div class="fp-ua-box" style="margin-top:8px;">${esc(r.user_agent || "(empty User-Agent)")}</div>
             ${r.error ? `<div class="fp-ua-box" style="margin-top:8px;color:var(--err,#ff6b6b);">Error: ${esc(r.error)}</div>` : ""}
           `,
-          actions: [{ label: t("common.close"), cls: "primary" }],
+          actions: modalActions,
         });
       });
     });
@@ -527,30 +664,15 @@ export function createAnalyticsViews({ api, store, navigate }) {
     if (logFilters.method !== "all") qs.set("method", logFilters.method);
     if (logFilters.status !== "all") qs.set("status", logFilters.status);
     if (logFilters.action !== "all") qs.set("action", logFilters.action);
-    if (logFilters.window_secs > 0) qs.set("window_secs", String(logFilters.window_secs));
+    const winSec = logFilters.window_secs > 0 ? logFilters.window_secs : Number(el("sel-time-window")?.value || 0);
+    if (winSec > 0) qs.set("window_secs", String(winSec));
     logData = await api(`/api/logs${qs.toString() ? `?${qs}` : ""}`);
-    if (anaSubTab === "logs") renderLogs();
+    if (loggingSubTab === "access") renderLogs();
     return logData;
   }
 
-  async function refreshAnalytics() {
-    if (anaSubTab === "logs") {
-      return refreshLogs();
-    }
-    const qs = new URLSearchParams();
-    if (obsNode !== "all") qs.set("node", obsNode);
-    if (obsSvc !== "all") qs.set("service", obsSvc);
-    if (obsWin > 0) qs.set("window_secs", String(obsWin));
-    const data = await api(`/api/telemetry${qs.toString() ? `?${qs}` : ""}`);
-    store.telemetry = data;
-    renderAnalyticsCharts();
-    return data;
-  }
-
-  /* ==================== FINGERPRINTS ==================== */
-
-  function renderFingerprints() {
-    const root = el("tab-fingerprints");
+  function renderVisitors() {
+    const root = el("tab-logging");
     if (!root) return;
     const data = fpData || {};
     const sum = data.summary || {};
@@ -559,21 +681,23 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const items = data.items || [];
 
     root.innerHTML = `
+      ${renderLoggingSubtabsBar()}
       <div class="kpi-grid">
         <div class="kpi"><div class="kpi-label">Matched Visitors</div><div class="kpi-val">${formatCompact(sum.total_visitors || 0)}</div><div class="kpi-sub">${formatCompact(sum.unique_ips || 0)} unique IPs</div></div>
         <div class="kpi"><div class="kpi-label">JS-Verified FPs</div><div class="kpi-val">${formatCompact(sum.js_verified || 0)}</div><div class="kpi-sub">${formatCompact(sum.beacon_count || 0)} beacon · ${formatCompact(sum.pow_count || 0)} PoW</div></div>
         <div class="kpi"><div class="kpi-label">Unique Browser FPs</div><div class="kpi-val">${formatCompact(sum.unique_fps || 0)}</div><div class="kpi-sub">Distinct signatures</div></div>
-        <div class="kpi"><div class="kpi-label">Bots &amp; Headless</div><div class="kpi-val">${sum.bots || 0} / ${sum.headless || 0}</div><div class="kpi-sub">Bot UA / Headless JS</div></div>
+        <div class="kpi"><div class="kpi-label">Bots · Headless · WebRTC Leaks</div><div class="kpi-val">${sum.bots || 0} / ${sum.headless || 0} / ${sum.webrtc_leaks || 0}</div><div class="kpi-sub">${sum.webrtc_lan_leaks || 0} LAN IP exposed</div></div>
       </div>
 
       <div class="panel">
         <div class="fp-search-bar">
-          <label><span>Universal Search</span><input id="fp-search-q" type="search" value="${esc(fpFilters.q)}" placeholder="Chrome, NVIDIA, example.com, IP, hash…" /></label>
-          <label><span>IP / Prefix / HMAC</span><input id="fp-search-ip" type="search" value="${esc(fpFilters.ip)}" placeholder="203.0.113.5" /></label>
+          <label><span>Universal Search</span><input id="fp-search-q" type="search" value="${esc(fpFilters.q)}" placeholder="Chrome, NVIDIA, example.com, IP, leaked IP, hash…" /></label>
+          <label><span>IP / Prefix / HMAC / WebRTC</span><input id="fp-search-ip" type="search" value="${esc(fpFilters.ip)}" placeholder="203.0.113.5" /></label>
           <label><span>Browser FP / Canvas</span><input id="fp-search-fp" type="search" value="${esc(fpFilters.fp)}" placeholder="fp_hash" /></label>
           <div class="btn-row">
             <button type="button" id="btn-fp-search" class="btn primary">${esc(t("common.search"))}</button>
             <button type="button" id="btn-fp-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+            <button type="button" id="btn-fp-export" class="btn sm">${esc(t("logging.export_json"))}</button>
           </div>
         </div>
         <div class="fp-filter-row">
@@ -581,7 +705,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             ${["all", "js", "beacon", "pow", "ua"].map((v) => `<button type="button" class="fp-chip ${fpFilters.verified === v ? "active" : ""}" data-fp-ver="${v}">${v.toUpperCase()}</button>`).join("")}
           </div>
           <div class="fp-chip-group">
-            ${["all", "clean", "suspicious", "headless", "bot"].map((r) => `<button type="button" class="fp-chip ${fpFilters.risk === r ? "active" : ""}" data-fp-risk="${r}">${r.toUpperCase()}</button>`).join("")}
+            ${["all", "clean", "suspicious", "headless", "bot", "webrtc_leak"].map((r) => `<button type="button" class="fp-chip ${fpFilters.risk === r ? "active" : ""}" data-fp-risk="${r}">${r.toUpperCase()}</button>`).join("")}
           </div>
           <div class="btn-row">
             <select id="fp-node-filter" class="select-sm">
@@ -599,11 +723,11 @@ export function createAnalyticsViews({ api, store, navigate }) {
       <div class="panel">
         <div class="panel-header">
           <h3>Visitor &amp; Fingerprint Directory (${items.length})</h3>
-          <span class="muted-sm">Click any row for full TLS, UA &amp; JS signals</span>
+          <span class="muted-sm">Click any row for TLS, UA, WebRTC leak &amp; JS signals</span>
         </div>
         <div class="table-scroll" style="max-height:540px;">
           <table class="table">
-            <thead><tr><th>IP / HMAC</th><th>Browser FP</th><th>Device · Browser · OS</th><th>JS Signals</th><th>Host / Service</th><th>Risk</th><th>Traffic</th><th>Last Seen</th></tr></thead>
+            <thead><tr><th>IP / HMAC</th><th>Browser FP</th><th>Device · Browser · OS</th><th>JS &amp; WebRTC Signals</th><th>Host / Service</th><th>Risk &amp; Leaks</th><th>Traffic</th><th>Last Seen</th></tr></thead>
             <tbody>
               ${
                 items
@@ -618,6 +742,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
                       if (js.audio_hash) jsParts.push(`au:${js.audio_hash}`);
                       if (js.fonts_count) jsParts.push(`ft:${js.fonts_count}`);
                       if (js.webgl) jsParts.push(js.webgl.slice(0, 22));
+                      if (js.webrtc_public_ips?.length) jsParts.push(`rtc:${js.webrtc_public_ips[0]}`);
                     }
                     const jsSum = jsParts.length ? jsParts.join(" · ") : "-";
                     const riskCls = obs.is_headless || obs.is_bot || obs.suspicion_score >= 60 ? "err" : obs.suspicion_score >= 30 ? "warn" : "ok";
@@ -625,6 +750,13 @@ export function createAnalyticsViews({ api, store, navigate }) {
                     const abuseBadge = obs.abuse_score != null
                       ? `<span class="pill ${obs.abuse_score >= 75 ? "err" : obs.abuse_score >= 25 ? "warn" : "ok"}">Abuse ${Number(obs.abuse_score)}${obs.abuse_country ? ` · ${esc(obs.abuse_country)}` : ""}${obs.abuse_is_tor ? " · TOR" : ""}</span>`
                       : "";
+                    const webrtcBadge = js?.webrtc_ip_mismatch
+                      ? `<span class="pill err">${esc(t("fp.webrtc.leak_badge"))}</span>`
+                      : js?.webrtc_local_ips?.length
+                        ? `<span class="pill warn">${esc(t("fp.webrtc.lan_badge"))}</span>`
+                        : js?.webrtc_mdns
+                          ? `<span class="pill info">${esc(t("fp.webrtc.mdns_badge"))}</span>`
+                          : "";
                     const ja3Line = obs.tls_ja3
                       ? `<div class="muted-sm">JA3: <span class="fp-code">${esc(obs.tls_ja3.slice(0, 12))}</span>${obs.tls_grease ? " · GREASE" : ""}</div>`
                       : "";
@@ -635,7 +767,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
                     <td><div><strong>${esc(obs.browser_family || "-")}</strong> · ${esc(obs.os_family || "-")}</div><div class="muted-sm">${esc(obs.device_type || "-")}</div></td>
                     <td><span class="muted-sm">${esc(jsSum)}</span></td>
                     <td><div><code>${esc(obs.service_tag)}</code></div><div class="muted-sm">${esc(obs.node_tag)}</div></td>
-                    <td><div style="display:flex;flex-wrap:wrap;gap:4px;"><span class="pill ${riskCls}">${esc(riskLbl)}</span>${abuseBadge}</div></td>
+                    <td><div style="display:flex;flex-wrap:wrap;gap:4px;"><span class="pill ${riskCls}">${esc(riskLbl)}</span>${abuseBadge}${webrtcBadge}</div></td>
                     <td><div><strong>${formatCompact(obs.request_count)}</strong></div><div class="muted-sm">${obs.challenge_count || 0} ch · ${obs.rate_limited_count || 0} 429</div></td>
                     <td>${esc(formatDateTime(obs.last_seen_ts))}</td>
                   </tr>`;
@@ -648,24 +780,28 @@ export function createAnalyticsViews({ api, store, navigate }) {
       </div>
     `;
 
+    wireLoggingSubtabs(root);
     const triggerSearch = () => {
       fpFilters.q = el("fp-search-q")?.value.trim() || "";
       fpFilters.ip = el("fp-search-ip")?.value.trim() || "";
       fpFilters.fp = el("fp-search-fp")?.value.trim() || "";
-      refreshFingerprints();
+      refreshVisitors();
     };
     el("btn-fp-search")?.addEventListener("click", triggerSearch);
     el("btn-fp-clear")?.addEventListener("click", () => {
       fpFilters = { q: "", ip: "", fp: "", node: "all", service: "all", verified: "all", risk: "all" };
-      refreshFingerprints();
+      refreshVisitors();
+    });
+    el("btn-fp-export")?.addEventListener("click", () => {
+      downloadJson("exposure-visitor-fingerprints.json", items);
     });
     ["fp-search-q", "fp-search-ip", "fp-search-fp"].forEach((id) => {
       el(id)?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); triggerSearch(); } });
     });
-    el("fp-node-filter")?.addEventListener("change", (ev) => { fpFilters.node = ev.target.value; refreshFingerprints(); });
-    el("fp-svc-filter")?.addEventListener("change", (ev) => { fpFilters.service = ev.target.value; refreshFingerprints(); });
-    root.querySelectorAll("[data-fp-ver]").forEach((b) => b.addEventListener("click", () => { fpFilters.verified = b.dataset.fpVer; refreshFingerprints(); }));
-    root.querySelectorAll("[data-fp-risk]").forEach((b) => b.addEventListener("click", () => { fpFilters.risk = b.dataset.fpRisk; refreshFingerprints(); }));
+    el("fp-node-filter")?.addEventListener("change", (ev) => { fpFilters.node = ev.target.value; refreshVisitors(); });
+    el("fp-svc-filter")?.addEventListener("change", (ev) => { fpFilters.service = ev.target.value; refreshVisitors(); });
+    root.querySelectorAll("[data-fp-ver]").forEach((b) => b.addEventListener("click", () => { fpFilters.verified = b.dataset.fpVer; refreshVisitors(); }));
+    root.querySelectorAll("[data-fp-risk]").forEach((b) => b.addEventListener("click", () => { fpFilters.risk = b.dataset.fpRisk; refreshVisitors(); }));
     root.querySelectorAll("[data-fp-idx]").forEach((tr) => {
       tr.addEventListener("click", () => {
         const obs = items[Number(tr.dataset.fpIdx)];
@@ -678,6 +814,39 @@ export function createAnalyticsViews({ api, store, navigate }) {
         const tamperHtml = js?.tamper_flags?.length
           ? js.tamper_flags.map((f) => `<span class="pill err">${esc(f)}</span>`).join(" ")
           : `<span class="pill ok">none</span>`;
+
+        let webrtcHtml = "";
+        if (js) {
+          const pubList = (js.webrtc_public_ips || []).map((ip) => `<code>${esc(ip)}</code>`).join(", ") || "-";
+          const locList = (js.webrtc_local_ips || []).map((ip) => `<code>${esc(ip)}</code>`).join(", ") || "-";
+          const verdictPill = js.webrtc_ip_mismatch
+            ? `<span class="pill err">${esc(t("fp.webrtc.leak_badge"))}</span>`
+            : js.webrtc_local_ips?.length
+              ? `<span class="pill warn">${esc(t("fp.webrtc.lan_badge"))}</span>`
+              : `<span class="pill ok">${esc(t("fp.webrtc.clean"))}</span>`;
+          webrtcHtml = `
+            <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--accent);">${esc(t("fp.webrtc.title"))}</div>
+            <div class="fp-detail-grid">
+              <div class="fp-kv"><div class="fp-kv-lbl">Verdict &amp; Status</div><div class="fp-kv-val">${verdictPill} <span class="muted-sm">(${esc(js.webrtc_status || "-")}${js.webrtc_mdns ? " · mDNS" : ""})</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Public / Local ICE IPs</div><div class="fp-kv-val">pub: ${pubList}<br/>lan: ${locList}</div></div>
+            </div>`;
+        }
+
+        const ipKey = obs.client_ip || obs.ip_hmac || "";
+        const modalActions = [];
+        if (ipKey) {
+          modalActions.push({
+            label: t("logging.cross.view_logs"),
+            cls: "ghost",
+            onClick: () => {
+              loggingSubTab = "access";
+              logFilters = { q: "", ip: ipKey, host: "", node: "all", service: "all", role: "all", method: "all", status: "all", action: "all", window_secs: 0 };
+              refreshLogs();
+            },
+          });
+        }
+        modalActions.push({ label: t("common.close"), cls: "primary" });
+
         openModal({
           title: `Fingerprint — ${obs.fp_hash}`,
           bodyHtml: `
@@ -691,6 +860,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
               <div class="fp-kv"><div class="fp-kv-lbl">Traffic</div><div class="fp-kv-val">${formatCompact(obs.request_count)} req · ${obs.challenge_count || 0} PoW · ${obs.rate_limited_count || 0} 429</div></div>
             </div>
             <div class="fp-ua-box" style="margin-top:8px;">${esc(obs.user_agent || "(empty)")}</div>
+            ${webrtcHtml}
             ${
               js
                 ? `
@@ -705,13 +875,13 @@ export function createAnalyticsViews({ api, store, navigate }) {
               </div>`
                 : ""
             }`,
-          actions: [{ label: t("common.close"), cls: "primary" }],
+          actions: modalActions,
         });
       });
     });
   }
 
-  async function refreshFingerprints() {
+  async function refreshVisitors() {
     const qs = new URLSearchParams();
     if (fpFilters.q) qs.set("q", fpFilters.q);
     if (fpFilters.ip) qs.set("ip", fpFilters.ip);
@@ -723,14 +893,41 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const winSec = Number(el("sel-time-window")?.value || 0);
     if (winSec > 0) qs.set("window_secs", String(winSec));
     fpData = await api(`/api/fingerprints${qs.toString() ? `?${qs}` : ""}`);
-    renderFingerprints();
+    if (loggingSubTab === "visitors") renderVisitors();
     return fpData;
+  }
+
+  function renderLogging() {
+    if (loggingSubTab === "visitors") renderVisitors();
+    else renderLogs();
+  }
+
+  async function refreshLogging(opts = {}) {
+    if (opts?.subTab === "visitors" || opts?.subTab === "access") {
+      loggingSubTab = opts.subTab;
+    }
+    if (opts?.service) {
+      if (loggingSubTab === "visitors") fpFilters.service = opts.service;
+      else logFilters.service = opts.service;
+    }
+    if (opts?.ip) {
+      if (loggingSubTab === "visitors") fpFilters.ip = opts.ip;
+      else logFilters.ip = opts.ip;
+    }
+    if (opts?.q) {
+      if (loggingSubTab === "visitors") fpFilters.q = opts.q;
+      else logFilters.q = opts.q;
+    }
+    if (loggingSubTab === "visitors") return refreshVisitors();
+    return refreshLogs();
   }
 
   return {
     refreshAnalytics,
     renderAnalytics: renderAnalyticsCharts,
-    refreshFingerprints,
-    renderFingerprints,
+    refreshLogging,
+    renderLogging,
+    refreshFingerprints: refreshVisitors,
+    renderFingerprints: renderVisitors,
   };
 }

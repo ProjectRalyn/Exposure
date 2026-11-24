@@ -1005,7 +1005,7 @@ impl GuardEngine {
             if let Err(retry_after) = self.consume_fp_report_rate_limit(client_ip) {
                 return rate_limit_resp(retry_after, b"rate limited");
             }
-            if body.len() > 4096 {
+            if body.len() > 8192 {
                 return (
                     GuardHttpResponse {
                         status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -1112,6 +1112,7 @@ impl GuardEngine {
             }
 
             req.fp.sanitize();
+            req.fp.evaluate_webrtc_against_client_ip(client_ip);
             let is_headless = req.fp.detect_headless(ua);
             let fp_hash = req.fp.canonical_hash();
             let ttl = profile
@@ -1177,7 +1178,7 @@ impl GuardEngine {
             ) {
                 return rate_limit_resp(retry_after, b"verify rate limited");
             }
-            if body.len() > 4096 {
+            if body.len() > 8192 {
                 return (
                     GuardHttpResponse {
                         status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -1291,6 +1292,7 @@ impl GuardEngine {
             let mut verified_fp_sub: Option<VerifiedFpSubmission> = None;
             let fp_hash = if let Some(ref mut cfp) = req.client_fp {
                 cfp.sanitize();
+                cfp.evaluate_webrtc_against_client_ip(client_ip);
                 let is_headless = cfp.detect_headless(ua);
                 if block_headless && is_headless {
                     self.record_verify_failure(client_ip);
