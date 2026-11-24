@@ -175,6 +175,7 @@ export function createSecurityView({ api, store }) {
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "bind_ua", label: "Bind User-Agent", val: g.bind_ua, inherited: gDefs.bind_ua })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "bind_ip_prefix", label: "Bind Client IP", val: g.bind_ip_prefix, inherited: gDefs.bind_ip_prefix })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "block_bots", label: "Block Known Bots", val: g.block_bots, inherited: gDefs.block_bots })}
+              ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "browser_only", label: "Browser-Only Strict Mode", val: g.browser_only, inherited: gDefs.browser_only })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "block_headless", label: "Block Headless Browsers", val: g.block_headless, inherited: gDefs.block_headless })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "require_client_fp", label: "Require Verified JS FP", val: g.require_client_fp, inherited: gDefs.require_client_fp })}
               ${renderTriSlider({ attrName: `data-gd-tri-${gName}`, attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: g.js_fp_beacon, inherited: gDefs.js_fp_beacon })}
@@ -637,9 +638,14 @@ export function createSecurityView({ api, store }) {
       tracked_sessions: 0,
       tarpit_bytes_dripped: 0,
       active_tarpit_connections: 0,
+      active_ip_bans: 0,
+      active_fp_bans: 0,
+      total_auto_bans: 0,
+      total_ban_drops: 0,
     };
     const sessions = evilpotData?.sessions || [];
     const events = evilpotData?.recent_events || [];
+    const activeBans = evilpotData?.active_bans || [];
 
     container.innerHTML = `
       <div class="kpi-grid" style="margin-bottom:14px;">
@@ -659,6 +665,11 @@ export function createSecurityView({ api, store }) {
           <div class="kpi-sub">Canary replay hits</div>
         </div>
         <div class="kpi-card">
+          <div class="kpi-label">${esc(t("ep.kpi.autoban"))}</div>
+          <div class="kpi-value" style="color:var(--err);">${esc(sum.active_ip_bans || 0)} / ${esc(sum.active_fp_bans || 0)}</div>
+          <div class="kpi-sub">Drops: ${esc(sum.total_ban_drops || 0)} · Total: ${esc(sum.total_auto_bans || 0)}</div>
+        </div>
+        <div class="kpi-card">
           <div class="kpi-label">${esc(t("ep.kpi.tarpit"))}</div>
           <div class="kpi-value">${esc(sum.active_tarpit_connections)} / ${esc(formatBytesShort(sum.tarpit_bytes_dripped))}</div>
           <div class="kpi-sub">${evilpotData?.last_pulled_at ? esc(formatDateTime(evilpotData.last_pulled_at)) : esc(t("common.loading"))}</div>
@@ -666,7 +677,44 @@ export function createSecurityView({ api, store }) {
       </div>
 
       ${
-        !sessions.length && !events.length
+        activeBans.length
+          ? `
+      <div class="panel">
+        <div class="panel-header"><h3>${esc(t("ep.bans.title"))} (${activeBans.length})</h3></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Kind</th>
+                <th>Target</th>
+                <th>Reason</th>
+                <th>Level / Drops</th>
+                <th>Expires</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${activeBans
+                .slice(0, 60)
+                .map(
+                  (b) => `
+                <tr>
+                  <td><span class="pill ${b.kind === "ip" ? "err" : "warn"}">${esc(b.kind)}</span></td>
+                  <td><code>${esc(b.target)}</code> <span class="muted">(${esc(b.node_tag || "")})</span></td>
+                  <td><code>${esc(b.reason)}</code></td>
+                  <td>L${esc(b.offense_level || 1)} · <b>${esc(b.hits_blocked || 0)}</b> drops</td>
+                  <td style="white-space:nowrap;">${esc(formatDateTime(b.expires_at_unix || 0))}</td>
+                </tr>`
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>`
+          : ""
+      }
+
+      ${
+        !sessions.length && !events.length && !activeBans.length
           ? `<div class="empty-state-box"><p>${esc(t("ep.empty"))}</p></div>`
           : `
       <div class="panel">
@@ -696,7 +744,7 @@ export function createSecurityView({ api, store }) {
                       <td>${renderEpStatusPill(s.status)}</td>
                       <td>
                         <div><code>${esc(s.client_ip)}</code></div>
-                        <div class="muted" style="font-size:11px;">${esc(s.node_tag || "")} · ${esc(formatDateTime((s.last_seen_unix || 0) * 1000))}</div>
+                        <div class="muted" style="font-size:11px;">${esc(s.node_tag || "")} · ${esc(formatDateTime(s.last_seen_unix || 0))}</div>
                       </td>
                       <td>
                         <code>${esc(s.persona_hostname)}</code>
@@ -746,7 +794,7 @@ export function createSecurityView({ api, store }) {
                   .map(
                     (ev) => `
                   <tr>
-                    <td style="white-space:nowrap;">${esc(formatDateTime((ev.timestamp_unix || 0) * 1000))}</td>
+                    <td style="white-space:nowrap;">${esc(formatDateTime(ev.timestamp_unix || 0))}</td>
                     <td>${renderEpStatusPill(ev.verification_status)}</td>
                     <td><code>${esc(ev.client_ip)}</code> <span class="muted">(${esc(ev.node_tag || "")})</span></td>
                     <td><code>${esc(ev.trap_kind)}</code></td>

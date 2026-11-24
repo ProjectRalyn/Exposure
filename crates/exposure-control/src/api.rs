@@ -1822,10 +1822,15 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
     let mut verified_attack_sessions = 0u64;
     let mut tarpit_bytes_dripped = 0u64;
     let mut active_tarpit_connections = 0usize;
+    let mut active_ip_bans = 0usize;
+    let mut active_fp_bans = 0usize;
+    let mut total_auto_bans = 0u64;
+    let mut total_ban_drops = 0u64;
 
     let mut nodes = Vec::new();
     let mut sessions: Vec<serde_json::Value> = Vec::new();
     let mut recent_events: Vec<serde_json::Value> = Vec::new();
+    let mut active_bans: Vec<serde_json::Value> = Vec::new();
 
     for rep in &tel.evilpot_reports {
         requests_handled = requests_handled.saturating_add(rep.requests_handled);
@@ -1836,6 +1841,10 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
         tarpit_bytes_dripped = tarpit_bytes_dripped.saturating_add(rep.tarpit_bytes_dripped);
         active_tarpit_connections =
             active_tarpit_connections.saturating_add(rep.active_tarpit_connections);
+        active_ip_bans = active_ip_bans.saturating_add(rep.active_ip_bans);
+        active_fp_bans = active_fp_bans.saturating_add(rep.active_fp_bans);
+        total_auto_bans = total_auto_bans.saturating_add(rep.total_auto_bans);
+        total_ban_drops = total_ban_drops.saturating_add(rep.total_ban_drops);
 
         nodes.push(serde_json::json!({
             "node_tag": rep.node_tag,
@@ -1847,8 +1856,23 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
             "verified_attack_sessions": rep.verified_attack_sessions,
             "tarpit_bytes_dripped": rep.tarpit_bytes_dripped,
             "active_tarpit_connections": rep.active_tarpit_connections,
+            "active_ip_bans": rep.active_ip_bans,
+            "active_fp_bans": rep.active_fp_bans,
+            "total_auto_bans": rep.total_auto_bans,
+            "total_ban_drops": rep.total_ban_drops,
             "tracked_sessions": rep.sessions.len(),
         }));
+
+        for b in &rep.active_bans {
+            let mut val = serde_json::to_value(b).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
+            }
+            active_bans.push(val);
+        }
 
         for s in &rep.sessions {
             let mut val = serde_json::to_value(s).unwrap_or_default();
@@ -1895,6 +1919,15 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
     });
     recent_events.truncate(200);
 
+    active_bans.sort_by(|a, b| {
+        let ha = a.get("hits_blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+        let hb = b.get("hits_blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ta = a.get("banned_at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tb = b.get("banned_at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+        hb.cmp(&ha).then_with(|| tb.cmp(&ta))
+    });
+    active_bans.truncate(200);
+
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
         "summary": {
@@ -1906,10 +1939,15 @@ async fn get_evilpot(State(state): State<ApiState>, headers: HeaderMap) -> Respo
             "tracked_sessions": sessions.len(),
             "tarpit_bytes_dripped": tarpit_bytes_dripped,
             "active_tarpit_connections": active_tarpit_connections,
+            "active_ip_bans": active_ip_bans,
+            "active_fp_bans": active_fp_bans,
+            "total_auto_bans": total_auto_bans,
+            "total_ban_drops": total_ban_drops,
         },
         "nodes": nodes,
         "sessions": sessions,
         "recent_events": recent_events,
+        "active_bans": active_bans,
     }))
     .into_response()
 }

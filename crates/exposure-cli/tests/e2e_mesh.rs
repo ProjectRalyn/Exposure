@@ -321,6 +321,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             clearance_ttl_secs: 600,
             bind_ua: Some(true),
             bind_ip_prefix: Some(false),
+            browser_only: Some(true),
             ..Default::default()
         },
     );
@@ -466,6 +467,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             pages: Default::default(),
             cache: Default::default(),
             evilpot: Default::default(),
+            auto_ban: Default::default(),
             abuseipdb: Default::default(),
             crs: Default::default(),
             crs_rules: vec![],

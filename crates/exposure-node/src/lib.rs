@@ -1,5 +1,6 @@
 pub mod abuseipdb;
 pub mod acme;
+pub mod ban;
 pub mod cache;
 pub mod egress;
 pub mod forwarder;

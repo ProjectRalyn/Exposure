@@ -382,6 +382,55 @@ impl Default for EvilpotNodeConfig {
     }
 }
 
+fn default_autoban_ttl_secs() -> u64 {
+    1800
+}
+fn default_autoban_max_ttl_secs() -> u64 {
+    86_400
+}
+fn default_autoban_confirm_hits() -> u32 {
+    4
+}
+
+/// Node-level automatic IP & fingerprint ban policy triggered after attack behavior is confirmed
+/// (e.g. Evilpot canary replay / RCE / sustained tarpit / multi-step exploit, or repeated WAF hits).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoBanConfig {
+    /// Automatically ban IPs and attacker fingerprints once attack behavior is confirmed (default true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Initial ban duration in seconds (default 1800s = 30m); escalates exponentially on repeat offenses.
+    #[serde(default = "default_autoban_ttl_secs")]
+    pub ban_ttl_secs: u64,
+    /// Maximum escalated ban duration in seconds for repeat offenders (default 86400s = 24h).
+    #[serde(default = "default_autoban_max_ttl_secs")]
+    pub max_ban_ttl_secs: u64,
+    /// Number of probing WAF/Evilpot hits within the 5-minute window before confirming & banning
+    /// when Evilpot has not yet verified an exploit directly (default 4).
+    #[serde(default = "default_autoban_confirm_hits")]
+    pub confirm_hits: u32,
+    /// Also ban high-confidence attacker fingerprints (verified JS FP hash and attacker-exclusive
+    /// composite TLS+UA fingerprint; never bans fingerprints observed on benign traffic).
+    #[serde(default = "default_true")]
+    pub ban_fingerprints: bool,
+    /// Drop confirmed-banned IPs at TCP accept before TLS handshake for near-zero CPU/RAM overhead (default true).
+    #[serde(default = "default_true")]
+    pub drop_at_tcp: bool,
+}
+
+impl Default for AutoBanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ban_ttl_secs: default_autoban_ttl_secs(),
+            max_ban_ttl_secs: default_autoban_max_ttl_secs(),
+            confirm_hits: default_autoban_confirm_hits(),
+            ban_fingerprints: true,
+            drop_at_tcp: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum WafCategory {
@@ -619,6 +668,11 @@ pub struct GuardProfile {
     /// Block known bot/scraper User-Agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_bots: Option<bool>,
+    /// Enforce strict browser-only scoring (penalizes non-browser HTTP clients like curl/SDKs).
+    /// Defaults to `false` so non-browser services behind Egress (APIs, CLIs, webhooks, mobile apps)
+    /// are not blindly blocked while browser impersonators & attack payloads are still caught.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_only: Option<bool>,
     /// Reject headless/automated browsers detected via JS WebGL/webdriver/platform cross-check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_headless: Option<bool>,
@@ -645,6 +699,9 @@ impl GuardProfile {
     }
     pub fn effective_block_bots(&self) -> bool {
         self.block_bots.unwrap_or(false)
+    }
+    pub fn effective_browser_only(&self) -> bool {
+        self.browser_only.unwrap_or(false)
     }
     pub fn effective_block_headless(&self) -> bool {
         self.block_headless.unwrap_or(true)
@@ -678,6 +735,7 @@ impl Default for GuardProfile {
             bind_ip_prefix: None,
             api_bypass_headers: Vec::new(),
             block_bots: None,
+            browser_only: None,
             block_headless: None,
             require_client_fp: None,
             js_fp_beacon: None,
@@ -816,6 +874,9 @@ pub struct IngressConfig {
     /// Node-level embedded `evilpot` honeypot engine settings (used when a Guard enables `waf.mode = evilpot`).
     #[serde(default)]
     pub evilpot: EvilpotNodeConfig,
+    /// Automatic IP & fingerprint banning upon confirmed attack behavior.
+    #[serde(default)]
+    pub auto_ban: AutoBanConfig,
     /// Optional AbuseIPDB IP reputation integration.
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
@@ -852,6 +913,7 @@ impl Default for IngressConfig {
             pages: CustomPagesConfig::default(),
             cache: NodeCacheConfig::default(),
             evilpot: EvilpotNodeConfig::default(),
+            auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
             crs: CrsUpdateConfig::default(),
             crs_rules: Vec::new(),
@@ -1513,6 +1575,8 @@ pub struct IngressDefaults {
     #[serde(default)]
     pub evilpot: EvilpotNodeConfig,
     #[serde(default)]
+    pub auto_ban: AutoBanConfig,
+    #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
     #[serde(default)]
     pub crs: CrsUpdateConfig,
@@ -1530,6 +1594,7 @@ impl Default for IngressDefaults {
             js_fp_ttl_secs: default_js_fp_ttl_secs(),
             cache: NodeCacheConfig::default(),
             evilpot: EvilpotNodeConfig::default(),
+            auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
             crs: CrsUpdateConfig::default(),
         }
@@ -1556,6 +1621,8 @@ pub struct GuardDefaults {
     pub bind_ip_prefix: bool,
     #[serde(default)]
     pub block_bots: bool,
+    #[serde(default)]
+    pub browser_only: bool,
     #[serde(default = "default_true")]
     pub block_headless: bool,
     #[serde(default)]
@@ -1580,6 +1647,7 @@ impl Default for GuardDefaults {
             bind_ua: true,
             bind_ip_prefix: true,
             block_bots: false,
+            browser_only: false,
             block_headless: true,
             require_client_fp: false,
             js_fp_beacon: true,

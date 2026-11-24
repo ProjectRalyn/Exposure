@@ -107,6 +107,32 @@ export function normalizeCrsUpdateConfig(raw) {
   };
 }
 
+export function defaultAutoBanConfig() {
+  return {
+    enabled: true,
+    ban_ttl_secs: 1800,
+    max_ban_ttl_secs: 86400,
+    confirm_hits: 4,
+    ban_fingerprints: true,
+    drop_at_tcp: true,
+  };
+}
+
+export function normalizeAutoBanConfig(raw) {
+  const b = defaultAutoBanConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const ttl = Math.min(86400, Math.max(60, Number(s.ban_ttl_secs ?? b.ban_ttl_secs) || b.ban_ttl_secs));
+  const maxTtl = Math.min(7 * 86400, Math.max(ttl, Number(s.max_ban_ttl_secs ?? b.max_ban_ttl_secs) || b.max_ban_ttl_secs));
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    ban_ttl_secs: ttl,
+    max_ban_ttl_secs: maxTtl,
+    confirm_hits: Math.min(50, Math.max(1, Number(s.confirm_hits ?? b.confirm_hits) || b.confirm_hits)),
+    ban_fingerprints: Boolean(s.ban_fingerprints ?? b.ban_fingerprints),
+    drop_at_tcp: Boolean(s.drop_at_tcp ?? b.drop_at_tcp),
+  };
+}
+
 export function defaultEvilpotConfig() {
   return {
     rotation_interval_secs: 300,
@@ -226,6 +252,7 @@ export function defaultTopologyDefaults() {
       js_fp_ttl_secs: 3600,
       cache: defaultNodeCacheConfig(),
       evilpot: defaultEvilpotConfig(),
+      auto_ban: defaultAutoBanConfig(),
       abuseipdb: defaultAbuseIpDbConfig(),
       crs: defaultCrsUpdateConfig(),
     },
@@ -239,6 +266,7 @@ export function defaultTopologyDefaults() {
       bind_ua: true,
       bind_ip_prefix: true,
       block_bots: false,
+      browser_only: false,
       block_headless: true,
       require_client_fp: false,
       js_fp_beacon: true,
@@ -282,6 +310,7 @@ export function defaultGuardProfile(defs = null) {
     bind_ip_prefix: null,
     api_bypass_headers: [],
     block_bots: null,
+    browser_only: null,
     block_headless: null,
     require_client_fp: null,
     js_fp_beacon: null,
@@ -305,6 +334,7 @@ export function normalizeGuardProfile(g) {
     bind_ip_prefix: normalizeTri(src.bind_ip_prefix),
     api_bypass_headers: Array.isArray(src.api_bypass_headers) ? src.api_bypass_headers : [],
     block_bots: normalizeTri(src.block_bots),
+    browser_only: normalizeTri(src.browser_only),
     block_headless: normalizeTri(src.block_headless),
     require_client_fp: normalizeTri(src.require_client_fp),
     js_fp_beacon: normalizeTri(src.js_fp_beacon),
@@ -560,6 +590,7 @@ export function normalizeDefaults(raw) {
       js_fp_ttl_secs: Number(src.ingress?.js_fp_ttl_secs ?? base.ingress.js_fp_ttl_secs) || 3600,
       cache: normalizeNodeCacheConfig(src.ingress?.cache),
       evilpot: normalizeEvilpotConfig(src.ingress?.evilpot),
+      auto_ban: normalizeAutoBanConfig(src.ingress?.auto_ban),
       abuseipdb: normalizeAbuseIpDbConfig(src.ingress?.abuseipdb),
       crs: normalizeCrsUpdateConfig(src.ingress?.crs),
     },
@@ -570,6 +601,7 @@ export function normalizeDefaults(raw) {
       bind_ua: Boolean(src.guard?.bind_ua ?? base.guard.bind_ua),
       bind_ip_prefix: Boolean(src.guard?.bind_ip_prefix ?? base.guard.bind_ip_prefix),
       block_bots: Boolean(src.guard?.block_bots ?? base.guard.block_bots),
+      browser_only: Boolean(src.guard?.browser_only ?? base.guard.browser_only),
       block_headless: Boolean(src.guard?.block_headless ?? base.guard.block_headless),
       require_client_fp: Boolean(src.guard?.require_client_fp ?? base.guard.require_client_fp),
       js_fp_beacon: Boolean(src.guard?.js_fp_beacon ?? base.guard.js_fp_beacon),

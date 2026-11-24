@@ -877,7 +877,21 @@ pub struct EvilpotEventInfo {
     pub evidence: Vec<String>,
 }
 
-/// Per-node `evilpot` honeypot metrics, tracked attacker sessions, and recent deception events.
+/// Active auto-ban entry for a confirmed attacker IP or fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveBanInfo {
+    /// `"ip"` | `"js_fp"` | `"composite_fp"`
+    pub kind: String,
+    pub target: String,
+    pub reason: String,
+    pub banned_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub offense_level: u8,
+    pub hits_blocked: u64,
+}
+
+/// Per-node `evilpot` honeypot metrics, tracked attacker sessions, recent deception events,
+/// and active auto-ban state for confirmed attacker IPs & fingerprints.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EvilpotNodeReport {
     pub node_tag: String,
@@ -890,9 +904,19 @@ pub struct EvilpotNodeReport {
     pub tarpit_bytes_dripped: u64,
     pub active_tarpit_connections: usize,
     #[serde(default)]
+    pub active_ip_bans: usize,
+    #[serde(default)]
+    pub active_fp_bans: usize,
+    #[serde(default)]
+    pub total_auto_bans: u64,
+    #[serde(default)]
+    pub total_ban_drops: u64,
+    #[serde(default)]
     pub sessions: Vec<EvilpotSessionInfo>,
     #[serde(default)]
     pub recent_events: Vec<EvilpotEventInfo>,
+    #[serde(default)]
+    pub active_bans: Vec<ActiveBanInfo>,
 }
 
 #[cfg(test)]

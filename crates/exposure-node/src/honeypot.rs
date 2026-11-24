@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,8 +20,9 @@ use hyper::body::{Body, Frame};
 use rand::RngCore;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
 use crate::egress::ProxyBody;
 use crate::waf::WafFinding;
 
@@ -38,10 +40,13 @@ pub const MAX_EVILPOT_QUERY_CHARS: usize = 512;
 
 /// Hard DoS / CC protection caps for embedded `evilpot` execution on Ingress.
 const MAX_GLOBAL_EVILPOT_INFLIGHT: usize = 64;
-const MAX_PER_IP_EVILPOT_INFLIGHT: usize = 4;
+const MAX_PER_IP_EVILPOT_INFLIGHT: usize = 3;
 const MAX_PER_IP_HITS_PER_WINDOW: u32 = 45;
 const EVILPOT_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_RATE_IPS: usize = 8192;
+
+/// Hard timeout on `evilpot` request handling (including time-blind SQLi delays).
+pub const EVILPOT_HANDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Hard wall-clock ceiling on slow-drip tarpit streams (10x `tarpit_verify_min_ms`,
 /// enough to verify active exfil tools while preventing multi-day connection pinning).
@@ -50,6 +55,38 @@ const MAX_EVILPOT_STREAM_DURATION: Duration = Duration::from_secs(30);
 /// Alert deduplication cooldown per `(client_ip, verification_status)` to prevent alert flooding.
 const ALERT_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
+
+fn evict_half<K, V>(map: &DashMap<K, V>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let to_remove = map.len() / 2;
+    if to_remove == 0 {
+        return;
+    }
+    let mut removed = 0usize;
+    map.retain(|_, _| {
+        if removed < to_remove {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Optional post-stream verification hook attached to `BoundedEvilpotBody`.
+/// When a slow-drip tarpit stream completes or hits its deadline, this checks whether
+/// `evilpot` upgraded the attacker to `VerifiedExploit` (`SustainedTarpitRead`) mid-stream
+/// and triggers `AutoBanManager` immediately without holding an extra background task.
+pub struct TarpitBanHook {
+    pub engine: Arc<EvilpotEngine>,
+    pub auto_ban: Arc<AutoBanManager>,
+    pub client_ip: IpAddr,
+    pub tls_ja3: Option<String>,
+    pub user_agent: String,
+    pub js_fp_hash: Option<String>,
+}
 
 /// Zero-sized response extension marker indicating the response was synthesized by `evilpot`.
 /// Ensures Ingress preserves `evilpot`'s rotating spoofed `Server` persona header without adding
@@ -74,12 +111,44 @@ impl Drop for EvilpotInflightPermit {
     }
 }
 
-/// Wraps `evilpot::EvilpotBody` with a hard wall-clock deadline and retains `EvilpotInflightPermit`
-/// until the response stream finishes or closes.
+/// Wraps `evilpot::EvilpotBody` with an active timer-driven wall-clock deadline and retains
+/// `EvilpotInflightPermit` until the response stream finishes or closes.
+/// On completion/drop, if `evilpot` upgraded the session to `VerifiedExploit` during the tarpit
+/// stream (`SustainedTarpitRead`), automatically bans the confirmed attacker IP & fingerprint.
 struct BoundedEvilpotBody {
     inner: EvilpotBody,
-    deadline: Instant,
+    deadline_sleep: Pin<Box<tokio::time::Sleep>>,
     _permit: Option<EvilpotInflightPermit>,
+    ban_hook: Option<TarpitBanHook>,
+}
+
+impl Drop for BoundedEvilpotBody {
+    fn drop(&mut self) {
+        if let Some(hook) = self.ban_hook.take() {
+            if let Some(session) = hook.engine.session_report(hook.client_ip) {
+                if session.status == ExploitVerificationStatus::VerifiedExploit {
+                    let outcome = hook.auto_ban.record_offense(OffenseContext {
+                        client_ip: hook.client_ip,
+                        tls_ja3: hook.tls_ja3.as_deref(),
+                        user_agent: &hook.user_agent,
+                        js_fp_hash: hook.js_fp_hash.as_deref(),
+                        kind: OffenseKind::VerifiedExploit,
+                        reason: "evilpot:verified_exploit:tarpit",
+                    });
+                    if outcome.any_banned() {
+                        warn!(
+                            client = %hook.client_ip,
+                            ttl_secs = outcome.ban_ttl_secs,
+                            banned_ip = outcome.newly_banned_ip,
+                            banned_js_fp = outcome.newly_banned_js_fp,
+                            banned_comp_fp = outcome.newly_banned_composite_fp,
+                            "auto-banned confirmed attacker after sustained evilpot tarpit verification"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Body for BoundedEvilpotBody {
@@ -90,7 +159,7 @@ impl Body for BoundedEvilpotBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if Instant::now() >= self.deadline {
+        if self.deadline_sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(None);
         }
         match Pin::new(&mut self.inner).poll_frame(cx) {
@@ -235,7 +304,7 @@ impl EvilpotManager {
             self.per_ip_rate
                 .retain(|_, (ts, _)| now.duration_since(*ts) < EVILPOT_RATE_WINDOW);
             if self.per_ip_rate.len() >= MAX_TRACKED_RATE_IPS {
-                self.per_ip_rate.clear();
+                evict_half(&self.per_ip_rate);
             }
         }
         {
@@ -291,7 +360,7 @@ impl EvilpotManager {
             self.alert_cooldowns
                 .retain(|_, ts| now.duration_since(*ts) < ALERT_COOLDOWN);
             if self.alert_cooldowns.len() >= MAX_ALERT_COOLDOWN_ENTRIES {
-                self.alert_cooldowns.clear();
+                evict_half(&self.alert_cooldowns);
             }
         }
         let key = (client_ip, tag);
@@ -305,7 +374,32 @@ impl EvilpotManager {
     }
 
     pub async fn build_report(&self) -> Option<EvilpotNodeReport> {
-        let engine = self.engine().await?;
+        self.build_report_with_bans(None).await
+    }
+
+    pub async fn build_report_with_bans(
+        &self,
+        auto_ban: Option<&AutoBanManager>,
+    ) -> Option<EvilpotNodeReport> {
+        let ban_snap = auto_ban.map(AutoBanManager::snapshot);
+        let Some(engine) = self.engine().await else {
+            let snap = ban_snap?;
+            if snap.active_ip_bans == 0
+                && snap.active_fp_bans == 0
+                && snap.total_auto_bans == 0
+            {
+                return None;
+            }
+            return Some(EvilpotNodeReport {
+                node_tag: self.node_tag.clone(),
+                active_ip_bans: snap.active_ip_bans,
+                active_fp_bans: snap.active_fp_bans,
+                total_auto_bans: snap.total_auto_bans,
+                total_ban_drops: snap.total_ban_drops,
+                active_bans: snap.active_bans,
+                ..Default::default()
+            });
+        };
         let m = engine.metrics_snapshot();
 
         let mut raw_sessions = engine.all_session_reports();
@@ -381,6 +475,7 @@ impl EvilpotManager {
             })
             .collect();
 
+        let snap = ban_snap.unwrap_or_default();
         Some(EvilpotNodeReport {
             node_tag: self.node_tag.clone(),
             current_epoch: m.current_epoch,
@@ -391,8 +486,13 @@ impl EvilpotManager {
             verified_attack_sessions: m.verified_attack_sessions,
             tarpit_bytes_dripped: m.tarpit_bytes_dripped,
             active_tarpit_connections: m.active_tarpit_connections,
+            active_ip_bans: snap.active_ip_bans,
+            active_fp_bans: snap.active_fp_bans,
+            total_auto_bans: snap.total_auto_bans,
+            total_ban_drops: snap.total_ban_drops,
             sessions,
             recent_events,
+            active_bans: snap.active_bans,
         })
     }
 }
@@ -512,19 +612,28 @@ pub fn build_attack_signal(
 }
 
 /// Zero-copy conversion from `evilpot::EvilpotBody` (`Infallible` error) to Exposure's `ProxyBody`,
-/// enforcing a hard stream duration deadline (`MAX_EVILPOT_STREAM_DURATION`), retaining the
-/// admission `EvilpotInflightPermit` until stream completion, and attaching `EvilpotStealthMarker`
-/// so Ingress preserves `evilpot`'s spoofed persona `Server` header.
+/// enforcing an active timer-driven stream duration deadline (`MAX_EVILPOT_STREAM_DURATION`),
+/// retaining the admission `EvilpotInflightPermit` until stream completion, and attaching
+/// `EvilpotStealthMarker` so Ingress preserves `evilpot`'s spoofed persona `Server` header.
 pub fn into_proxy_response(
     resp: Response<EvilpotBody>,
     permit: Option<EvilpotInflightPermit>,
 ) -> Response<ProxyBody> {
-    let deadline = Instant::now() + MAX_EVILPOT_STREAM_DURATION;
+    into_proxy_response_with_ban_hook(resp, permit, None)
+}
+
+pub fn into_proxy_response_with_ban_hook(
+    resp: Response<EvilpotBody>,
+    permit: Option<EvilpotInflightPermit>,
+    ban_hook: Option<TarpitBanHook>,
+) -> Response<ProxyBody> {
+    let deadline_sleep = Box::pin(tokio::time::sleep(MAX_EVILPOT_STREAM_DURATION));
     let mut out = resp.map(|body| {
         BoundedEvilpotBody {
             inner: body,
-            deadline,
+            deadline_sleep,
             _permit: permit,
+            ban_hook,
         }
         .boxed()
     });

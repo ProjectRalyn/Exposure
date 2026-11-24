@@ -32,16 +32,18 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::abuseipdb::AbuseIpDbClient;
+use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
 use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
 use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
 use crate::forwarder::Forwarder;
 use crate::guard::{
-    compute_server_suspicion_score, compute_suspicion_score, matches_api_bypass, sanitize_redirect,
-    ClientFingerprint, GuardDecision, GuardEngine,
+    compute_server_suspicion_score_for_mode, compute_suspicion_score, matches_api_bypass,
+    sanitize_redirect, ClientFingerprint, GuardDecision, GuardEngine,
 };
 use crate::honeypot::{
-    build_attack_signal, clamp_input_slice, into_proxy_response, verification_status_label,
-    EvilpotManager, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
+    build_attack_signal, clamp_input_slice, into_proxy_response_with_ban_hook,
+    verification_status_label, EvilpotManager, TarpitBanHook, EVILPOT_HANDLE_TIMEOUT,
+    MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
 };
 use crate::logger::{FpServerExtras, NodeLogger};
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
@@ -63,10 +65,12 @@ const MESH_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 const WAF_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CDN_CGI_BODY_BYTES: usize = 4096;
 const MAX_HTML_INJECT_BYTES: usize = 2 * 1024 * 1024;
-/// Global cap on concurrently buffered cacheable responses. Each buffer may hold up to
-/// `cache.max_object_bytes` (default 4 MiB), so this bounds worst-case transient memory
-/// instead of letting it scale with `MAX_CONCURRENT_INGRESS_CONNS`.
+/// Global cap on concurrently buffered cacheable responses & HTML beacon injections.
+/// Each buffer may hold up to `cache.max_object_bytes` (default 4 MiB), so this bounds worst-case
+/// transient memory instead of letting it scale with `MAX_CONCURRENT_INGRESS_CONNS`.
 const MAX_CONCURRENT_RESPONSE_BUFFERS: usize = 256;
+/// Global cap on concurrently buffered WAF request body prefixes (default 32 KiB each -> <= 16 MiB).
+const MAX_CONCURRENT_WAF_BODY_BUFFERS: usize = 512;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 struct PerIpConnGuard {
@@ -135,6 +139,7 @@ pub struct IngressServer {
     guard: Arc<GuardEngine>,
     cache: Arc<EdgeCache>,
     evilpot: Arc<EvilpotManager>,
+    auto_ban: Arc<AutoBanManager>,
     abuseipdb: Arc<AbuseIpDbClient>,
     crs: Arc<RwLock<Arc<CompiledCrsEngine>>>,
     cert_resolver: Arc<DynamicCertResolver>,
@@ -142,6 +147,7 @@ pub struct IngressServer {
     started_listeners: DashMap<String, JoinHandle<()>>,
     conn_sem: Arc<Semaphore>,
     buffer_sem: Arc<Semaphore>,
+    waf_body_sem: Arc<Semaphore>,
     per_ip_conns: Arc<DashMap<IpAddr, Arc<AtomicUsize>>>,
 }
 
@@ -187,6 +193,7 @@ impl IngressServer {
             cfg.cache.max_entries,
         ));
         let evilpot = Arc::new(EvilpotManager::new(tag.clone()));
+        let auto_ban = Arc::new(AutoBanManager::new(&cfg.auto_ban));
         let crs = Arc::new(CompiledCrsEngine::compile(
             &cfg.crs_rules,
             &cfg.crs.disabled_rule_ids,
@@ -200,6 +207,7 @@ impl IngressServer {
             guard: Arc::new(GuardEngine::new()),
             cache,
             evilpot,
+            auto_ban,
             abuseipdb,
             crs: Arc::new(RwLock::new(crs)),
             cert_resolver,
@@ -207,6 +215,7 @@ impl IngressServer {
             started_listeners: DashMap::new(),
             conn_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS_CONNS)),
             buffer_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_RESPONSE_BUFFERS)),
+            waf_body_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_WAF_BODY_BUFFERS)),
             per_ip_conns: Arc::new(DashMap::new()),
         })
     }
@@ -215,8 +224,12 @@ impl IngressServer {
         &self.cache
     }
 
+    pub fn auto_ban(&self) -> &Arc<AutoBanManager> {
+        &self.auto_ban
+    }
+
     pub async fn evilpot_report(&self) -> Option<EvilpotNodeReport> {
-        self.evilpot.build_report().await
+        self.evilpot.build_report_with_bans(Some(&self.auto_ban)).await
     }
 
     pub async fn update_config(
@@ -247,6 +260,7 @@ impl IngressServer {
         self.evilpot
             .reconfigure(&cfg.evilpot, &cfg.server_header, any_evilpot_enabled)
             .await;
+        self.auto_ban.reconfigure(&cfg.auto_ban);
         self.abuseipdb.reconfigure(cfg.abuseipdb.clone()).await;
         let compiled_crs = Arc::new(CompiledCrsEngine::compile(
             &cfg.crs_rules,
@@ -324,6 +338,10 @@ impl IngressServer {
                     }
                 };
                 let canon_ip = canonical_ip(peer_addr.ip());
+                if this.auto_ban.is_ip_banned_for_tcp(canon_ip) {
+                    debug!(peer = %peer_addr, "ingress dropped confirmed-banned IP at TCP accept");
+                    continue;
+                }
                 let ip_guard = match PerIpConnGuard::try_acquire(&this.per_ip_conns, canon_ip) {
                     Some(g) => g,
                     None => {
@@ -473,6 +491,59 @@ impl IngressServer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn record_offense_and_maybe_alert(
+        &self,
+        service_tag: &str,
+        host: &str,
+        client_ip: IpAddr,
+        tls_ja3: Option<&str>,
+        ua_str: &str,
+        js_fp_hash: Option<&str>,
+        kind: OffenseKind,
+        reason: &str,
+    ) {
+        let out = self.auto_ban.record_offense(OffenseContext {
+            client_ip,
+            tls_ja3,
+            user_agent: ua_str,
+            js_fp_hash,
+            kind,
+            reason,
+        });
+        if out.any_banned() {
+            warn!(
+                node = %self.node_tag,
+                service = %service_tag,
+                host = %host,
+                client = %client_ip,
+                reason = %reason,
+                ttl_secs = out.ban_ttl_secs,
+                level = out.offense_level,
+                banned_ip = out.newly_banned_ip,
+                banned_js_fp = out.newly_banned_js_fp,
+                banned_comp_fp = out.newly_banned_composite_fp,
+                "auto-banned confirmed attacker IP/fingerprint"
+            );
+            self.logger
+                .emit_alert(
+                    "warning",
+                    format!(
+                        "AutoBan triggered for {} on {} [service={}, reason={}, ttl={}s, ip={}, js_fp={}, comp_fp={}]",
+                        client_ip,
+                        host,
+                        service_tag,
+                        reason,
+                        out.ban_ttl_secs,
+                        out.newly_banned_ip,
+                        out.newly_banned_js_fp,
+                        out.newly_banned_composite_fp,
+                    ),
+                )
+                .await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn try_handle_evilpot_canary(
         &self,
         waf_cfg: &WafConfig,
@@ -487,6 +558,7 @@ impl IngressServer {
         start: Instant,
         client_fp: &ClientFingerprint,
         fallback_fp_hash: &str,
+        req_js_fp_hash: Option<&str>,
         ua_str: &str,
         al_str: &str,
         suspicion_score: u8,
@@ -505,6 +577,17 @@ impl IngressServer {
         ep_engine.check_canary_trigger(client_ip, ep_path, ep_query, headers)?;
 
         let Some(permit) = self.evilpot.try_admit(client_ip) else {
+            self.record_offense_and_maybe_alert(
+                service_tag,
+                host,
+                client_ip,
+                tls_signal.and_then(|s| s.fingerprint.as_deref()),
+                ua_str,
+                req_js_fp_hash,
+                OffenseKind::VerifiedExploit,
+                "evilpot:canary_flood",
+            )
+            .await;
             return Some(
                 Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -513,9 +596,15 @@ impl IngressServer {
                     .unwrap(),
             );
         };
-        let outcome = ep_engine
-            .handle_canary_if_present(client_ip, method_str, ep_path, ep_query, headers)
-            .await?;
+        let outcome = match tokio::time::timeout(
+            EVILPOT_HANDLE_TIMEOUT,
+            ep_engine.handle_canary_if_present(client_ip, method_str, ep_path, ep_query, headers),
+        )
+        .await
+        {
+            Ok(Some(o)) => o,
+            _ => return None,
+        };
 
         let status_lbl = verification_status_label(outcome.session.status);
         warn!(
@@ -543,6 +632,20 @@ impl IngressServer {
                 )
                 .await;
         }
+        // Canary replay is 100% confirmed active exploitation: let this final trap response
+        // return to waste attacker time, while immediately banning IP & fingerprints for all
+        // subsequent requests!
+        self.record_offense_and_maybe_alert(
+            service_tag,
+            host,
+            client_ip,
+            tls_signal.and_then(|s| s.fingerprint.as_deref()),
+            ua_str,
+            req_js_fp_hash,
+            OffenseKind::VerifiedExploit,
+            "evilpot:verified_exploit:canary",
+        )
+        .await;
         let resp_status = outcome.response.status().as_u16();
         self.logger
             .record_session_with_fp(
@@ -588,7 +691,19 @@ impl IngressServer {
                 0,
             )
             .await;
-        Some(into_proxy_response(outcome.response, Some(permit)))
+        let ban_hook = TarpitBanHook {
+            engine: ep_engine,
+            auto_ban: Arc::clone(&self.auto_ban),
+            client_ip,
+            tls_ja3: tls_signal.and_then(|s| s.fingerprint.clone()),
+            user_agent: ua_str.to_string(),
+            js_fp_hash: req_js_fp_hash.map(str::to_string),
+        };
+        Some(into_proxy_response_with_ban_hook(
+            outcome.response,
+            Some(permit),
+            Some(ban_hook),
+        ))
     }
 
     async fn handle_http_request_inner(
@@ -622,9 +737,89 @@ impl IngressServer {
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".into());
         let client_ip = canonical_ip(peer_addr.ip());
+        let tls_ja3 = tls_signal.and_then(|s| s.fingerprint.as_deref());
+        let ua_str = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let al_str = req
+            .headers()
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let is_cdn_cgi = path == "/cdn-cgi" || path.starts_with("/cdn-cgi/");
+
+        // Resolve matched route early (pure in-memory O(rules)) so we can check AutoBan
+        // BEFORE spending AbuseIPDB API quota, WAF CPU, or Evilpot slots, while still honoring
+        // explicit `api_bypass_headers` and `allow_cidrs` on the target route.
+        let pre_matched_rule = if is_cdn_cgi {
+            None
+        } else {
+            match_ingress_rule(&cfg.rules, &host, &path, client_ip, auth_sni).cloned()
+        };
+        let pre_profile = pre_matched_rule
+            .as_ref()
+            .and_then(|r| r.guard.as_ref())
+            .filter(|g| !g.trim().is_empty())
+            .and_then(|g| cfg.guards.get(g));
+        let pre_verified_fp = self.guard.verified_fp_info(
+            pre_profile,
+            &cfg.clearance_secret,
+            &host,
+            client_ip,
+            req.headers(),
+        );
+        let req_js_fp_hash = pre_verified_fp.as_ref().map(|(h, _, _)| h.clone());
+        let is_api_bypassed = pre_profile
+            .map(|p| matches_api_bypass(p, req.headers()))
+            .unwrap_or(false);
+        let is_allowlisted_cidr = pre_profile
+            .map(|p| {
+                !p.allow_cidrs.is_empty()
+                    && exposure_core::routing::ip_matches_cidrs(client_ip, &p.allow_cidrs)
+            })
+            .unwrap_or(false);
+
+        // Zero-cost early rejection for confirmed-banned IPs, JS fingerprints, and attacker-exclusive
+        // composite TLS+UA fingerprints (catches keep-alive connections and rotating-IP attackers).
+        if !is_api_bypassed && !is_allowlisted_cidr {
+            if let Some(ban_hit) =
+                self.auto_ban
+                    .check_request(client_ip, tls_ja3, &ua_str, req_js_fp_hash.as_deref())
+            {
+                let svc_tag = pre_matched_rule
+                    .as_ref()
+                    .map(|r| r.service_tag.as_str())
+                    .unwrap_or(if is_cdn_cgi { "_cdn_cgi" } else { "_banned" });
+                self.logger
+                    .record_session(
+                        "ingress",
+                        svc_tag,
+                        &client_ip.to_string(),
+                        403,
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        0,
+                        0,
+                        false,
+                        true,
+                        false,
+                        Some(format!("autoban:{}:{}", ban_hit.kind.as_str(), ban_hit.reason)),
+                    )
+                    .await;
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .header(header::CONNECTION, "close")
+                    .body(full_body("Forbidden"))
+                    .unwrap();
+            }
+        }
 
         // Proactively look up client IP reputation (cache hit -> immediate, miss -> AbuseIPDB v2 API)
-        // as soon as the IP appears on ANY request (HTML, API, 404/421, /cdn-cgi/*, redirect, or WAF/Evilpot).
+        // for non-banned public IPs.
         let abuse_rep = if cfg.abuseipdb.enabled && !cfg.abuseipdb.api_key.trim().is_empty() {
             self.abuseipdb.lookup(client_ip).await
         } else {
@@ -632,7 +827,7 @@ impl IngressServer {
         };
         let abuse_score = abuse_rep.as_ref().map(|r| r.abuse_confidence_score);
         let fp_extras = FpServerExtras {
-            tls_ja3: tls_signal.and_then(|s| s.fingerprint.as_deref()),
+            tls_ja3,
             tls_grease: tls_signal.map(|s| s.has_grease).unwrap_or(false),
             abuse_score,
             abuse_country: abuse_rep.as_ref().and_then(|r| r.country_code.as_deref()),
@@ -653,7 +848,7 @@ impl IngressServer {
         }
 
         // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`)
-        if path == "/cdn-cgi" || path.starts_with("/cdn-cgi/") {
+        if is_cdn_cgi {
             let method = req.method().clone();
             let headers = req.headers().clone();
             let query_redirect = req
@@ -766,16 +961,26 @@ impl IngressServer {
             );
 
             let passed = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::OK;
-            let ua_str = headers
-                .get(header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let al_str = headers
-                .get(header::ACCEPT_LANGUAGE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+            let verify_rejected = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::FORBIDDEN;
             let cfp_cls = crate::guard::classify_client(&headers);
             let score = compute_suspicion_score(&headers, tls_signal);
+
+            if verify_rejected {
+                let svc_tag = matched_rule
+                    .map(|r| r.service_tag.as_str())
+                    .unwrap_or("_cdn_cgi");
+                self.record_offense_and_maybe_alert(
+                    svc_tag,
+                    &host,
+                    client_ip,
+                    tls_ja3,
+                    &ua_str,
+                    req_js_fp_hash.as_deref(),
+                    OffenseKind::HeadlessOrVerifyAbuse,
+                    "guard:pow_verify_rejected",
+                )
+                .await;
+            }
 
             if let Some(sub) = verified_fp_sub {
                 let svc_tag = sub
@@ -783,6 +988,19 @@ impl IngressServer {
                     .as_deref()
                     .or_else(|| matched_rule.map(|r| r.service_tag.as_str()))
                     .unwrap_or("_cdn_cgi");
+                if sub.is_headless {
+                    self.record_offense_and_maybe_alert(
+                        svc_tag,
+                        &host,
+                        client_ip,
+                        tls_ja3,
+                        &ua_str,
+                        Some(&sub.fp_hash),
+                        OffenseKind::HeadlessOrVerifyAbuse,
+                        "guard:headless_fp_detected",
+                    )
+                    .await;
+                }
                 self.logger
                     .record_fingerprint_with_extras(
                         svc_tag,
@@ -791,8 +1009,8 @@ impl IngressServer {
                         &sub.fp_hash,
                         true,
                         sub.fp_source,
-                        ua_str,
-                        al_str,
+                        &ua_str,
+                        &al_str,
                         cfp_cls.device_type,
                         cfp_cls.browser_family,
                         cfp_cls.os_family,
@@ -844,24 +1062,19 @@ impl IngressServer {
             return rb.body(full_body(g_resp.body)).unwrap();
         }
 
-        // Identify service and next hop via local rules
-        let rule = match match_ingress_rule(&cfg.rules, &host, &path, client_ip, auth_sni) {
-            Some(r) => r.clone(),
+        // Identify service and next hop via local rules (reusing early match)
+        let rule = match pre_matched_rule {
+            Some(r) => r,
             None => {
                 if abuse_rep.is_some() {
                     let cfp = crate::guard::classify_client(req.headers());
-                    let ua_s = req
-                        .headers()
-                        .get(header::USER_AGENT)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let al_s = req
-                        .headers()
-                        .get(header::ACCEPT_LANGUAGE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    let susp = compute_server_suspicion_score(req.headers(), tls_signal, abuse_score);
-                    let fph = short_sha256_hex(&format!("ua|{ua_s}|{al_s}"));
+                    let susp = compute_server_suspicion_score_for_mode(
+                        req.headers(),
+                        tls_signal,
+                        abuse_score,
+                        false,
+                    );
+                    let fph = short_sha256_hex(&format!("ua|{ua_str}|{al_str}"));
                     self.logger
                         .record_fingerprint_with_extras(
                             "_unmatched",
@@ -870,8 +1083,8 @@ impl IngressServer {
                             &fph,
                             false,
                             "none",
-                            ua_s,
-                            al_s,
+                            &ua_str,
+                            &al_str,
                             cfp.device_type,
                             cfp.browser_family,
                             cfp.os_family,
@@ -902,102 +1115,329 @@ impl IngressServer {
         };
 
         let client_fp = crate::guard::classify_client(req.headers());
-        let ua_str = req
-            .headers()
-            .get(header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let al_str = req
-            .headers()
-            .get(header::ACCEPT_LANGUAGE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let suspicion_score = compute_server_suspicion_score(req.headers(), tls_signal, abuse_score);
         let fallback_fp_hash = short_sha256_hex(&format!("ua|{ua_str}|{al_str}"));
 
-        let mut active_profile = None;
-        // Evaluate Entry Guard if attached to this route (fail closed on undefined guard name!)
-        if let Some(ref guard_name) = rule.guard {
+        // Resolve attached Guard profile (fail closed on undefined guard name!)
+        let active_profile = if let Some(ref guard_name) = rule.guard {
             if !guard_name.trim().is_empty() {
-                if let Some(profile) = cfg.guards.get(guard_name) {
-                    active_profile = Some(profile);
-                    match self.guard.evaluate_with_reputation(
-                        profile,
-                        &cfg.rate_limit_buckets,
-                        &cfg.clearance_secret,
-                        client_ip,
-                        &host,
-                        &path_and_query,
+                match cfg.guards.get(guard_name) {
+                    Some(p) => Some(p),
+                    None => {
+                        warn!(
+                            node = %self.node_tag,
+                            service = %rule.service_tag,
+                            guard = %guard_name,
+                            "ingress rule references undefined guard profile; failing closed"
+                        );
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(full_body("503 Service Unavailable"))
+                            .unwrap();
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let suspicion_score = compute_server_suspicion_score_for_mode(
+            req.headers(),
+            tls_signal,
+            abuse_score,
+            active_profile
+                .map(|p| p.effective_browser_only())
+                .unwrap_or(false),
+        );
+
+        // Phase A: Fast O(1) CIDR allow/deny + Token-Bucket Rate Limiting (stops volumetric floods
+        // and denied CIDRs BEFORE WAF body buffering or honeypot slot allocation).
+        if let Some(profile) = active_profile {
+            match self.guard.evaluate_access_and_rate_limit(
+                profile,
+                &cfg.rate_limit_buckets,
+                client_ip,
+            ) {
+                GuardDecision::Allow => {}
+                GuardDecision::RateLimited {
+                    retry_after_secs,
+                    show_error_page,
+                } => {
+                    self.logger
+                        .record_session_with_fp(
+                            "ingress",
+                            &rule.service_tag,
+                            &client_ip.to_string(),
+                            429,
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            0,
+                            0,
+                            true,
+                            false,
+                            false,
+                            None,
+                            Some(client_fp.device_type.to_string()),
+                            Some(client_fp.browser_family.to_string()),
+                            Some(client_fp.os_family.to_string()),
+                            false,
+                        )
+                        .await;
+                    self.logger
+                        .record_fingerprint_with_extras(
+                            &rule.service_tag,
+                            &host,
+                            &client_ip.to_string(),
+                            &fallback_fp_hash,
+                            false,
+                            "none",
+                            &ua_str,
+                            &al_str,
+                            client_fp.device_type,
+                            client_fp.browser_family,
+                            client_fp.os_family,
+                            client_fp.is_bot,
+                            false,
+                            suspicion_score,
+                            tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                            tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                            fp_extras.clone(),
+                            None,
+                            1,
+                            0,
+                            1,
+                        )
+                        .await;
+                    return build_rate_limit_response(
+                        retry_after_secs,
+                        show_error_page,
+                        rule.effective_intercept_errors(),
+                        &ray_id,
+                        cfg.pages.error_html.as_deref(),
+                    );
+                }
+                GuardDecision::Reject { status, reason } => {
+                    self.logger
+                        .record_session_with_fp(
+                            "ingress",
+                            &rule.service_tag,
+                            &client_ip.to_string(),
+                            status.as_u16(),
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            0,
+                            0,
+                            false,
+                            true,
+                            false,
+                            Some(reason),
+                            Some(client_fp.device_type.to_string()),
+                            Some(client_fp.browser_family.to_string()),
+                            Some(client_fp.os_family.to_string()),
+                            false,
+                        )
+                        .await;
+                    self.logger
+                        .record_fingerprint_with_extras(
+                            &rule.service_tag,
+                            &host,
+                            &client_ip.to_string(),
+                            &fallback_fp_hash,
+                            false,
+                            "none",
+                            &ua_str,
+                            &al_str,
+                            client_fp.device_type,
+                            client_fp.browser_family,
+                            client_fp.os_family,
+                            client_fp.is_bot,
+                            false,
+                            suspicion_score,
+                            tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                            tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                            fp_extras.clone(),
+                            None,
+                            1,
+                            1,
+                            0,
+                        )
+                        .await;
+                    return Response::builder()
+                        .status(status)
+                        .body(full_body("Access Denied"))
+                        .unwrap();
+                }
+                GuardDecision::ChallengeRedirect { .. } => {}
+            }
+        }
+
+        let is_upgrade = req.headers().contains_key(header::UPGRADE);
+        let mut req: Request<ProxyBody> = req.map(|b| b.boxed());
+
+        // Phase B: Attack Identification -> Evilpot Time-Wasting -> Behavior Confirmation -> Auto-Ban!
+        // Runs BEFORE Guard Antibot Challenge/Reject so attack payloads & offensive scanners (including
+        // non-browser tools like sqlmap/curl/python) are diverted into Evilpot to waste attacker time,
+        // verify exploit intent, and auto-ban IP + fingerprints instead of getting an instant 403.
+        if let Some(profile) = active_profile {
+            if let Some(waf_cfg) = profile.effective_waf() {
+                if !is_api_bypassed {
+                    // 1. O(1) Canary Replay check (0-ns skip before any trap has fired)
+                    if let Some(canary_resp) = self
+                        .try_handle_evilpot_canary(
+                            waf_cfg,
+                            &rule.service_tag,
+                            &host,
+                            &path,
+                            req.uri().query(),
+                            req.method().as_str(),
+                            req.headers(),
+                            client_ip,
+                            &ray_id,
+                            start,
+                            &client_fp,
+                            &fallback_fp_hash,
+                            req_js_fp_hash.as_deref(),
+                            &ua_str,
+                            &al_str,
+                            suspicion_score,
+                            tls_signal,
+                            &fp_extras,
+                        )
+                        .await
+                    {
+                        return canary_resp;
+                    }
+
+                    // 2. WAF inspection (`sigil-filter` + supplemental SQLi/CMDi + OWASP CRS)
+                    let crs_engine = Arc::clone(&*self.crs.read().await);
+                    let mut verdict = inspect_request_head(
+                        waf_cfg,
+                        &path,
+                        req.uri().query(),
                         req.headers(),
-                        tls_signal,
-                        abuse_score,
-                    ) {
-                        GuardDecision::Allow => {}
-                        GuardDecision::RateLimited {
-                            retry_after_secs,
-                            show_error_page,
-                        } => {
-                            self.logger
-                                .record_session_with_fp(
-                                    "ingress",
-                                    &rule.service_tag,
-                                    &client_ip.to_string(),
-                                    429,
-                                    start.elapsed().as_secs_f64() * 1000.0,
-                                    0,
-                                    0,
-                                    true,
-                                    false,
-                                    false,
-                                    None,
-                                    Some(client_fp.device_type.to_string()),
-                                    Some(client_fp.browser_family.to_string()),
-                                    Some(client_fp.os_family.to_string()),
-                                    false,
-                                )
-                                .await;
-                            self.logger
-                                .record_fingerprint_with_extras(
-                                    &rule.service_tag,
-                                    &host,
-                                    &client_ip.to_string(),
-                                    &fallback_fp_hash,
-                                    false,
-                                    "none",
-                                    &ua_str,
-                                    &al_str,
-                                    client_fp.device_type,
-                                    client_fp.browser_family,
-                                    client_fp.os_family,
-                                    client_fp.is_bot,
-                                    false,
-                                    suspicion_score,
-                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
-                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
-                                    fp_extras.clone(),
-                                    None,
-                                    1,
-                                    0,
-                                    1,
-                                )
-                                .await;
-                            return build_rate_limit_response(
-                                retry_after_secs,
-                                show_error_page,
-                                rule.effective_intercept_errors(),
-                                &ray_id,
-                                cfg.pages.error_html.as_deref(),
+                    );
+                    if matches!(verdict, WafVerdict::Allow) {
+                        verdict = crs_engine.inspect_head(
+                            waf_cfg,
+                            &path,
+                            req.uri().query(),
+                            req.headers(),
+                        );
+                    }
+                    // 3. Unambiguous offensive vulnerability scanner UA (e.g. sqlmap, nikto, nuclei, ffuf)
+                    if matches!(verdict, WafVerdict::Allow)
+                        && client_fp.is_scanner
+                        && !is_path_exempt(&path, &waf_cfg.exempt_paths)
+                    {
+                        let scanner_finding = WafFinding {
+                            category: "scanner",
+                            location: "header:user-agent",
+                            confidence: 0.95,
+                            reasons: vec!["offensive-scanner-user-agent"],
+                            matched_payload: Some(ua_str.chars().take(256).collect()),
+                            rule_id: None,
+                            rule_msg: Some("Offensive vulnerability scanner User-Agent".into()),
+                        };
+                        verdict = match waf_cfg.mode {
+                            WafMode::Off => WafVerdict::Allow,
+                            WafMode::Monitor => WafVerdict::Monitor(scanner_finding),
+                            WafMode::Block => WafVerdict::Block(scanner_finding),
+                            WafMode::Evilpot => WafVerdict::Evilpot(scanner_finding),
+                        };
+                    }
+                    // 4. Bounded request body inspection (concurrency-capped by `waf_body_sem`)
+                    if matches!(verdict, WafVerdict::Allow)
+                        && !is_path_exempt(&path, &waf_cfg.exempt_paths)
+                    {
+                        if let Some(body_limit) =
+                            should_inspect_body(waf_cfg, req.method(), req.headers(), is_upgrade)
+                        {
+                            let ct = req
+                                .headers()
+                                .get(header::CONTENT_TYPE)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string);
+                            let _waf_buf_permit = self.waf_body_sem.clone().acquire_owned().await.ok();
+                            match buffer_prefix_for_waf(req, body_limit).await {
+                                Ok((rebuilt_req, inspected_bytes)) => {
+                                    req = rebuilt_req;
+                                    if !inspected_bytes.is_empty() {
+                                        verdict = inspect_request_body(
+                                            waf_cfg,
+                                            ct.as_deref(),
+                                            &inspected_bytes,
+                                        );
+                                        if matches!(verdict, WafVerdict::Allow) {
+                                            verdict =
+                                                crs_engine.inspect_body(waf_cfg, &inspected_bytes);
+                                        }
+                                    }
+                                }
+                                Err(()) => {
+                                    // Slow-POST / R.U.D.Y. timeout while reading request body prefix
+                                    return Response::builder()
+                                        .status(StatusCode::REQUEST_TIMEOUT)
+                                        .header(header::CACHE_CONTROL, "no-store")
+                                        .body(full_body("408 Request Timeout"))
+                                        .unwrap();
+                                }
+                            }
+                        }
+                    }
+
+                    match verdict {
+                        WafVerdict::Allow => {}
+                        WafVerdict::Monitor(finding) => {
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "monitor",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                reasons = ?finding.reasons,
+                                "waf matched suspicious payload (monitor mode)"
                             );
                         }
-                        GuardDecision::Reject { status, reason } => {
+                        WafVerdict::Block(finding) => {
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "block",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                reasons = ?finding.reasons,
+                                "waf blocked malicious request"
+                            );
+                            let reason = finding.telemetry_reason();
+                            let offense_kind = if finding.category == "scanner" || client_fp.is_scanner {
+                                OffenseKind::AttackScannerProbe
+                            } else {
+                                OffenseKind::WafAttackProbe
+                            };
+                            self.record_offense_and_maybe_alert(
+                                &rule.service_tag,
+                                &host,
+                                client_ip,
+                                tls_ja3,
+                                &ua_str,
+                                req_js_fp_hash.as_deref(),
+                                offense_kind,
+                                &reason,
+                            )
+                            .await;
                             self.logger
                                 .record_session_with_fp(
                                     "ingress",
                                     &rule.service_tag,
                                     &client_ip.to_string(),
-                                    status.as_u16(),
+                                    403,
                                     start.elapsed().as_secs_f64() * 1000.0,
                                     0,
                                     0,
@@ -1036,103 +1476,176 @@ impl IngressServer {
                                     0,
                                 )
                                 .await;
-                            return Response::builder()
-                                .status(status)
-                                .body(full_body("Access Denied"))
-                                .unwrap();
+                            return build_waf_block_response(
+                                &finding,
+                                rule.effective_intercept_errors(),
+                                is_browser_navigation(req.method(), req.headers()),
+                                &ray_id,
+                                cfg.pages.error_html.as_deref(),
+                            );
                         }
-                        GuardDecision::ChallengeRedirect { location } => {
-                            if let Some(waf_cfg) = profile.effective_waf() {
-                                if let Some(canary_resp) = self
-                                    .try_handle_evilpot_canary(
-                                        waf_cfg,
-                                        &rule.service_tag,
-                                        &host,
-                                        &path,
-                                        req.uri().query(),
-                                        req.method().as_str(),
-                                        req.headers(),
-                                        client_ip,
-                                        &ray_id,
-                                        start,
-                                        &client_fp,
-                                        &fallback_fp_hash,
-                                        &ua_str,
-                                        &al_str,
-                                        suspicion_score,
-                                        tls_signal,
-                                        &fp_extras,
-                                    )
-                                    .await
-                                {
-                                    return canary_resp;
+                        WafVerdict::Evilpot(finding) => {
+                            // Enforce per-IP & global Evilpot concurrency/rate caps so CC floods
+                            // cannot starve Ingress slots or inflate honeypot session memory.
+                            let Some(permit) = self.evilpot.try_admit(client_ip) else {
+                                self.record_offense_and_maybe_alert(
+                                    &rule.service_tag,
+                                    &host,
+                                    client_ip,
+                                    tls_ja3,
+                                    &ua_str,
+                                    req_js_fp_hash.as_deref(),
+                                    OffenseKind::EvilpotFlood,
+                                    &format!("evilpot:flood:{}", finding.category),
+                                )
+                                .await;
+                                return build_waf_block_response(
+                                    &finding,
+                                    false,
+                                    false,
+                                    &ray_id,
+                                    None,
+                                );
+                            };
+                            let ep_engine = self
+                                .evilpot
+                                .get_or_init(&cfg.evilpot, &cfg.server_header)
+                                .await;
+                            let ep_path = clamp_input_slice(&path, MAX_EVILPOT_PATH_CHARS);
+                            let ep_query = req
+                                .uri()
+                                .query()
+                                .map(|q| clamp_input_slice(q, MAX_EVILPOT_QUERY_CHARS));
+                            let signal = build_attack_signal(
+                                &finding,
+                                ep_query.or(Some(ep_path)),
+                            );
+                            let Ok(outcome) = tokio::time::timeout(
+                                EVILPOT_HANDLE_TIMEOUT,
+                                ep_engine.handle_attack(
+                                    client_ip,
+                                    req.method().as_str(),
+                                    ep_path,
+                                    ep_query,
+                                    req.headers(),
+                                    signal,
+                                ),
+                            )
+                            .await
+                            else {
+                                return build_waf_block_response(
+                                    &finding,
+                                    false,
+                                    false,
+                                    &ray_id,
+                                    None,
+                                );
+                            };
+                            let status_lbl = verification_status_label(outcome.session.status);
+                            warn!(
+                                node = %self.node_tag,
+                                service = %rule.service_tag,
+                                host = %host,
+                                client = %client_ip,
+                                ray_id = %ray_id,
+                                mode = "evilpot",
+                                category = finding.category,
+                                location = finding.location,
+                                confidence = finding.confidence,
+                                verification_status = status_lbl,
+                                persona = %outcome.session.persona_hostname,
+                                trapped_reqs = outcome.session.total_trapped_requests,
+                                sqli_probes = outcome.session.sqli_probes,
+                                rce_cmds = outcome.session.rce_commands_executed.len(),
+                                iocs = ?outcome.session.captured_iocs,
+                                "waf diverted attack into evilpot honeypot"
+                            );
+                            if self
+                                .evilpot
+                                .should_emit_alert(client_ip, outcome.session.status)
+                            {
+                                match outcome.session.status {
+                                    ExploitVerificationStatus::VerifiedExploit => {
+                                        self.logger
+                                            .emit_alert(
+                                                "critical",
+                                                format!(
+                                                    "Evilpot VerifiedExploit ({}) from {} on {} [service={}, reqs={}, iocs={}]",
+                                                    finding.category,
+                                                    client_ip,
+                                                    host,
+                                                    rule.service_tag,
+                                                    outcome.session.total_trapped_requests,
+                                                    outcome.session.captured_iocs.len(),
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    ExploitVerificationStatus::MultiStepExploitation => {
+                                        self.logger
+                                            .emit_alert(
+                                                "warning",
+                                                format!(
+                                                    "Evilpot MultiStepExploitation ({}) from {} on {} [service={}, reqs={}, sqli_pos={}]",
+                                                    finding.category,
+                                                    client_ip,
+                                                    host,
+                                                    rule.service_tag,
+                                                    outcome.session.total_trapped_requests,
+                                                    outcome.session.sqli_distinct_positions,
+                                                ),
+                                            )
+                                            .await;
+                                    }
+                                    ExploitVerificationStatus::Probing => {}
                                 }
                             }
-                            if !is_browser_navigation(req.method(), req.headers()) {
-                                self.logger
-                                    .record_session_with_fp(
-                                        "ingress",
-                                        &rule.service_tag,
-                                        &client_ip.to_string(),
-                                        403,
-                                        start.elapsed().as_secs_f64() * 1000.0,
-                                        0,
-                                        0,
-                                        false,
-                                        true,
-                                        false,
-                                        Some("verification_required".into()),
-                                        Some(client_fp.device_type.to_string()),
-                                        Some(client_fp.browser_family.to_string()),
-                                        Some(client_fp.os_family.to_string()),
-                                        false,
-                                    )
-                                    .await;
-                                self.logger
-                                    .record_fingerprint_with_extras(
-                                        &rule.service_tag,
-                                        &host,
-                                        &client_ip.to_string(),
-                                        &fallback_fp_hash,
-                                        false,
-                                        "none",
-                                        &ua_str,
-                                        &al_str,
-                                        client_fp.device_type,
-                                        client_fp.browser_family,
-                                        client_fp.os_family,
-                                        client_fp.is_bot,
-                                        false,
-                                        suspicion_score,
-                                        tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
-                                        tls_signal.map(|s| s.has_alpn).unwrap_or(false),
-                                        fp_extras.clone(),
-                                        None,
-                                        1,
-                                        1,
-                                        0,
-                                    )
-                                    .await;
-                                return Response::builder()
-                                    .status(StatusCode::FORBIDDEN)
-                                    .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-                                    .header(header::CACHE_CONTROL, "no-store")
-                                    .body(full_body(r#"{"error":"verification_required"}"#))
-                                    .unwrap();
-                            }
+                            // Feed Evilpot verification status into AutoBan:
+                            // - Probing: wastes attacker time without premature banning (unless repeated >= confirm_hits)
+                            // - MultiStepExploitation / VerifiedExploit: confirms attack and bans IP + safe fingerprints!
+                            let offense_kind = match outcome.session.status {
+                                ExploitVerificationStatus::VerifiedExploit => {
+                                    OffenseKind::VerifiedExploit
+                                }
+                                ExploitVerificationStatus::MultiStepExploitation => {
+                                    OffenseKind::MultiStepExploitation {
+                                        trapped_requests: outcome.session.total_trapped_requests,
+                                    }
+                                }
+                                ExploitVerificationStatus::Probing => {
+                                    if finding.category == "scanner" || client_fp.is_scanner {
+                                        OffenseKind::AttackScannerProbe
+                                    } else {
+                                        OffenseKind::WafAttackProbe
+                                    }
+                                }
+                            };
+                            let ban_reason = format!("evilpot:{status_lbl}:{}", finding.category);
+                            self.record_offense_and_maybe_alert(
+                                &rule.service_tag,
+                                &host,
+                                client_ip,
+                                tls_ja3,
+                                &ua_str,
+                                req_js_fp_hash.as_deref(),
+                                offense_kind,
+                                &ban_reason,
+                            )
+                            .await;
+                            let resp_status = outcome.response.status().as_u16();
                             self.logger
                                 .record_session_with_fp(
                                     "ingress",
                                     &rule.service_tag,
                                     &client_ip.to_string(),
-                                    302,
+                                    resp_status,
                                     start.elapsed().as_secs_f64() * 1000.0,
                                     0,
                                     0,
                                     false,
                                     true,
                                     false,
-                                    None,
+                                    Some(ban_reason),
                                     Some(client_fp.device_type.to_string()),
                                     Some(client_fp.browser_family.to_string()),
                                     Some(client_fp.os_family.to_string()),
@@ -1164,35 +1677,211 @@ impl IngressServer {
                                     0,
                                 )
                                 .await;
-                            return Response::builder()
-                                .status(StatusCode::FOUND)
-                                .header(header::LOCATION, location)
-                                .header(header::CACHE_CONTROL, "no-store")
-                                .body(full_body(""))
-                                .unwrap();
+                            let ban_hook = TarpitBanHook {
+                                engine: ep_engine,
+                                auto_ban: Arc::clone(&self.auto_ban),
+                                client_ip,
+                                tls_ja3: tls_ja3.map(str::to_string),
+                                user_agent: ua_str.clone(),
+                                js_fp_hash: req_js_fp_hash.clone(),
+                            };
+                            return into_proxy_response_with_ban_hook(
+                                outcome.response,
+                                Some(permit),
+                                Some(ban_hook),
+                            );
                         }
                     }
-                } else {
-                    warn!(
-                        node = %self.node_tag,
-                        service = %rule.service_tag,
-                        guard = %guard_name,
-                        "ingress rule references undefined guard profile; failing closed"
-                    );
+                }
+            }
+        }
+
+        // Phase C: Entry Guard Antibot / Suspicion Scoring (non-browser-safe unless `browser_only: true`).
+        if let Some(profile) = active_profile {
+            match self.guard.evaluate_antibot_only(
+                profile,
+                &cfg.clearance_secret,
+                client_ip,
+                &host,
+                &path_and_query,
+                req.headers(),
+                tls_signal,
+                abuse_score,
+            ) {
+                GuardDecision::Allow | GuardDecision::RateLimited { .. } => {}
+                GuardDecision::Reject { status, reason } => {
+                    if reason.contains("headless") {
+                        self.record_offense_and_maybe_alert(
+                            &rule.service_tag,
+                            &host,
+                            client_ip,
+                            tls_ja3,
+                            &ua_str,
+                            req_js_fp_hash.as_deref(),
+                            OffenseKind::HeadlessOrVerifyAbuse,
+                            "guard:headless_blocked",
+                        )
+                        .await;
+                    }
+                    self.logger
+                        .record_session_with_fp(
+                            "ingress",
+                            &rule.service_tag,
+                            &client_ip.to_string(),
+                            status.as_u16(),
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            0,
+                            0,
+                            false,
+                            true,
+                            false,
+                            Some(reason),
+                            Some(client_fp.device_type.to_string()),
+                            Some(client_fp.browser_family.to_string()),
+                            Some(client_fp.os_family.to_string()),
+                            false,
+                        )
+                        .await;
+                    self.logger
+                        .record_fingerprint_with_extras(
+                            &rule.service_tag,
+                            &host,
+                            &client_ip.to_string(),
+                            &fallback_fp_hash,
+                            false,
+                            "none",
+                            &ua_str,
+                            &al_str,
+                            client_fp.device_type,
+                            client_fp.browser_family,
+                            client_fp.os_family,
+                            client_fp.is_bot,
+                            false,
+                            suspicion_score,
+                            tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                            tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                            fp_extras.clone(),
+                            None,
+                            1,
+                            1,
+                            0,
+                        )
+                        .await;
                     return Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(full_body("503 Service Unavailable"))
+                        .status(status)
+                        .body(full_body("Access Denied"))
+                        .unwrap();
+                }
+                GuardDecision::ChallengeRedirect { location } => {
+                    if !is_browser_navigation(req.method(), req.headers()) {
+                        self.logger
+                            .record_session_with_fp(
+                                "ingress",
+                                &rule.service_tag,
+                                &client_ip.to_string(),
+                                403,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                                0,
+                                0,
+                                false,
+                                true,
+                                false,
+                                Some("verification_required".into()),
+                                Some(client_fp.device_type.to_string()),
+                                Some(client_fp.browser_family.to_string()),
+                                Some(client_fp.os_family.to_string()),
+                                false,
+                            )
+                            .await;
+                        self.logger
+                            .record_fingerprint_with_extras(
+                                &rule.service_tag,
+                                &host,
+                                &client_ip.to_string(),
+                                &fallback_fp_hash,
+                                false,
+                                "none",
+                                &ua_str,
+                                &al_str,
+                                client_fp.device_type,
+                                client_fp.browser_family,
+                                client_fp.os_family,
+                                client_fp.is_bot,
+                                false,
+                                suspicion_score,
+                                tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                                tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                                fp_extras.clone(),
+                                None,
+                                1,
+                                1,
+                                0,
+                            )
+                            .await;
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .body(full_body(r#"{"error":"verification_required"}"#))
+                            .unwrap();
+                    }
+                    self.logger
+                        .record_session_with_fp(
+                            "ingress",
+                            &rule.service_tag,
+                            &client_ip.to_string(),
+                            302,
+                            start.elapsed().as_secs_f64() * 1000.0,
+                            0,
+                            0,
+                            false,
+                            true,
+                            false,
+                            None,
+                            Some(client_fp.device_type.to_string()),
+                            Some(client_fp.browser_family.to_string()),
+                            Some(client_fp.os_family.to_string()),
+                            false,
+                        )
+                        .await;
+                    self.logger
+                        .record_fingerprint_with_extras(
+                            &rule.service_tag,
+                            &host,
+                            &client_ip.to_string(),
+                            &fallback_fp_hash,
+                            false,
+                            "none",
+                            &ua_str,
+                            &al_str,
+                            client_fp.device_type,
+                            client_fp.browser_family,
+                            client_fp.os_family,
+                            client_fp.is_bot,
+                            false,
+                            suspicion_score,
+                            tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
+                            tls_signal.map(|s| s.has_alpn).unwrap_or(false),
+                            fp_extras.clone(),
+                            None,
+                            1,
+                            1,
+                            0,
+                        )
+                        .await;
+                    return Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(header::LOCATION, location)
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .body(full_body(""))
                         .unwrap();
                 }
             }
         }
 
-        // Enforce AbuseIPDB automatic high-risk IP mitigation (before Edge Cache & upstream)
+        // Phase D: Enforce AbuseIPDB automatic high-risk IP mitigation (before Edge Cache & upstream)
         if let Some(ab_score) = abuse_score {
-            let bypassed = active_profile
-                .map(|p| matches_api_bypass(p, req.headers()))
-                .unwrap_or(false);
-            if !bypassed
+            if !is_api_bypassed
                 && cfg.abuseipdb.enabled
                 && ab_score >= cfg.abuseipdb.block_threshold
                 && cfg.abuseipdb.high_risk_action != AbuseIpDbAction::Off
@@ -1298,17 +1987,69 @@ impl IngressServer {
                                 (ab_score as f32 / 100.0).clamp(0.5, 1.0),
                             )
                             .with_reasons(vec![format!("abuseipdb_score={ab_score}")]);
-                            let outcome = ep_engine
-                                .handle_attack(
+                            if let Ok(outcome) = tokio::time::timeout(
+                                EVILPOT_HANDLE_TIMEOUT,
+                                ep_engine.handle_attack(
                                     client_ip,
                                     req.method().as_str(),
                                     ep_path,
                                     ep_query,
                                     req.headers(),
                                     sig,
+                                ),
+                            )
+                            .await
+                            {
+                                let offense_kind = match outcome.session.status {
+                                    ExploitVerificationStatus::VerifiedExploit => {
+                                        OffenseKind::VerifiedExploit
+                                    }
+                                    ExploitVerificationStatus::MultiStepExploitation => {
+                                        OffenseKind::MultiStepExploitation {
+                                            trapped_requests: outcome.session.total_trapped_requests,
+                                        }
+                                    }
+                                    ExploitVerificationStatus::Probing => {
+                                        OffenseKind::WafAttackProbe
+                                    }
+                                };
+                                self.record_offense_and_maybe_alert(
+                                    &rule.service_tag,
+                                    &host,
+                                    client_ip,
+                                    tls_ja3,
+                                    &ua_str,
+                                    req_js_fp_hash.as_deref(),
+                                    offense_kind,
+                                    &format!("abuseipdb:evilpot:score={ab_score}"),
                                 )
                                 .await;
-                            return into_proxy_response(outcome.response, Some(permit));
+                                let ban_hook = TarpitBanHook {
+                                    engine: ep_engine,
+                                    auto_ban: Arc::clone(&self.auto_ban),
+                                    client_ip,
+                                    tls_ja3: tls_ja3.map(str::to_string),
+                                    user_agent: ua_str.clone(),
+                                    js_fp_hash: req_js_fp_hash.clone(),
+                                };
+                                return into_proxy_response_with_ban_hook(
+                                    outcome.response,
+                                    Some(permit),
+                                    Some(ban_hook),
+                                );
+                            }
+                        } else {
+                            self.record_offense_and_maybe_alert(
+                                &rule.service_tag,
+                                &host,
+                                client_ip,
+                                tls_ja3,
+                                &ua_str,
+                                req_js_fp_hash.as_deref(),
+                                OffenseKind::EvilpotFlood,
+                                &format!("abuseipdb:evilpot_flood:score={ab_score}"),
+                            )
+                            .await;
                         }
                         return Response::builder()
                             .status(StatusCode::FORBIDDEN)
@@ -1387,333 +2128,8 @@ impl IngressServer {
             }
         }
 
-        let is_upgrade = req.headers().contains_key(header::UPGRADE);
-        let mut req: Request<ProxyBody> = req.map(|b| b.boxed());
-
-        // Evaluate lightweight WAF (sigil-filter) + optional Evilpot deception/analysis AFTER Entry Guard and BEFORE Edge Cache / upstream
-        if let Some(profile) = active_profile {
-            if let Some(waf_cfg) = profile.effective_waf() {
-                if !matches_api_bypass(profile, req.headers()) {
-                    // When WAF action is `evilpot`, check first whether a follow-up request replays
-                    // any implanted canary token, cookie, API key, or secret vault path.
-                    // Fast O(1) skip when no trap has ever fired yet (0-ns overhead on benign traffic).
-                    if let Some(canary_resp) = self
-                        .try_handle_evilpot_canary(
-                            waf_cfg,
-                            &rule.service_tag,
-                            &host,
-                            &path,
-                            req.uri().query(),
-                            req.method().as_str(),
-                            req.headers(),
-                            client_ip,
-                            &ray_id,
-                            start,
-                            &client_fp,
-                            &fallback_fp_hash,
-                            &ua_str,
-                            &al_str,
-                            suspicion_score,
-                            tls_signal,
-                            &fp_extras,
-                        )
-                        .await
-                    {
-                        return canary_resp;
-                    }
-
-                    let crs_engine = Arc::clone(&*self.crs.read().await);
-                    let mut verdict = inspect_request_head(
-                        waf_cfg,
-                        &path,
-                        req.uri().query(),
-                        req.headers(),
-                    );
-                    if matches!(verdict, WafVerdict::Allow) {
-                        verdict = crs_engine.inspect_head(
-                            waf_cfg,
-                            &path,
-                            req.uri().query(),
-                            req.headers(),
-                        );
-                    }
-                    if matches!(verdict, WafVerdict::Allow)
-                        && !is_path_exempt(&path, &waf_cfg.exempt_paths)
-                    {
-                        if let Some(body_limit) =
-                            should_inspect_body(waf_cfg, req.method(), req.headers(), is_upgrade)
-                        {
-                            let ct = req
-                                .headers()
-                                .get(header::CONTENT_TYPE)
-                                .and_then(|v| v.to_str().ok())
-                                .map(str::to_string);
-                            match buffer_prefix_for_waf(req, body_limit).await {
-                                Ok((rebuilt_req, inspected_bytes)) => {
-                                    req = rebuilt_req;
-                                    if !inspected_bytes.is_empty() {
-                                        verdict = inspect_request_body(
-                                            waf_cfg,
-                                            ct.as_deref(),
-                                            &inspected_bytes,
-                                        );
-                                        if matches!(verdict, WafVerdict::Allow) {
-                                            verdict =
-                                                crs_engine.inspect_body(waf_cfg, &inspected_bytes);
-                                        }
-                                    }
-                                }
-                                Err(()) => {
-                                    // Slow-POST / R.U.D.Y. timeout while reading request body prefix
-                                    return Response::builder()
-                                        .status(StatusCode::REQUEST_TIMEOUT)
-                                        .header(header::CACHE_CONTROL, "no-store")
-                                        .body(full_body("408 Request Timeout"))
-                                        .unwrap();
-                                }
-                            }
-                        }
-                    }
-
-                    match verdict {
-                        WafVerdict::Allow => {}
-                        WafVerdict::Monitor(finding) => {
-                            warn!(
-                                node = %self.node_tag,
-                                service = %rule.service_tag,
-                                host = %host,
-                                client = %client_ip,
-                                ray_id = %ray_id,
-                                mode = "monitor",
-                                category = finding.category,
-                                location = finding.location,
-                                confidence = finding.confidence,
-                                reasons = ?finding.reasons,
-                                "waf matched suspicious payload (monitor mode)"
-                            );
-                        }
-                        WafVerdict::Block(finding) => {
-                            warn!(
-                                node = %self.node_tag,
-                                service = %rule.service_tag,
-                                host = %host,
-                                client = %client_ip,
-                                ray_id = %ray_id,
-                                mode = "block",
-                                category = finding.category,
-                                location = finding.location,
-                                confidence = finding.confidence,
-                                reasons = ?finding.reasons,
-                                "waf blocked malicious request"
-                            );
-                            let reason = finding.telemetry_reason();
-                            self.logger
-                                .record_session_with_fp(
-                                    "ingress",
-                                    &rule.service_tag,
-                                    &client_ip.to_string(),
-                                    403,
-                                    start.elapsed().as_secs_f64() * 1000.0,
-                                    0,
-                                    0,
-                                    false,
-                                    true,
-                                    false,
-                                    Some(reason),
-                                    Some(client_fp.device_type.to_string()),
-                                    Some(client_fp.browser_family.to_string()),
-                                    Some(client_fp.os_family.to_string()),
-                                    false,
-                                )
-                                .await;
-                            self.logger
-                                .record_fingerprint_with_extras(
-                                    &rule.service_tag,
-                                    &host,
-                                    &client_ip.to_string(),
-                                    &fallback_fp_hash,
-                                    false,
-                                    "none",
-                                    &ua_str,
-                                    &al_str,
-                                    client_fp.device_type,
-                                    client_fp.browser_family,
-                                    client_fp.os_family,
-                                    client_fp.is_bot,
-                                    false,
-                                    suspicion_score,
-                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
-                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
-                                    fp_extras.clone(),
-                                    None,
-                                    1,
-                                    1,
-                                    0,
-                                )
-                                .await;
-                            return build_waf_block_response(
-                                &finding,
-                                rule.effective_intercept_errors(),
-                                is_browser_navigation(req.method(), req.headers()),
-                                &ray_id,
-                                cfg.pages.error_html.as_deref(),
-                            );
-                        }
-                        WafVerdict::Evilpot(finding) => {
-                            // Enforce per-IP & global Evilpot concurrency/rate caps so CC floods
-                            // cannot starve Ingress slots or inflate honeypot session memory.
-                            let Some(permit) = self.evilpot.try_admit(client_ip) else {
-                                return build_waf_block_response(
-                                    &finding,
-                                    false,
-                                    false,
-                                    &ray_id,
-                                    None,
-                                );
-                            };
-                            let ep_engine = self
-                                .evilpot
-                                .get_or_init(&cfg.evilpot, &cfg.server_header)
-                                .await;
-                            let ep_path = clamp_input_slice(&path, MAX_EVILPOT_PATH_CHARS);
-                            let ep_query = req
-                                .uri()
-                                .query()
-                                .map(|q| clamp_input_slice(q, MAX_EVILPOT_QUERY_CHARS));
-                            let signal = build_attack_signal(
-                                &finding,
-                                ep_query.or(Some(ep_path)),
-                            );
-                            let outcome = ep_engine
-                                .handle_attack(
-                                    client_ip,
-                                    req.method().as_str(),
-                                    ep_path,
-                                    ep_query,
-                                    req.headers(),
-                                    signal,
-                                )
-                                .await;
-                            let status_lbl = verification_status_label(outcome.session.status);
-                            warn!(
-                                node = %self.node_tag,
-                                service = %rule.service_tag,
-                                host = %host,
-                                client = %client_ip,
-                                ray_id = %ray_id,
-                                mode = "evilpot",
-                                category = finding.category,
-                                location = finding.location,
-                                confidence = finding.confidence,
-                                verification_status = status_lbl,
-                                persona = %outcome.session.persona_hostname,
-                                trapped_reqs = outcome.session.total_trapped_requests,
-                                sqli_probes = outcome.session.sqli_probes,
-                                rce_cmds = outcome.session.rce_commands_executed.len(),
-                                iocs = ?outcome.session.captured_iocs,
-                                "waf diverted attack into evilpot honeypot"
-                            );
-                            if self
-                                .evilpot
-                                .should_emit_alert(client_ip, outcome.session.status)
-                            {
-                                match outcome.session.status {
-                                    ExploitVerificationStatus::VerifiedExploit => {
-                                        self.logger
-                                            .emit_alert(
-                                                "critical",
-                                                format!(
-                                                    "Evilpot VerifiedExploit ({}) from {} on {} [service={}, reqs={}, iocs={}]",
-                                                    finding.category,
-                                                    client_ip,
-                                                    host,
-                                                    rule.service_tag,
-                                                    outcome.session.total_trapped_requests,
-                                                    outcome.session.captured_iocs.len(),
-                                                ),
-                                            )
-                                            .await;
-                                    }
-                                    ExploitVerificationStatus::MultiStepExploitation => {
-                                        self.logger
-                                            .emit_alert(
-                                                "warning",
-                                                format!(
-                                                    "Evilpot MultiStepExploitation ({}) from {} on {} [service={}, reqs={}, sqli_pos={}]",
-                                                    finding.category,
-                                                    client_ip,
-                                                    host,
-                                                    rule.service_tag,
-                                                    outcome.session.total_trapped_requests,
-                                                    outcome.session.sqli_distinct_positions,
-                                                ),
-                                            )
-                                            .await;
-                                    }
-                                    ExploitVerificationStatus::Probing => {}
-                                }
-                            }
-                            let resp_status = outcome.response.status().as_u16();
-                            self.logger
-                                .record_session_with_fp(
-                                    "ingress",
-                                    &rule.service_tag,
-                                    &client_ip.to_string(),
-                                    resp_status,
-                                    start.elapsed().as_secs_f64() * 1000.0,
-                                    0,
-                                    0,
-                                    false,
-                                    true,
-                                    false,
-                                    Some(format!("evilpot:{status_lbl}:{}", finding.category)),
-                                    Some(client_fp.device_type.to_string()),
-                                    Some(client_fp.browser_family.to_string()),
-                                    Some(client_fp.os_family.to_string()),
-                                    false,
-                                )
-                                .await;
-                            self.logger
-                                .record_fingerprint_with_extras(
-                                    &rule.service_tag,
-                                    &host,
-                                    &client_ip.to_string(),
-                                    &fallback_fp_hash,
-                                    false,
-                                    "none",
-                                    &ua_str,
-                                    &al_str,
-                                    client_fp.device_type,
-                                    client_fp.browser_family,
-                                    client_fp.os_family,
-                                    client_fp.is_bot,
-                                    false,
-                                    suspicion_score,
-                                    tls_signal.map(|s| s.cipher_count as u16).unwrap_or(0),
-                                    tls_signal.map(|s| s.has_alpn).unwrap_or(false),
-                                    fp_extras.clone(),
-                                    None,
-                                    1,
-                                    1,
-                                    0,
-                                )
-                                .await;
-                            return into_proxy_response(outcome.response, Some(permit));
-                        }
-                    }
-                }
-            }
-        }
-
-        let verified_info = self.guard.verified_fp_info(
-            active_profile,
-            &cfg.clearance_secret,
-            &host,
-            client_ip,
-            req.headers(),
-        );
-        let fp_verified = verified_info.is_some();
-        let (obs_fp_hash, obs_fp_source, obs_is_headless) = match verified_info {
+        let fp_verified = pre_verified_fp.is_some();
+        let (obs_fp_hash, obs_fp_source, obs_is_headless) = match pre_verified_fp {
             Some((h, src, hl)) => (h, src, hl),
             None => (fallback_fp_hash, "none", false),
         };
@@ -1784,7 +2200,10 @@ impl IngressServer {
                         let mut resp =
                             build_response_from_cache(&entry, &orig_method, lookup_headers, "HIT");
                         if let Some(ref fp_token) = fp_inject_token {
-                            resp = maybe_inject_fp_beacon(resp, fp_token).await;
+                            resp = maybe_inject_fp_beacon(resp, fp_token, &self.buffer_sem).await;
+                        }
+                        if !client_fp.is_scanner && suspicion_score < 50 && resp.status().as_u16() < 400 {
+                            self.auto_ban.record_benign_request(client_ip, tls_ja3, &ua_str);
                         }
                         let resp_bytes_out = resp
                             .headers()
@@ -2164,7 +2583,10 @@ impl IngressServer {
                     }
                 }
                 if let Some(ref fp_token) = fp_inject_token {
-                    resp = maybe_inject_fp_beacon(resp, fp_token).await;
+                    resp = maybe_inject_fp_beacon(resp, fp_token, &self.buffer_sem).await;
+                }
+                if !client_fp.is_scanner && suspicion_score < 50 && resp.status().as_u16() < 400 {
+                    self.auto_ban.record_benign_request(client_ip, tls_ja3, &ua_str);
                 }
                 let resp_bytes_out = resp
                     .headers()
@@ -2366,8 +2788,16 @@ async fn maybe_store_in_cache(
 }
 
 /// Inject `<script defer src="/cdn-cgi/fp.js" data-t="..."></script>` into eligible uncompressed 2xx HTML responses.
-/// Safely passes through oversized or non-HTML responses untouched.
-async fn maybe_inject_fp_beacon(resp: Response<ProxyBody>, fp_token: &str) -> Response<ProxyBody> {
+/// Safely passes through oversized, non-HTML, or high-load responses untouched without stalling normal traffic.
+async fn maybe_inject_fp_beacon(
+    resp: Response<ProxyBody>,
+    fp_token: &str,
+    buffer_sem: &Arc<Semaphore>,
+) -> Response<ProxyBody> {
+    // Non-blocking memory pressure guard: under heavy load, skip passive beacon injection and stream directly!
+    let Ok(_buf_permit) = Arc::clone(buffer_sem).try_acquire_owned() else {
+        return resp;
+    };
     if !resp.status().is_success()
         || resp.status() == StatusCode::NO_CONTENT
         || resp.status() == StatusCode::RESET_CONTENT
@@ -3053,6 +3483,12 @@ mod tests {
             }],
             guards,
             server_header: "nginx".into(),
+            // Disable auto-ban in this multi-payload rule-coverage test so one loopback client
+            // can exercise all 6 sequential SQLi/CMDi/XSS/canary traps in a row.
+            auto_ban: exposure_core::config::AutoBanConfig {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -3326,6 +3762,240 @@ mod tests {
             assert_eq!(fp.abuse_isp.as_deref(), Some("ScannerNet"));
             assert!(fp.abuse_is_tor);
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn non_browser_clients_pass_while_attacks_tarpit_confirm_and_autoban_ip_and_fingerprint() {
+        use exposure_core::config::{
+            AntibotMode, AutoBanConfig, EgressConfig, GuardProfile, IngressRule, LoggerConfig,
+            NodeRoles, RelayConfig, RuleMatch, SegmentConfig, WafConfig,
+        };
+        use exposure_link::LinkManager;
+        use std::collections::BTreeMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp_dir = std::env::temp_dir().join(format!("exp-autoban-test-{}", Uuid::new_v4()));
+        let logger = NodeLogger::new(
+            "ing-ab-flow",
+            LoggerConfig {
+                hmac_key: generate_random_secret_hex(32),
+                store_raw_ip: false,
+                sample_rate: 1.0,
+                hll_precision: 10,
+                segment: SegmentConfig {
+                    dir: tmp_dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let kp = NodeKeyPair::generate();
+        let lm = LinkManager::new("ing-ab-flow", kp.clone(), false, vec![], Default::default());
+        let egress = crate::egress::EgressHandler::new(
+            "ing-ab-flow",
+            EgressConfig::default(),
+            vec![],
+            Arc::clone(&logger),
+        );
+        let (fwd, _rx) = Forwarder::new(
+            "ing-ab-flow",
+            NodeRoles {
+                ingress: true,
+                egress: false,
+                relay: false,
+                maintainer: false,
+            },
+            RelayConfig::default(),
+            lm,
+            egress,
+            Arc::clone(&logger),
+        );
+
+        let mut guards = BTreeMap::new();
+        guards.insert(
+            "api-and-web".to_string(),
+            GuardProfile {
+                antibot: AntibotMode::Challenge,
+                // browser_only defaults to false: non-browser API/CLI clients MUST NOT be blindly blocked!
+                waf: Some(WafConfig {
+                    mode: WafMode::Evilpot,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let cfg = IngressConfig {
+            rules: vec![IngressRule {
+                name: Some("api".into()),
+                r#match: RuleMatch {
+                    host: Some("api.example.test".into()),
+                    ..Default::default()
+                },
+                service_tag: "svc-api".into(),
+                next_peer: "missing-peer".into(),
+                guard: Some("api-and-web".into()),
+                intercept_errors: Some(false),
+                js_fp_beacon: Some(false),
+                cache: None,
+            }],
+            guards,
+            auto_ban: AutoBanConfig {
+                enabled: true,
+                ban_ttl_secs: 600,
+                max_ban_ttl_secs: 3600,
+                confirm_hits: 3,
+                ban_fingerprints: true,
+                drop_at_tcp: true,
+            },
+            ..Default::default()
+        };
+
+        let server = IngressServer::new(
+            "ing-ab-flow",
+            kp,
+            cfg,
+            8,
+            fwd,
+            DynamicCertResolver::new(),
+            Arc::clone(&logger),
+        );
+
+        let send_raw = |srv: Arc<IngressServer>,
+                        peer: SocketAddr,
+                        tls_sig: Option<ClientHelloSignal>,
+                        raw_req: String| async move {
+            let (client_io, server_io) = tokio::io::duplex(16384);
+            tokio::spawn(async move {
+                srv.serve_conn(server_io, peer, tls_sig.is_some(), false, None, tls_sig)
+                    .await;
+            });
+            let (mut r, mut w) = tokio::io::split(client_io);
+            w.write_all(raw_req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+
+        let benign_api_peer: SocketAddr = "198.51.100.11:40001".parse().unwrap();
+        let attacker_peer: SocketAddr = "198.51.100.66:40002".parse().unwrap();
+        let attacker_rotated_peer: SocketAddr = "203.0.113.88:40003".parse().unwrap();
+
+        let attacker_tls = ClientHelloSignal {
+            sni: Some("api.example.test".into()),
+            tls_version: 0x0303,
+            cipher_count: 6,
+            extension_count: 5,
+            has_alpn: true,
+            alpn_h2: false,
+            has_grease: false,
+            supported_groups_count: 2,
+            fingerprint: Some("beef00112233445566778899".into()),
+        };
+
+        // 1. Honest non-browser API client (`curl/8.5.0`) passes Guard & WAF cleanly (reaches mesh forward -> 502 missing-peer, NOT 403/302!)
+        let benign_resp = send_raw(
+            Arc::clone(&server),
+            benign_api_peer,
+            None,
+            "GET /v1/health HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: curl/8.5.0\r\nAccept: application/json\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            benign_resp.starts_with("HTTP/1.1 502"),
+            "honest curl API client must pass Guard+WAF and reach forwarder, got: {benign_resp}"
+        );
+
+        // 2. Non-browser attacker sends path traversal -> diverted to Evilpot FIRST (200 fake .env with canary, NOT instant 403!)
+        let probe_resp = send_raw(
+            Arc::clone(&server),
+            attacker_peer,
+            Some(attacker_tls.clone()),
+            "GET /download?file=../../../../.env HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: ExploitKit/9.0\r\nAccept: */*\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            probe_resp.starts_with("HTTP/1.1 200"),
+            "initial attack must be diverted to evilpot to waste time, got: {probe_resp}"
+        );
+        let canary_key = probe_resp
+            .lines()
+            .find_map(|l| l.strip_prefix("ADMIN_BYPASS_TOKEN="))
+            .expect("decoy .env must embed canary token")
+            .trim()
+            .to_string();
+        assert!(
+            !server.auto_ban().is_ip_banned_for_tcp(attacker_peer.ip()),
+            "single probe must not ban yet before behavior confirmation"
+        );
+
+        // 3. Attacker replays stolen canary token -> Evilpot confirms VerifiedExploit and AUTO-BANS IP + composite TLS+UA fingerprint!
+        let canary_resp = send_raw(
+            Arc::clone(&server),
+            attacker_peer,
+            Some(attacker_tls.clone()),
+            format!(
+                "GET /v1/admin/keys HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: ExploitKit/9.0\r\nAuthorization: Bearer {canary_key}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            canary_resp.starts_with("HTTP/1.1 200"),
+            "confirming canary replay returns trap response while registering ban, got: {canary_resp}"
+        );
+        assert!(
+            server.auto_ban().is_ip_banned_for_tcp(attacker_peer.ip()),
+            "confirmed attacker IP must now be auto-banned at TCP layer"
+        );
+
+        // 4. Subsequent benign-looking request from banned attacker IP -> immediately 403 Forbidden (zero upstream / Evilpot cost)!
+        let blocked_ip_resp = send_raw(
+            Arc::clone(&server),
+            attacker_peer,
+            Some(attacker_tls.clone()),
+            "GET /v1/health HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            blocked_ip_resp.starts_with("HTTP/1.1 403"),
+            "banned attacker IP must be immediately blocked on all routes, got: {blocked_ip_resp}"
+        );
+
+        // 5. Attacker rotates to a BRAND-NEW IP with the same custom TLS+UA fingerprint -> immediately 403 Forbidden!
+        let blocked_fp_resp = send_raw(
+            Arc::clone(&server),
+            attacker_rotated_peer,
+            Some(attacker_tls.clone()),
+            "GET /v1/health HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: ExploitKit/9.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            blocked_fp_resp.starts_with("HTTP/1.1 403"),
+            "rotating-IP attacker matching banned composite TLS+UA fingerprint must be blocked, got: {blocked_fp_resp}"
+        );
+
+        // 6. Legitimate API client remains 100% unaffected!
+        let still_ok = send_raw(
+            Arc::clone(&server),
+            benign_api_peer,
+            None,
+            "GET /v1/health HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            still_ok.starts_with("HTTP/1.1 502"),
+            "legitimate non-browser client must remain unaffected, got: {still_ok}"
+        );
+
+        // 7. Evilpot report surfaces active IP & fingerprint bans + drops
+        let report = server.evilpot_report().await.expect("report active");
+        assert!(report.active_ip_bans >= 1);
+        assert!(report.active_fp_bans >= 1);
+        assert!(report.total_ban_drops >= 3);
+        assert!(!report.active_bans.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -2,12 +2,13 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, AbuseIpDbConfig, CertOrderConfig, CrsUpdateConfig, CustomPagesConfig,
-    DomainLineRecordType, EgressConfig, EgressDefaults, EgressServiceConfig, EvilpotNodeConfig,
-    GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
-    LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig, PeerConfig,
-    ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode,
-    ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection,
+    resolve_domain_binding, AbuseIpDbConfig, AutoBanConfig, CertOrderConfig, CrsUpdateConfig,
+    CustomPagesConfig, DomainLineRecordType, EgressConfig, EgressDefaults, EgressServiceConfig,
+    EvilpotNodeConfig, GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule,
+    LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig,
+    PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
+    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
+    TunnelDirection,
 };
 use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
@@ -108,6 +109,7 @@ fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile
     out.bind_ua = Some(out.bind_ua.unwrap_or(defs.bind_ua));
     out.bind_ip_prefix = Some(out.bind_ip_prefix.unwrap_or(defs.bind_ip_prefix));
     out.block_bots = Some(out.block_bots.unwrap_or(defs.block_bots));
+    out.browser_only = Some(out.browser_only.unwrap_or(defs.browser_only));
     out.block_headless = Some(out.block_headless.unwrap_or(defs.block_headless));
     out.require_client_fp = Some(out.require_client_fp.unwrap_or(defs.require_client_fp));
     out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(defs.js_fp_beacon));
@@ -219,6 +221,16 @@ fn resolve_ingress_config(
     if out.evilpot == EvilpotNodeConfig::default() {
         out.evilpot = ingress_defs.evilpot.clone();
     }
+    if out.auto_ban == AutoBanConfig::default() {
+        out.auto_ban = ingress_defs.auto_ban.clone();
+    }
+    out.auto_ban.ban_ttl_secs = out.auto_ban.ban_ttl_secs.clamp(60, 86_400);
+    out.auto_ban.max_ban_ttl_secs = out
+        .auto_ban
+        .max_ban_ttl_secs
+        .max(out.auto_ban.ban_ttl_secs)
+        .clamp(60, 7 * 86_400);
+    out.auto_ban.confirm_hits = out.auto_ban.confirm_hits.clamp(1, 50);
     if out.abuseipdb == AbuseIpDbConfig::default() {
         out.abuseipdb = ingress_defs.abuseipdb.clone();
     }

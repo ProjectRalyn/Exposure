@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 const MAX_CACHE_ENTRIES: usize = 32_768;
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_BACKOFF_SECS: u64 = 600;
-const REQUEST_WAIT_BUDGET: Duration = Duration::from_millis(750);
+const REQUEST_WAIT_BUDGET: Duration = Duration::from_millis(200);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
 const DEFAULT_API_BASE: &str = "https://api.abuseipdb.com/api/v2/check";
 
@@ -254,7 +254,16 @@ impl AbuseIpDbClient {
         if self.cache.len() >= MAX_CACHE_ENTRIES && !self.cache.contains_key(&ip) {
             self.cache.retain(|_, v| now < v.expires_at);
             if self.cache.len() >= MAX_CACHE_ENTRIES {
-                self.cache.clear();
+                let to_remove = self.cache.len() / 2;
+                let mut removed = 0usize;
+                self.cache.retain(|_, _| {
+                    if removed < to_remove {
+                        removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
         self.cache.insert(

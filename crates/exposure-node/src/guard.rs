@@ -446,6 +446,33 @@ impl GuardEngine {
             other => return other,
         }
 
+        self.evaluate_antibot_only(
+            profile,
+            clearance_secret,
+            client_ip,
+            host,
+            path_and_query,
+            headers,
+            tls_signal,
+            abuse_score,
+        )
+    }
+
+    /// Evaluate ONLY antibot / suspicion / PoW clearance policy (after CIDR, rate-limit, and WAF/Evilpot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_antibot_only(
+        &self,
+        profile: &GuardProfile,
+        clearance_secret: &str,
+        client_ip: IpAddr,
+        host: &str,
+        path_and_query: &str,
+        headers: &HeaderMap,
+        tls_signal: Option<&ClientHelloSignal>,
+        abuse_score: Option<u8>,
+    ) -> GuardDecision {
+        let client_ip = canonical_ip(client_ip);
+
         // 3. `antibot: off` completely skips challenge/fingerprint logic
         if profile.antibot == AntibotMode::Off
             && !profile.effective_block_bots()
@@ -459,7 +486,7 @@ impl GuardEngine {
             return GuardDecision::Allow;
         }
 
-        // 4b. Block known bot/scraper UAs if enabled
+        // 4b. Block known bot/scraper UAs if explicitly enabled
         let client_fp = classify_client(headers);
         if profile.effective_block_bots() && client_fp.is_bot {
             return GuardDecision::Reject {
@@ -489,8 +516,11 @@ impl GuardEngine {
             }
         }
 
-        // 5b. `antibot: always` or `require_client_fp`: challenge every client without valid FP clearance
-        if profile.antibot == AntibotMode::Always || profile.effective_require_client_fp() {
+        // 5b. `antibot: always`, or `antibot: challenge` with `require_client_fp`:
+        // challenge every client without valid FP clearance. Never redirect to PoW in `silent`/`off` mode.
+        if profile.antibot == AntibotMode::Always
+            || (profile.antibot == AntibotMode::Challenge && profile.effective_require_client_fp())
+        {
             let encoded = url_encode(path_and_query);
             return GuardDecision::ChallengeRedirect {
                 location: format!("/cdn-cgi/?redirect={encoded}"),
@@ -501,10 +531,16 @@ impl GuardEngine {
             return GuardDecision::Allow;
         }
 
-        // 6. Authoritative server-side suspicion scoring (TLS JA3/GREASE/ALPN + HTTP wire headers + AbuseIPDB).
-        // Client JS fingerprints are strictly auxiliary (used only for headless/tamper detection in step 4c)
-        // and NEVER reduce this server-side score.
-        let score = compute_server_suspicion_score(headers, tls_signal, abuse_score);
+        // 6. Authoritative server-side suspicion scoring.
+        // Defaults to non-browser-safe mode (`browser_only = false`) so APIs/CLIs/SDKs behind Egress
+        // are not blindly blocked; browser impersonators, offensive scanners, headless browsers, and
+        // high AbuseIPDB IPs still score high.
+        let score = compute_server_suspicion_score_for_mode(
+            headers,
+            tls_signal,
+            abuse_score,
+            profile.effective_browser_only(),
+        );
 
         if profile.reject_threshold > 0 && score >= profile.reject_threshold {
             return GuardDecision::Reject {
@@ -1413,18 +1449,86 @@ impl GuardEngine {
     }
 }
 
-/// Server-side suspicion score (0 = clean browser, 100 = clearly automated/abusive).
-/// Derived exclusively from unforgeable server-observed signals (TLS ClientHello JA3/GREASE/ALPN,
-/// HTTP header structure/consistency, and optional AbuseIPDB IP reputation).
-pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSignal>) -> u8 {
-    compute_server_suspicion_score(headers, tls, None)
+/// Returns `true` for unambiguous offensive vulnerability scanners and exploit frameworks.
+/// Legitimate non-browser HTTP clients (`curl`, `Go-http-client`, `okhttp`, `axios`, `python-requests`,
+/// custom SDKs) are explicitly NOT matched here.
+pub fn is_attack_scanner_ua(ua: &str) -> bool {
+    let u = ua.trim().to_ascii_lowercase();
+    if u.is_empty() {
+        return false;
+    }
+    const SCANNERS: &[&str] = &[
+        "sqlmap",
+        "nikto",
+        "nuclei",
+        "acunetix",
+        "nessus",
+        "openvas",
+        "masscan",
+        "zgrab",
+        "dirbuster",
+        "gobuster",
+        "ffuf",
+        "wfuzz",
+        "feroxbuster",
+        "dirsearch",
+        "wpscan",
+        "havij",
+        "commix",
+        "xsstrike",
+        "dalfox",
+        "jaeles",
+        "netsparker",
+        "appscan",
+        "qualys",
+        "burpsuite",
+        "zaproxy",
+        "metasploit",
+        "whatweb",
+        "hydra",
+        "medusa",
+        "nmap scripting engine",
+    ];
+    SCANNERS.iter().any(|s| u.contains(s))
 }
 
-/// Full server-side suspicion score combining TLS ClientHello, HTTP wire headers, and AbuseIPDB score.
+fn is_headless_ua(ua_l: &str) -> bool {
+    ua_l.contains("headless")
+        || ua_l.contains("phantomjs")
+        || ua_l.contains("selenium")
+        || ua_l.contains("playwright")
+        || ua_l.contains("puppeteer")
+        || ua_l.contains("webdriver")
+}
+
+/// Server-side suspicion score (0 = clean, 100 = clearly automated/abusive).
+/// Defaults to non-browser-safe mode (`browser_only = false`) so APIs/CLIs/SDKs are not blindly blocked.
+pub fn compute_suspicion_score(headers: &HeaderMap, tls: Option<&ClientHelloSignal>) -> u8 {
+    compute_server_suspicion_score_for_mode(headers, tls, None, false)
+}
+
+/// Full server-side suspicion score combining TLS ClientHello, HTTP wire headers, and AbuseIPDB score
+/// in default non-browser-safe mode (`browser_only = false`).
 pub fn compute_server_suspicion_score(
     headers: &HeaderMap,
     tls: Option<&ClientHelloSignal>,
     abuse_score: Option<u8>,
+) -> u8 {
+    compute_server_suspicion_score_for_mode(headers, tls, abuse_score, false)
+}
+
+/// Full server-side suspicion score with explicit `browser_only` mode control:
+/// - `browser_only = false` (default): Honest non-browser clients (APIs, CLIs, mobile apps, webhooks)
+///   are NOT penalized for omitting browser headers. Only offensive scanners, headless UAs,
+///   **browser impersonation contradictions** (claiming `Mozilla/5.0`/`Chrome` while missing browser
+///   headers or contradicting TLS/Client-Hints), and AbuseIPDB scores contribute.
+/// - `browser_only = true`: Strict pure-browser portal mode; CLI/library and non-Mozilla UAs are
+///   also scored suspicious.
+pub fn compute_server_suspicion_score_for_mode(
+    headers: &HeaderMap,
+    tls: Option<&ClientHelloSignal>,
+    abuse_score: Option<u8>,
+    browser_only: bool,
 ) -> u8 {
     let mut score: u32 = 0;
 
@@ -1435,12 +1539,13 @@ pub fn compute_server_suspicion_score(
         .trim();
     let ua_l = ua.to_ascii_lowercase();
 
-    let is_known_bot = ua_l.contains("curl")
+    let is_scanner = is_attack_scanner_ua(ua);
+    let is_headless = is_headless_ua(&ua_l);
+    let is_cli_or_generic_bot = ua_l.contains("curl")
         || ua_l.contains("wget")
         || ua_l.contains("python")
         || ua_l.contains("scrapy")
         || ua_l.contains("go-http-client")
-        || ua_l.contains("headless")
         || ua_l.contains("bot")
         || ua_l.contains("spider")
         || ua_l.contains("crawler")
@@ -1456,46 +1561,58 @@ pub fn compute_server_suspicion_score(
         || ua_l.contains("postman")
         || ua_l.contains("insomnia");
 
-    if ua.is_empty() {
-        score += 55;
-    } else if is_known_bot {
-        score += 50;
-    } else if !ua_l.contains("mozilla/") {
-        // Real desktop/mobile browsers always advertise `Mozilla/5.0 ...`; arbitrary custom UAs
-        // (e.g. `notnginx`, `ZabbixX`, `abc`) should score MORE suspicious, never less.
-        score += 35;
+    let claims_browser = ua_l.contains("mozilla/") && !is_scanner && !is_cli_or_generic_bot;
+
+    if is_scanner {
+        score += 80;
+    } else if is_headless {
+        score += 60;
+    } else if browser_only {
+        if ua.is_empty() {
+            score += 55;
+        } else if is_cli_or_generic_bot {
+            score += 50;
+        } else if !ua_l.contains("mozilla/") {
+            score += 35;
+        }
+    } else if ua.is_empty() {
+        // Mild signal only in mixed mode so minimal health checks/probes aren't blindly rejected.
+        score += 20;
     }
 
-    let has_accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if !has_accept {
-        score += 15;
+    // Browser-header checks apply ONLY when the client claims to be a browser OR in `browser_only` mode.
+    if claims_browser || browser_only {
+        let has_accept = headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_accept {
+            score += 15;
+        }
+
+        let has_accept_lang = headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_accept_lang {
+            score += 25;
+        }
+
+        let has_sec_fetch = headers
+            .get("sec-fetch-mode")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !is_cli_or_generic_bot && !has_sec_fetch {
+            // Real browsers on plain HTTP still stay at 25 (< 50), while spoofed Mozilla UAs
+            // lacking Accept-Language cross the 50-point challenge threshold.
+            score += 25;
+        }
     }
 
-    let has_accept_lang = headers
-        .get(header::ACCEPT_LANGUAGE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if !has_accept_lang {
-        score += 25;
-    }
-
-    let has_sec_fetch = headers
-        .get("sec-fetch-mode")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    if !is_known_bot && !has_sec_fetch {
-        // Real browsers on plain HTTP still stay at 25 (< 50), while scripts lacking Accept-Language
-        // or using non-Mozilla UAs cross the 50-point challenge threshold.
-        score += 25;
-    }
-
-    // Server-side Sec-Ch-Ua-Platform vs User-Agent OS contradiction check (unforgeable by JS beacon)
+    // Server-side Sec-Ch-Ua-Platform vs User-Agent OS contradiction check (always active: catches impersonation)
     if let Some(ch_plat) = headers
         .get("sec-ch-ua-platform")
         .and_then(|v| v.to_str().ok())
@@ -1512,17 +1629,20 @@ pub fn compute_server_suspicion_score(
                 && !ua_l.contains("android")
                 && (ch_plat.contains("win") || ch_plat.contains("mac")));
         if contradiction {
-            score += 25;
+            score += 30;
         }
     }
 
-    // Unforgeable TLS ClientHello signals (cipher suite count, ALPN h2, GREASE, UA-CH consistency)
+    // Unforgeable TLS ClientHello consistency signals:
+    // Applied when the client claims to be a browser (catching TLS-impersonating bots) or in `browser_only` mode.
     if let Some(sig) = tls {
-        if sig.cipher_count > 0 && sig.cipher_count < 4 {
-            score += 20;
-        }
-        if !sig.has_alpn {
-            score += 15;
+        if claims_browser || browser_only {
+            if sig.cipher_count > 0 && sig.cipher_count < 4 {
+                score += 20;
+            }
+            if !sig.has_alpn {
+                score += 15;
+            }
         }
         let claims_chromium = ua_l.contains("chrome/1") || ua_l.contains("edg/1");
         if claims_chromium {
@@ -1543,7 +1663,7 @@ pub fn compute_server_suspicion_score(
         }
     }
 
-    // Server-side AbuseIPDB IP reputation contribution
+    // Server-side AbuseIPDB IP reputation contribution (always active for both browser & non-browser)
     if let Some(ab) = abuse_score {
         if ab >= 75 {
             score += 55;
@@ -1588,9 +1708,10 @@ pub struct ClientFingerprint {
     pub browser_family: &'static str,
     pub os_family: &'static str,
     pub is_bot: bool,
+    pub is_scanner: bool,
 }
 
-/// Classify client device, browser family, OS, and bot status from HTTP headers (server-side).
+/// Classify client device, browser family, OS, and bot/scanner status from HTTP headers (server-side).
 pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
     let ua = headers
         .get(header::USER_AGENT)
@@ -1607,7 +1728,9 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let is_bot = ua.is_empty()
+    let is_scanner = is_attack_scanner_ua(ua);
+    let is_bot = is_scanner
+        || ua.is_empty()
         || ua_l.contains("bot")
         || ua_l.contains("spider")
         || ua_l.contains("crawler")
@@ -1616,9 +1739,11 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
         || ua_l.contains("wget")
         || ua_l.contains("python-requests")
         || ua_l.contains("go-http-client")
-        || ua_l.contains("headless");
+        || is_headless_ua(&ua_l);
 
-    let device_type = if is_bot {
+    let device_type = if is_scanner {
+        "Scanner"
+    } else if is_bot {
         if ua_l.contains("curl") || ua_l.contains("wget") || ua_l.contains("python") || ua_l.contains("go-http") {
             "API/CLI"
         } else {
@@ -1632,7 +1757,9 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
         "Desktop"
     };
 
-    let browser_family = if ua_l.contains("edg/") || ua_l.contains("edge/") {
+    let browser_family = if is_scanner {
+        "Scanner"
+    } else if ua_l.contains("edg/") || ua_l.contains("edge/") {
         "Edge"
     } else if ua_l.contains("opr/") || ua_l.contains("opera") {
         "Opera"
@@ -1669,6 +1796,7 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
         browser_family,
         os_family,
         is_bot,
+        is_scanner,
     }
 }
 
@@ -1801,6 +1929,7 @@ mod tests {
             clearance_ttl_secs: 600,
             bind_ua: Some(true),
             bind_ip_prefix: Some(false),
+            browser_only: Some(true),
             ..Default::default()
         };
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
@@ -2266,15 +2395,20 @@ mod tests {
     #[test]
     fn guard_blocks_poc_accept_and_custom_ua_bypasses() {
         let engine = GuardEngine::new();
-        let profile = GuardProfile {
+        let default_profile = GuardProfile {
             antibot: AntibotMode::Challenge,
             challenge_threshold: 50,
             reject_threshold: 85,
-            ..Default::default()
+            ..Default::default() // browser_only = false (non-browser-safe!)
+        };
+        let strict_profile = GuardProfile {
+            browser_only: Some(true),
+            ..default_profile.clone()
         };
         let ip: IpAddr = "172.16.36.36".parse().unwrap();
 
-        // 1. PoC experiment: Mozilla UA + Accept: */* (no Accept-Language, no Sec-Fetch-Mode) -> MUST be challenged!
+        // 1. Browser impersonation (Mozilla UA + Accept: */*, no Accept-Language, no Sec-Fetch-Mode)
+        //    MUST be challenged even in default mixed mode!
         let mut poc_accept = HeaderMap::new();
         poc_accept.insert(
             header::USER_AGENT,
@@ -2285,30 +2419,54 @@ mod tests {
         poc_accept.insert(header::ACCEPT, "*/*".parse().unwrap());
         assert!(compute_suspicion_score(&poc_accept, None) >= 50);
         assert!(matches!(
-            engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &poc_accept, None),
+            engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &poc_accept, None),
             GuardDecision::ChallengeRedirect { .. }
         ));
 
-        // 2. Empty Accept header must NOT count as valid Accept
+        // 2. Empty Accept header on spoofed browser UA must NOT count as valid Accept
         let mut poc_empty_accept = poc_accept.clone();
         poc_empty_accept.insert(header::ACCEPT, "".parse().unwrap());
         assert!(compute_suspicion_score(&poc_empty_accept, None) >= 65);
 
-        // 3. Arbitrary non-Mozilla UAs (`notnginx`, `Xkube-probeXX`, `ZabbixX`) -> MUST NOT bypass!
+        // 3. Honest non-browser clients (APIs, CLIs, mobile SDKs) MUST NOT be blindly blocked in default mode!
+        for api_ua in ["curl/8.5.0", "Go-http-client/2.0", "okhttp/4.12.0", "MyServiceSDK/1.0"] {
+            let mut h = HeaderMap::new();
+            h.insert(header::USER_AGENT, api_ua.parse().unwrap());
+            h.insert(header::ACCEPT, "application/json".parse().unwrap());
+            assert_eq!(compute_suspicion_score(&h, None), 0, "honest non-browser `{api_ua}` must score 0");
+            assert!(matches!(
+                engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "api.local", "/v1/items", &h, None),
+                GuardDecision::Allow
+            ));
+        }
+
+        // 3b. Offensive attack scanners MUST still score high even in default non-browser-safe mode!
+        for scanner_ua in ["sqlmap/1.8.2", "Nikto/2.1.6", "Nuclei - Open-source project"] {
+            let mut h = HeaderMap::new();
+            h.insert(header::USER_AGENT, scanner_ua.parse().unwrap());
+            assert!(classify_client(&h).is_scanner);
+            assert!(compute_suspicion_score(&h, None) >= 80);
+            assert!(!matches!(
+                engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "api.local", "/v1/items", &h, None),
+                GuardDecision::Allow
+            ));
+        }
+
+        // 3c. Explicit `browser_only: true` routes STILL block non-Mozilla / custom UAs!
         for custom_ua in ["notnginx-123", "Xkube-probeXX", "ZabbixX", "abc"] {
             let mut h = HeaderMap::new();
             h.insert(header::USER_AGENT, custom_ua.parse().unwrap());
-            assert!(compute_suspicion_score(&h, None) >= 85);
+            assert!(compute_server_suspicion_score_for_mode(&h, None, None, true) >= 85);
             assert!(!matches!(
-                engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                engine.evaluate(&strict_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
                 GuardDecision::Allow
             ));
             // Even with Accept + Accept-Language, missing Sec-Fetch-Mode + non-Mozilla UA still >= 50
             h.insert(header::ACCEPT, "*/*".parse().unwrap());
             h.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
-            assert!(compute_suspicion_score(&h, None) >= 50);
+            assert!(compute_server_suspicion_score_for_mode(&h, None, None, true) >= 50);
             assert!(!matches!(
-                engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                engine.evaluate(&strict_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
                 GuardDecision::Allow
             ));
         }
@@ -2325,7 +2483,7 @@ mod tests {
         real_http_browser.insert(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9".parse().unwrap());
         assert!(compute_suspicion_score(&real_http_browser, None) < 50);
         assert!(matches!(
-            engine.evaluate(&profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &real_http_browser, None),
+            engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &real_http_browser, None),
             GuardDecision::Allow
         ));
     }
