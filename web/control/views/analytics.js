@@ -13,15 +13,63 @@ import { t } from "../i18n.js";
 import { el, esc, openModal } from "../ui.js";
 
 export function createAnalyticsViews({ api, store, navigate }) {
+  let anaSubTab = "overview"; // overview | logs
   let obsHeroMetric = "requests";
   let obsNode = "all";
   let obsSvc = "all";
   let obsWin = 0;
 
+  let logFilters = {
+    q: "",
+    ip: "",
+    host: "",
+    node: "all",
+    service: "all",
+    role: "all",
+    method: "all",
+    status: "all",
+    action: "all",
+    window_secs: 0,
+  };
+  let logData = null;
+
   let fpFilters = { q: "", ip: "", fp: "", node: "all", service: "all", verified: "all", risk: "all" };
   let fpData = null;
 
   /* ==================== ANALYTICS ==================== */
+
+  function renderAnaSubtabsBar() {
+    const logCnt = logData ? Number(logData.total_matched ?? (logData.items || []).length ?? 0) : null;
+    return `
+      <div class="subtabs-bar">
+        <div class="subtabs-list">
+          <button type="button" class="subtab-btn ${anaSubTab === "overview" ? "active" : ""}" data-ana-sub="overview">
+            ${esc(t("ana.tab.overview"))}
+          </button>
+          <button type="button" class="subtab-btn ${anaSubTab === "logs" ? "active" : ""}" data-ana-sub="logs">
+            ${esc(t("ana.tab.logs"))} ${logCnt != null ? `<span class="subtab-count">${logCnt}</span>` : ""}
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  function wireAnaSubtabs(root) {
+    root.querySelectorAll("[data-ana-sub]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const next = btn.dataset.anaSub;
+        if (next === anaSubTab) return;
+        anaSubTab = next;
+        if (anaSubTab === "logs") {
+          renderLogs();
+          refreshLogs();
+        } else {
+          renderAnalyticsCharts();
+          refreshAnalytics();
+        }
+      });
+    });
+  }
 
   function renderAnalyticsShell() {
     const root = el("tab-analytics");
@@ -31,6 +79,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const svcs = (data.available_services || []).slice().sort();
 
     root.innerHTML = `
+      ${renderAnaSubtabsBar()}
       <div class="filter-bar">
         <label class="filter-inline">
           <span>Host</span>
@@ -122,6 +171,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
       </details>
     `;
 
+    wireAnaSubtabs(root);
     el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; refreshAnalytics(); });
     el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; refreshAnalytics(); });
     el("obs-window-filter")?.addEventListener("change", (ev) => { obsWin = Number(ev.target.value) || 0; refreshAnalytics(); });
@@ -135,8 +185,19 @@ export function createAnalyticsViews({ api, store, navigate }) {
   }
 
   function renderAnalyticsCharts() {
+    if (anaSubTab === "logs") {
+      renderLogs();
+      return;
+    }
     const data = store.telemetry;
-    if (!data) return;
+    if (!data) {
+      const root = el("tab-analytics");
+      if (root) {
+        root.innerHTML = renderAnaSubtabsBar() + `<div class="panel muted">Loading telemetry…</div>`;
+        wireAnaSubtabs(root);
+      }
+      return;
+    }
     renderAnalyticsShell();
     const tr = data.traffic || {};
     const totalReq = Number(tr.total_requests) || 0;
@@ -229,7 +290,253 @@ export function createAnalyticsViews({ api, store, navigate }) {
         .join("") || `<tr><td colspan="11" class="muted">No telemetry buckets</td></tr>`;
   }
 
+  function renderLogs() {
+    const root = el("tab-analytics");
+    if (!root) return;
+    const data = logData || {};
+    const sum = data.summary || {};
+    const prot = data.log_protection || {};
+    const items = data.items || [];
+    const topPaths = data.top_paths || [];
+    const nodes = (data.available_nodes || []).slice().sort();
+    const svcs = (data.available_services || []).slice().sort();
+
+    const actionPillCls = (act, status) => {
+      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "guard_reject" || act === "abuseipdb" || status >= 500) return "err";
+      if (act === "rate_limit" || act === "challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
+      if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass") return "info";
+      return "ok";
+    };
+
+    root.innerHTML = `
+      ${renderAnaSubtabsBar()}
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.requests"))}</div><div class="kpi-val">${formatCompact(sum.total_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.total_events || items.length)} events · ${formatCompact(sum.unique_ips || 0)} unique IPs</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.blocked"))}</div><div class="kpi-val">${formatCompact(sum.blocked_requests || 0)}</div><div class="kpi-sub">cache hits: ${formatCompact(sum.cache_hits || 0)} · folded: ${formatCompact(sum.folded_requests || 0)}</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.errors"))}</div><div class="kpi-val">${formatCompact(sum.error_5xx_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.unique_paths || 0)} unique URLs</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.dos_shield"))}</div><div class="kpi-val">${formatCompact(prot.folded_records || 0)} / ${formatCompact(prot.dropped_records || 0)}</div><div class="kpi-sub">folded / dropped · ${formatCompact(prot.warn_suppressed || 0)} warns muted</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="fp-search-bar">
+          <label><span>URL / Search</span><input id="log-search-q" type="search" value="${esc(logFilters.q)}" placeholder="${esc(t("logs.search_ph"))}" /></label>
+          <label><span>IP / HMAC</span><input id="log-search-ip" type="search" value="${esc(logFilters.ip)}" placeholder="${esc(t("logs.ip_ph"))}" /></label>
+          <label><span>Host</span><input id="log-search-host" type="search" value="${esc(logFilters.host)}" placeholder="${esc(t("logs.host_ph"))}" /></label>
+          <div class="btn-row">
+            <button type="button" id="btn-log-search" class="btn primary">${esc(t("common.search"))}</button>
+            <button type="button" id="btn-log-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+          </div>
+        </div>
+        <div class="fp-filter-row">
+          <div class="fp-chip-group">
+            ${["all", "2xx", "3xx", "4xx", "5xx"].map((st) => `<button type="button" class="fp-chip ${logFilters.status === st ? "active" : ""}" data-log-st="${st}">${st.toUpperCase()}</button>`).join("")}
+          </div>
+          <div class="fp-chip-group">
+            ${["all", "allow", "blocked", "waf_block", "evilpot", "autoban", "rate_limit", "cache_hit", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
+          </div>
+          <div class="btn-row">
+            <select id="log-method-filter" class="select-sm">
+              <option value="all" ${logFilters.method === "all" ? "selected" : ""}>All Methods</option>
+              ${["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"].map((m) => `<option value="${m}" ${logFilters.method === m ? "selected" : ""}>${m}</option>`).join("")}
+            </select>
+            <select id="log-node-filter" class="select-sm">
+              <option value="all">${esc(t("ana.all_nodes"))}</option>
+              ${nodes.map((n) => `<option value="${esc(n)}" ${logFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
+            </select>
+            <select id="log-svc-filter" class="select-sm">
+              <option value="all">${esc(t("ana.all_services"))}</option>
+              ${svcs.map((s) => `<option value="${esc(s)}" ${logFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
+            </select>
+            <select id="log-window-filter" class="select-sm">
+              <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>All</option>
+              <option value="300" ${logFilters.window_secs === 300 ? "selected" : ""}>5m</option>
+              <option value="900" ${logFilters.window_secs === 900 ? "selected" : ""}>15m</option>
+              <option value="3600" ${logFilters.window_secs === 3600 ? "selected" : ""}>1h</option>
+              <option value="86400" ${logFilters.window_secs === 86400 ? "selected" : ""}>24h</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      ${
+        topPaths.length
+          ? `<div class="panel">
+              <div class="panel-header"><h3>${esc(t("logs.top_urls"))}</h3><span class="muted-sm">Click a path to filter</span></div>
+              <div class="table-scroll" style="max-height:220px;">
+                <table class="table">
+                  <thead><tr><th>Host</th><th>Path</th><th>Hits</th><th>Blocked</th><th>5xx</th></tr></thead>
+                  <tbody>
+                    ${topPaths
+                      .map(
+                        (tp, i) => `
+                      <tr class="fp-table-row" data-top-path-idx="${i}">
+                        <td><code>${esc(tp.host || "-")}</code></td>
+                        <td><span class="fp-code">${esc(tp.path || "/")}</span></td>
+                        <td><strong>${formatCompact(tp.hits || 0)}</strong></td>
+                        <td>${tp.blocked ? `<span class="pill warn">${formatCompact(tp.blocked)}</span>` : "0"}</td>
+                        <td>${tp.errors_5xx ? `<span class="pill err">${formatCompact(tp.errors_5xx)}</span>` : "0"}</td>
+                      </tr>`
+                      )
+                      .join("")}
+                  </tbody>
+                </table>
+              </div>
+            </div>`
+          : ""
+      }
+
+      <div class="panel">
+        <div class="panel-header">
+          <h3>${esc(t("logs.explorer_title"))} (${items.length})</h3>
+          <span class="muted-sm">Query strings redact secrets · Click row for full detail</span>
+        </div>
+        <div class="table-scroll" style="max-height:560px;">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>${esc(t("logs.col.time"))}</th>
+                <th>${esc(t("logs.col.method"))}</th>
+                <th>${esc(t("logs.col.status"))}</th>
+                <th>${esc(t("logs.col.url"))}</th>
+                <th>${esc(t("logs.col.action"))}</th>
+                <th>${esc(t("logs.col.client"))}</th>
+                <th>${esc(t("logs.col.route"))}</th>
+                <th>${esc(t("logs.col.perf"))}</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${
+                items
+                  .map((r, idx) => {
+                    const st = Number(r.status) || 0;
+                    const stCls = st >= 500 ? "err" : st >= 400 ? "warn" : st >= 300 ? "info" : "ok";
+                    const act = r.action || "allow";
+                    const actCls = actionPillCls(act, st);
+                    const repeat = Number(r.repeat_count) || 1;
+                    const tsSec = Math.floor((Number(r.timestamp_ms) || 0) / 1000);
+                    return `
+                  <tr class="fp-table-row" data-log-idx="${idx}">
+                    <td><div>${esc(formatDateTime(tsSec))}</div><div class="muted-sm">${esc(r.ray_id ? r.ray_id.slice(0, 12) : "-")}</div></td>
+                    <td><div><strong>${esc(r.method || "-")}</strong></div><div class="muted-sm">${esc(r.scheme || "")}${r.protocol ? ` · ${esc(r.protocol)}` : ""}</div></td>
+                    <td><span class="pill ${stCls}">${st}</span>${r.cache_status ? ` <span class="pill">${esc(r.cache_status)}</span>` : ""}</td>
+                    <td style="max-width:340px;word-break:break-all;">
+                      <div><strong>${esc(r.host || "-")}</strong></div>
+                      <div><span class="fp-code">${esc(r.path || "/")}</span>${r.query ? `<span class="muted-sm">?${esc(r.query)}</span>` : ""}</div>
+                    </td>
+                    <td>
+                      <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                        <span class="pill ${actCls}">${esc(act)}</span>
+                        ${repeat > 1 ? `<span class="pill warn">&times;${repeat}</span>` : ""}
+                      </div>
+                      ${r.waf_category || r.error ? `<div class="muted-sm">${esc(r.waf_category || r.error || "")}</div>` : ""}
+                    </td>
+                    <td><div>${esc(r.raw_ip || "-")}</div><div class="muted-sm"><span class="fp-code">${esc((r.ip_hmac || "").slice(0, 14))}</span></div></td>
+                    <td><div><code>${esc(r.service_tag)}</code></div><div class="muted-sm">${esc(r.node_tag)} · ${esc(r.role)}</div></td>
+                    <td><div>${(Number(r.latency_ms) || 0).toFixed(1)} ms</div><div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div></td>
+                  </tr>`;
+                  })
+                  .join("") || `<tr><td colspan="8" class="muted">${esc(t("logs.empty"))}</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    wireAnaSubtabs(root);
+    const triggerLogSearch = () => {
+      logFilters.q = el("log-search-q")?.value.trim() || "";
+      logFilters.ip = el("log-search-ip")?.value.trim() || "";
+      logFilters.host = el("log-search-host")?.value.trim() || "";
+      logFilters.method = el("log-method-filter")?.value || "all";
+      logFilters.node = el("log-node-filter")?.value || "all";
+      logFilters.service = el("log-svc-filter")?.value || "all";
+      logFilters.window_secs = Number(el("log-window-filter")?.value || 0);
+      refreshLogs();
+    };
+    el("btn-log-search")?.addEventListener("click", triggerLogSearch);
+    ["log-search-q", "log-search-ip", "log-search-host"].forEach((id) => {
+      el(id)?.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") triggerLogSearch();
+      });
+    });
+    ["log-method-filter", "log-node-filter", "log-svc-filter", "log-window-filter"].forEach((id) => {
+      el(id)?.addEventListener("change", triggerLogSearch);
+    });
+    el("btn-log-clear")?.addEventListener("click", () => {
+      logFilters = { q: "", ip: "", host: "", node: "all", service: "all", role: "all", method: "all", status: "all", action: "all", window_secs: 0 };
+      refreshLogs();
+    });
+    root.querySelectorAll("[data-log-st]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        logFilters.status = btn.dataset.logSt;
+        refreshLogs();
+      });
+    });
+    root.querySelectorAll("[data-log-act]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        logFilters.action = btn.dataset.logAct;
+        refreshLogs();
+      });
+    });
+    root.querySelectorAll("[data-top-path-idx]").forEach((row) => {
+      row.addEventListener("click", () => {
+        const tp = topPaths[Number(row.dataset.topPathIdx)];
+        if (!tp) return;
+        logFilters.q = tp.path || "";
+        if (tp.host) logFilters.host = tp.host;
+        refreshLogs();
+      });
+    });
+    root.querySelectorAll("[data-log-idx]").forEach((row) => {
+      row.addEventListener("click", () => {
+        const r = items[Number(row.dataset.logIdx)];
+        if (!r) return;
+        const tsSec = Math.floor((Number(r.timestamp_ms) || 0) / 1000);
+        openModal({
+          title: `${r.method || "HTTP"} ${r.path || "/"} (${r.status || 0})`,
+          bodyHtml: `
+            <div class="fp-detail-grid">
+              <div class="fp-kv"><div class="fp-kv-lbl">Ray ID · Time</div><div class="fp-kv-val"><code>${esc(r.ray_id || "-")}</code><br/><span class="muted-sm">${esc(formatDateTime(tsSec))}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Host · Scheme · Proto</div><div class="fp-kv-val"><strong>${esc(r.host || "-")}</strong><br/><span class="muted-sm">${esc(r.scheme || "-")} · ${esc(r.protocol || "-")}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Path</div><div class="fp-kv-val"><code>${esc(r.path || "/")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Query (Redacted)</div><div class="fp-kv-val"><code>${esc(r.query || "-")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Action · Cache · Repeat</div><div class="fp-kv-val"><strong>${esc(r.action || "allow")}</strong> · cache: ${esc(r.cache_status || "-")} · count: ${Number(r.repeat_count) || 1}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">WAF / Suspicion</div><div class="fp-kv-val">rule: ${esc(r.waf_rule_id != null ? String(r.waf_rule_id) : "-")} · cat: ${esc(r.waf_category || "-")}<br/><span class="muted-sm">suspicion: ${esc(r.suspicion_score != null ? String(r.suspicion_score) : "-")} · JA3: ${esc(r.tls_ja3 || "-")}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Client IP / HMAC</div><div class="fp-kv-val">${esc(r.raw_ip || "-")}<br/><code>${esc(r.ip_hmac || "-")}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Node · Service · Perf</div><div class="fp-kv-val">${esc(r.node_tag)} (${esc(r.role)}) → <code>${esc(r.service_tag)}</code><br/><span class="muted-sm">${(Number(r.latency_ms) || 0).toFixed(2)} ms · in ${formatBytes(r.bytes_in || 0)} · out ${formatBytes(r.bytes_out || 0)}</span></div></div>
+            </div>
+            <div style="margin-top:8px;"><strong>Referer:</strong> <code>${esc(r.referer || "-")}</code></div>
+            <div class="fp-ua-box" style="margin-top:8px;">${esc(r.user_agent || "(empty User-Agent)")}</div>
+            ${r.error ? `<div class="fp-ua-box" style="margin-top:8px;color:var(--err,#ff6b6b);">Error: ${esc(r.error)}</div>` : ""}
+          `,
+          actions: [{ label: t("common.close"), cls: "primary" }],
+        });
+      });
+    });
+  }
+
+  async function refreshLogs() {
+    const qs = new URLSearchParams();
+    if (logFilters.q) qs.set("q", logFilters.q);
+    if (logFilters.ip) qs.set("ip", logFilters.ip);
+    if (logFilters.host) qs.set("host", logFilters.host);
+    if (logFilters.node !== "all") qs.set("node", logFilters.node);
+    if (logFilters.service !== "all") qs.set("service", logFilters.service);
+    if (logFilters.role !== "all") qs.set("role", logFilters.role);
+    if (logFilters.method !== "all") qs.set("method", logFilters.method);
+    if (logFilters.status !== "all") qs.set("status", logFilters.status);
+    if (logFilters.action !== "all") qs.set("action", logFilters.action);
+    if (logFilters.window_secs > 0) qs.set("window_secs", String(logFilters.window_secs));
+    logData = await api(`/api/logs${qs.toString() ? `?${qs}` : ""}`);
+    if (anaSubTab === "logs") renderLogs();
+    return logData;
+  }
+
   async function refreshAnalytics() {
+    if (anaSubTab === "logs") {
+      return refreshLogs();
+    }
     const qs = new URLSearchParams();
     if (obsNode !== "all") qs.set("node", obsNode);
     if (obsSvc !== "all") qs.set("service", obsSvc);

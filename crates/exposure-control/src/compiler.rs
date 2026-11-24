@@ -1545,6 +1545,20 @@ pub fn compile_topology_full(
 
     // Build consistent cluster-wide LoggerConfig (so all nodes share the exact same IP HMAC key for UV!)
     let mut effective_logger: LoggerConfig = topo.global_logger.clone().unwrap_or_default();
+    effective_logger.segment.max_recent_logs =
+        effective_logger.segment.max_recent_logs.clamp(100, 10_000);
+    effective_logger.protection.max_records_per_sec =
+        effective_logger.protection.max_records_per_sec.clamp(10, 100_000);
+    effective_logger.protection.max_per_ip_per_sec =
+        effective_logger.protection.max_per_ip_per_sec.clamp(1, 50_000);
+    effective_logger.protection.max_bytes_per_min = effective_logger
+        .protection
+        .max_bytes_per_min
+        .clamp(64 * 1024, 512 * 1024 * 1024);
+    effective_logger.protection.dedup_window_secs =
+        effective_logger.protection.dedup_window_secs.clamp(0, 300);
+    effective_logger.protection.warn_rate_per_sec =
+        effective_logger.protection.warn_rate_per_sec.clamp(1, 1000);
     if effective_logger.hmac_key.trim().is_empty() {
         if let Some(ck) = cluster_hmac_key.filter(|k| !k.trim().is_empty()) {
             effective_logger.hmac_key = ck.to_string();
@@ -1561,13 +1575,21 @@ pub fn compile_topology_full(
                 .and_then(|t| topo.maintainer_templates.get(t))
                 .cloned()
                 .unwrap_or_default();
-            // Propagate cluster logger settings (hmac_key & store_raw_ip) into Maintainer unless explicitly set
+            // Propagate cluster logger settings (hmac_key, store_raw_ip, DoS protection & recent log retention) into Maintainer unless explicitly set
             if mc.logger.hmac_key.trim().is_empty() {
                 mc.logger.hmac_key = effective_logger.hmac_key.clone();
             }
             if effective_logger.store_raw_ip {
                 mc.logger.store_raw_ip = true;
             }
+            let default_recent = exposure_core::config::SegmentConfig::default().max_recent_logs;
+            if mc.logger.segment.max_recent_logs == default_recent {
+                mc.logger.segment.max_recent_logs = effective_logger.segment.max_recent_logs;
+            } else {
+                mc.logger.segment.max_recent_logs =
+                    mc.logger.segment.max_recent_logs.clamp(100, 10_000);
+            }
+            mc.logger.protection = effective_logger.protection.clone();
             if mc.is_primary_cert_manager {
                 if let Some((sec, _)) = maintainer_keys.get(node_tag) {
                     mc.cert_signing_secret_key = Some(sec.clone());

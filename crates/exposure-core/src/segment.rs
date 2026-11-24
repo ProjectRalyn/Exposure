@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -35,9 +36,10 @@ fn sanitize_prefix(raw: &str) -> String {
 pub struct SegmentWriter<T> {
     cfg: SegmentConfig,
     prefix: String,
-    buffer: Vec<T>,
+    buffer: Vec<String>,
     pending_bytes: usize,
     seq: u64,
+    _marker: PhantomData<T>,
 }
 
 impl<T: Serialize> SegmentWriter<T> {
@@ -50,22 +52,47 @@ impl<T: Serialize> SegmentWriter<T> {
             buffer: Vec::new(),
             pending_bytes: 0,
             seq: 0,
+            _marker: PhantomData,
         })
     }
 
-    /// Push a record to the batch buffer. Returns `Ok(true)` if either `max_batch_records` or
-    /// `max_batch_bytes` was reached and an immediate atomic flush occurred.
-    pub fn push(&mut self, record: T) -> Result<bool> {
-        let est_bytes = serde_json::to_vec(&record).map(|v| v.len() + 1).unwrap_or(256);
-        self.buffer.push(record);
-        self.pending_bytes = self.pending_bytes.saturating_add(est_bytes);
+    fn should_flush(&self) -> bool {
         let max_records = self.cfg.max_batch_records.max(1);
         let max_bytes = self.cfg.max_batch_bytes.max(1024);
-        if self.buffer.len() >= max_records || self.pending_bytes >= max_bytes {
+        let max_seg_bytes = self.cfg.max_segment_bytes.max(4096);
+        self.buffer.len() >= max_records
+            || self.pending_bytes >= max_bytes
+            || (self.pending_bytes as u64) >= max_seg_bytes
+    }
+
+    /// Push a record to the batch buffer. Returns `Ok(true)` if batch or segment thresholds
+    /// were reached and an immediate atomic flush occurred.
+    pub fn push(&mut self, record: T) -> Result<bool> {
+        let line = serde_json::to_string(&record)
+            .map_err(|e| ExposureError::Storage(format!("serialize segment record: {e}")))?;
+        let est_bytes = line.len() + 1;
+        self.buffer.push(line);
+        self.pending_bytes = self.pending_bytes.saturating_add(est_bytes);
+        if self.should_flush() {
             self.flush()?;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Push a batch of records in one pass, flushing intermediate segments whenever
+    /// batch/segment limits are reached. Returns `Ok(true)` if at least one flush occurred.
+    pub fn push_batch<I>(&mut self, records: I) -> Result<bool>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut flushed = false;
+        for record in records {
+            if self.push(record)? {
+                flushed = true;
+            }
+        }
+        Ok(flushed)
     }
 
     pub fn pending_count(&self) -> usize {
@@ -99,9 +126,7 @@ impl<T: Serialize> SegmentWriter<T> {
                 opts.mode(0o600);
             }
             let mut file = opts.open(&tmp_path)?;
-            for item in &self.buffer {
-                let line = serde_json::to_string(item)
-                    .map_err(|e| ExposureError::Storage(format!("serialize segment record: {e}")))?;
+            for line in &self.buffer {
                 file.write_all(line.as_bytes())?;
                 file.write_all(b"\n")?;
             }
@@ -281,15 +306,7 @@ mod tests {
             bytes_in: 100,
             bytes_out: 200,
             ip_hmac: "abcdef1234567890".into(),
-            raw_ip: None,
-            rate_limited: false,
-            challenged: false,
-            challenge_passed: false,
-            error: None,
-            device_type: None,
-            browser_family: None,
-            os_family: None,
-            client_fp_verified: false,
+            ..Default::default()
         };
         assert!(!w.push(sample.clone()).unwrap());
         assert!(w.push(sample.clone()).unwrap());
@@ -325,15 +342,7 @@ mod tests {
             bytes_in: 64,
             bytes_out: 128,
             ip_hmac: "0123456789abcdef".into(),
-            raw_ip: None,
-            rate_limited: false,
-            challenged: false,
-            challenge_passed: false,
-            error: None,
-            device_type: None,
-            browser_family: None,
-            os_family: None,
-            client_fp_verified: false,
+            ..Default::default()
         };
         let mut flushed_at = None;
         for i in 1..=20 {

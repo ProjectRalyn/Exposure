@@ -1,21 +1,26 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use exposure_core::config::LoggerConfig;
+use dashmap::DashMap;
+use exposure_core::config::{LogProtectionConfig, LoggerConfig};
 use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret};
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic, SegmentWriter};
 use exposure_core::telemetry::{
-    AlertRecord, ClientJsFingerprint, FingerprintObservation, MinuteSummary, SessionSummary,
+    sanitize_and_redact_query, sanitize_log_text, sanitize_referer, sanitize_url_path,
+    AlertRecord, ClientJsFingerprint, FingerprintObservation, LogProtectionStats, MinuteSummary,
+    SessionSummary,
 };
 use exposure_core::Result;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_MINUTE_BUCKETS: usize = 4096;
 const MINUTE_BUCKET_RETENTION_SECS: i64 = 3600;
@@ -23,6 +28,33 @@ const MAX_FP_OBSERVATIONS: usize = 4096;
 const FP_RETENTION_SECS: i64 = 3600 * 6;
 const MAX_ALERT_MSG_LEN: usize = 512;
 const MAX_RECENT_RECORDS: usize = 4096;
+const MAX_PENDING_DISK_RECORDS: usize = 8192;
+const MAX_PER_IP_LOG_BUCKETS: usize = 16_384;
+const MAX_FOLDED_LOG_KEYS: usize = 4096;
+const MAX_WARN_KEYS: usize = 4096;
+const MAX_ALERT_DEDUP_KEYS: usize = 1024;
+const PER_IP_IDLE_TTL: Duration = Duration::from_secs(300);
+const WARN_KEY_COOLDOWN: Duration = Duration::from_secs(5);
+const ALERT_DEDUP_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn evict_half<K, V>(map: &DashMap<K, V>)
+where
+    K: Eq + std::hash::Hash,
+{
+    let to_remove = map.len() / 2;
+    if to_remove == 0 {
+        return;
+    }
+    let mut removed = 0usize;
+    map.retain(|_, _| {
+        if removed < to_remove {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
 
 /// Extra unforgeable server-side signals attached to a visitor fingerprint observation.
 #[derive(Debug, Clone, Default)]
@@ -33,6 +65,388 @@ pub struct FpServerExtras<'a> {
     pub abuse_country: Option<&'a str>,
     pub abuse_isp: Option<&'a str>,
     pub abuse_is_tor: bool,
+}
+
+/// Rich HTTP request/security metadata recorded with each access log entry.
+#[derive(Debug, Clone, Default)]
+pub struct AccessLogMeta<'a> {
+    pub ray_id: Option<&'a str>,
+    pub method: Option<&'a str>,
+    pub host: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub query: Option<&'a str>,
+    pub protocol: Option<&'a str>,
+    pub scheme: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+    pub referer: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub cache_status: Option<&'a str>,
+    pub tls_ja3: Option<&'a str>,
+    pub waf_rule_id: Option<u32>,
+    pub waf_category: Option<&'a str>,
+    pub suspicion_score: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogPriority {
+    High,
+    Normal,
+    Low,
+}
+
+impl LogPriority {
+    fn classify(status: u16, rate_limited: bool, action: Option<&str>) -> Self {
+        if status >= 500 || matches!(action, Some("evilpot_canary" | "upstream_error")) {
+            return Self::High;
+        }
+        if rate_limited
+            || matches!(
+                action,
+                Some(
+                    "autoban"
+                        | "unmatched"
+                        | "waf_block"
+                        | "evilpot"
+                        | "guard_reject"
+                        | "abuseipdb"
+                )
+            )
+        {
+            return Self::Low;
+        }
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BucketState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl BucketState {
+    fn new(capacity: f64, now: Instant) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    fn try_consume(&mut self, capacity: f64, refill_per_sec: f64, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * refill_per_sec).min(capacity);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct FoldedLogEntry {
+    template: SessionSummary,
+    started_at: Instant,
+    last_ts_ms: i64,
+    suppressed_count: u32,
+}
+
+enum AdmitDecision {
+    Emit,
+    Folded,
+    Dropped,
+}
+
+/// Multi-layer anti-DoS log protection engine:
+/// - Per-IP & global token buckets (with high-priority emergency reserve for 5xx/canary alerts)
+/// - Per-minute byte budget preventing disk/mesh exhaustion
+/// - Duplicate flood folding (collapses thousands of identical 429/403/404 flood lines into one
+///   summary entry with `repeat_count`)
+/// - Stdout `tracing::warn!` & `emit_alert` rate limiting
+struct LogDoSGuard {
+    global_bucket: StdMutex<BucketState>,
+    high_reserve_bucket: StdMutex<BucketState>,
+    warn_bucket: StdMutex<BucketState>,
+    minute_bytes: StdMutex<(Instant, u64)>,
+    per_ip_buckets: DashMap<String, BucketState>,
+    folded: DashMap<(String, u16, String, String), FoldedLogEntry>,
+    warn_cooldowns: DashMap<String, (Instant, u64)>,
+    alert_cooldowns: DashMap<(String, String), Instant>,
+    dropped_records: AtomicU64,
+    folded_records: AtomicU64,
+    warn_suppressed: AtomicU64,
+}
+
+impl LogDoSGuard {
+    fn new(cfg: &LogProtectionConfig) -> Self {
+        let now = Instant::now();
+        let g_rate = cfg.max_records_per_sec.max(1) as f64;
+        let w_rate = cfg.warn_rate_per_sec.max(1) as f64;
+        Self {
+            global_bucket: StdMutex::new(BucketState::new(g_rate * 2.0, now)),
+            high_reserve_bucket: StdMutex::new(BucketState::new(64.0, now)),
+            warn_bucket: StdMutex::new(BucketState::new(w_rate * 2.0, now)),
+            minute_bytes: StdMutex::new((now, 0)),
+            per_ip_buckets: DashMap::new(),
+            folded: DashMap::new(),
+            warn_cooldowns: DashMap::new(),
+            alert_cooldowns: DashMap::new(),
+            dropped_records: AtomicU64::new(0),
+            folded_records: AtomicU64::new(0),
+            warn_suppressed: AtomicU64::new(0),
+        }
+    }
+
+    fn fold_key(rec: &SessionSummary, overflow_wildcard: bool) -> (String, u16, String, String) {
+        let act = rec.action.as_deref().unwrap_or("").to_string();
+        let path_k = if overflow_wildcard {
+            "*".to_string()
+        } else {
+            rec.path
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(64)
+                .collect()
+        };
+        (rec.ip_hmac.clone(), rec.status, act, path_k)
+    }
+
+    fn try_fold(&self, rec: &SessionSummary, key: (String, u16, String, String), window: Duration, now: Instant) -> bool {
+        if let Some(mut existing) = self.folded.get_mut(&key) {
+            if now.duration_since(existing.started_at) < window {
+                existing.suppressed_count = existing.suppressed_count.saturating_add(1);
+                existing.last_ts_ms = existing.last_ts_ms.max(rec.timestamp_ms);
+                self.folded_records.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn arm_fold(&self, rec: &SessionSummary, key: (String, u16, String, String), initial_suppressed: u32, window: Duration, now: Instant) {
+        if self.folded.len() >= MAX_FOLDED_LOG_KEYS && !self.folded.contains_key(&key) {
+            self.folded
+                .retain(|_, v| now.duration_since(v.started_at) < window || v.suppressed_count > 0);
+            if self.folded.len() >= MAX_FOLDED_LOG_KEYS {
+                evict_half(&self.folded);
+            }
+        }
+        self.folded.insert(
+            key,
+            FoldedLogEntry {
+                template: rec.clone(),
+                started_at: now,
+                last_ts_ms: rec.timestamp_ms,
+                suppressed_count: initial_suppressed,
+            },
+        );
+    }
+
+    fn admit(&self, rec: &SessionSummary, est_bytes: usize, priority: LogPriority, cfg: &LogProtectionConfig) -> AdmitDecision {
+        if !cfg.enabled {
+            return AdmitDecision::Emit;
+        }
+        let now = Instant::now();
+        let dedup_secs = cfg.dedup_window_secs.clamp(1, 300);
+        let dedup_window = Duration::from_secs(dedup_secs);
+
+        // 1. Fold duplicate low-priority flood events (429 / autoban / 404 / waf_block / evilpot)
+        if priority == LogPriority::Low {
+            let exact_key = Self::fold_key(rec, false);
+            if self.try_fold(rec, exact_key.clone(), dedup_window, now) {
+                return AdmitDecision::Folded;
+            }
+            let overflow_key = Self::fold_key(rec, true);
+            if self.try_fold(rec, overflow_key, dedup_window, now) {
+                return AdmitDecision::Folded;
+            }
+        }
+
+        // 2. Per-IP token bucket (for Normal & Low priority; High priority bypasses per-IP limit)
+        if priority != LogPriority::High && cfg.max_per_ip_per_sec > 0 {
+            if self.per_ip_buckets.len() >= MAX_PER_IP_LOG_BUCKETS
+                && !self.per_ip_buckets.contains_key(&rec.ip_hmac)
+            {
+                self.per_ip_buckets
+                    .retain(|_, b| now.duration_since(b.last_refill) < PER_IP_IDLE_TTL);
+                if self.per_ip_buckets.len() >= MAX_PER_IP_LOG_BUCKETS {
+                    evict_half(&self.per_ip_buckets);
+                }
+            }
+            let rate = cfg.max_per_ip_per_sec as f64;
+            let cap = (rate * 2.0).max(2.0);
+            let mut b = self
+                .per_ip_buckets
+                .entry(rec.ip_hmac.clone())
+                .or_insert_with(|| BucketState::new(cap, now));
+            if !b.try_consume(cap, rate, now) {
+                drop(b);
+                // Per-IP quota exceeded (e.g. randomized URL scanner from one IP):
+                // fold into an IP-wide summary bucket instead of emitting or dropping silently.
+                let overflow_key = Self::fold_key(rec, true);
+                if self.try_fold(rec, overflow_key.clone(), dedup_window, now) {
+                    return AdmitDecision::Folded;
+                }
+                self.arm_fold(rec, overflow_key, 1, dedup_window, now);
+                self.folded_records.fetch_add(1, Ordering::Relaxed);
+                return AdmitDecision::Folded;
+            }
+        }
+
+        // 3. Global token bucket (with emergency reserve for High-priority 5xx / canary events)
+        if cfg.max_records_per_sec > 0 {
+            let rate = cfg.max_records_per_sec as f64;
+            let cap = (rate * 2.0).max(2.0);
+            let global_ok = self
+                .global_bucket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_consume(cap, rate, now);
+            if !global_ok {
+                let high_ok = priority == LogPriority::High
+                    && self
+                        .high_reserve_bucket
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .try_consume(64.0, 32.0, now);
+                if !high_ok {
+                    self.dropped_records.fetch_add(1, Ordering::Relaxed);
+                    return AdmitDecision::Dropped;
+                }
+            }
+        }
+
+        // 4. Per-minute byte budget ceiling
+        if cfg.max_bytes_per_min > 0 {
+            let mut mb = self.minute_bytes.lock().unwrap_or_else(|e| e.into_inner());
+            if now.duration_since(mb.0) >= Duration::from_secs(60) {
+                *mb = (now, 0);
+            }
+            let cap_bytes = if priority == LogPriority::High {
+                cfg.max_bytes_per_min.saturating_add(cfg.max_bytes_per_min / 10)
+            } else {
+                cfg.max_bytes_per_min
+            };
+            if mb.1.saturating_add(est_bytes as u64) > cap_bytes {
+                self.dropped_records.fetch_add(1, Ordering::Relaxed);
+                return AdmitDecision::Dropped;
+            }
+            mb.1 = mb.1.saturating_add(est_bytes as u64);
+        }
+
+        // Arm duplicate folder for Low-priority events after admitting the initial full URL record
+        if priority == LogPriority::Low {
+            let exact_key = Self::fold_key(rec, false);
+            self.arm_fold(rec, exact_key, 0, dedup_window, now);
+        }
+
+        AdmitDecision::Emit
+    }
+
+    fn drain_folded(&self, flush_all: bool, dedup_window: Duration) -> Vec<SessionSummary> {
+        let now = Instant::now();
+        let expired_keys: Vec<(String, u16, String, String)> = self
+            .folded
+            .iter()
+            .filter_map(|e| {
+                if flush_all || now.duration_since(e.value().started_at) >= dedup_window {
+                    Some(e.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        for k in expired_keys {
+            if let Some((_, mut entry)) = self.folded.remove(&k) {
+                if entry.suppressed_count > 0 {
+                    entry.template.timestamp_ms = entry.last_ts_ms;
+                    entry.template.repeat_count = entry.suppressed_count;
+                    if k.3 == "*" {
+                        entry.template.path = Some("/* (folded flood)".to_string());
+                        entry.template.query = None;
+                    }
+                    entry.template.sanitize();
+                    out.push(entry.template);
+                }
+            }
+        }
+        out
+    }
+
+    fn should_log_warn(&self, key: &str, cfg: &LogProtectionConfig) -> Option<u64> {
+        if !cfg.enabled {
+            return Some(0);
+        }
+        let now = Instant::now();
+        if cfg.warn_rate_per_sec > 0 {
+            let rate = cfg.warn_rate_per_sec as f64;
+            let cap = (rate * 2.0).max(2.0);
+            let ok = self
+                .warn_bucket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_consume(cap, rate, now);
+            if !ok {
+                self.warn_suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        let k = sanitize_log_text(key, 64);
+        if self.warn_cooldowns.len() >= MAX_WARN_KEYS && !self.warn_cooldowns.contains_key(&k) {
+            self.warn_cooldowns
+                .retain(|_, (ts, _)| now.duration_since(*ts) < WARN_KEY_COOLDOWN);
+            if self.warn_cooldowns.len() >= MAX_WARN_KEYS {
+                evict_half(&self.warn_cooldowns);
+            }
+        }
+        if let Some(mut entry) = self.warn_cooldowns.get_mut(&k) {
+            if now.duration_since(entry.0) < WARN_KEY_COOLDOWN {
+                entry.1 = entry.1.saturating_add(1);
+                self.warn_suppressed.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let prev_suppressed = entry.1;
+            *entry = (now, 0);
+            Some(prev_suppressed)
+        } else {
+            self.warn_cooldowns.insert(k, (now, 0));
+            Some(0)
+        }
+    }
+
+    fn should_emit_alert(&self, severity: &str, msg: &str, enabled: bool) -> bool {
+        if !enabled {
+            return true;
+        }
+        let now = Instant::now();
+        let prefix: String = msg.chars().take(64).collect();
+        let key = (severity.to_string(), prefix);
+        if self.alert_cooldowns.len() >= MAX_ALERT_DEDUP_KEYS && !self.alert_cooldowns.contains_key(&key) {
+            self.alert_cooldowns
+                .retain(|_, ts| now.duration_since(*ts) < ALERT_DEDUP_COOLDOWN);
+            if self.alert_cooldowns.len() >= MAX_ALERT_DEDUP_KEYS {
+                evict_half(&self.alert_cooldowns);
+            }
+        }
+        if let Some(prev) = self.alert_cooldowns.get(&key) {
+            if now.duration_since(*prev) < ALERT_DEDUP_COOLDOWN {
+                return false;
+            }
+        }
+        self.alert_cooldowns.insert(key, now);
+        true
+    }
+
+    fn stats(&self) -> LogProtectionStats {
+        LogProtectionStats {
+            dropped_records: self.dropped_records.load(Ordering::Relaxed),
+            folded_records: self.folded_records.load(Ordering::Relaxed),
+            warn_suppressed: self.warn_suppressed.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -95,19 +509,22 @@ fn ensure_strong_hmac_key(mut cfg: LoggerConfig) -> LoggerConfig {
 }
 
 /// Production-layer Node logger (DESIGN.md §4 & §12):
-/// - Applies configured `sample_rate`
-/// - Stores HMAC IP by default; raw IP only when `store_raw_ip: true`
-/// - Writes batches atomically to disk segments via `spawn_blocking` (never blocking Tokio workers)
-/// - Maintains bounded per-(node, role, minute, service) summaries and visitor fingerprint observations
+/// - Always records 100% exact per-(node, role, minute, service) summaries (HLL UV, latency histograms)
+/// - Sanitizes & redacts URL paths/queries/headers to prevent injection and secret leakage
+/// - Protects disk, CPU, memory, and stdout from DoS log explosion via rate-limits, byte budgets, and flood folding
+/// - Flushes batched JSONL segments atomically via `spawn_blocking` (never per-request)
 pub struct NodeLogger {
     node_tag: String,
     cfg: Arc<RwLock<Arc<LoggerConfig>>>,
     writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
     minute_buckets: Arc<Mutex<HashMap<(i64, String, String), MinuteSummary>>>,
     fp_observations: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
+    pending_disk_records: Arc<Mutex<Vec<SessionSummary>>>,
+    pending_disk_bytes: Arc<Mutex<usize>>,
     recent_records: Arc<Mutex<Vec<SessionSummary>>>,
     recent_bytes: Arc<Mutex<usize>>,
     alerts: Arc<Mutex<Vec<AlertRecord>>>,
+    dos_guard: Arc<LogDoSGuard>,
     flush_notify: Arc<Notify>,
 }
 
@@ -116,6 +533,7 @@ impl NodeLogger {
         let tag = node_tag.into();
         let cfg = ensure_strong_hmac_key(cfg);
         let writer = SegmentWriter::new(cfg.segment.clone(), &tag)?;
+        let dos_guard = Arc::new(LogDoSGuard::new(&cfg.protection));
 
         // Restore unsent summaries, fingerprints, and alerts from disk checkpoint on restart
         let mut init_buckets = HashMap::new();
@@ -147,9 +565,12 @@ impl NodeLogger {
             writer: Arc::new(StdMutex::new(writer)),
             minute_buckets: Arc::new(Mutex::new(init_buckets)),
             fp_observations: Arc::new(Mutex::new(init_fps)),
+            pending_disk_records: Arc::new(Mutex::new(Vec::new())),
+            pending_disk_bytes: Arc::new(Mutex::new(0)),
             recent_records: Arc::new(Mutex::new(Vec::new())),
             recent_bytes: Arc::new(Mutex::new(0)),
             alerts: Arc::new(Mutex::new(init_alerts)),
+            dos_guard,
             flush_notify: Arc::new(Notify::new()),
         }))
     }
@@ -159,13 +580,35 @@ impl NodeLogger {
         self.flush_notify.notified().await;
     }
 
+    pub fn protection_stats(&self) -> LogProtectionStats {
+        self.dos_guard.stats()
+    }
+
+    /// Rate-limited warning check preventing stdout log flooding under DDoS.
+    /// Returns `Some(suppressed_since_last)` when logging is permitted, `None` when throttled.
+    pub fn should_log_warn(&self, key: &str) -> Option<u64> {
+        let prot = self
+            .cfg
+            .try_read()
+            .map(|c| c.protection.clone())
+            .unwrap_or_default();
+        self.dos_guard.should_log_warn(key, &prot)
+    }
+
     pub async fn update_config(&self, new_cfg: LoggerConfig) -> Result<()> {
         let new_cfg = ensure_strong_hmac_key(new_cfg);
         let writer = Arc::clone(&self.writer);
         let seg_cfg = new_cfg.segment.clone();
         let tag = self.node_tag.clone();
+        let pending = {
+            let mut p = self.pending_disk_records.lock().await;
+            let mut pb = self.pending_disk_bytes.lock().await;
+            *pb = 0;
+            std::mem::take(&mut *p)
+        };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut guard = writer.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.push_batch(pending);
             let _ = guard.flush();
             *guard = SegmentWriter::new(seg_cfg, &tag)?;
             Ok(())
@@ -192,7 +635,7 @@ impl NodeLogger {
         challenge_passed: bool,
         error: Option<String>,
     ) {
-        self.record_session_with_fp(
+        self.record_access_log(
             role,
             service_tag,
             client_ip,
@@ -208,6 +651,7 @@ impl NodeLogger {
             None,
             None,
             false,
+            AccessLogMeta::default(),
         )
         .await;
     }
@@ -231,20 +675,63 @@ impl NodeLogger {
         os_family: Option<String>,
         client_fp_verified: bool,
     ) {
-        let cfg = Arc::clone(&*self.cfg.read().await);
+        self.record_access_log(
+            role,
+            service_tag,
+            client_ip,
+            status,
+            latency_ms,
+            bytes_in,
+            bytes_out,
+            rate_limited,
+            challenged,
+            challenge_passed,
+            error,
+            device_type,
+            browser_family,
+            os_family,
+            client_fp_verified,
+            AccessLogMeta::default(),
+        )
+        .await;
+    }
 
-        let sampled = if cfg.sample_rate >= 1.0 {
-            true
-        } else if cfg.sample_rate <= 0.0 {
-            false
-        } else {
-            rand::thread_rng().r#gen::<f64>() < cfg.sample_rate
-        };
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_access_log(
+        &self,
+        role: &str,
+        service_tag: &str,
+        client_ip: &str,
+        status: u16,
+        latency_ms: f64,
+        bytes_in: u64,
+        bytes_out: u64,
+        rate_limited: bool,
+        challenged: bool,
+        challenge_passed: bool,
+        error: Option<String>,
+        device_type: Option<String>,
+        browser_family: Option<String>,
+        os_family: Option<String>,
+        client_fp_verified: bool,
+        meta: AccessLogMeta<'_>,
+    ) {
+        let cfg = Arc::clone(&*self.cfg.read().await);
 
         let now = Utc::now();
         let canon_ip = canonical_ip_str(client_ip);
         let ip_tag = hmac_ip(&cfg.hmac_key, &canon_ip);
-        let rec = SessionSummary {
+        let priority = LogPriority::classify(status, rate_limited, meta.action);
+
+        let clean_query = if cfg.protection.log_query_string {
+            meta.query
+                .map(sanitize_and_redact_query)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+
+        let mut rec = SessionSummary {
             timestamp_ms: now.timestamp_millis(),
             node_tag: self.node_tag.clone(),
             role: role.to_string(),
@@ -267,9 +754,26 @@ impl NodeLogger {
             browser_family,
             os_family,
             client_fp_verified,
+            ray_id: meta.ray_id.map(|s| sanitize_log_text(s, 32)),
+            method: meta.method.map(|s| sanitize_log_text(s, 16)),
+            host: meta.host.map(|s| sanitize_log_text(s, 128)),
+            path: meta.path.map(sanitize_url_path),
+            query: clean_query,
+            protocol: meta.protocol.map(|s| sanitize_log_text(s, 16)),
+            scheme: meta.scheme.map(|s| sanitize_log_text(s, 8)),
+            user_agent: meta.user_agent.map(|s| sanitize_log_text(s, 192)),
+            referer: meta.referer.map(sanitize_referer).filter(|s| !s.is_empty()),
+            action: meta.action.map(|s| sanitize_log_text(s, 32)),
+            cache_status: meta.cache_status.map(|s| sanitize_log_text(s, 16)),
+            tls_ja3: meta.tls_ja3.map(|s| sanitize_log_text(s, 32)),
+            waf_rule_id: meta.waf_rule_id,
+            waf_category: meta.waf_category.map(|s| sanitize_log_text(s, 48)),
+            suspicion_score: meta.suspicion_score,
+            repeat_count: 1,
         };
+        rec.sanitize();
 
-        // Minute summary aggregates accurate counts/HLL/histograms with rolling eviction
+        // 1. Always update exact minute summary metrics BEFORE sampling / DoS log folding
         let minute_epoch = (now.timestamp() / 60) * 60;
         {
             let mut buckets = self.minute_buckets.lock().await;
@@ -296,48 +800,131 @@ impl NodeLogger {
             entry.record(&rec);
         }
 
-        if sampled {
-            let est_bytes = serde_json::to_vec(&rec).map(|v| v.len() + 1).unwrap_or(256);
-            let writer = Arc::clone(&self.writer);
-            let rec_disk = rec.clone();
-            let disk_flushed = tokio::task::spawn_blocking(move || {
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                match w.push(rec_disk) {
-                    Ok(flushed) => flushed,
-                    Err(e) => {
-                        warn!(error = %e, "failed to push session segment record");
-                        false
-                    }
-                }
-            })
-            .await
-            .unwrap_or(false);
+        let sampled = if cfg.sample_rate >= 1.0 || priority == LogPriority::High {
+            true
+        } else if cfg.sample_rate <= 0.0 {
+            false
+        } else {
+            rand::thread_rng().r#gen::<f64>() < cfg.sample_rate
+        };
+        if !sampled {
+            return;
+        }
 
-            let (rec_len, byte_len) = {
-                let mut recent = self.recent_records.lock().await;
-                let mut bytes = self.recent_bytes.lock().await;
-                if recent.len() < MAX_RECENT_RECORDS {
+        let est_bytes = serde_json::to_vec(&rec).map(|v| v.len() + 1).unwrap_or(256);
+
+        // 2. Evaluate anti-DoS log protection (per-IP/global caps, byte budget, flood folding)
+        match self.dos_guard.admit(&rec, est_bytes, priority, &cfg.protection) {
+            AdmitDecision::Emit => {}
+            AdmitDecision::Folded | AdmitDecision::Dropped => return,
+        }
+
+        if cfg.protection.access_log_stdout {
+            info!(
+                target: "exposure::access",
+                node = %rec.node_tag,
+                role = %rec.role,
+                service = %rec.service_tag,
+                ray_id = rec.ray_id.as_deref().unwrap_or("-"),
+                method = rec.method.as_deref().unwrap_or("-"),
+                host = rec.host.as_deref().unwrap_or("-"),
+                path = rec.path.as_deref().unwrap_or("-"),
+                status = rec.status,
+                action = rec.action.as_deref().unwrap_or("-"),
+                latency_ms = rec.latency_ms,
+                ip_hmac = %rec.ip_hmac,
+                "access"
+            );
+        }
+
+        // 3. Buffer in bounded memory for batched disk flush & Maintainer push (zero per-request fsync!)
+        let (disk_len, disk_bytes) = {
+            let mut pending = self.pending_disk_records.lock().await;
+            let mut pbytes = self.pending_disk_bytes.lock().await;
+            if pending.len() < MAX_PENDING_DISK_RECORDS {
+                pending.push(rec.clone());
+                *pbytes = pbytes.saturating_add(est_bytes);
+            } else {
+                self.dos_guard.dropped_records.fetch_add(1, Ordering::Relaxed);
+            }
+            (pending.len(), *pbytes)
+        };
+
+        let (rec_len, byte_len) = {
+            let mut recent = self.recent_records.lock().await;
+            let mut bytes = self.recent_bytes.lock().await;
+            if recent.len() < MAX_RECENT_RECORDS {
+                recent.push(rec);
+                *bytes = bytes.saturating_add(est_bytes);
+            } else if priority == LogPriority::High {
+                // Preserve high-priority errors/exploits by displacing the oldest low/normal record
+                if let Some(pos) = recent.iter().position(|r| {
+                    LogPriority::classify(r.status, r.rate_limited, r.action.as_deref())
+                        != LogPriority::High
+                }) {
+                    recent.remove(pos);
                     recent.push(rec);
-                    *bytes = bytes.saturating_add(est_bytes);
                 }
-                (recent.len(), *bytes)
-            };
+            }
+            (recent.len(), *bytes)
+        };
 
-            let max_recs = cfg.segment.max_batch_records.clamp(1, MAX_RECENT_RECORDS);
-            let max_bytes = cfg.segment.max_batch_bytes.max(4096);
-            if disk_flushed || rec_len >= max_recs || byte_len >= max_bytes {
-                self.flush_notify.notify_one();
+        let max_recs = cfg.segment.max_batch_records.clamp(1, MAX_RECENT_RECORDS);
+        let max_bytes = cfg.segment.max_batch_bytes.max(4096);
+        if disk_len >= max_recs || disk_bytes >= max_bytes || rec_len >= max_recs || byte_len >= max_bytes {
+            self.flush_notify.notify_one();
+        }
+    }
+
+    async fn promote_expired_folded(&self, flush_all: bool) {
+        let dedup_secs = self.cfg.read().await.protection.dedup_window_secs.clamp(1, 300);
+        let folded = self
+            .dos_guard
+            .drain_folded(flush_all, Duration::from_secs(dedup_secs));
+        if folded.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.pending_disk_records.lock().await;
+            let mut pbytes = self.pending_disk_bytes.lock().await;
+            for rec in &folded {
+                if pending.len() >= MAX_PENDING_DISK_RECORDS {
+                    break;
+                }
+                pending.push(rec.clone());
+                *pbytes = pbytes.saturating_add(256);
+            }
+        }
+        {
+            let mut recent = self.recent_records.lock().await;
+            let mut bytes = self.recent_bytes.lock().await;
+            for rec in folded {
+                if recent.len() >= MAX_RECENT_RECORDS {
+                    break;
+                }
+                recent.push(rec);
+                *bytes = bytes.saturating_add(256);
             }
         }
     }
 
     pub async fn emit_alert(&self, severity: &str, message: impl Into<String>) {
+        let raw_msg = message.into();
+        let clean_msg = sanitize_alert_msg(raw_msg);
+        let prot_enabled = self
+            .cfg
+            .try_read()
+            .map(|c| c.protection.enabled)
+            .unwrap_or(true);
+        if !self.dos_guard.should_emit_alert(severity, &clean_msg, prot_enabled) {
+            return;
+        }
         let mut alerts = self.alerts.lock().await;
         alerts.push(AlertRecord {
             timestamp: Utc::now().to_rfc3339(),
             source: self.node_tag.clone(),
             severity: severity.to_string(),
-            message: sanitize_alert_msg(message.into()),
+            message: clean_msg,
         });
         if alerts.len() > 200 {
             let drain = alerts.len() - 200;
@@ -350,9 +937,25 @@ impl NodeLogger {
     }
 
     pub async fn flush_segments(&self) -> Result<()> {
+        self.flush_segments_inner(false).await
+    }
+
+    /// Flush all buffered records AND all active folded flood summaries (e.g. on shutdown/tests).
+    pub async fn flush_all(&self) -> Result<()> {
+        self.flush_segments_inner(true).await
+    }
+
+    async fn flush_segments_inner(&self, flush_folded: bool) -> Result<()> {
+        self.promote_expired_folded(flush_folded).await;
         let writer = Arc::clone(&self.writer);
         let dir = self.cfg.read().await.segment.dir.clone();
         let cp_path = node_checkpoint_path(&dir, &self.node_tag);
+        let pending_disk = {
+            let mut p = self.pending_disk_records.lock().await;
+            let mut pb = self.pending_disk_bytes.lock().await;
+            *pb = 0;
+            std::mem::take(&mut *p)
+        };
         let cp = NodeLoggerCheckpoint {
             summaries: self.minute_buckets.lock().await.values().cloned().collect(),
             fingerprints: self.fp_observations.lock().await.values().cloned().collect(),
@@ -360,6 +963,9 @@ impl NodeLogger {
         };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending_disk.is_empty() {
+                w.push_batch(pending_disk)?;
+            }
             if let Some(path) = w.flush()? {
                 debug!(path = %path.display(), "flushed node segment file");
             }
@@ -518,6 +1124,7 @@ impl NodeLogger {
         Vec<MinuteSummary>,
         Vec<FingerprintObservation>,
     ) {
+        self.promote_expired_folded(false).await;
         let records = {
             let mut r = self.recent_records.lock().await;
             let mut b = self.recent_bytes.lock().await;
@@ -593,6 +1200,7 @@ impl NodeLogger {
 mod tests {
     use super::*;
     use exposure_core::config::SegmentConfig;
+    use exposure_core::segment::{list_recent_segment_files, read_segment_file};
 
     #[tokio::test]
     async fn node_logger_persists_checkpoint_and_triggers_early_flush() {
@@ -611,7 +1219,34 @@ mod tests {
         let logger = NodeLogger::new("edge-1", cfg.clone()).unwrap();
         // Record 2 requests -> hits max_batch_records = 2 -> triggers early flush notify
         logger
-            .record_session("ingress", "web", "203.0.113.5", 200, 12.0, 100, 500, false, false, false, None)
+            .record_access_log(
+                "ingress",
+                "web",
+                "203.0.113.5",
+                200,
+                12.0,
+                100,
+                500,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                AccessLogMeta {
+                    ray_id: Some("ray-1"),
+                    method: Some("GET"),
+                    host: Some("app.example.com"),
+                    path: Some("/dashboard"),
+                    query: Some("tab=overview&token=secret123"),
+                    protocol: Some("HTTP/2"),
+                    scheme: Some("https"),
+                    action: Some("allow"),
+                    ..Default::default()
+                },
+            )
             .await;
         logger
             .record_session("ingress", "web", "203.0.113.6", 200, 18.0, 120, 600, false, false, false, None)
@@ -623,11 +1258,253 @@ mod tests {
 
         logger.flush_segments().await.unwrap();
 
+        let segs = list_recent_segment_files(&dir, "edge-1", 24);
+        assert_eq!(segs.len(), 1);
+        let rows: Vec<SessionSummary> = read_segment_file(&segs[0]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path.as_deref(), Some("/dashboard"));
+        assert_eq!(rows[0].query.as_deref(), Some("tab=overview&token=[REDACTED]"));
+        assert_eq!(rows[0].method.as_deref(), Some("GET"));
+        assert_eq!(rows[0].ray_id.as_deref(), Some("ray-1"));
+
         // Simulate restart: brand-new NodeLogger pointing at the same dir must restore summaries!
         let restored = NodeLogger::new("edge-1", cfg).unwrap();
         let (_, sums, _) = restored.drain_for_maintainer().await;
         assert_eq!(sums.len(), 1);
         assert_eq!(sums[0].requests, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dos_log_protection_folds_floods_keeps_exact_metrics_and_preserves_high_priority_logs() {
+        let dir = std::env::temp_dir().join(format!("exposure-nlog-dos-{}", uuid::Uuid::new_v4()));
+        let cfg = LoggerConfig {
+            hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
+            segment: SegmentConfig {
+                dir: dir.to_string_lossy().to_string(),
+                max_batch_records: 1000,
+                max_batch_bytes: 2 * 1024 * 1024,
+                ..Default::default()
+            },
+            protection: LogProtectionConfig {
+                enabled: true,
+                max_records_per_sec: 100,
+                max_per_ip_per_sec: 5,
+                max_bytes_per_min: 1024 * 1024,
+                dedup_window_secs: 30,
+                log_query_string: true,
+                access_log_stdout: false,
+                warn_rate_per_sec: 2,
+            },
+            ..Default::default()
+        };
+
+        let logger = NodeLogger::new("edge-dos", cfg).unwrap();
+
+        // 1. Simulate 500 rapid 429 flood hits from one attacker IP + 50 random-path 404 probes
+        for _ in 0..500 {
+            logger
+                .record_access_log(
+                    "ingress",
+                    "web",
+                    "198.51.100.77",
+                    429,
+                    0.5,
+                    0,
+                    32,
+                    true,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    AccessLogMeta {
+                        method: Some("GET"),
+                        host: Some("victim.test"),
+                        path: Some("/login"),
+                        action: Some("rate_limit"),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        for i in 0..50 {
+            logger
+                .record_access_log(
+                    "ingress",
+                    "_unmatched",
+                    "198.51.100.77",
+                    404,
+                    0.4,
+                    0,
+                    16,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    AccessLogMeta {
+                        method: Some("GET"),
+                        host: Some("victim.test"),
+                        path: Some(&format!("/scan-{i}")),
+                        action: Some("unmatched"),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+
+        // 2. Legitimate visitor 200 + critical 500 error MUST NOT be drowned out!
+        logger
+            .record_access_log(
+                "ingress",
+                "web",
+                "203.0.113.10",
+                200,
+                14.0,
+                128,
+                1024,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                AccessLogMeta {
+                    method: Some("GET"),
+                    host: Some("victim.test"),
+                    path: Some("/api/profile"),
+                    action: Some("allow"),
+                    ..Default::default()
+                },
+            )
+            .await;
+        logger
+            .record_access_log(
+                "ingress",
+                "web",
+                "203.0.113.11",
+                502,
+                55.0,
+                256,
+                0,
+                false,
+                false,
+                false,
+                Some("backend down".into()),
+                None,
+                None,
+                None,
+                false,
+                AccessLogMeta {
+                    method: Some("POST"),
+                    host: Some("victim.test"),
+                    path: Some("/api/checkout"),
+                    action: Some("upstream_error"),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        // 3. Flush all active folded summaries + buffered records
+        logger.flush_all().await.unwrap();
+        let (recs, sums, _) = logger.drain_for_maintainer().await;
+
+        // MinuteSummary MUST have 100% exact total request counts (550 + 2 = 552)
+        let total_reqs: u64 = sums.iter().map(|s| s.requests).sum();
+        assert_eq!(total_reqs, 552);
+
+        // Emitted log rows must be drastically folded (<< 552 rows) while accounting for all events
+        assert!(
+            recs.len() < 30,
+            "expected DoS folding to reduce 552 events to <30 rows, got {}",
+            recs.len()
+        );
+        let folded_total: u32 = recs.iter().map(|r| r.repeat_count).sum();
+        assert_eq!(folded_total, 552);
+        assert!(recs.iter().any(|r| r.path.as_deref() == Some("/api/profile") && r.status == 200));
+        assert!(recs.iter().any(|r| r.path.as_deref() == Some("/api/checkout") && r.status == 502));
+        assert!(recs.iter().any(|r| r.status == 429 && r.repeat_count >= 499));
+
+        let stats = logger.protection_stats();
+        assert!(stats.folded_records >= 530);
+
+        // 4. Warn rate limiting suppresses rapid repeated warnings
+        let mut warn_emitted = 0u32;
+        for _ in 0..20 {
+            if logger.should_log_warn("waf:block:attacker").is_some() {
+                warn_emitted += 1;
+            }
+        }
+        assert_eq!(warn_emitted, 1);
+        assert!(logger.protection_stats().warn_suppressed >= 19);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dos_log_protection_enforces_per_minute_byte_budget() {
+        let dir = std::env::temp_dir().join(format!("exposure-nlog-bytes-{}", uuid::Uuid::new_v4()));
+        let cfg = LoggerConfig {
+            hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
+            segment: SegmentConfig {
+                dir: dir.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            protection: LogProtectionConfig {
+                enabled: true,
+                max_records_per_sec: 10_000,
+                max_per_ip_per_sec: 100,
+                max_bytes_per_min: 1500, // Tight 1.5 KiB/min cap
+                dedup_window_secs: 10,
+                log_query_string: true,
+                access_log_stdout: false,
+                warn_rate_per_sec: 20,
+            },
+            ..Default::default()
+        };
+
+        let logger = NodeLogger::new("edge-bytecap", cfg).unwrap();
+        for i in 0..30 {
+            logger
+                .record_access_log(
+                    "ingress",
+                    "web",
+                    &format!("203.0.113.{}", i + 1),
+                    200,
+                    5.0,
+                    100,
+                    200,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    AccessLogMeta {
+                        method: Some("GET"),
+                        host: Some("app.example.com"),
+                        path: Some(&format!("/items/page/{i}")),
+                        action: Some("allow"),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        let (recs, sums, _) = logger.drain_for_maintainer().await;
+        assert_eq!(sums[0].requests, 30);
+        assert!(recs.len() < 15, "byte budget should cap emitted rows, got {}", recs.len());
+        assert!(logger.protection_stats().dropped_records > 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

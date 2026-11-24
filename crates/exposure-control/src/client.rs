@@ -22,7 +22,7 @@ use exposure_core::protocol::{
 use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
     AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
-    MinuteSummary,
+    LogProtectionStats, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -40,6 +40,7 @@ const KV_TELEMETRY_CACHE: &str = "telemetry_cache_json";
 pub const KV_CRS_RULESET: &str = "crs_ruleset_json";
 const MAX_PERSISTED_SUMMARIES: usize = 10_000;
 const MAX_PERSISTED_FINGERPRINTS: usize = 5_000;
+const MAX_PERSISTED_LOGS: usize = 2_000;
 const MAX_PERSISTED_ALERTS: usize = 500;
 
 const MAX_INCOMING_DISPATCH_TASKS: usize = 128;
@@ -66,6 +67,8 @@ pub struct CachedTelemetry {
     #[serde(default)]
     pub fingerprints: Vec<FingerprintObservation>,
     #[serde(default)]
+    pub recent_logs: Vec<SessionSummary>,
+    #[serde(default)]
     pub certificates: Vec<CertStatusInfo>,
     #[serde(default)]
     pub alerts: Vec<AlertRecord>,
@@ -73,6 +76,8 @@ pub struct CachedTelemetry {
     pub maintainers: Vec<MaintainerHealthInfo>,
     #[serde(default)]
     pub node_uptimes: HashMap<String, u64>,
+    #[serde(default)]
+    pub log_stats: HashMap<String, LogProtectionStats>,
     #[serde(default)]
     pub evilpot_reports: Vec<EvilpotNodeReport>,
     #[serde(default)]
@@ -1081,6 +1086,8 @@ impl ControlClient {
         let mut dedup_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
             HashMap::new();
         let mut dedup_fingerprints: HashMap<String, FingerprintObservation> = HashMap::new();
+        let mut dedup_logs: HashMap<(String, String, i64, String), SessionSummary> =
+            HashMap::new();
         let mut dedup_certs: HashMap<String, CertStatusInfo> = HashMap::new();
 
         while let Some(res) = futs.next().await {
@@ -1091,9 +1098,11 @@ impl ControlClient {
                     links,
                     alerts,
                     evilpot,
+                    log_stats,
                     ..
                 } = snap;
-                cache.node_uptimes.insert(node_tag, uptime_secs);
+                cache.node_uptimes.insert(node_tag.clone(), uptime_secs);
+                cache.log_stats.insert(node_tag, log_stats);
                 cache.links.extend(links);
                 cache.alerts.extend(alerts);
                 if let Some(ep) = evilpot {
@@ -1105,6 +1114,7 @@ impl ControlClient {
                     maintainer_tag,
                     summaries,
                     fingerprints,
+                    recent_logs,
                     certificates,
                     segment_backlog,
                     merge_latency_ms,
@@ -1146,6 +1156,29 @@ impl ControlClient {
                             })
                             .or_insert(fp);
                     }
+                    for rec in recent_logs {
+                        let key = (
+                            rec.node_tag.clone(),
+                            rec.role.clone(),
+                            rec.timestamp_ms,
+                            rec.ray_id.clone().unwrap_or_else(|| {
+                                format!(
+                                    "{}:{}:{}",
+                                    rec.ip_hmac,
+                                    rec.path.as_deref().unwrap_or(""),
+                                    rec.status
+                                )
+                            }),
+                        );
+                        dedup_logs
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if rec.repeat_count > existing.repeat_count {
+                                    *existing = rec.clone();
+                                }
+                            })
+                            .or_insert(rec);
+                    }
                     for c in certificates {
                         dedup_certs.insert(c.domain.clone(), c);
                     }
@@ -1163,10 +1196,14 @@ impl ControlClient {
         fps.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
         fps.truncate(10_000);
         cache.fingerprints = fps;
+        let mut logs: Vec<SessionSummary> = dedup_logs.into_values().collect();
+        logs.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+        logs.truncate(MAX_PERSISTED_LOGS);
+        cache.recent_logs = logs;
         cache.certificates = dedup_certs.into_values().collect();
         cache.last_pulled_at = Some(Utc::now().to_rfc3339());
 
-        // If no Maintainer responded during this cycle, retain previously persisted summaries/fingerprints
+        // If no Maintainer responded during this cycle, retain previously persisted summaries/fingerprints/logs
         // so transient Maintainer restarts never blank out Control telemetry.
         {
             let mut guard = self.telemetry_cache.write().await;
@@ -1176,6 +1213,9 @@ impl ControlClient {
                 }
                 if cache.fingerprints.is_empty() && !guard.fingerprints.is_empty() {
                     cache.fingerprints = guard.fingerprints.clone();
+                }
+                if cache.recent_logs.is_empty() && !guard.recent_logs.is_empty() {
+                    cache.recent_logs = guard.recent_logs.clone();
                 }
                 if cache.certificates.is_empty() && !guard.certificates.is_empty() {
                     cache.certificates = guard.certificates.clone();
@@ -1194,6 +1234,9 @@ impl ControlClient {
         }
         if persisted.fingerprints.len() > MAX_PERSISTED_FINGERPRINTS {
             persisted.fingerprints.truncate(MAX_PERSISTED_FINGERPRINTS);
+        }
+        if persisted.recent_logs.len() > MAX_PERSISTED_LOGS {
+            persisted.recent_logs.truncate(MAX_PERSISTED_LOGS);
         }
         if persisted.alerts.len() > MAX_PERSISTED_ALERTS {
             persisted.alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));

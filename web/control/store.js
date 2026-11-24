@@ -240,6 +240,39 @@ export function normalizeRuleCacheConfig(raw) {
   return out;
 }
 
+export function defaultLogProtectionConfig() {
+  return {
+    enabled: true,
+    max_records_per_sec: 500,
+    max_per_ip_per_sec: 20,
+    max_bytes_per_min: 8 * 1024 * 1024,
+    dedup_window_secs: 10,
+    log_query_string: true,
+    access_log_stdout: false,
+    warn_rate_per_sec: 20,
+  };
+}
+
+export function normalizeLogProtectionConfig(raw) {
+  const b = defaultLogProtectionConfig();
+  const s = raw && typeof raw === "object" ? raw : {};
+  const clamp = (v, fb, min, max) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return fb;
+    return Math.min(max, Math.max(min, Math.round(n)));
+  };
+  return {
+    enabled: Boolean(s.enabled ?? b.enabled),
+    max_records_per_sec: clamp(s.max_records_per_sec, b.max_records_per_sec, 10, 100000),
+    max_per_ip_per_sec: clamp(s.max_per_ip_per_sec, b.max_per_ip_per_sec, 1, 50000),
+    max_bytes_per_min: clamp(s.max_bytes_per_min, b.max_bytes_per_min, 64 * 1024, 512 * 1024 * 1024),
+    dedup_window_secs: clamp(s.dedup_window_secs, b.dedup_window_secs, 0, 300),
+    log_query_string: Boolean(s.log_query_string ?? b.log_query_string),
+    access_log_stdout: Boolean(s.access_log_stdout ?? b.access_log_stdout),
+    warn_rate_per_sec: clamp(s.warn_rate_per_sec, b.warn_rate_per_sec, 1, 1000),
+  };
+}
+
 export function defaultTopologyDefaults() {
   return {
     ingress: {
@@ -701,6 +734,15 @@ export function normalizeSpec(raw) {
       : {}
   );
   const global_logger = raw?.global_logger ? deepClone(raw.global_logger) : null;
+  if (global_logger && typeof global_logger === "object") {
+    if (global_logger.protection && typeof global_logger.protection === "object") {
+      global_logger.protection = normalizeLogProtectionConfig(global_logger.protection);
+    }
+    if (global_logger.segment && typeof global_logger.segment === "object" && global_logger.segment.max_recent_logs != null) {
+      const m = Number(global_logger.segment.max_recent_logs);
+      global_logger.segment.max_recent_logs = Number.isFinite(m) ? Math.min(10000, Math.max(100, Math.round(m))) : 2000;
+    }
+  }
   return {
     defaults,
     guard_templates,

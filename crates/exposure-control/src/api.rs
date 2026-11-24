@@ -109,6 +109,7 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/waf/crs/sync", post(sync_waf_crs))
         .route("/api/security/abuseipdb/test", post(test_abuseipdb_key))
         .route("/api/fingerprints", get(list_fingerprints))
+        .route("/api/logs", get(list_logs))
         .route("/api/audit", get(list_audit))
         .fallback(serve_web_panel)
         .layer(middleware::from_fn(security_headers_middleware))
@@ -2070,6 +2071,25 @@ struct FingerprintQuery {
     limit: Option<usize>,
 }
 
+fn compute_query_ip_hmac(hmac_key: Option<&str>, raw: Option<&str>) -> Option<String> {
+    let parsed = raw?.parse::<IpAddr>().ok()?;
+    let key = hmac_key?;
+    Some(hmac_ip(key, &canonical_ip(parsed).to_string()))
+}
+
+async fn is_store_raw_ip_enabled(state: &ApiState) -> bool {
+    state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .ok()
+        .and_then(|y| serde_yaml::from_str::<TopologySpec>(&y).ok())
+        .and_then(|t| t.global_logger)
+        .map(|l| l.store_raw_ip)
+        .unwrap_or(false)
+}
+
 async fn list_fingerprints(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2129,14 +2149,8 @@ async fn list_fingerprints(
 
     // Auto-compute cluster IP HMAC when the search query or IP filter is a literal IP address,
     // allowing exact IP lookup even when `store_raw_ip: false`!
-    let compute_query_ip_hmac = |raw: &Option<String>| -> Option<String> {
-        let s = raw.as_deref()?;
-        let parsed = s.parse::<IpAddr>().ok()?;
-        let key = hmac_key.as_deref()?;
-        Some(hmac_ip(key, &canonical_ip(parsed).to_string()))
-    };
-    let q_ip_hmac = compute_query_ip_hmac(&q_str);
-    let ip_filter_hmac = compute_query_ip_hmac(&ip_str);
+    let q_ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), q_str.as_deref());
+    let ip_filter_hmac = compute_query_ip_hmac(hmac_key.as_deref(), ip_str.as_deref());
 
     let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut available_services: std::collections::BTreeSet<String> =
@@ -2314,16 +2328,7 @@ async fn list_fingerprints(
     let limit = q.limit.unwrap_or(150).clamp(1, 500);
     matched.truncate(limit);
 
-    let store_raw_ip_enabled = state
-        .client
-        .db()
-        .get_topology_yaml()
-        .await
-        .ok()
-        .and_then(|y| serde_yaml::from_str::<TopologySpec>(&y).ok())
-        .and_then(|t| t.global_logger)
-        .map(|l| l.store_raw_ip)
-        .unwrap_or(false);
+    let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
 
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
@@ -2344,6 +2349,370 @@ async fn list_fingerprints(
         "os_counts": os_counts,
         "available_nodes": available_nodes.into_iter().collect::<Vec<_>>(),
         "available_services": available_services.into_iter().collect::<Vec<_>>(),
+        "items": matched,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct LogQuery {
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    node: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    /// Exact status (`"404"`), status class (`"2xx"`, `"3xx"`, `"4xx"`, `"5xx"`), or `"all"`.
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    window_secs: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn clean_filter_opt(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+        .map(str::to_string)
+}
+
+async fn list_logs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<LogQuery>,
+) -> Response {
+    if let Err(r) = verify_admin_auth(&state, &headers) {
+        return r;
+    }
+    let tel = state.client.cached_telemetry().await;
+    let hmac_key = state.client.effective_logger_hmac_key().await;
+
+    let cutoff_ms = q
+        .window_secs
+        .filter(|&w| w > 0)
+        .map(|w| Utc::now().timestamp_millis().saturating_sub(w.saturating_mul(1000)))
+        .unwrap_or(0);
+    let node_f = clean_filter_opt(q.node.as_deref());
+    let svc_f = clean_filter_opt(q.service.as_deref());
+    let role_f = clean_filter_opt(q.role.as_deref());
+    let method_f = clean_filter_opt(q.method.as_deref()).map(|s| s.to_ascii_uppercase());
+    let action_f = clean_filter_opt(q.action.as_deref()).map(|s| s.to_ascii_lowercase());
+    let status_f = clean_filter_opt(q.status.as_deref()).map(|s| s.to_ascii_lowercase());
+    let host_f = clean_filter_opt(q.host.as_deref()).map(|s| s.to_ascii_lowercase());
+    let ip_str = clean_filter_opt(q.ip.as_deref()).map(|s| s.to_ascii_lowercase());
+    let q_str = clean_filter_opt(q.q.as_deref()).map(|s| s.to_ascii_lowercase());
+
+    let q_ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), q_str.as_deref());
+    let ip_filter_hmac = compute_query_ip_hmac(hmac_key.as_deref(), ip_str.as_deref());
+
+    let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut available_services: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut available_hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut available_actions: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for rec in &tel.recent_logs {
+        available_nodes.insert(rec.node_tag.clone());
+        available_services.insert(rec.service_tag.clone());
+        if let Some(ref h) = rec.host {
+            if !h.is_empty() {
+                available_hosts.insert(h.clone());
+            }
+        }
+        if let Some(ref a) = rec.action {
+            if !a.is_empty() {
+                available_actions.insert(a.clone());
+            }
+        }
+    }
+
+    let mut matched = Vec::new();
+    let mut total_requests: u64 = 0;
+    let mut blocked_requests: u64 = 0;
+    let mut error_5xx_requests: u64 = 0;
+    let mut cache_hits: u64 = 0;
+    let mut folded_requests: u64 = 0;
+    let mut unique_ips = std::collections::HashSet::new();
+    let mut unique_paths = std::collections::HashSet::new();
+    let mut action_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut status_class_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    // (host, path) -> (total_hits, blocked_hits, error_5xx)
+    let mut path_stats: std::collections::HashMap<(String, String), (u64, u64, u64)> =
+        std::collections::HashMap::new();
+
+    for rec in &tel.recent_logs {
+        if rec.timestamp_ms < cutoff_ms {
+            continue;
+        }
+        if let Some(ref nf) = node_f {
+            if &rec.node_tag != nf {
+                continue;
+            }
+        }
+        if let Some(ref sf) = svc_f {
+            if &rec.service_tag != sf {
+                continue;
+            }
+        }
+        if let Some(ref rf) = role_f {
+            if !rec.role.eq_ignore_ascii_case(rf) {
+                continue;
+            }
+        }
+        if let Some(ref mf) = method_f {
+            if !rec
+                .method
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case(mf))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        let is_blocked_rec = rec.rate_limited
+            || rec.challenged
+            || rec
+                .action
+                .as_deref()
+                .map(|a| {
+                    matches!(
+                        a,
+                        "autoban"
+                            | "waf_block"
+                            | "evilpot"
+                            | "guard_reject"
+                            | "abuseipdb"
+                            | "rate_limit"
+                            | "challenge"
+                    )
+                })
+                .unwrap_or(false)
+            || rec.status == 403
+            || rec.status == 429;
+        if let Some(ref af) = action_f {
+            if af == "blocked" {
+                if !is_blocked_rec {
+                    continue;
+                }
+            } else if !rec
+                .action
+                .as_deref()
+                .map(|a| a.eq_ignore_ascii_case(af))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        if let Some(ref sf) = status_f {
+            let ok = match sf.as_str() {
+                "2xx" => (200..300).contains(&rec.status),
+                "3xx" => (300..400).contains(&rec.status),
+                "4xx" => (400..500).contains(&rec.status),
+                "5xx" => (500..600).contains(&rec.status),
+                exact => exact.parse::<u16>().map(|code| rec.status == code).unwrap_or(true),
+            };
+            if !ok {
+                continue;
+            }
+        }
+        if let Some(ref hf) = host_f {
+            if !rec
+                .host
+                .as_deref()
+                .map(|h| h.to_ascii_lowercase().contains(hf))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        if let Some(ref ipq) = ip_str {
+            let raw_match = rec
+                .raw_ip
+                .as_deref()
+                .map(|v| v.to_ascii_lowercase().contains(ipq))
+                .unwrap_or(false);
+            let hmac_sub = rec.ip_hmac.to_ascii_lowercase().contains(ipq);
+            let hmac_exact = ip_filter_hmac
+                .as_deref()
+                .map(|h| rec.ip_hmac.eq_ignore_ascii_case(h))
+                .unwrap_or(false);
+            if !(raw_match || hmac_sub || hmac_exact) {
+                continue;
+            }
+        }
+        if let Some(ref qs) = q_str {
+            let hmac_exact = q_ip_hmac
+                .as_deref()
+                .map(|h| rec.ip_hmac.eq_ignore_ascii_case(h))
+                .unwrap_or(false);
+            let hit = hmac_exact
+                || rec
+                    .path
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .query
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .host
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .ray_id
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .user_agent
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .referer
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .error
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .waf_category
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .action
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec
+                    .raw_ip
+                    .as_deref()
+                    .map(|v| v.to_ascii_lowercase().contains(qs))
+                    .unwrap_or(false)
+                || rec.ip_hmac.to_ascii_lowercase().contains(qs)
+                || rec.service_tag.to_ascii_lowercase().contains(qs)
+                || rec.node_tag.to_ascii_lowercase().contains(qs);
+            if !hit {
+                continue;
+            }
+        }
+
+        let weight = u64::from(rec.repeat_count.max(1));
+        total_requests = total_requests.saturating_add(weight);
+        folded_requests = folded_requests.saturating_add(u64::from(rec.repeat_count.saturating_sub(1)));
+        if is_blocked_rec {
+            blocked_requests = blocked_requests.saturating_add(weight);
+        }
+        if rec.status >= 500 {
+            error_5xx_requests = error_5xx_requests.saturating_add(weight);
+        }
+        if rec.cache_status.as_deref() == Some("HIT") {
+            cache_hits = cache_hits.saturating_add(weight);
+        }
+        unique_ips.insert(rec.ip_hmac.clone());
+        let act_key = rec.action.clone().unwrap_or_else(|| "allow".into());
+        *action_counts.entry(act_key).or_insert(0) += weight;
+        let sc_key = format!("{}xx", rec.status / 100);
+        *status_class_counts.entry(sc_key).or_insert(0) += weight;
+        if let Some(ref p) = rec.path {
+            if !p.is_empty() {
+                let h = rec.host.clone().unwrap_or_default();
+                unique_paths.insert((h.clone(), p.clone()));
+                let entry = path_stats.entry((h, p.clone())).or_insert((0, 0, 0));
+                entry.0 = entry.0.saturating_add(weight);
+                if is_blocked_rec {
+                    entry.1 = entry.1.saturating_add(weight);
+                }
+                if rec.status >= 500 {
+                    entry.2 = entry.2.saturating_add(weight);
+                }
+            }
+        }
+        matched.push(rec);
+    }
+
+    let mut top_paths: Vec<_> = path_stats
+        .into_iter()
+        .map(|((host, path), (hits, blocked, errors_5xx))| {
+            serde_json::json!({
+                "host": host,
+                "path": path,
+                "hits": hits,
+                "blocked": blocked,
+                "errors_5xx": errors_5xx,
+            })
+        })
+        .collect();
+    top_paths.sort_by(|a, b| {
+        b["hits"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["hits"].as_u64().unwrap_or(0))
+    });
+    top_paths.truncate(12);
+
+    let mut prot_totals = exposure_core::telemetry::LogProtectionStats::default();
+    for st in tel.log_stats.values() {
+        prot_totals.dropped_records = prot_totals
+            .dropped_records
+            .saturating_add(st.dropped_records);
+        prot_totals.folded_records = prot_totals
+            .folded_records
+            .saturating_add(st.folded_records);
+        prot_totals.warn_suppressed = prot_totals
+            .warn_suppressed
+            .saturating_add(st.warn_suppressed);
+    }
+
+    let total_matched = matched.len();
+    let limit = q.limit.unwrap_or(200).clamp(1, 500);
+    matched.truncate(limit);
+
+    let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
+
+    Json(serde_json::json!({
+        "last_pulled_at": tel.last_pulled_at,
+        "total_matched": total_matched,
+        "store_raw_ip_enabled": store_raw_ip_enabled,
+        "summary": {
+            "total_events": total_matched,
+            "total_requests": total_requests,
+            "blocked_requests": blocked_requests,
+            "error_5xx_requests": error_5xx_requests,
+            "cache_hits": cache_hits,
+            "folded_requests": folded_requests,
+            "unique_ips": unique_ips.len(),
+            "unique_paths": unique_paths.len(),
+        },
+        "top_paths": top_paths,
+        "action_counts": action_counts,
+        "status_class_counts": status_class_counts,
+        "log_protection": prot_totals,
+        "node_log_stats": tel.log_stats,
+        "available_nodes": available_nodes.into_iter().collect::<Vec<_>>(),
+        "available_services": available_services.into_iter().collect::<Vec<_>>(),
+        "available_hosts": available_hosts.into_iter().collect::<Vec<_>>(),
+        "available_actions": available_actions.into_iter().collect::<Vec<_>>(),
         "items": matched,
     }))
     .into_response()

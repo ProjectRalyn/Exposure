@@ -216,7 +216,114 @@ impl LatencyHistogram {
     }
 }
 
-/// Individual session log record written to segment files (production layer).
+fn default_repeat_one() -> u32 {
+    1
+}
+
+fn is_repeat_one(v: &u32) -> bool {
+    *v <= 1
+}
+
+const SENSITIVE_QUERY_KEYS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "key",
+    "auth",
+    "session",
+    "sid",
+    "jwt",
+    "sig",
+    "signature",
+    "cookie",
+    "credential",
+    "code",
+    "access_key",
+    "private",
+];
+
+/// Strip control characters (preventing log/CRLF injection), trim, and safely truncate to `max_chars`.
+pub fn sanitize_log_text(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect();
+    let trimmed = cleaned.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    if max_chars > 3 {
+        let mut out: String = trimmed.chars().take(max_chars - 1).collect();
+        out.push('…');
+        out
+    } else {
+        trimmed.chars().take(max_chars).collect()
+    }
+}
+
+pub fn sanitize_url_path(raw: &str) -> String {
+    sanitize_log_text(raw, 256)
+}
+
+/// Sanitize a URL query string (stripping leading `?`, control chars, capping at 64 pairs / 256 chars)
+/// and redacting sensitive parameter values such as tokens, passwords, secrets, and API keys.
+pub fn sanitize_and_redact_query(raw: &str) -> String {
+    let trimmed = raw.trim().trim_start_matches('?');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for pair in trimmed.split('&').take(64) {
+        if pair.is_empty() {
+            continue;
+        }
+        let clean_pair: String = pair
+            .chars()
+            .filter(|c| !c.is_control() || *c == ' ')
+            .collect();
+        if let Some((k, v)) = clean_pair.split_once('=') {
+            let kl = k.trim().to_ascii_lowercase();
+            let sensitive = SENSITIVE_QUERY_KEYS.iter().any(|s| kl.contains(s));
+            if sensitive {
+                parts.push(format!("{}=[REDACTED]", k.trim()));
+            } else {
+                parts.push(format!("{}={}", k.trim(), v.trim()));
+            }
+        } else {
+            parts.push(clean_pair.trim().to_string());
+        }
+    }
+    let joined = parts.join("&");
+    sanitize_log_text(&joined, 256)
+}
+
+/// Sanitize HTTP `Referer` header by stripping query/fragment components and capping to 192 chars.
+pub fn sanitize_referer(raw: &str) -> String {
+    let no_frag = raw.split('#').next().unwrap_or(raw);
+    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+    sanitize_log_text(no_query, 192)
+}
+
+fn sanitize_opt(opt: &mut Option<String>, max_chars: usize) {
+    if let Some(val) = opt.as_mut() {
+        let cleaned = sanitize_log_text(val, max_chars);
+        if cleaned.is_empty() {
+            *opt = None;
+        } else {
+            *val = cleaned;
+        }
+    }
+}
+
+/// Individual session / HTTP access log record written to segment files (production layer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub timestamp_ms: i64,
@@ -228,7 +335,7 @@ pub struct SessionSummary {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub ip_hmac: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_ip: Option<String>,
     #[serde(default)]
     pub rate_limited: bool,
@@ -236,16 +343,153 @@ pub struct SessionSummary {
     pub challenged: bool,
     #[serde(default)]
     pub challenge_passed: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_family: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_family: Option<String>,
     #[serde(default)]
     pub client_fp_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ray_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ja3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf_rule_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waf_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspicion_score: Option<u8>,
+    #[serde(default = "default_repeat_one", skip_serializing_if = "is_repeat_one")]
+    pub repeat_count: u32,
+}
+
+impl Default for SessionSummary {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            node_tag: String::new(),
+            role: String::new(),
+            service_tag: String::new(),
+            status: 0,
+            latency_ms: 0.0,
+            bytes_in: 0,
+            bytes_out: 0,
+            ip_hmac: String::new(),
+            raw_ip: None,
+            rate_limited: false,
+            challenged: false,
+            challenge_passed: false,
+            error: None,
+            device_type: None,
+            browser_family: None,
+            os_family: None,
+            client_fp_verified: false,
+            ray_id: None,
+            method: None,
+            host: None,
+            path: None,
+            query: None,
+            protocol: None,
+            scheme: None,
+            user_agent: None,
+            referer: None,
+            action: None,
+            cache_status: None,
+            tls_ja3: None,
+            waf_rule_id: None,
+            waf_category: None,
+            suspicion_score: None,
+            repeat_count: 1,
+        }
+    }
+}
+
+impl SessionSummary {
+    /// Enforce strict control-character stripping, query redaction, and length bounds
+    /// so untrusted HTTP inputs can never cause log injection or storage amplification.
+    pub fn sanitize(&mut self) {
+        self.node_tag = sanitize_log_text(&self.node_tag, 64);
+        self.role = sanitize_log_text(&self.role, 32);
+        self.service_tag = sanitize_log_text(&self.service_tag, 128);
+        self.ip_hmac = sanitize_log_text(&self.ip_hmac, 64);
+        sanitize_opt(&mut self.raw_ip, 64);
+        sanitize_opt(&mut self.error, 256);
+        sanitize_opt(&mut self.device_type, 32);
+        sanitize_opt(&mut self.browser_family, 32);
+        sanitize_opt(&mut self.os_family, 32);
+        sanitize_opt(&mut self.ray_id, 32);
+        sanitize_opt(&mut self.method, 16);
+        sanitize_opt(&mut self.host, 128);
+        if let Some(ref mut p) = self.path {
+            let cleaned = sanitize_url_path(p);
+            if cleaned.is_empty() {
+                self.path = None;
+            } else {
+                *p = cleaned;
+            }
+        }
+        if let Some(ref mut q) = self.query {
+            let cleaned = sanitize_and_redact_query(q);
+            if cleaned.is_empty() {
+                self.query = None;
+            } else {
+                *q = cleaned;
+            }
+        }
+        sanitize_opt(&mut self.protocol, 16);
+        sanitize_opt(&mut self.scheme, 8);
+        sanitize_opt(&mut self.user_agent, 192);
+        if let Some(ref mut rf) = self.referer {
+            let cleaned = sanitize_referer(rf);
+            if cleaned.is_empty() {
+                self.referer = None;
+            } else {
+                *rf = cleaned;
+            }
+        }
+        sanitize_opt(&mut self.action, 32);
+        sanitize_opt(&mut self.cache_status, 16);
+        sanitize_opt(&mut self.tls_ja3, 32);
+        sanitize_opt(&mut self.waf_category, 48);
+        if self.repeat_count == 0 {
+            self.repeat_count = 1;
+        }
+    }
+}
+
+/// Anti-DoS log protection counters reported per node.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogProtectionStats {
+    #[serde(default)]
+    pub dropped_records: u64,
+    #[serde(default)]
+    pub folded_records: u64,
+    #[serde(default)]
+    pub warn_suppressed: u64,
 }
 
 /// Aggregated summary per `(node_tag, role, minute_epoch, service_tag)` pushed to Maintainer.
@@ -974,5 +1218,59 @@ mod tests {
         assert_eq!(h1.total(), 100);
         assert!(h1.quantile(0.50) <= 10.0);
         assert!(h1.quantile(0.95) > 50.0 && h1.quantile(0.95) <= 100.0);
+    }
+
+    #[test]
+    fn url_query_referer_sanitization_redacts_secrets_and_bounds_lengths() {
+        let long_path = format!("/api/v1/{}?bad\r\ninject", "a".repeat(300));
+        let clean_path = sanitize_url_path(&long_path);
+        assert!(clean_path.chars().count() <= 256);
+        assert!(!clean_path.contains('\r') && !clean_path.contains('\n'));
+        assert!(clean_path.ends_with('…'));
+
+        let raw_q = "page=2&q=hello&token=supersecret123&api_key=abc&password=pw1&auth=xyz&secret=s1&sort=desc";
+        let redacted = sanitize_and_redact_query(raw_q);
+        assert!(redacted.contains("page=2"));
+        assert!(redacted.contains("q=hello"));
+        assert!(redacted.contains("sort=desc"));
+        assert!(redacted.contains("token=[REDACTED]"));
+        assert!(redacted.contains("api_key=[REDACTED]"));
+        assert!(redacted.contains("password=[REDACTED]"));
+        assert!(redacted.contains("auth=[REDACTED]"));
+        assert!(redacted.contains("secret=[REDACTED]"));
+        assert!(!redacted.contains("supersecret123"));
+        assert!(!redacted.contains("pw1"));
+
+        let long_q = (0..100)
+            .map(|i| format!("k{i}={}", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert!(sanitize_and_redact_query(&long_q).chars().count() <= 256);
+
+        let rf = sanitize_referer("https://app.example.com/login?token=leak#frag\r\n");
+        assert_eq!(rf, "https://app.example.com/login");
+
+        let mut rec = SessionSummary {
+            node_tag: "n1\n".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            path: Some(format!("/{}", "p".repeat(300))),
+            query: Some("token=secret999&page=1".into()),
+            referer: Some("https://ref.example.com/p?code=123#hash".into()),
+            repeat_count: 0,
+            ..Default::default()
+        };
+        rec.sanitize();
+        assert_eq!(rec.node_tag, "n1");
+        assert_eq!(rec.path.as_deref().unwrap().chars().count(), 256);
+        assert_eq!(rec.query.as_deref(), Some("token=[REDACTED]&page=1"));
+        assert_eq!(rec.referer.as_deref(), Some("https://ref.example.com/p"));
+        assert_eq!(rec.repeat_count, 1);
+
+        // Legacy SessionSummary without new fields must deserialize cleanly
+        let legacy_json = r#"{"timestamp_ms":1700000000000,"node_tag":"n","role":"ingress","service_tag":"s","status":200,"latency_ms":1.0,"bytes_in":1,"bytes_out":2,"ip_hmac":"abcd"}"#;
+        let parsed: SessionSummary = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.repeat_count, 1);
+        assert!(parsed.path.is_none());
     }
 }

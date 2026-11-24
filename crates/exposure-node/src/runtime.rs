@@ -505,6 +505,7 @@ impl NodeRuntime {
                     let (ok, err) = self.last_reload_status.read().await.clone();
                     let alerts = self.logger.recent_alerts().await;
                     let evilpot = self.ingress.evilpot_report().await;
+                    let log_stats = self.logger.protection_stats();
                     Some(SpecialPayload::StatusResp(NodeStatusSnapshot {
                         node_tag: cfg.node_tag,
                         roles: cfg.roles,
@@ -515,6 +516,7 @@ impl NodeRuntime {
                         links,
                         alerts,
                         evilpot,
+                        log_stats,
                     }))
                 }
             }
@@ -1752,7 +1754,7 @@ impl NodeRuntime {
             self.push_pending_logs_to_maintainer(),
         )
         .await;
-        let _ = self.logger.flush_segments().await;
+        let _ = self.logger.flush_all().await;
         if let Some(maint) = self.maintainer.read().await.clone() {
             maint.stop_background_tasks();
             let _ = maint.flush_segments().await;

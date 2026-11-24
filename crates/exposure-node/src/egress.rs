@@ -27,7 +27,7 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
-use crate::logger::NodeLogger;
+use crate::logger::{AccessLogMeta, NodeLogger};
 
 const ORIGIN_SIG_MAX_SKEW_SECS: u64 = 120;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -366,8 +366,82 @@ impl EgressHandler {
     ) -> Response<ProxyBody> {
         let start = Instant::now();
         let client_ip = hdr.client_ip.as_deref().unwrap_or("0.0.0.0");
+        let method_str = req.method().as_str().to_string();
+        let host_str = hdr
+            .sni
+            .clone()
+            .or_else(|| {
+                req.headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let path_str = req.uri().path().to_string();
+        let query_opt = req.uri().query().map(str::to_string);
+        let is_upgrade = req.headers().get(header::UPGRADE).is_some();
+        let use_h2 = svc.protocol == BackendProtocol::H2
+            || (svc.protocol == BackendProtocol::Auto
+                && req.version() == http::Version::HTTP_2
+                && !is_upgrade);
+        let proto_str: &'static str = if is_upgrade {
+            "WS"
+        } else if use_h2 {
+            "HTTP/2"
+        } else {
+            "HTTP/1.1"
+        };
+        let scheme_str = if svc.effective_tls() { "https" } else { "http" };
+        let ua_str = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let referer_opt = req
+            .headers()
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let make_meta = |action: &'static str| AccessLogMeta {
+            ray_id: Some(&hdr.request_id),
+            method: Some(&method_str),
+            host: (!host_str.is_empty()).then_some(host_str.as_str()),
+            path: Some(&path_str),
+            query: query_opt.as_deref(),
+            protocol: Some(proto_str),
+            scheme: Some(scheme_str),
+            user_agent: (!ua_str.is_empty()).then_some(ua_str.as_str()),
+            referer: referer_opt.as_deref(),
+            action: Some(action),
+            cache_status: None,
+            tls_ja3: None,
+            waf_rule_id: None,
+            waf_category: None,
+            suspicion_score: None,
+        };
 
         if !self.is_local_backend_healthy(&hdr.service_tag) {
+            self.logger
+                .record_access_log(
+                    "egress",
+                    &hdr.service_tag,
+                    client_ip,
+                    503,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some("backend unhealthy".into()),
+                    None,
+                    None,
+                    None,
+                    false,
+                    make_meta("upstream_error"),
+                )
+                .await;
             return self
                 .build_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -385,8 +459,6 @@ impl EgressHandler {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| req.body().size_hint().lower());
 
-        let is_upgrade = req.headers().get(header::UPGRADE).is_some();
-
         let timeout = Duration::from_millis(svc.timeout_ms.max(1000));
         let tcp = match tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await {
             Ok(Ok(s)) => {
@@ -398,10 +470,15 @@ impl EgressHandler {
                     "egress backend connect failed service={} backend={}: {}",
                     hdr.service_tag, svc.backend, e
                 );
-                warn!("{msg}");
+                if let Some(suppressed) = self
+                    .logger
+                    .should_log_warn(&format!("egress:conn_err:{}", hdr.service_tag))
+                {
+                    warn!(suppressed, "{msg}");
+                }
                 self.logger.emit_alert("error", msg.clone()).await;
                 self.logger
-                    .record_session(
+                    .record_access_log(
                         "egress",
                         &hdr.service_tag,
                         client_ip,
@@ -413,6 +490,11 @@ impl EgressHandler {
                         false,
                         false,
                         Some(msg),
+                        None,
+                        None,
+                        None,
+                        false,
+                        make_meta("upstream_error"),
                     )
                     .await;
                 return self.build_error_response(
@@ -428,10 +510,15 @@ impl EgressHandler {
                     "egress backend connect timeout service={} backend={}",
                     hdr.service_tag, svc.backend
                 );
-                warn!("{msg}");
+                if let Some(suppressed) = self
+                    .logger
+                    .should_log_warn(&format!("egress:conn_to:{}", hdr.service_tag))
+                {
+                    warn!(suppressed, "{msg}");
+                }
                 self.logger.emit_alert("error", msg.clone()).await;
                 self.logger
-                    .record_session(
+                    .record_access_log(
                         "egress",
                         &hdr.service_tag,
                         client_ip,
@@ -443,6 +530,11 @@ impl EgressHandler {
                         false,
                         false,
                         Some(msg),
+                        None,
+                        None,
+                        None,
+                        false,
+                        make_meta("upstream_error"),
                     )
                     .await;
                 return self.build_error_response(
@@ -461,11 +553,6 @@ impl EgressHandler {
                 req.headers_mut().insert(header::HOST, hv);
             }
         }
-
-        let use_h2 = svc.protocol == BackendProtocol::H2
-            || (svc.protocol == BackendProtocol::Auto
-                && req.version() == http::Version::HTTP_2
-                && !is_upgrade);
 
         let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.effective_tls() {
             match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, use_h2)).await {
@@ -494,7 +581,7 @@ impl EgressHandler {
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or_else(|| resp.body().size_hint().lower());
                 self.logger
-                    .record_session(
+                    .record_access_log(
                         "egress",
                         &hdr.service_tag,
                         client_ip,
@@ -510,15 +597,25 @@ impl EgressHandler {
                         } else {
                             None
                         },
+                        None,
+                        None,
+                        None,
+                        false,
+                        make_meta("allow"),
                     )
                     .await;
                 resp
             }
             Err((err_status, err_msg)) => {
-                warn!(service = %hdr.service_tag, backend = %svc.backend, error = %err_msg, "egress request failed");
+                if let Some(suppressed) = self
+                    .logger
+                    .should_log_warn(&format!("egress:req_err:{}", hdr.service_tag))
+                {
+                    warn!(service = %hdr.service_tag, backend = %svc.backend, error = %err_msg, suppressed, "egress request failed");
+                }
                 self.logger.emit_alert("error", err_msg.clone()).await;
                 self.logger
-                    .record_session(
+                    .record_access_log(
                         "egress",
                         &hdr.service_tag,
                         client_ip,
@@ -530,6 +627,11 @@ impl EgressHandler {
                         false,
                         false,
                         Some(err_msg),
+                        None,
+                        None,
+                        None,
+                        false,
+                        make_meta("upstream_error"),
                     )
                     .await;
                 let (title, detail) = if err_status == StatusCode::GATEWAY_TIMEOUT {

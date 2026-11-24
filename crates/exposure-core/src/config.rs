@@ -67,6 +67,24 @@ fn default_max_summaries() -> usize {
 fn default_max_fingerprints() -> usize {
     20_000
 }
+fn default_max_recent_logs() -> usize {
+    2_000
+}
+fn default_max_log_records_per_sec() -> u32 {
+    500
+}
+fn default_max_log_per_ip_per_sec() -> u32 {
+    20
+}
+fn default_max_log_bytes_per_min() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_log_dedup_window_secs() -> u64 {
+    10
+}
+fn default_warn_rate_per_sec() -> u32 {
+    20
+}
 fn default_max_segment_bytes() -> u64 {
     16 * 1024 * 1024
 }
@@ -1042,6 +1060,9 @@ pub struct SegmentConfig {
     /// Maximum visitor fingerprint records retained on Maintainer (default 20,000).
     #[serde(default = "default_max_fingerprints")]
     pub max_fingerprints: usize,
+    /// Maximum recent detailed access logs retained in memory on Maintainer (default 2,000).
+    #[serde(default = "default_max_recent_logs")]
+    pub max_recent_logs: usize,
 }
 
 fn default_segment_dir() -> String {
@@ -1060,6 +1081,53 @@ impl Default for SegmentConfig {
             retention_hours: default_retention_hours(),
             max_summaries: default_max_summaries(),
             max_fingerprints: default_max_fingerprints(),
+            max_recent_logs: default_max_recent_logs(),
+        }
+    }
+}
+
+/// Anti-DoS log protection & privacy sanitization settings for node access/warning logs.
+/// Note: aggregated `MinuteSummary` metrics (requests, UV, 429, 5xx, latency) ALWAYS remain
+/// 100% exact even when detailed per-request logs are folded or rate-limited.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogProtectionConfig {
+    /// Enable multi-layer DoS log explosion protection (rate caps, byte budget, flood folding).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum detailed access log records persisted per second globally (burst = 2x, default 500).
+    #[serde(default = "default_max_log_records_per_sec")]
+    pub max_records_per_sec: u32,
+    /// Maximum detailed access log records persisted per second per client IP (burst = 2x, default 20).
+    #[serde(default = "default_max_log_per_ip_per_sec")]
+    pub max_per_ip_per_sec: u32,
+    /// Hard per-minute byte budget for persisted/forwarded access logs (default 8 MiB/min).
+    #[serde(default = "default_max_log_bytes_per_min")]
+    pub max_bytes_per_min: u64,
+    /// Coalescing window in seconds for repeated low-priority/flood records (default 10s).
+    #[serde(default = "default_log_dedup_window_secs")]
+    pub dedup_window_secs: u64,
+    /// Include secret-redacted URL query string in access logs (default true).
+    #[serde(default = "default_true")]
+    pub log_query_string: bool,
+    /// Emit structured per-request access logs via `tracing::info!` (subject to DoS rate limits, default false).
+    #[serde(default)]
+    pub access_log_stdout: bool,
+    /// Maximum per-request security/error `tracing::warn!` stdout messages per second (default 20).
+    #[serde(default = "default_warn_rate_per_sec")]
+    pub warn_rate_per_sec: u32,
+}
+
+impl Default for LogProtectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_records_per_sec: default_max_log_records_per_sec(),
+            max_per_ip_per_sec: default_max_log_per_ip_per_sec(),
+            max_bytes_per_min: default_max_log_bytes_per_min(),
+            dedup_window_secs: default_log_dedup_window_secs(),
+            log_query_string: true,
+            access_log_stdout: false,
+            warn_rate_per_sec: default_warn_rate_per_sec(),
         }
     }
 }
@@ -1081,6 +1149,9 @@ pub struct LoggerConfig {
     pub histogram_buckets_ms: Vec<f64>,
     #[serde(default)]
     pub segment: SegmentConfig,
+    /// Anti-DoS protection & URL/query redaction settings for detailed access logs.
+    #[serde(default)]
+    pub protection: LogProtectionConfig,
 }
 
 impl Default for LoggerConfig {
@@ -1093,6 +1164,7 @@ impl Default for LoggerConfig {
             hll_seed: default_hll_seed(),
             histogram_buckets_ms: default_histogram_buckets(),
             segment: SegmentConfig::default(),
+            protection: LogProtectionConfig::default(),
         }
     }
 }

@@ -4,6 +4,7 @@ import { t } from "../i18n.js";
 import {
   defaultAbuseIpDbConfig,
   defaultEvilpotConfig,
+  defaultLogProtectionConfig,
   defaultNodeCacheConfig,
   defaultTopologyDefaults,
   defaultWafConfig,
@@ -86,9 +87,12 @@ export function createSystemView({ api, store }) {
         retention_hours: 72,
         max_summaries: 50000,
         max_fingerprints: 20000,
+        max_recent_logs: 2000,
       },
+      protection: defaultLogProtectionConfig(),
     };
     const seg = gl.segment || {};
+    const prot = { ...defaultLogProtectionConfig(), ...(gl.protection || {}) };
     const guardNames = Object.keys(store.spec.guard_templates || {});
     const bucketNames = Object.keys(store.spec.bucket_templates || {});
 
@@ -208,7 +212,10 @@ export function createSystemView({ api, store }) {
             ${renderBinSlider({ attrName: "data-sd-ll-bin", attrVal: "allow_on_demand", label: "Allow On-Demand Links", val: ll.allow_on_demand })}
             ${renderBinSlider({ attrName: "data-sd-ll-bin", attrVal: "allow_tunnel", label: "Allow Reverse Tunnels", val: ll.allow_tunnel })}
             ${renderBinSlider({ attrName: "data-sd-ll-bin", attrVal: "allow_bootstrap", label: "Allow Bootstrap Onboarding", val: ll.allow_bootstrap })}
-            ${renderBinSlider({ attrName: "data-sd-log-bin", attrVal: "store_raw_ip", label: "Store Raw Client IP in Fingerprints", val: Boolean(gl.store_raw_ip) })}
+            ${renderBinSlider({ attrName: "data-sd-log-bin", attrVal: "store_raw_ip", label: "Store Raw Client IP in Fingerprints & Logs", val: Boolean(gl.store_raw_ip) })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "enabled", label: t("log.prot_enable"), sub: t("log.prot_enable_sub"), val: prot.enabled })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "log_query_string", label: t("log.prot_query"), sub: t("log.prot_query_sub"), val: prot.log_query_string })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "access_log_stdout", label: t("log.prot_stdout"), val: prot.access_log_stdout })}
           </div>
           <div class="inspector-row" style="margin-top:8px;">
             <label><span>Sample Rate</span><input id="sd-log-sr" type="number" step="0.05" min="0.01" max="1" value="${gl.sample_rate ?? 1.0}" /></label>
@@ -221,6 +228,14 @@ export function createSystemView({ api, store }) {
             <label><span>${esc(t("log.max_disk_mb"))}</span><input id="sd-log-disk" type="number" min="16" value="${Math.max(16, Math.round((seg.max_disk_bytes ?? 536870912) / 1048576))}" /></label>
             <label><span>${esc(t("log.max_summaries"))}</span><input id="sd-log-maxsum" type="number" min="500" value="${seg.max_summaries ?? 50000}" /></label>
             <label><span>${esc(t("log.max_fps"))}</span><input id="sd-log-maxfp" type="number" min="500" value="${seg.max_fingerprints ?? 20000}" /></label>
+            <label><span>${esc(t("log.max_recent"))}</span><input id="sd-log-maxrec" type="number" min="100" max="10000" value="${seg.max_recent_logs ?? 2000}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("log.prot_rps"))}</span><input id="sd-logp-rps" type="number" min="10" max="100000" value="${prot.max_records_per_sec ?? 500}" /></label>
+            <label><span>${esc(t("log.prot_iprps"))}</span><input id="sd-logp-iprps" type="number" min="1" max="50000" value="${prot.max_per_ip_per_sec ?? 20}" /></label>
+            <label><span>${esc(t("log.prot_mbmin"))}</span><input id="sd-logp-mbmin" type="number" min="1" max="512" value="${Math.max(1, Math.round((prot.max_bytes_per_min ?? 8388608) / 1048576))}" /></label>
+            <label><span>${esc(t("log.prot_dedup"))}</span><input id="sd-logp-dedup" type="number" min="0" max="300" value="${prot.dedup_window_secs ?? 10}" /></label>
+            <label><span>${esc(t("log.prot_warn"))}</span><input id="sd-logp-warn" type="number" min="1" max="1000" value="${prot.warn_rate_per_sec ?? 20}" /></label>
           </div>
         </div>
 
@@ -358,13 +373,17 @@ export function createSystemView({ api, store }) {
             retention_hours: 72,
             max_summaries: 50000,
             max_fingerprints: 20000,
+            max_recent_logs: 2000,
           },
+          protection: defaultLogProtectionConfig(),
         };
       }
-      if (!s.global_logger.segment) s.global_logger.segment = { retention_hours: 72 };
+      if (!s.global_logger.segment) s.global_logger.segment = { retention_hours: 72, max_recent_logs: 2000 };
+      if (!s.global_logger.protection) s.global_logger.protection = defaultLogProtectionConfig();
       return s.global_logger;
     };
     wireBinSliders(container, "data-sd-log-bin", (f, v) => store.mutate((s) => { ensureGl(s)[f] = v; }, false));
+    wireBinSliders(container, "data-sd-logp-bin", (f, v) => store.mutate((s) => { ensureGl(s).protection[f] = v; }, false));
     el("sd-log-sr")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).sample_rate = parseNum(ev.target.value, 1.0, 0.01, 1.0); }, false));
     el("sd-log-flush")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.flush_interval_secs = parseNum(ev.target.value, 30, 5); }, false));
     el("sd-log-brec")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_batch_records = parseNum(ev.target.value, 500, 50); }, false));
@@ -373,6 +392,12 @@ export function createSystemView({ api, store }) {
     el("sd-log-disk")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_disk_bytes = parseNum(ev.target.value, 512, 16) * 1048576; }, false));
     el("sd-log-maxsum")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_summaries = parseNum(ev.target.value, 50000, 500); }, false));
     el("sd-log-maxfp")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_fingerprints = parseNum(ev.target.value, 20000, 500); }, false));
+    el("sd-log-maxrec")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).segment.max_recent_logs = parseNum(ev.target.value, 2000, 100, 10000); }, false));
+    el("sd-logp-rps")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.max_records_per_sec = parseNum(ev.target.value, 500, 10, 100000); }, false));
+    el("sd-logp-iprps")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.max_per_ip_per_sec = parseNum(ev.target.value, 20, 1, 50000); }, false));
+    el("sd-logp-mbmin")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.max_bytes_per_min = parseNum(ev.target.value, 8, 1, 512) * 1048576; }, false));
+    el("sd-logp-dedup")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.dedup_window_secs = parseNum(ev.target.value, 10, 0, 300); }, false));
+    el("sd-logp-warn")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.warn_rate_per_sec = parseNum(ev.target.value, 20, 1, 1000); }, false));
 
     const ensureAb = (s) => {
       if (!s.defaults.ingress.abuseipdb) s.defaults.ingress.abuseipdb = defaultAbuseIpDbConfig();

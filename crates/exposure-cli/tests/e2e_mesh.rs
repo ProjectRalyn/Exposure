@@ -979,6 +979,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         SpecialPayload::PullTelemetryResp(snap) => {
             assert!(!snap.summaries.is_empty());
             assert!(
+                !snap.recent_logs.is_empty(),
+                "expected recent URL access logs in Maintainer snapshot"
+            );
+            assert!(
                 snap.fingerprints.iter().any(|f| f.js_verified && f.fp_source == "beacon"),
                 "expected JS-verified beacon fingerprint in Maintainer snapshot"
             );
@@ -1046,6 +1050,52 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         fp_by_canvas["items"].as_array().map(|a| a.len()),
         Some(1),
         "FP search by canvas_hash must find exact browser observation: {fp_by_canvas}"
+    );
+
+    // Verify GET /api/logs returns recorded URL paths, host, method, status, ray_id, action, and log_protection
+    let logs_resp = http_client
+        .get(format!(
+            "http://{panel_addr}/api/logs?window_secs=3600&ip=127.0.0.1"
+        ))
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logs_resp.status(), 200);
+    let logs_json: serde_json::Value = logs_resp.json().await.unwrap();
+    let log_items = logs_json["items"]
+        .as_array()
+        .expect("logs items must be an array");
+    assert!(
+        !log_items.is_empty(),
+        "expected /api/logs to return recent URL logs: {logs_json}"
+    );
+    let cleared_log = log_items
+        .iter()
+        .find(|item| {
+            item["path"].as_str() == Some("/protected")
+                && item["host"].as_str() == Some("pow.test")
+                && item["status"].as_u64() == Some(200)
+        })
+        .unwrap_or_else(|| panic!("expected GET /protected on pow.test in /api/logs: {logs_json}"));
+    assert_eq!(cleared_log["method"].as_str(), Some("GET"));
+    assert!(
+        cleared_log["ray_id"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "expected non-empty ray_id in URL log: {cleared_log}"
+    );
+    assert!(
+        cleared_log["action"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "expected non-empty action in URL log: {cleared_log}"
+    );
+    assert!(
+        logs_json["log_protection"].is_object(),
+        "expected log_protection stats in /api/logs: {logs_json}"
     );
 
     // Verify Preflight bundle CANNOT be replayed as ConfigPush (domain separation!)

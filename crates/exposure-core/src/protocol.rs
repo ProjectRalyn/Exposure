@@ -6,7 +6,7 @@ use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
 use crate::telemetry::{
     AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, LinkStatusSnapshot,
-    MinuteSummary, SessionSummary,
+    LogProtectionStats, MinuteSummary, SessionSummary,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -302,6 +302,8 @@ pub struct NodeStatusSnapshot {
     pub alerts: Vec<AlertRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evilpot: Option<EvilpotNodeReport>,
+    #[serde(default)]
+    pub log_stats: LogProtectionStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -310,6 +312,8 @@ pub struct MaintainerTelemetrySnapshot {
     pub summaries: Vec<MinuteSummary>,
     #[serde(default)]
     pub fingerprints: Vec<FingerprintObservation>,
+    #[serde(default)]
+    pub recent_logs: Vec<SessionSummary>,
     pub certificates: Vec<CertStatusInfo>,
     pub segment_backlog: usize,
     pub merge_latency_ms: f64,
