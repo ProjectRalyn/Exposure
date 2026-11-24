@@ -208,6 +208,23 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             enabled: true,
         },
         WafRuleDescriptor {
+            id: 934150,
+            source: "owasp-crs".into(),
+            file: "REQUEST-934-APPLICATION-ATTACK-GENERIC.conf".into(),
+            category: "ssti".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "Server-Side Template Injection (Jinja/Twig/Mustache/EL arithmetic expression)".into(),
+            targets: vec!["ARGS".into(), "REQUEST_URI".into(), "REQUEST_BODY".into()],
+            operator: "rx".into(),
+            // Detects template-delimiter expressions containing arithmetic (e.g. `{{7*7}}`,
+            // `${7*7}`, `#{7*7}`) which are used to fingerprint SSTI engines via computed output,
+            // while leaving benign variable interpolation like `{{name}}` untouched.
+            pattern: r#"(?i)(?:\{\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}\}|\$\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}|#\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\})"#.into(),
+            tags: vec!["OWASP_CRS".into(), "attack-ssti".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
             id: 941110,
             source: "owasp-crs".into(),
             file: "REQUEST-941-APPLICATION-ATTACK-XSS.conf".into(),

@@ -980,6 +980,19 @@ mod tests {
             )
             .is_block());
 
+        // SSTI arithmetic template expression in query
+        assert!(crs
+            .inspect_head(&cfg, "/render", Some("name={{7*7}}"), &empty)
+            .is_block());
+        assert!(crs
+            .inspect_head(&cfg, "/render", Some("name=${7*7}"), &empty)
+            .is_block());
+        // Benign template interpolation without arithmetic must NOT be flagged
+        assert!(matches!(
+            crs.inspect_head(&cfg, "/render", Some("name={{username}}"), &empty),
+            WafVerdict::Allow
+        ));
+
         // Log4Shell / JNDI in User-Agent
         let mut log4j_hdrs = HeaderMap::new();
         log4j_hdrs.insert(
