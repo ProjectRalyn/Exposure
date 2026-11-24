@@ -1020,6 +1020,9 @@ mod tests {
         // SQLi in form-urlencoded body with `+` spaces
         let form = b"user=admin'+OR+'1'='1'+--&pass=123";
         assert!(crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form).is_block());
+        // Double-equals tautology (`1==1`) in a password field must still be blocked.
+        let form_eq = b"username=zhouyitian2403&password=%27+or+1%3D%3D1+--";
+        assert!(crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form_eq).is_block());
 
         // XXE in XML body
         let xxe = br#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>"#;
@@ -1331,6 +1334,8 @@ mod tests {
             "1 and exists(select * from users)",
             "1\" or \"1\"=\"1",
             "1' %0b or %0b 1=1--",
+            "' or 1==1 --",
+            "1 or 1==1#",
         ];
         for p in payloads {
             let q = format!("q={p}");
@@ -1365,6 +1370,65 @@ mod tests {
                 matches!(crs.inspect_head(&cfg, "/search", Some(&q), &empty), WafVerdict::Allow),
                 "benign phrase falsely flagged: {benign:?}"
             );
+        }
+    }
+
+    #[test]
+    fn blocks_broader_evasion_variants_across_categories() {
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        let empty = HeaderMap::new();
+
+        // (path, query) that must all be blocked. Covers SQLi predicate/operator variants,
+        // comment-obfuscated UNION, XSS event handlers/pseudo-protocol splits, SSRF decimal/hex
+        // encodings, generic NoSQL operators, SSTI globals/ERB and LF-only CRLF injection.
+        let attacks: &[(&str, &str)] = &[
+            ("/", "q=1 or 1 like 1"),
+            ("/", "q=1 or 1 between 0 and 2"),
+            ("/", "q=1 and 1 in (1)"),
+            ("/", "q=1 or '1' regexp '1'"),
+            ("/", "q=1 or(1)=(1)"),
+            ("/", "q=1 || 1=1"),
+            ("/", "q=1 && 1=1"),
+            ("/", "q=1 or null is null"),
+            ("/", "q=1 or 1 is not null"),
+            ("/", "q=1 or not 1=2"),
+            ("/", "q=1 union%23%0aselect 1,2"),
+            ("/", "q=1 /*!50000union*/ select 1"),
+            ("/", "q=1 union /*!50000select*/ 1"),
+            ("/", "q=1'||'1"),
+            ("/", "q=<details open ontoggle=alert(1)>"),
+            ("/", "q=<input autofocus onfocus=alert(1)>"),
+            ("/", "q=<marquee onstart=alert(1)>"),
+            ("/", "q=java\tscript:alert(1)"),
+            ("/", "u=http://2852039166/"),
+            ("/", "u=http://0x7f000001/"),
+            ("/", "u=http://127.1/"),
+            ("/", "u=$where"),
+            ("/", "u[\"$regex\"]=.*"),
+            ("/", "n={{config}}"),
+            ("/", "n={{self}}"),
+            ("/", "n=<%= 7*7 %>"),
+            ("/", "n=%0aSet-Cookie:x=1"),
+        ];
+        for (path, q) in attacks {
+            let v = crs.inspect_head(&cfg, path, Some(*q), &empty);
+            assert!(v.is_block(), "evasion missed: {q:?} => {v:?}");
+        }
+
+        // Benign values that must NOT be blocked by the broadened rules.
+        let benign: &[(&str, &str)] = &[
+            ("/search", "q=either this or that"),
+            ("/search", "q=true or false"),
+            ("/search", "q=cat and dog"),
+            ("/search", "q=order by date"),
+            ("/api", "q=age>=18"),
+            ("/search", "q={{name}}"),
+            ("/profile", "bio=Hello, I like C++ and C#."),
+        ];
+        for (path, q) in benign {
+            let v = crs.inspect_head(&cfg, path, Some(*q), &empty);
+            assert!(matches!(v, WafVerdict::Allow), "benign falsely flagged: {q:?} => {v:?}");
         }
     }
 }

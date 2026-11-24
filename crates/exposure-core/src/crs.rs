@@ -105,7 +105,7 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "HTTP Request Smuggling / CRLF Header Injection".into(),
             targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_HEADERS".into()],
             operator: "rx".into(),
-            pattern: r"(?i)(?:%0d%0a|\r\n)\s*(?:set-cookie|location|content-length|transfer-encoding|http/1\.[01]|x-forwarded-host)\s*:".into(),
+            pattern: r"(?i)(?:%0d%0a|%0a|\r\n|\n)\s*(?:set-cookie|location|content-length|transfer-encoding|http/1\.[01]|x-forwarded-host)\s*:".into(),
             tags: vec!["OWASP_CRS".into(), "attack-protocol".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -175,7 +175,9 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "Server-Side Request Forgery (SSRF): Cloud Metadata or Dangerous Scheme".into(),
             targets: vec!["REQUEST_URI".into(), "ARGS".into(), "REQUEST_BODY".into()],
             operator: "rx".into(),
-            pattern: r"(?i)(?:\b169\.254\.169\.254\b|\bmetadata\.google\.internal\b|\b100\.100\.100\.200\b|\b(?:gopher|dict|file)://)".into(),
+            // Includes decimal/hex/short-form loopback & link-local encodings used to bypass
+            // naive string matching (e.g. `2852039166`, `0xa9fea9fe`, `0x7f000001`, `127.1`).
+            pattern: r"(?i)(?:\b169\.254\.169\.254\b|\b2852039166\b|\b0xa9fea9fe\b|\bmetadata\.google\.internal\b|\b100\.100\.100\.200\b|\b(?:2130706433|0x7f[0-9a-f]{6})\b|\b127(?:\.\d{1,3}){1,3}\b|\b(?:gopher|dict|file)://)".into(),
             tags: vec!["OWASP_CRS".into(), "attack-ssrf".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -203,7 +205,9 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "NoSQL Query Operator Injection ($ne/$gt/$where/$regex)".into(),
             targets: vec!["ARGS".into(), "REQUEST_BODY".into()],
             operator: "rx".into(),
-            pattern: r#"(?i)(?:["']\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists|expr)["']\s*:|\[\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists)\])"#.into(),
+            // Generic operator match also catches unquoted/bracket-quoted forms (`$where`,
+            // `["$regex"]`, `user[$ne]=`).
+            pattern: r#"(?i)(?:["']\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists|expr)["']\s*:|\[\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists)\]|\$(?:ne|gt|gte|lt|lte|nin|regex|where|exists|expr)\b)"#.into(),
             tags: vec!["OWASP_CRS".into(), "attack-nosql".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -220,7 +224,9 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             // Detects template-delimiter expressions containing arithmetic (e.g. `{{7*7}}`,
             // `${7*7}`, `#{7*7}`) which are used to fingerprint SSTI engines via computed output,
             // while leaving benign variable interpolation like `{{name}}` untouched.
-            pattern: r#"(?i)(?:\{\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}\}|\$\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}|#\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\})"#.into(),
+            // Also flags Jinja globals (`{{config}}`/`{{self}}`), dunder access, and ERB
+            // arithmetic (`<%= 7*7 %>`) used to fingerprint SSTI engines.
+            pattern: r#"(?i)(?:\{\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}\}|\$\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}|#\{[^{}\n]*\d\s*[+\-*/%]\s*\d[^{}\n]*\}|\{\{\s*(?:config|self|request|session|lipsum|cycler|joiner|namespace|__class__|__globals__|__builtins__)\b|<%[=\-]?[^%]*[+\-*/%][^%]*%>)"#.into(),
             tags: vec!["OWASP_CRS".into(), "attack-ssti".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -234,7 +240,9 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             msg: "XSS Filter - Category 1: Script Tag / Event Handler / Pseudo-Protocol".into(),
             targets: vec!["ARGS".into(), "REQUEST_URI".into(), "REQUEST_BODY".into(), "REQUEST_COOKIES".into()],
             operator: "rx".into(),
-            pattern: r"(?i)<\s*/?\s*script\b[^>]*>|\bjavascript\s*:|<\s*(?:svg|img|iframe|object|embed|body)\b[^>]*\bon[a-z]+\s*=".into(),
+            // Generic event handler on ANY tag (`<details ontoggle=>`, `<input onfocus=>`,
+            // `<marquee onstart=>`) plus whitespace/control-split `java\tscript:`.
+            pattern: r"(?i)<\s*/?\s*script\b[^>]*>|java\s*script\s*:|<\s*[a-z][a-z0-9]*\b[^>]*\bon[a-z]+\s*=".into(),
             tags: vec!["OWASP_CRS".into(), "attack-xss".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -253,7 +261,7 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             // (`' OR 'a'<'b`), `||` string concatenation tricks (`'||'1'='1`), block-comment
             // obfuscation between operators (`or/**/1=1`), value-then-comment truncation (`' or 1#`),
             // multi-column `ORDER BY`/`GROUP BY` (`order by 1,2,3--`) and `HAVING` tautologies.
-            pattern: r#"(?i)(?:(?:^|[\s'"\x28\x29 0-9])(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:\x28(?:\s|/\*[^*]*\*/|\+)*)?(?:(?:[0-9]+|0x[0-9a-f]+)\s*(?:=|!=|<>|<=|>=|<|>)\s*(?:[0-9]+|0x[0-9a-f]+)|'[^']*'\s*(?:=|!=|<>|<=|>=|<|>|\blike\b)\s*'[^']*(?:'|$|\s|\x29)|"[^"]*"\s*(?:=|!=|<>|<=|>=|<|>|\blike\b)\s*"[^"]*(?:"|$|\s|\x29)|(?:[0-9]+|'[^']*'|"[^"]*")\s*(?:--|#|/\*))|(?:['"\x29]|\d+)(?:\s|/\*[^*]*\*/|\+)+(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:true|false)\b|(?:'[^']*'|')\s*\|{1,2}\s*'[^']*'\s*(?:=|!=|<>|<=|>=|<|>)\s*'[^']*|'\s*(?:--|#|/\*)|\b(?:order|group)\s+by\s+[0-9]+(?:\s*,\s*[0-9]+)*\s*(?:--|#|/\*|$)|\bhaving\s+[0-9]+\s*(?:=|!=|<>|<=|>=|<|>))"#.into(),
+            pattern: r#"(?i)(?:(?:^|[\s'"\x28\x29 0-9])(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:\x28(?:\s|/\*[^*]*\*/|\+)*)?(?:(?:[0-9]+|0x[0-9a-f]+)\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>)\s*(?:[0-9]+|0x[0-9a-f]+)|'[^']*'\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>|\blike\b)\s*'[^']*(?:'|$|\s|\x29)|"[^"]*"\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>|\blike\b)\s*"[^"]*(?:"|$|\s|\x29)|(?:[0-9]+|'[^']*'|"[^"]*")\s*(?:--|#|/\*))|(?:['"\x29]|\d+)(?:\s|/\*[^*]*\*/|\+)+(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:true|false)\b|(?:'[^']*'|')\s*\|{1,2}\s*'[^']*'\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>)\s*'[^']*|'\s*(?:--|#|/\*)|\b(?:order|group)\s+by\s+[0-9]+(?:\s*,\s*[0-9]+)*\s*(?:--|#|/\*|$)|\bhaving\s+[0-9]+\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>)|(?:^|[\s'"\x28\x29 0-9])(?:or|and)(?:\s|/\*[^*]*\*/|\+)*(?:not\s+)?\(?\s*(?:[0-9]+|0x[0-9a-f]+|'[^']*'|"[^"]*"|null|true|false)\s*\)?\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>|\b(?:like|regexp|rlike|between|in|is)\b)|(?:[0-9]+|'[^']*'|"[^"]*")\s*(?:\|\||&&)\s*(?:[0-9]+|'[^']*'|"[^"]*")\s*(?:<=>|<>|!=|<=|>=|={1,3}|<|>)|'\s*\|{1,2}\s*')"#.into(),
             tags: vec!["OWASP_CRS".into(), "attack-sqli".into(), "paranoia-level/1".into()],
             enabled: true,
         },
@@ -269,7 +277,9 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             operator: "rx".into(),
             // Also detects parenthesised / `EXISTS` subquery injection (`1 AND (SELECT ...)`,
             // `AND EXISTS(SELECT ...)`) and comment-obfuscated keywords (`UNION/**/SELECT`).
-            pattern: r"(?i)(?:\bunion[\s/*]+(?:all[\s/*]+|distinct[\s/*]+)?select\b|\b(?:and|or)\s*\(\s*select\b|\bexists\s*\(\s*select\b|\b(?:information_schema|sqlite_master|pg_catalog|mysql\.user)\b|\b(?:sleep|pg_sleep|benchmark|extractvalue|updatexml|load_file)\s*\(|\bwaitfor\s+delay\b)".into(),
+            // Tolerates MySQL versioned comments (`/*!50000union*/`), `#`/newline and mixed
+            // comment separators between UNION [ALL] SELECT.
+            pattern: r"(?i)(?:(?:^|[^a-z])union(?:/\*![0-9]*|\s|/\*[^*]*\*/|[*#/+])+(?:all(?:/\*![0-9]*|\s|/\*[^*]*\*/|[*#/+])+|distinct(?:/\*![0-9]*|\s|/\*[^*]*\*/|[*#/+])+)?select\b|\b(?:and|or)\s*\(\s*select\b|\bexists\s*\(\s*select\b|\b(?:information_schema|sqlite_master|pg_catalog|mysql\.user)\b|\b(?:sleep|pg_sleep|benchmark|extractvalue|updatexml|load_file)\s*\(|\bwaitfor\s+delay\b)".into(),
             tags: vec!["OWASP_CRS".into(), "attack-sqli".into(), "paranoia-level/1".into()],
             enabled: true,
         },
