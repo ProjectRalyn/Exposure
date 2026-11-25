@@ -15,15 +15,15 @@ use exposure_core::crypto::{
 use exposure_core::protocol::{
     dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, dns_manage_req_signing_bytes,
     dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes, pull_telemetry_req_signing_bytes,
-    read_json_frame, unban_req_signing_bytes, write_json_frame, DnsLineSyncEntry, DnsManageOp,
-    DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult,
-    DnsSyncRecordSpec, MaintainerTelemetrySnapshot, NodeStatusSnapshot, SpecialFrame,
-    SpecialPayload, StreamKind,
+    query_maintainer_req_signing_bytes, read_json_frame, unban_req_signing_bytes, write_json_frame,
+    DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine,
+    DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerQuery, MaintainerTelemetrySnapshot,
+    NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
     AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, GeoIpStatusSnapshot,
-    LinkStatusSnapshot, LogProtectionStats, MinuteSummary, SessionSummary,
+    LinkStatusSnapshot, LogProtectionStats, MaintainerStorageStats, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
@@ -57,6 +57,17 @@ pub struct MaintainerHealthInfo {
     pub segment_backlog: usize,
     #[serde(default)]
     pub merge_latency_ms: f64,
+    #[serde(default)]
+    pub storage_stats: Option<MaintainerStorageStats>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeployReleaseResult {
+    pub release_seq: u64,
+    pub revision: String,
+    pub revision_full: String,
+    pub parent_revision: Option<String>,
+    pub results: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -617,11 +628,27 @@ impl ControlClient {
         purpose: ConfigBundlePurpose,
         ttl_secs: i64,
     ) -> Result<SignedConfigBundle> {
+        let rev = config.config_revision.clone();
+        self.sign_config_bundle_with_revision(node_tag, sequence, &rev, config, purpose, ttl_secs)
+    }
+
+    /// Sign a `NodeConfig` with an explicit Git-style cluster `config_revision`.
+    pub fn sign_config_bundle_with_revision(
+        &self,
+        node_tag: &str,
+        sequence: u64,
+        config_revision: &str,
+        mut config: NodeConfig,
+        purpose: ConfigBundlePurpose,
+        ttl_secs: i64,
+    ) -> Result<SignedConfigBundle> {
+        config.config_revision = config_revision.to_string();
         let now = Utc::now().timestamp();
         let mut bundle = SignedConfigBundle {
             purpose,
             node_tag: node_tag.to_string(),
             sequence,
+            config_revision: config_revision.to_string(),
             min_sequence: sequence,
             issued_at: now,
             expires_at: now + ttl_secs,
@@ -817,13 +844,15 @@ impl ControlClient {
         }
     }
 
-    pub async fn push_node_config(
+    async fn send_config_push_with_seq(
         &self,
         actor: &str,
         topo: &TopologySpec,
         node_tag: &str,
         cfg: NodeConfig,
-    ) -> Result<u64> {
+        seq: u64,
+        revision: Option<&str>,
+    ) -> Result<()> {
         let push_lock = self
             .node_push_locks
             .entry(node_tag.to_string())
@@ -835,21 +864,29 @@ impl ControlClient {
             .active_bootstrap_tag()
             .await
             .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
-        let hops = compute_control_hops(&self.cfg.control_id, &boot, node_tag, topo).ok_or_else(
-            || {
+        let hops = compute_control_hops(&self.cfg.control_id, &boot, node_tag, topo)
+            .or_else(|| {
+                if node_tag == boot {
+                    Some(vec![self.cfg.control_id.clone(), boot.clone()])
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
                 ExposureError::Routing(format!(
                     "no hop path from bootstrap '{boot}' to '{node_tag}'"
                 ))
-            },
-        )?;
+            })?;
 
-        let cfg_json = serde_json::to_string(&cfg)
-            .map_err(|e| ExposureError::Config(format!("serialize node config: {e}")))?;
-        let (seq, ver_id) = self
-            .db
-            .allocate_and_record_config_version(node_tag, &cfg_json)
-            .await?;
-        let bundle = self.sign_config_bundle(node_tag, seq, cfg)?;
+        let rev_str = revision.unwrap_or("");
+        let bundle = self.sign_config_bundle_with_revision(
+            node_tag,
+            seq,
+            rev_str,
+            cfg,
+            ConfigBundlePurpose::Apply,
+            3600,
+        )?;
 
         let frame = SpecialFrame::new(
             Uuid::new_v4().to_string(),
@@ -857,6 +894,12 @@ impl ControlClient {
             16,
             SpecialPayload::ConfigPush(Box::new(bundle)),
         );
+
+        let rev_label = if rev_str.is_empty() {
+            format!("seq={seq}")
+        } else {
+            format!("seq={seq} rev={rev_str}")
+        };
 
         match self.send_special_rpc(frame, Duration::from_secs(10)).await {
             Ok(SpecialFrame {
@@ -869,16 +912,19 @@ impl ControlClient {
                     },
                 ..
             }) if ack_node == node_tag && ack_seq == seq => {
+                if revision.is_some() {
+                    let _ = self
+                        .db
+                        .update_release_node_status(seq, node_tag, "applied", None)
+                        .await;
+                }
                 self.db
-                    .update_config_version_status(ver_id, "applied")
+                    .set_node_reload_result(node_tag, seq, revision, true, None)
                     .await?;
                 self.db
-                    .set_node_reload_result(node_tag, seq, true, None)
-                    .await?;
-                self.db
-                    .append_audit(actor, "config_push", node_tag, true, &format!("seq={seq}"))
+                    .append_audit(actor, "config_push", node_tag, true, &rev_label)
                     .await;
-                Ok(seq)
+                Ok(())
             }
             Ok(SpecialFrame {
                 payload:
@@ -887,15 +933,19 @@ impl ControlClient {
                         sequence: ack_seq,
                         applied: false,
                         error,
+                        ..
                     },
                 ..
             }) if ack_node == node_tag && ack_seq == seq => {
                 let err_s = error.unwrap_or_else(|| "node rejected config".into());
+                if revision.is_some() {
+                    let _ = self
+                        .db
+                        .update_release_node_status(seq, node_tag, "failed", Some(&err_s))
+                        .await;
+                }
                 self.db
-                    .update_config_version_status(ver_id, "failed")
-                    .await?;
-                self.db
-                    .set_node_reload_result(node_tag, seq, false, Some(&err_s))
+                    .set_node_reload_result(node_tag, seq, revision, false, Some(&err_s))
                     .await?;
                 self.db
                     .append_audit(actor, "config_push", node_tag, false, &err_s)
@@ -903,9 +953,12 @@ impl ControlClient {
                 Err(ExposureError::Config(err_s))
             }
             Err(e) => {
-                self.db
-                    .update_config_version_status(ver_id, "failed")
-                    .await?;
+                if revision.is_some() {
+                    let _ = self
+                        .db
+                        .update_release_node_status(seq, node_tag, "failed", Some(&e.to_string()))
+                        .await;
+                }
                 self.db
                     .append_audit(actor, "config_push", node_tag, false, &e.to_string())
                     .await;
@@ -913,15 +966,341 @@ impl ControlClient {
             }
             _ => {
                 let err_s = "unexpected reply to ConfigPush";
-                self.db
-                    .update_config_version_status(ver_id, "failed")
-                    .await?;
+                if revision.is_some() {
+                    let _ = self
+                        .db
+                        .update_release_node_status(seq, node_tag, "failed", Some(err_s))
+                        .await;
+                }
                 self.db
                     .append_audit(actor, "config_push", node_tag, false, err_s)
                     .await;
                 Err(ExposureError::Protocol(err_s.into()))
             }
         }
+    }
+
+    pub async fn push_node_config(
+        &self,
+        actor: &str,
+        topo: &TopologySpec,
+        node_tag: &str,
+        cfg: NodeConfig,
+    ) -> Result<u64> {
+        let cfg_json = serde_json::to_string(&cfg)
+            .map_err(|e| ExposureError::Config(format!("serialize node config: {e}")))?;
+        let (seq, ver_id) = self
+            .db
+            .allocate_and_record_config_version(node_tag, &cfg_json)
+            .await?;
+        let res = self
+            .send_config_push_with_seq(actor, topo, node_tag, cfg, seq, None)
+            .await;
+        let _ = self
+            .db
+            .update_config_version_status(ver_id, if res.is_ok() { "applied" } else { "failed" })
+            .await;
+        res.map(|()| seq)
+    }
+
+    /// Deploy a single global Git-style `(release_seq, revision)` to all compiled nodes concurrently.
+    pub async fn deploy_topology_release(
+        self: &Arc<Self>,
+        actor: &str,
+        topology_yaml: &str,
+        topo: &TopologySpec,
+        compiled: BTreeMap<String, NodeConfig>,
+        trigger_kind: &str,
+        message: &str,
+    ) -> Result<DeployReleaseResult> {
+        let target_nodes: Vec<String> = compiled.keys().cloned().collect();
+        let crs_version = self.active_crs_snapshot().await.version.clone();
+        let rel = self
+            .db
+            .allocate_release(
+                trigger_kind,
+                message,
+                topology_yaml,
+                &crs_version,
+                actor,
+                &target_nodes,
+            )
+            .await?;
+
+        let mut futs = FuturesUnordered::new();
+        for (tag, cfg) in compiled {
+            let client = Arc::clone(self);
+            let topo_c = topo.clone();
+            let rev = rel.revision.clone();
+            let seq = rel.release_seq;
+            let actor_s = actor.to_string();
+            futs.push(tokio::spawn(async move {
+                let res = client
+                    .send_config_push_with_seq(&actor_s, &topo_c, &tag, cfg, seq, Some(&rev))
+                    .await;
+                (tag, res)
+            }));
+        }
+
+        let mut results = Vec::new();
+        while let Some(joined) = futs.next().await {
+            if let Ok((tag, res)) = joined {
+                match res {
+                    Ok(()) => results.push(serde_json::json!({
+                        "node_tag": tag,
+                        "ok": true,
+                        "sequence": rel.release_seq,
+                        "revision": rel.revision,
+                    })),
+                    Err(e) => results.push(serde_json::json!({
+                        "node_tag": tag,
+                        "ok": false,
+                        "sequence": rel.release_seq,
+                        "revision": rel.revision,
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+        }
+        results.sort_by(|a, b| a["node_tag"].as_str().cmp(&b["node_tag"].as_str()));
+
+        Ok(DeployReleaseResult {
+            release_seq: rel.release_seq,
+            revision: rel.revision,
+            revision_full: rel.revision_full,
+            parent_revision: rel.parent_revision,
+            results,
+        })
+    }
+
+    /// Push to a single node, reusing the latest cluster release's `(release_seq, revision)`
+    /// if the node is behind (`node.config_seq < latest.release_seq`) and the topology/CRS matches.
+    pub async fn push_single_node_latest(
+        self: &Arc<Self>,
+        actor: &str,
+        topo: &TopologySpec,
+        topology_yaml: &str,
+        node_tag: &str,
+        cfg: NodeConfig,
+        is_custom_override: bool,
+    ) -> Result<(u64, String)> {
+        let cur_crs_ver = self.active_crs_snapshot().await.version.clone();
+        if !is_custom_override {
+            if let Ok(Some(latest)) = self.db.get_latest_config_release().await {
+                if latest.topology_yaml.trim() == topology_yaml.trim()
+                    && latest.crs_version == cur_crs_ver
+                {
+                    let node_seq = self
+                        .db
+                        .get_node(node_tag)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|n| n.config_seq)
+                        .unwrap_or(0);
+                    if node_seq < latest.release_seq {
+                        self.send_config_push_with_seq(
+                            actor,
+                            topo,
+                            node_tag,
+                            cfg,
+                            latest.release_seq,
+                            Some(&latest.revision),
+                        )
+                        .await?;
+                        return Ok((latest.release_seq, latest.revision));
+                    }
+                }
+            }
+        }
+
+        let rel = self
+            .db
+            .allocate_release(
+                "single_node",
+                &format!("Push config to {node_tag}"),
+                topology_yaml,
+                &cur_crs_ver,
+                actor,
+                &[node_tag.to_string()],
+            )
+            .await?;
+        self.send_config_push_with_seq(
+            actor,
+            topo,
+            node_tag,
+            cfg,
+            rel.release_seq,
+            Some(&rel.revision),
+        )
+        .await?;
+        Ok((rel.release_seq, rel.revision))
+    }
+
+    /// Rollback cluster topology to a historical Git revision or release sequence by creating a new forward revert release.
+    pub async fn rollback_to_release(
+        self: &Arc<Self>,
+        actor: &str,
+        rev_or_seq: &str,
+    ) -> Result<DeployReleaseResult> {
+        let target = self
+            .db
+            .get_config_release(rev_or_seq)
+            .await?
+            .ok_or_else(|| {
+                ExposureError::Config(format!("config release '{rev_or_seq}' not found"))
+            })?;
+        let (topo, report, compiled) = self
+            .compile_yaml_and_provision(&target.topology_yaml)
+            .await?;
+        if !report.valid {
+            return Err(ExposureError::Config(format!(
+                "rollback target '{}' no longer compiles cleanly: {}",
+                target.revision,
+                report.errors.join("; ")
+            )));
+        }
+        self.db.set_topology_yaml(&target.topology_yaml).await?;
+        *self.cached_topology.write().await = None;
+
+        let msg = format!("Rollback to {}", target.revision);
+        let deploy = self
+            .deploy_topology_release(
+                actor,
+                &target.topology_yaml,
+                &topo,
+                compiled,
+                "rollback",
+                &msg,
+            )
+            .await?;
+        self.db
+            .append_audit(
+                actor,
+                "config_rollback",
+                &target.revision,
+                true,
+                &format!("created release #{} rev={}", deploy.release_seq, deploy.revision),
+            )
+            .await;
+        Ok(deploy)
+    }
+
+    /// Query all reachable Maintainer nodes concurrently using Control-signed `QueryMaintainerReq`.
+    pub async fn query_maintainers(
+        self: &Arc<Self>,
+        query: MaintainerQuery,
+    ) -> Vec<(String, Result<serde_json::Value>)> {
+        let Some(boot) = self.active_bootstrap_tag().await else {
+            return Vec::new();
+        };
+        let topo = self
+            .cached_topology_spec()
+            .await
+            .unwrap_or_else(|_| Arc::new(TopologySpec::default()));
+
+        let mut tags: BTreeSet<String> = topo
+            .nodes
+            .iter()
+            .filter(|(_, spec)| spec.roles.maintainer)
+            .map(|(tag, _)| tag.clone())
+            .collect();
+        if let Ok(db_nodes) = self.db.list_nodes().await {
+            for n in db_nodes {
+                if n.roles.iter().any(|r| r == "maintainer") {
+                    tags.insert(n.node_tag);
+                }
+            }
+        }
+        if tags.is_empty() {
+            return Vec::new();
+        }
+
+        let mut futs = FuturesUnordered::new();
+        for tag in tags {
+            let Some(hops) = compute_control_hops(&self.cfg.control_id, &boot, &tag, &topo)
+                .or_else(|| {
+                    if tag == boot {
+                        Some(vec![self.cfg.control_id.clone(), boot.clone()])
+                    } else {
+                        None
+                    }
+                })
+            else {
+                continue;
+            };
+            let this = Arc::clone(self);
+            let q = query.clone();
+            futs.push(tokio::spawn(async move {
+                let now = Utc::now().timestamp();
+                let expires_at = now + 60;
+                let request_id = Uuid::new_v4().to_string();
+                let signing = query_maintainer_req_signing_bytes(
+                    &request_id,
+                    now,
+                    expires_at,
+                    &tag,
+                    &q,
+                );
+                let control_signature = this.signing_kp.sign_b64(&signing);
+                let frame = SpecialFrame::new(
+                    Uuid::new_v4().to_string(),
+                    hops,
+                    16,
+                    SpecialPayload::QueryMaintainerReq {
+                        request_id: request_id.clone(),
+                        issued_at: now,
+                        expires_at,
+                        maintainer_tag: tag.clone(),
+                        query: q,
+                        control_signature,
+                    },
+                );
+                let res = match this.send_special_rpc(frame, Duration::from_secs(10)).await {
+                    Ok(SpecialFrame {
+                        payload:
+                            SpecialPayload::QueryMaintainerResp {
+                                request_id: resp_id,
+                                ok,
+                                data,
+                                error,
+                                ..
+                            },
+                        ..
+                    }) => {
+                        if resp_id != request_id {
+                            Err(ExposureError::Protocol(
+                                "QueryMaintainerResp request_id mismatch".into(),
+                            ))
+                        } else if ok {
+                            Ok(data)
+                        } else {
+                            Err(ExposureError::Storage(
+                                error.unwrap_or_else(|| "maintainer query rejected".into()),
+                            ))
+                        }
+                    }
+                    Ok(SpecialFrame {
+                        payload: SpecialPayload::ErrorReply { message },
+                        ..
+                    }) => Err(ExposureError::Storage(message)),
+                    Ok(_) => Err(ExposureError::Protocol(
+                        "unexpected reply to QueryMaintainerReq".into(),
+                    )),
+                    Err(e) => Err(e),
+                };
+                (tag, res)
+            }));
+        }
+
+        let mut out = Vec::new();
+        while let Some(joined) = futs.next().await {
+            if let Ok(item) = joined {
+                out.push(item);
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Run bounded multi-hop BFS Discovery starting from the connected bootstrap tunnel Node (DESIGN.md §9.4).
@@ -964,6 +1343,7 @@ impl ControlClient {
                             roles,
                             public_key,
                             config_sequence,
+                            config_revision,
                             neighbors,
                             signature,
                         },
@@ -1009,6 +1389,10 @@ impl ControlClient {
                             .await;
                         continue;
                     }
+                    let _ = self
+                        .db
+                        .sync_node_reported_version(&node_tag, config_sequence, &config_revision)
+                        .await;
                     discovered += 1;
 
                     if hops.len() < MAX_DISCOVERY_DEPTH {
@@ -1103,11 +1487,17 @@ impl ControlClient {
                             .db
                             .upsert_node_if_unpinned(&tag, "", &snap.roles, true)
                             .await;
+                        let rev_opt = if snap.config_revision.trim().is_empty() {
+                            None
+                        } else {
+                            Some(snap.config_revision.as_str())
+                        };
                         let _ = this
                             .db
                             .set_node_reload_result(
                                 &tag,
                                 snap.config_sequence,
+                                rev_opt,
                                 snap.last_reload_ok,
                                 snap.last_reload_error.as_deref(),
                             )
@@ -1210,12 +1600,14 @@ impl ControlClient {
                         segment_backlog,
                         merge_latency_ms,
                         alerts: m_alerts,
+                        storage_stats,
                     })) => {
                         succeeded_maintainers.insert(maintainer_tag.clone());
                         cache.maintainers.push(MaintainerHealthInfo {
                             maintainer_tag,
                             segment_backlog,
                             merge_latency_ms,
+                            storage_stats,
                         });
                         for s in summaries {
                             let key = (
@@ -2184,6 +2576,20 @@ impl ControlClient {
             && results
                 .iter()
                 .all(|r| r["ok"].as_bool().unwrap_or(false));
+
+        if !succeeded_nodes.is_empty() {
+            let unbanned_at_unix = Utc::now().timestamp().max(0) as u64;
+            let _ = self
+                .query_maintainers(MaintainerQuery::MarkUnbanned {
+                    node_tag: node_tag.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    ban_kind: kind_norm.clone(),
+                    target: clean_target.clone(),
+                    actor: actor.to_string(),
+                    unbanned_at_unix,
+                })
+                .await;
+        }
+
         self.db
             .append_audit(
                 actor,

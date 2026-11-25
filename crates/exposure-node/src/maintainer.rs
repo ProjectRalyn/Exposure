@@ -1,10 +1,9 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::BufReader;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
@@ -15,21 +14,16 @@ use exposure_core::config::{
 use exposure_core::crypto::{validate_dns_domain, write_secret_file_atomic, NodeKeyPair};
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities,
-    DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult, DnsSyncRecordSpec,
+    DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerQuery,
     MaintainerTelemetrySnapshot, SpecialFrame, SpecialPayload,
 };
 use exposure_core::routing::is_public_routable_ip;
-use exposure_core::segment::{
-    list_recent_segment_files, read_json_snapshot, read_segment_file, write_json_snapshot_atomic,
-    SegmentWriter,
-};
 use exposure_core::telemetry::{
-    is_cache_served_status, is_security_block_action, AlertRecord, CertStatusInfo,
+    AlertRecord, BanRecord, CertStatusInfo, EvilpotEventInfo, EvilpotSessionInfo,
     FingerprintObservation, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio::sync::{watch, Mutex, RwLock};
@@ -37,10 +31,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::forwarder::Forwarder;
+use crate::maintainer_db::MaintainerDb;
 use crate::tls::generate_self_signed_pem;
 
-const MAX_MERGED_SUMMARIES: usize = 50_000;
-const MAX_MERGED_FINGERPRINTS: usize = 20_000;
 const EXEC_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
 const ALIDNS_API_VERSION: &str = "2015-01-09";
@@ -495,278 +488,27 @@ pub(crate) fn parse_x509_not_after_unix(cert_pem: &str) -> Option<i64> {
 }
 
 /// Maintainer Mode Service (DESIGN.md §4, §12, §13):
-/// - Aggregation logger: merges per-(node, minute, service) summaries via counter sums, HLL union,
-///   and fixed-bucket latency histogram addition, writing merged segments asynchronously via `spawn_blocking`.
+/// - Embedded SQLite WAL observability store (`maintainer-{tag}.db`): stores access logs,
+///   per-minute traffic/latency summaries, visitor fingerprints, persistent Evilpot sessions/events,
+///   AutoBan history, and cluster alerts with configurable per-type retention & size caps.
 /// - ACME DNS01 certificate lifecycle (Cloudflare, Aliyun DNS, HTTPS-only SSRF-checked Webhook, timeout-bounded Exec Hook),
 ///   signing bundles per target node with Maintainer's Ed25519 key and distributing along Hop tables.
 pub struct MaintainerService {
     node_tag: String,
     cfg: Arc<RwLock<MaintainerConfig>>,
-    merged_summaries: Arc<Mutex<HashMap<(i64, String, String, String), MinuteSummary>>>,
-    merged_fingerprints: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
-    recent_logs: Arc<Mutex<VecDeque<SessionSummary>>>,
-    segment_writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
+    db: Arc<RwLock<Arc<MaintainerDb>>>,
+    db_dir: Arc<RwLock<String>>,
     cert_statuses: Arc<Mutex<HashMap<String, CertStatusInfo>>>,
-    alerts: Arc<Mutex<Vec<AlertRecord>>>,
     last_merge_latency_ms: Arc<Mutex<f64>>,
     http_client: reqwest::Client,
     shutdown_tx: watch::Sender<bool>,
-    state_dirty: AtomicBool,
-    last_state_persist: Mutex<Instant>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct MaintainerPersistedState {
-    #[serde(default)]
-    summaries: Vec<MinuteSummary>,
-    #[serde(default)]
-    fingerprints: Vec<FingerprintObservation>,
-    #[serde(default)]
-    recent_logs: Vec<SessionSummary>,
-    #[serde(default)]
-    alerts: Vec<AlertRecord>,
-}
-
-fn maintainer_state_path(dir: &str, node_tag: &str) -> PathBuf {
-    let safe: String = node_tag
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
-        .take(64)
-        .collect();
-    let name = if safe.is_empty() || safe.contains("..") {
-        "maintainer".to_string()
-    } else {
-        safe
-    };
-    PathBuf::from(dir).join(format!("maintainer-state-{name}.json"))
-}
-
-fn prune_summaries_map(
-    map: &mut HashMap<(i64, String, String, String), MinuteSummary>,
-    min_cutoff: i64,
-    max_allowed: i64,
-    max_entries: usize,
-) {
-    map.retain(|(min, _, _, _), _| *min >= min_cutoff && *min <= max_allowed);
-    if map.len() > max_entries {
-        let mut keys: Vec<_> = map.keys().cloned().collect();
-        keys.sort_by_key(|(min, _, _, _)| *min);
-        let to_drop = map.len().saturating_sub(max_entries);
-        for k in keys.into_iter().take(to_drop) {
-            map.remove(&k);
-        }
-    }
-}
-
-fn prune_fingerprints_map(
-    map: &mut HashMap<String, FingerprintObservation>,
-    min_cutoff: i64,
-    max_allowed: i64,
-    max_entries: usize,
-) {
-    map.retain(|_, v| v.last_seen_ts >= min_cutoff && v.last_seen_ts <= max_allowed);
-    if map.len() > max_entries {
-        let mut entries: Vec<(String, i64)> =
-            map.iter().map(|(k, v)| (k.clone(), v.last_seen_ts)).collect();
-        entries.sort_by_key(|(_, ts)| *ts);
-        let to_drop = map.len().saturating_sub(max_entries);
-        for (k, _) in entries.into_iter().take(to_drop) {
-            map.remove(&k);
-        }
-    }
 }
 
 impl MaintainerService {
     pub fn new(node_tag: impl Into<String>, cfg: MaintainerConfig) -> Result<Arc<Self>> {
         let tag = node_tag.into();
-        let writer = SegmentWriter::new(cfg.logger.segment.clone(), format!("maintainer-{tag}"))?;
-
-        // Restore persisted aggregated summaries, fingerprints, and alerts across restarts
-        let now_ts = Utc::now().timestamp();
-        let retention_hours = cfg.logger.segment.retention_hours.max(1);
-        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
-        let max_allowed = now_ts.saturating_add(300);
-        let max_summaries = cfg.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES);
-        let max_fps = cfg
-            .logger
-            .segment
-            .max_fingerprints
-            .clamp(100, MAX_MERGED_FINGERPRINTS);
-        let max_recent_logs = cfg.logger.segment.max_recent_logs.clamp(100, 10_000);
-
-        let mut init_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
-            HashMap::new();
-        let mut init_fps: HashMap<String, FingerprintObservation> = HashMap::new();
-        let mut init_recent_logs: VecDeque<SessionSummary> = VecDeque::new();
-        let mut init_alerts: Vec<AlertRecord> = Vec::new();
-
-        let state_path = maintainer_state_path(&cfg.logger.segment.dir, &tag);
-        match read_json_snapshot::<MaintainerPersistedState>(&state_path) {
-            Ok(Some(st)) => {
-                for s in st.summaries {
-                    if s.minute_epoch >= min_cutoff
-                        && s.minute_epoch <= max_allowed
-                        && s.uv_hll.is_valid()
-                    {
-                        let key = (
-                            s.minute_epoch,
-                            s.node_tag.clone(),
-                            s.role.clone(),
-                            s.service_tag.clone(),
-                        );
-                        init_summaries
-                            .entry(key)
-                            .and_modify(|e| e.merge_from(&s))
-                            .or_insert(s);
-                    }
-                }
-                for mut fp in st.fingerprints {
-                    if fp.last_seen_ts >= min_cutoff && fp.last_seen_ts <= max_allowed {
-                        if !cfg.logger.store_raw_ip {
-                            fp.client_ip = None;
-                        }
-                        fp.sanitize();
-                        if !cfg.logger.store_raw_ip {
-                            if let Some(ref mut js) = fp.js_fp {
-                                js.mask_raw_ips();
-                            }
-                        }
-                        if !fp.id.is_empty() {
-                            init_fps
-                                .entry(fp.id.clone())
-                                .and_modify(|e| e.merge_from(&fp))
-                                .or_insert(fp);
-                        }
-                    }
-                }
-                for mut rec in st.recent_logs {
-                    let rec_sec = rec.timestamp_ms / 1000;
-                    if rec_sec >= min_cutoff && rec_sec <= max_allowed {
-                        if !cfg.logger.store_raw_ip {
-                            rec.raw_ip = None;
-                        }
-                        rec.sanitize();
-                        if init_recent_logs.len() >= max_recent_logs {
-                            init_recent_logs.pop_front();
-                        }
-                        init_recent_logs.push_back(rec);
-                    }
-                }
-                init_alerts = st.alerts.into_iter().take(200).collect();
-                prune_summaries_map(&mut init_summaries, min_cutoff, max_allowed, max_summaries);
-                prune_fingerprints_map(&mut init_fps, min_cutoff, max_allowed, max_fps);
-                info!(
-                    node = %tag,
-                    summaries = init_summaries.len(),
-                    fingerprints = init_fps.len(),
-                    recent_logs = init_recent_logs.len(),
-                    "restored persisted maintainer telemetry state from disk"
-                );
-            }
-            Ok(None) => {
-                // Fallback: replay newest <=64 `.seg.jsonl` segment files if no state checkpoint exists yet
-                let seg_files = list_recent_segment_files(
-                    Path::new(&cfg.logger.segment.dir),
-                    &format!("maintainer-{tag}"),
-                    retention_hours,
-                );
-                let skip = seg_files.len().saturating_sub(64);
-                for path in seg_files.into_iter().skip(skip) {
-                    if let Ok(rows) = read_segment_file::<SessionSummary>(&path) {
-                        for mut rec in rows {
-                            let min_epoch = ((rec.timestamp_ms / 1000) / 60) * 60;
-                            if min_epoch < min_cutoff || min_epoch > max_allowed {
-                                continue;
-                            }
-                            if !cfg.logger.store_raw_ip {
-                                rec.raw_ip = None;
-                            }
-                            rec.sanitize();
-                            let key = (
-                                min_epoch,
-                                rec.node_tag.clone(),
-                                rec.role.clone(),
-                                rec.service_tag.clone(),
-                            );
-                            let entry = init_summaries.entry(key).or_insert_with(|| {
-                                MinuteSummary::new(
-                                    min_epoch,
-                                    &rec.node_tag,
-                                    &rec.role,
-                                    &rec.service_tag,
-                                    cfg.logger.hll_precision,
-                                    cfg.logger.hll_seed,
-                                    cfg.logger.histogram_buckets_ms.clone(),
-                                )
-                            });
-                            let reps = rec.repeat_count.clamp(1, 100_000) as u64;
-                            entry.record(&rec);
-                            if reps > 1 {
-                                let extra = reps - 1;
-                                entry.requests = entry.requests.saturating_add(extra);
-                                if rec.status >= 500 {
-                                    entry.errors = entry.errors.saturating_add(extra);
-                                }
-                                if rec.rate_limited {
-                                    entry.rate_limited = entry.rate_limited.saturating_add(extra);
-                                }
-                                if rec.challenged {
-                                    entry.challenges_issued =
-                                        entry.challenges_issued.saturating_add(extra);
-                                } else if !rec.rate_limited
-                                    && rec.status < 500
-                                    && is_security_block_action(rec.action.as_deref())
-                                {
-                                    entry.blocked = entry.blocked.saturating_add(extra);
-                                }
-                                if rec.challenge_passed {
-                                    entry.challenges_passed =
-                                        entry.challenges_passed.saturating_add(extra);
-                                }
-                                if rec.client_fp_verified {
-                                    entry.client_fp_verified =
-                                        entry.client_fp_verified.saturating_add(extra);
-                                }
-                                entry.bytes_in =
-                                    entry.bytes_in.saturating_add(rec.bytes_in.saturating_mul(extra));
-                                entry.bytes_out =
-                                    entry.bytes_out.saturating_add(rec.bytes_out.saturating_mul(extra));
-                                if is_cache_served_status(rec.cache_status.as_deref()) {
-                                    entry.cached_requests =
-                                        entry.cached_requests.saturating_add(extra);
-                                    entry.cached_bytes_out = entry
-                                        .cached_bytes_out
-                                        .saturating_add(rec.bytes_out.saturating_mul(extra));
-                                }
-                                if let Some(ref d) = rec.device_type {
-                                    if let Some(c) = entry.device_counts.get_mut(d) {
-                                        *c = c.saturating_add(extra);
-                                    }
-                                }
-                                if let Some(ref b) = rec.browser_family {
-                                    if let Some(c) = entry.browser_counts.get_mut(b) {
-                                        *c = c.saturating_add(extra);
-                                    }
-                                }
-                                if let Some(ref o) = rec.os_family {
-                                    if let Some(c) = entry.os_counts.get_mut(o) {
-                                        *c = c.saturating_add(extra);
-                                    }
-                                }
-                            }
-                            if init_recent_logs.len() >= max_recent_logs {
-                                init_recent_logs.pop_front();
-                            }
-                            init_recent_logs.push_back(rec);
-                        }
-                    }
-                }
-                prune_summaries_map(&mut init_summaries, min_cutoff, max_allowed, max_summaries);
-            }
-            Err(e) => {
-                warn!(path = %state_path.display(), error = %e, "failed to load persisted maintainer state; starting fresh");
-            }
-        }
+        let db_dir = cfg.logger.segment.dir.clone();
+        let db = MaintainerDb::open(&db_dir, &tag)?;
 
         let mut cert_map = HashMap::new();
         for order in &cfg.acme.orders {
@@ -791,17 +533,12 @@ impl MaintainerService {
         Ok(Arc::new(Self {
             node_tag: tag,
             cfg: Arc::new(RwLock::new(cfg)),
-            merged_summaries: Arc::new(Mutex::new(init_summaries)),
-            merged_fingerprints: Arc::new(Mutex::new(init_fps)),
-            recent_logs: Arc::new(Mutex::new(init_recent_logs)),
-            segment_writer: Arc::new(StdMutex::new(writer)),
+            db: Arc::new(RwLock::new(db)),
+            db_dir: Arc::new(RwLock::new(db_dir)),
             cert_statuses: Arc::new(Mutex::new(cert_map)),
-            alerts: Arc::new(Mutex::new(init_alerts)),
             last_merge_latency_ms: Arc::new(Mutex::new(0.0)),
             http_client,
             shutdown_tx,
-            state_dirty: AtomicBool::new(false),
-            last_state_persist: Mutex::new(Instant::now()),
         }))
     }
 
@@ -809,18 +546,20 @@ impl MaintainerService {
         let _ = self.shutdown_tx.send(true);
     }
 
+    async fn current_db(&self) -> Arc<MaintainerDb> {
+        Arc::clone(&*self.db.read().await)
+    }
+
     pub async fn update_config(&self, cfg: MaintainerConfig) -> Result<()> {
-        let writer = Arc::clone(&self.segment_writer);
-        let seg_cfg = cfg.logger.segment.clone();
-        let prefix = format!("maintainer-{}", self.node_tag);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = w.flush();
-            *w = SegmentWriter::new(seg_cfg, prefix)?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ExposureError::Storage(format!("maintainer update join: {e}")))??;
+        let new_dir = cfg.logger.segment.dir.clone();
+        let dir_changed = { *self.db_dir.read().await != new_dir };
+        if dir_changed {
+            let old_db = self.current_db().await;
+            let _ = old_db.checkpoint_wal().await;
+            let new_db = MaintainerDb::open(&new_dir, &self.node_tag)?;
+            *self.db.write().await = new_db;
+            *self.db_dir.write().await = new_dir;
+        }
 
         {
             let mut cs = self.cert_statuses.lock().await;
@@ -845,258 +584,229 @@ impl MaintainerService {
         Ok(())
     }
 
-    /// Merge incoming LogBatch from an authenticated Node (bounded timestamps, bounded maps, respects `store_raw_ip` & retention).
+    /// Merge incoming LogBatch from an authenticated Node into Maintainer's SQLite WAL database.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ingest_log_batch(
         &self,
         from_node: &str,
-        mut records: Vec<SessionSummary>,
+        records: Vec<SessionSummary>,
         summaries: Vec<MinuteSummary>,
         fingerprints: Vec<FingerprintObservation>,
+        evilpot_sessions: Vec<EvilpotSessionInfo>,
+        evilpot_events: Vec<EvilpotEventInfo>,
+        ban_records: Vec<BanRecord>,
+        alerts: Vec<AlertRecord>,
     ) -> usize {
         let start = Instant::now();
-        let (store_raw_ip, retention_hours, max_summaries, max_fps, max_recent_logs) = {
+        let (store_raw_ip, retention) = {
             let c = self.cfg.read().await;
-            (
-                c.logger.store_raw_ip,
-                c.logger.segment.retention_hours.max(1),
-                c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
-                c.logger
-                    .segment
-                    .max_fingerprints
-                    .clamp(100, MAX_MERGED_FINGERPRINTS),
-                c.logger.segment.max_recent_logs.clamp(100, 10_000),
-            )
+            (c.logger.store_raw_ip, c.logger.retention.clone())
         };
-        let now_ts = Utc::now().timestamp();
-        let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
-        let max_allowed = now_ts.saturating_add(300);
-
-        // Enforce Maintainer's `store_raw_ip` privacy policy, sanitize URL/header fields, and cap batch size
-        records.truncate(4096);
-        for r in &mut records {
-            if !store_raw_ip {
-                r.raw_ip = None;
-            }
-            r.sanitize();
-        }
-
-        let rec_count = records.len();
-        if !records.is_empty() {
-            {
-                let mut recent_q = self.recent_logs.lock().await;
-                for r in &records {
-                    let rec_sec = r.timestamp_ms / 1000;
-                    if rec_sec < min_cutoff || rec_sec > max_allowed {
-                        continue;
-                    }
-                    if recent_q.len() >= max_recent_logs {
-                        recent_q.pop_front();
-                    }
-                    recent_q.push_back(r.clone());
-                }
-            }
-            let writer = Arc::clone(&self.segment_writer);
-            let from_owned = from_node.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = w.push_batch(records) {
-                    warn!(from = %from_owned, error = %e, "maintainer segment batch write failed");
-                }
-            })
-            .await;
-        }
-
-        let mut accepted_summaries = 0usize;
+        let db = self.current_db().await;
+        let accepted = match db
+            .ingest_batch(
+                from_node,
+                store_raw_ip,
+                &retention,
+                records,
+                summaries,
+                fingerprints,
+                evilpot_sessions,
+                evilpot_events,
+                ban_records,
+                alerts,
+            )
+            .await
         {
-            let mut map = self.merged_summaries.lock().await;
-            for s in summaries.into_iter().take(1024) {
-                if s.minute_epoch < min_cutoff || s.minute_epoch > max_allowed {
-                    continue;
-                }
-                if !s.uv_hll.is_valid() {
-                    continue;
-                }
-                let key = (
-                    s.minute_epoch,
-                    s.node_tag.clone(),
-                    s.role.clone(),
-                    s.service_tag.clone(),
-                );
-                map.entry(key)
-                    .and_modify(|existing| existing.merge_from(&s))
-                    .or_insert(s);
-                accepted_summaries += 1;
+            Ok(n) => n,
+            Err(e) => {
+                warn!(from = %from_node, error = %e, "maintainer sqlite batch ingest failed");
+                0
             }
-            prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
-        }
-
-        let mut accepted_fps = 0usize;
-        if !fingerprints.is_empty() {
-            let mut fp_map = self.merged_fingerprints.lock().await;
-            for mut fp in fingerprints.into_iter().take(2048) {
-                if fp.last_seen_ts < min_cutoff || fp.last_seen_ts > max_allowed {
-                    continue;
-                }
-                if !store_raw_ip {
-                    fp.client_ip = None;
-                }
-                fp.sanitize();
-                if !store_raw_ip {
-                    if let Some(ref mut js) = fp.js_fp {
-                        js.mask_raw_ips();
-                    }
-                }
-                if fp.id.is_empty() {
-                    continue;
-                }
-                fp_map
-                    .entry(fp.id.clone())
-                    .and_modify(|existing| existing.merge_from(&fp))
-                    .or_insert(fp);
-                accepted_fps += 1;
-            }
-            prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
-        }
-
+        };
         *self.last_merge_latency_ms.lock().await = start.elapsed().as_secs_f64() * 1000.0;
-        let total = rec_count + accepted_summaries + accepted_fps;
-        if total > 0 {
-            self.state_dirty.store(true, Ordering::Relaxed);
-        }
-        total
+        accepted
     }
 
     pub async fn flush_segments(&self) -> Result<()> {
-        self.flush_segments_inner(true).await
+        let db = self.current_db().await;
+        db.checkpoint_wal().await
     }
 
-    async fn flush_segments_inner(&self, force_state_persist: bool) -> Result<()> {
-        const STATE_PERSIST_CADENCE: Duration = Duration::from_secs(30);
-
-        let should_persist_state = if self.state_dirty.load(Ordering::Acquire) {
-            if force_state_persist {
-                true
-            } else {
-                let last = *self.last_state_persist.lock().await;
-                last.elapsed() >= STATE_PERSIST_CADENCE
+    /// Execute a time-windowed, paginated query or maintenance action against Maintainer's SQLite store.
+    pub async fn handle_query(&self, query: MaintainerQuery) -> Result<serde_json::Value> {
+        let db = self.current_db().await;
+        let retention = self.cfg.read().await.logger.retention.clone();
+        match query {
+            MaintainerQuery::Overview { from_ms, to_ms } => db.query_overview(from_ms, to_ms).await,
+            MaintainerQuery::Telemetry {
+                from_ms,
+                to_ms,
+                node,
+                service,
+                bucket_offset,
+                bucket_limit,
+            } => {
+                db.query_telemetry(from_ms, to_ms, node, service, bucket_offset, bucket_limit)
+                    .await
             }
-        } else {
-            false
-        };
-
-        let state_payload = if should_persist_state {
-            self.state_dirty.store(false, Ordering::Release);
-            *self.last_state_persist.lock().await = Instant::now();
-            let (dir, retention_hours, max_summaries, max_fps) = {
-                let c = self.cfg.read().await;
-                (
-                    c.logger.segment.dir.clone(),
-                    c.logger.segment.retention_hours.max(1),
-                    c.logger.segment.max_summaries.clamp(100, MAX_MERGED_SUMMARIES),
-                    c.logger
-                        .segment
-                        .max_fingerprints
-                        .clamp(100, MAX_MERGED_FINGERPRINTS),
+            MaintainerQuery::AccessLogs {
+                from_ms,
+                to_ms,
+                node,
+                service,
+                role,
+                method,
+                action,
+                status,
+                host,
+                ip,
+                ip_hmac,
+                country,
+                ray_id,
+                q,
+                q_ip_hmac,
+                offset,
+                limit,
+            } => {
+                db.query_access_logs(
+                    from_ms, to_ms, node, service, role, method, action, status, host, ip, ip_hmac,
+                    country, ray_id, q, q_ip_hmac, offset, limit,
                 )
-            };
-            let now_ts = Utc::now().timestamp();
-            let min_cutoff = now_ts.saturating_sub((retention_hours as i64).saturating_mul(3600));
-            let max_allowed = now_ts.saturating_add(300);
-
-            let summaries: Vec<MinuteSummary> = {
-                let mut map = self.merged_summaries.lock().await;
-                prune_summaries_map(&mut map, min_cutoff, max_allowed, max_summaries);
-                map.values().cloned().collect()
-            };
-            let fingerprints: Vec<FingerprintObservation> = {
-                let mut fp_map = self.merged_fingerprints.lock().await;
-                prune_fingerprints_map(&mut fp_map, min_cutoff, max_allowed, max_fps);
-                fp_map.values().cloned().collect()
-            };
-            let recent_logs: Vec<SessionSummary> = {
-                let q = self.recent_logs.lock().await;
-                let skip = q.len().saturating_sub(1000);
-                q.iter().skip(skip).cloned().collect()
-            };
-            let alerts = self.alerts.lock().await.clone();
-            Some((
-                maintainer_state_path(&dir, &self.node_tag),
-                MaintainerPersistedState {
-                    summaries,
-                    fingerprints,
-                    recent_logs,
-                    alerts,
-                },
-            ))
-        } else {
-            None
-        };
-
-        let writer = Arc::clone(&self.segment_writer);
-        let state_write_res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = w.flush()?;
-            let _ = w.enforce_limits();
-            if let Some((state_path, state)) = state_payload {
-                write_json_snapshot_atomic(&state_path, &state)?;
+                .await
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| ExposureError::Storage(format!("maintainer flush join: {e}")))?;
-
-        if state_write_res.is_err() && should_persist_state {
-            self.state_dirty.store(true, Ordering::Relaxed);
+            MaintainerQuery::Fingerprints {
+                from_ms,
+                to_ms,
+                node,
+                service,
+                country,
+                verified,
+                risk,
+                ip,
+                ip_hmac,
+                fp,
+                q,
+                q_ip_hmac,
+                offset,
+                limit,
+            } => {
+                db.query_fingerprints(
+                    from_ms, to_ms, node, service, country, verified, risk, ip, ip_hmac, fp, q,
+                    q_ip_hmac, offset, limit,
+                )
+                .await
+            }
+            MaintainerQuery::Evilpot {
+                from_ms,
+                to_ms,
+                node,
+                status,
+                ip,
+                q,
+                sessions_offset,
+                sessions_limit,
+                events_offset,
+                events_limit,
+            } => {
+                db.query_evilpot(
+                    from_ms,
+                    to_ms,
+                    node,
+                    status,
+                    ip,
+                    q,
+                    sessions_offset,
+                    sessions_limit,
+                    events_offset,
+                    events_limit,
+                )
+                .await
+            }
+            MaintainerQuery::Bans {
+                from_ms,
+                to_ms,
+                node,
+                status,
+                kind,
+                target,
+                q,
+                offset,
+                limit,
+            } => {
+                db.query_bans(
+                    from_ms, to_ms, node, status, kind, target, q, offset, limit,
+                )
+                .await
+            }
+            MaintainerQuery::Alerts {
+                from_ms,
+                to_ms,
+                node,
+                severity,
+                q,
+                offset,
+                limit,
+            } => {
+                db.query_alerts(from_ms, to_ms, node, severity, q, offset, limit)
+                    .await
+            }
+            MaintainerQuery::StorageStats => {
+                let st = db.storage_stats(retention.max_db_bytes).await?;
+                Ok(serde_json::to_value(st).unwrap_or_default())
+            }
+            MaintainerQuery::RunCleanup => {
+                let rep = db.run_cleanup(&retention).await?;
+                Ok(serde_json::to_value(rep).unwrap_or_default())
+            }
+            MaintainerQuery::MarkUnbanned {
+                node_tag,
+                ban_kind,
+                target,
+                actor,
+                unbanned_at_unix,
+            } => {
+                let updated = db
+                    .mark_unbanned(node_tag, ban_kind, target, actor, unbanned_at_unix)
+                    .await?;
+                Ok(serde_json::json!({ "updated": updated }))
+            }
         }
-        state_write_res
     }
 
-    /// Build bounded telemetry snapshot for Control's active Pull RPC.
+    /// Build compact status & certificate snapshot for Control's periodic background pull.
     pub async fn build_telemetry_snapshot(
         &self,
         since_minute: Option<i64>,
     ) -> MaintainerTelemetrySnapshot {
-        const MAX_PULL_SUMMARIES: usize = 2000;
-        const MAX_PULL_FINGERPRINTS: usize = 1500;
-        const MAX_PULL_LOGS: usize = 2000;
-        const MAX_PULL_ALERTS: usize = 200;
-
-        let summaries = {
-            let map = self.merged_summaries.lock().await;
-            let mut list: Vec<MinuteSummary> = map
-                .values()
-                .filter(|s| since_minute.map(|m| s.minute_epoch >= m).unwrap_or(true))
-                .cloned()
-                .collect();
-            if list.len() > MAX_PULL_SUMMARIES {
-                list.sort_by(|a, b| b.minute_epoch.cmp(&a.minute_epoch));
-                list.truncate(MAX_PULL_SUMMARIES);
-            }
-            list
-        };
-        let fingerprints = {
-            let fp_map = self.merged_fingerprints.lock().await;
-            let mut list: Vec<FingerprintObservation> = fp_map
-                .values()
-                .filter(|f| since_minute.map(|m| f.last_seen_ts >= m).unwrap_or(true))
-                .cloned()
-                .collect();
-            list.sort_by(|a, b| b.last_seen_ts.cmp(&a.last_seen_ts));
-            list.truncate(MAX_PULL_FINGERPRINTS);
-            list
-        };
-        let recent_logs: Vec<SessionSummary> = {
-            let q = self.recent_logs.lock().await;
-            let since_ms = since_minute.map(|m| m.saturating_mul(1000));
-            let mut list: Vec<SessionSummary> = q
-                .iter()
-                .filter(|r| since_ms.map(|ms| r.timestamp_ms >= ms).unwrap_or(true))
-                .cloned()
-                .collect();
-            list.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-            list.truncate(MAX_PULL_LOGS);
-            list
-        };
+        let db = self.current_db().await;
+        let max_db_bytes = self.cfg.read().await.logger.retention.max_db_bytes;
+        let effective_since = since_minute.or_else(|| Some(Utc::now().timestamp() - 6 * 3600));
+        let summaries = db.snapshot_summaries(effective_since, 1000).await.unwrap_or_default();
+        let alerts = db.recent_alerts(50).await.unwrap_or_default();
+        let storage_stats = db.storage_stats(max_db_bytes).await.ok();
+        // The snapshot still carries recent logs & fingerprints for Control's cached telemetry
+        // (and protocol compatibility), now sourced from the SQLite WAL instead of the old
+        // in-memory ring buffers / dropped JSONL segment files.
+        let recent_logs = db
+            .query_access_logs(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, 0, 100,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("items").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<SessionSummary>>(v).ok())
+            .unwrap_or_default();
+        let fingerprints = db
+            .query_fingerprints(
+                None, None, None, None, None, None, None, None, None, None, None, None, 0, 200,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("items").cloned())
+            .and_then(|v| serde_json::from_value::<Vec<FingerprintObservation>>(v).ok())
+            .unwrap_or_default();
         let certificates = self
             .cert_statuses
             .lock()
@@ -1104,17 +814,7 @@ impl MaintainerService {
             .values()
             .cloned()
             .collect();
-        let segment_backlog = self
-            .segment_writer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending_count();
         let merge_latency_ms = *self.last_merge_latency_ms.lock().await;
-        let alerts = {
-            let a = self.alerts.lock().await;
-            let skip = a.len().saturating_sub(MAX_PULL_ALERTS);
-            a.iter().skip(skip).cloned().collect()
-        };
 
         MaintainerTelemetrySnapshot {
             maintainer_tag: self.node_tag.clone(),
@@ -1122,31 +822,18 @@ impl MaintainerService {
             fingerprints,
             recent_logs,
             certificates,
-            segment_backlog,
+            segment_backlog: 0,
             merge_latency_ms,
             alerts,
+            storage_stats,
         }
     }
 
     pub async fn record_alert(&self, severity: &str, message: impl Into<String>) {
-        let mut a = self.alerts.lock().await;
-        let clean: String = message
-            .into()
-            .chars()
-            .filter(|c| !c.is_control() || *c == ' ')
-            .take(512)
-            .collect();
-        a.push(AlertRecord {
-            timestamp: Utc::now().to_rfc3339(),
-            source: self.node_tag.clone(),
-            severity: severity.to_string(),
-            message: clean,
-        });
-        if a.len() > 200 {
-            let drain = a.len() - 200;
-            a.drain(0..drain);
+        let db = self.current_db().await;
+        if let Err(e) = db.record_alert(severity, message.into()).await {
+            warn!(error = %e, "failed to record maintainer alert");
         }
-        self.state_dirty.store(true, Ordering::Relaxed);
     }
 
     async fn call_alidns_api(
@@ -3293,7 +2980,6 @@ impl MaintainerService {
                 status: if all_ok { "valid".into() } else { "degraded".into() },
             },
         );
-        self.state_dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3302,24 +2988,26 @@ impl MaintainerService {
         let mut rx1 = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
-                let flush_secs = this
+                let mins = this
                     .cfg
                     .read()
                     .await
                     .logger
-                    .segment
-                    .flush_interval_secs
-                    .max(2);
+                    .retention
+                    .cleanup_interval_mins
+                    .clamp(5, 1440);
                 tokio::select! {
                     _ = rx1.changed() => {
                         if *rx1.borrow() {
                             return;
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(flush_secs)) => {}
+                    _ = tokio::time::sleep(Duration::from_secs(mins * 60)) => {}
                 }
-                if let Err(e) = this.flush_segments_inner(false).await {
-                    warn!(error = %e, "maintainer periodic segment flush failed");
+                let retention = this.cfg.read().await.logger.retention.clone();
+                let db = this.current_db().await;
+                if let Err(e) = db.run_cleanup(&retention).await {
+                    warn!(error = %e, "maintainer periodic sqlite retention cleanup failed");
                 }
             }
         });
@@ -4153,9 +3841,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("exposure-maint-persist-{}", uuid::Uuid::new_v4()));
         let mut cfg = MaintainerConfig::default();
         cfg.logger.segment.dir = dir.to_string_lossy().to_string();
-        cfg.logger.segment.retention_hours = 24;
-        cfg.logger.segment.max_summaries = 100;
-        cfg.logger.segment.max_fingerprints = 100;
+        cfg.logger.retention.stats_retention_days = 1;
+        cfg.logger.retention.max_summaries = 100;
+        cfg.logger.retention.max_fingerprints = 100;
 
         let svc = MaintainerService::new("maint-1", cfg.clone()).unwrap();
         let now_min = (Utc::now().timestamp() / 60) * 60;
@@ -4170,6 +3858,8 @@ mod tests {
             challenges_issued: 3,
             challenges_passed: 2,
             blocked: 0,
+            evilpot_hits: 0,
+            autoban_hits: 0,
             bytes_in: 1000,
             bytes_out: 4000,
             uv_hll: HyperLogLog::new(12, 0),
@@ -4182,17 +3872,27 @@ mod tests {
             cached_bytes_out: 0,
         };
         let expired_sum = MinuteSummary {
-            minute_epoch: now_min - 48 * 3600, // older than 24h retention_hours -> MUST be pruned!
+            minute_epoch: now_min - 48 * 3600, // older than 1d stats_retention_days -> MUST be pruned!
             ..fresh_sum.clone()
         };
         let ingested = svc
-            .ingest_log_batch("edge-1", vec![], vec![fresh_sum, expired_sum], vec![])
+            .ingest_log_batch(
+                "edge-1",
+                vec![],
+                vec![fresh_sum, expired_sum],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
             .await;
-        assert_eq!(ingested, 1, "expired summary older than retention_hours must be dropped");
+        assert_eq!(ingested, 1, "expired summary older than stats_retention_days must be dropped");
 
         svc.flush_segments().await.unwrap();
+        drop(svc);
 
-        // Simulate full Maintainer process restart: new instance loads persisted state from disk!
+        // Simulate full Maintainer process restart: new instance loads persisted state from SQLite!
         let restored = MaintainerService::new("maint-1", cfg).unwrap();
         let snap = restored.build_telemetry_snapshot(None).await;
         assert_eq!(snap.summaries.len(), 1);

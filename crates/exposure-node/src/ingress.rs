@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,8 +52,8 @@ use crate::guard::{
 };
 use crate::honeypot::{
     build_attack_signal, clamp_input_slice, into_proxy_response_with_ban_hook,
-    verification_status_label, EvilpotManager, TarpitBanHook, EVILPOT_HANDLE_TIMEOUT,
-    MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
+    session_report_to_info, trap_outcome_to_event_info, verification_status_label, EvilpotManager,
+    TarpitBanHook, EVILPOT_HANDLE_TIMEOUT, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
 };
 use crate::logger::{AccessLogMeta, FpServerExtras, NodeLogger};
 use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
@@ -80,6 +81,26 @@ const MAX_CONCURRENT_RESPONSE_BUFFERS: usize = 256;
 /// Global cap on concurrently buffered WAF request body prefixes (default 32 KiB each -> <= 16 MiB).
 const MAX_CONCURRENT_WAF_BODY_BUFFERS: usize = 512;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+pub fn node_bans_path(dir: &Path, node_tag: &str) -> PathBuf {
+    let safe: String = node_tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    let tag = if safe.is_empty() || safe.contains("..") {
+        "node"
+    } else {
+        &safe
+    };
+    dir.join(format!("node-bans-{tag}.json"))
+}
 
 struct PerIpConnGuard {
     map: Arc<DashMap<IpAddr, usize>>,
@@ -247,6 +268,12 @@ impl IngressServer {
         ));
         let evilpot = Arc::new(EvilpotManager::new(tag.clone()));
         let auto_ban = Arc::new(AutoBanManager::new(&cfg.auto_ban));
+        let bans_path = node_bans_path(&logger.segment_dir(), &tag);
+        match auto_ban.load_from_file(&bans_path) {
+            Ok(n) if n > 0 => info!(node = %tag, loaded_bans = n, path = %bans_path.display(), "restored persisted auto-ban entries from disk"),
+            Ok(_) => {}
+            Err(e) => warn!(node = %tag, error = %e, path = %bans_path.display(), "failed to restore persisted auto-ban entries"),
+        }
         let geoip = GeoIpManager::new(cfg.geoip.clone(), logger.segment_dir().join("geoip"));
         let crs = Arc::new(CompiledCrsEngine::compile(
             &cfg.crs_rules,
@@ -285,6 +312,26 @@ impl IngressServer {
 
     pub fn auto_ban(&self) -> &Arc<AutoBanManager> {
         &self.auto_ban
+    }
+
+    pub fn bans_file_path(&self) -> PathBuf {
+        node_bans_path(&self.logger.segment_dir(), &self.node_tag)
+    }
+
+    pub fn persist_active_bans_async(&self) {
+        let ab = Arc::clone(&self.auto_ban);
+        let path = self.bans_file_path();
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn_blocking(move || {
+                if let Err(e) = ab.save_to_file(&path) {
+                    warn!(error = %e, path = %path.display(), "failed to persist auto-ban snapshot");
+                }
+            });
+        }
+    }
+
+    pub fn persist_active_bans_blocking(&self) -> Result<()> {
+        self.auto_ban.save_to_file(&self.bans_file_path())
     }
 
     pub fn geoip(&self) -> &Arc<GeoIpManager> {
@@ -635,15 +682,25 @@ impl IngressServer {
         kind: OffenseKind,
         reason: &str,
     ) {
-        let out = self.auto_ban.record_offense(OffenseContext {
+        let mut out = self.auto_ban.record_offense(OffenseContext {
             client_ip,
             tls_ja3,
             user_agent: ua_str,
             js_fp_hash,
+            service_tag: Some(service_tag),
+            host: Some(host),
             kind,
             reason,
         });
-        if out.any_banned() {
+        let any_banned = out.any_banned();
+        if !out.created_bans.is_empty() {
+            for b in &mut out.created_bans {
+                b.node_tag = self.node_tag.clone();
+            }
+            self.logger.record_ban_records(out.created_bans).await;
+            self.persist_active_bans_async();
+        }
+        if any_banned {
             if let Some(suppressed) = self.logger.should_log_warn(&format!("autoban:{client_ip}")) {
                 warn!(
                     node = %self.node_tag,
@@ -852,9 +909,22 @@ impl IngressServer {
                 0,
             )
             .await;
+        let sess_info = session_report_to_info(&self.node_tag, &outcome.session);
+        let ev_info = trap_outcome_to_event_info(
+            &self.node_tag,
+            &outcome.session,
+            &outcome.verdict,
+            &format!("{method_str} {path}"),
+        );
+        self.logger.record_evilpot_interaction(sess_info, ev_info).await;
         let ban_hook = TarpitBanHook {
             engine: ep_engine,
             auto_ban: Arc::clone(&self.auto_ban),
+            logger: Arc::clone(&self.logger),
+            node_tag: self.node_tag.clone(),
+            service_tag: service_tag.to_string(),
+            host: host.to_string(),
+            ban_file: self.bans_file_path(),
             client_ip,
             tls_ja3: tls_signal.and_then(|s| s.fingerprint.clone()),
             user_agent: ua_str.to_string(),
@@ -1098,12 +1168,25 @@ impl IngressServer {
                 0,
             )
             .await;
+        let sess_info = session_report_to_info(&self.node_tag, &outcome.session);
+        let ev_info = trap_outcome_to_event_info(
+            &self.node_tag,
+            &outcome.session,
+            &outcome.verdict,
+            &format!("{method_str} {path}"),
+        );
+        self.logger.record_evilpot_interaction(sess_info, ev_info).await;
         let ban_hook = if outcome.session.status == ExploitVerificationStatus::VerifiedExploit {
             None
         } else {
             Some(TarpitBanHook {
                 engine: ep_engine,
                 auto_ban: Arc::clone(&self.auto_ban),
+                logger: Arc::clone(&self.logger),
+                node_tag: self.node_tag.clone(),
+                service_tag: service_tag.to_string(),
+                host: host.to_string(),
+                ban_file: self.bans_file_path(),
                 client_ip,
                 tls_ja3: log_ctx.tls_ja3.map(str::to_string),
                 user_agent: ua_str.to_string(),
@@ -3722,7 +3805,7 @@ async fn maybe_store_in_cache(
     }
 
     let bytes = Bytes::from(collected);
-    let _ = cache.store(
+    let stored = cache.store(
         policy,
         base_key,
         req_headers,
@@ -3734,9 +3817,12 @@ async fn maybe_store_in_cache(
     if let Ok(hv) = HeaderValue::from_str(&bytes.len().to_string()) {
         parts.headers.insert(header::CONTENT_LENGTH, hv);
     }
-    parts
-        .headers
-        .insert("x-exposure-cache", HeaderValue::from_static("MISS"));
+    // Only report MISS when the object actually entered the cache; otherwise the response was
+    // streamed but rejected by the cacheability guards (Vary/cookie/TTL), which is a BYPASS.
+    parts.headers.insert(
+        "x-exposure-cache",
+        HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),
+    );
     Response::from_parts(parts, full_body(bytes))
 }
 

@@ -1,4 +1,4 @@
-// Security View — Buckets, Antibot & GeoIP Region-Targeting, Pure OWASP CRS WAF, GeoIP DB, Evilpot & Unban, Pages
+// Security View — Buckets, Antibot & GeoIP Region-Targeting, Pure OWASP CRS WAF, GeoIP DB, Pages
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
@@ -46,13 +46,9 @@ const QUICK_GEO_TOKENS = [
 ];
 
 export function createSecurityView({ api, store }) {
-  let subTab = "buckets"; // buckets | antibot | waf | geoip | evilpot | pages
+  let subTab = "buckets"; // buckets | antibot | waf | geoip | pages
   let setScope = "cluster"; // "cluster" | <ingress-node-tag>
   let previewMode = "error"; // error | challenge
-
-  let evilpotData = null;
-  let evilpotLoading = false;
-  let unbanBusy = false;
 
   let wafRulesData = null;
   let wafRulesLoading = false;
@@ -1601,242 +1597,6 @@ export function createSecurityView({ api, store }) {
     });
   }
 
-  function formatBytesShort(b) {
-    const n = Number(b) || 0;
-    if (n >= 1048576) return `${(n / 1048576).toFixed(2)} MiB`;
-    if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
-    return `${n} B`;
-  }
-
-  function renderEpStatusPill(status) {
-    if (status === "verified_exploit") return `<span class="pill err">${esc(t("ep.status.verified"))}</span>`;
-    if (status === "multi_step_exploitation") return `<span class="pill warn">${esc(t("ep.status.multistep"))}</span>`;
-    return `<span class="pill info">${esc(t("ep.status.probing"))}</span>`;
-  }
-
-  async function loadEvilpot(triggerPull = false) {
-    if (!api) return;
-    evilpotLoading = true;
-    if (subTab === "evilpot") render();
-    try {
-      if (triggerPull) await api("/api/telemetry/pull", { method: "POST" });
-      evilpotData = await api("/api/evilpot");
-    } catch (e) {
-      showToast(e.message, true);
-    } finally {
-      evilpotLoading = false;
-      if (subTab === "evilpot") render();
-    }
-  }
-
-  async function submitUnban(kind, target, nodeTag = null) {
-    if (!api || unbanBusy) return;
-    unbanBusy = true;
-    render();
-    try {
-      const res = await api("/api/security/unban", {
-        method: "POST",
-        body: JSON.stringify({ kind, target, node_tag: nodeTag || null }),
-      });
-      showToast(t("ep.unban.done", { kind: res.kind || kind, target: res.target || target }));
-      await loadEvilpot(false);
-    } catch (e) {
-      showToast(e.message, true);
-    } finally {
-      unbanBusy = false;
-      if (subTab === "evilpot") render();
-    }
-  }
-
-  function renderEvilpotSubTab(container) {
-    el("btn-sec-ep-pull")?.addEventListener("click", () => loadEvilpot(true));
-    if (!evilpotData && !evilpotLoading) loadEvilpot(false);
-
-    const sum = evilpotData?.summary || {
-      active_nodes: 0,
-      requests_handled: 0,
-      traps_triggered: 0,
-      canary_verifications: 0,
-      verified_attack_sessions: 0,
-      tracked_sessions: 0,
-      tarpit_bytes_dripped: 0,
-      active_tarpit_connections: 0,
-      active_ip_bans: 0,
-      active_fp_bans: 0,
-      total_auto_bans: 0,
-      total_ban_drops: 0,
-    };
-    const sessions = evilpotData?.sessions || [];
-    const events = evilpotData?.recent_events || [];
-    const activeBans = evilpotData?.active_bans || [];
-    const ingNodes = ingressNodes();
-
-    container.innerHTML = `
-      <div class="kpi-grid" style="margin-bottom:14px;">
-        <div class="kpi-card"><div class="kpi-label">${esc(t("ep.kpi.trapped"))}</div><div class="kpi-value">${esc(sum.traps_triggered)}</div><div class="kpi-sub">${esc(t("ep.kpi.nodes"))}: ${esc(sum.active_nodes)}</div></div>
-        <div class="kpi-card"><div class="kpi-label">${esc(t("ep.kpi.verified"))}</div><div class="kpi-value" style="color:var(--err);">${esc(sum.verified_attack_sessions)}</div><div class="kpi-sub">Tracked: ${esc(sum.tracked_sessions)}</div></div>
-        <div class="kpi-card"><div class="kpi-label">${esc(t("ep.kpi.canaries"))}</div><div class="kpi-value" style="color:var(--warn);">${esc(sum.canary_verifications)}</div><div class="kpi-sub">Canary replay hits</div></div>
-        <div class="kpi-card"><div class="kpi-label">${esc(t("ep.kpi.autoban"))}</div><div class="kpi-value" style="color:var(--err);">${esc(sum.active_ip_bans || 0)} / ${esc(sum.active_fp_bans || 0)}</div><div class="kpi-sub">Drops: ${esc(sum.total_ban_drops || 0)} · Total: ${esc(sum.total_auto_bans || 0)}</div></div>
-        <div class="kpi-card"><div class="kpi-label">${esc(t("ep.kpi.tarpit"))}</div><div class="kpi-value">${esc(sum.active_tarpit_connections)} / ${esc(formatBytesShort(sum.tarpit_bytes_dripped))}</div><div class="kpi-sub">${evilpotData?.last_pulled_at ? esc(formatDateTime(evilpotData.last_pulled_at)) : esc(t("common.loading"))}</div></div>
-      </div>
-
-      <div class="panel" style="margin-bottom:14px;">
-        <div class="panel-header"><h3>${esc(t("ep.unban.title"))}</h3></div>
-        <div class="fp-search-bar" style="margin-bottom:0;">
-          <label><span>Kind</span>
-            <select id="ep-unban-kind">
-              <option value="ip">ip</option>
-              <option value="js_fp">js_fp</option>
-              <option value="composite_fp">composite_fp</option>
-            </select>
-          </label>
-          <label style="flex:1.6;"><span>Target (IP or FP Hash)</span><input id="ep-unban-target" placeholder="e.g. 203.0.113.9 or sha256 fp..." /></label>
-          <label><span>Ingress Node</span>
-            <select id="ep-unban-node">
-              <option value="">${esc(t("ep.unban.all_nodes"))}</option>
-              ${ingNodes.map(([tag]) => `<option value="${esc(tag)}">${esc(tag)}</option>`).join("")}
-            </select>
-          </label>
-          <div class="btn-row">
-            <button type="button" id="btn-ep-unban-manual" class="btn primary" ${unbanBusy ? "disabled" : ""}>${esc(t("ep.unban.btn"))}</button>
-            <button type="button" id="btn-ep-unban-clear" class="btn danger" ${unbanBusy ? "disabled" : ""}>${esc(t("ep.unban.clear_all"))}</button>
-          </div>
-        </div>
-      </div>
-
-      ${
-        activeBans.length
-          ? `
-      <div class="panel">
-        <div class="panel-header"><h3>${esc(t("ep.bans.title"))} (${activeBans.length})</h3></div>
-        <div class="table-scroll">
-          <table class="table">
-            <thead>
-              <tr><th>Kind</th><th>Target</th><th>Reason</th><th>Level / Drops</th><th>Expires</th><th>Action</th></tr>
-            </thead>
-            <tbody>
-              ${activeBans
-                .slice(0, 100)
-                .map(
-                  (b) => `
-                <tr>
-                  <td><span class="pill ${b.kind === "ip" ? "err" : "warn"}">${esc(b.kind)}</span></td>
-                  <td><code>${esc(b.target)}</code> <span class="muted">(${esc(b.node_tag || "")})</span></td>
-                  <td><code>${esc(b.reason)}</code></td>
-                  <td>L${esc(b.offense_level || 1)} · <b>${esc(b.hits_blocked || 0)}</b> drops</td>
-                  <td style="white-space:nowrap;">${esc(formatDateTime(b.expires_at_unix || 0))}</td>
-                  <td><button type="button" class="btn sm ghost" data-unban-kind="${esc(b.kind)}" data-unban-target="${esc(b.target)}" data-unban-node="${esc(b.node_tag || "")}" ${unbanBusy ? "disabled" : ""}>${esc(t("ep.unban.btn"))}</button></td>
-                </tr>`
-                )
-                .join("")}
-            </tbody>
-          </table>
-        </div>
-      </div>`
-          : ""
-      }
-
-      ${
-        !sessions.length && !events.length && !activeBans.length
-          ? `<div class="empty-state-box"><p>${esc(t("ep.empty"))}</p></div>`
-          : `
-      <div class="panel">
-        <div class="panel-header"><h3>${esc(t("ep.sessions.title"))} (${sessions.length})</h3></div>
-        <div class="table-scroll">
-          <table class="table">
-            <thead>
-              <tr>
-                <th>${esc(t("ep.col.status"))}</th>
-                <th>${esc(t("ep.col.ip"))}</th>
-                <th>${esc(t("ep.col.persona"))}</th>
-                <th>${esc(t("ep.col.activity"))}</th>
-                <th>${esc(t("ep.col.iocs"))}</th>
-                <th>${esc(t("ep.col.tarpit"))}</th>
-                <th>${esc(t("ep.col.evidence"))}</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${
-                sessions
-                  .map((s) => {
-                    const cmds = (s.rce_commands_executed || []).slice(-3);
-                    const iocs = (s.captured_iocs || []).slice(0, 5);
-                    const evs = (s.evidence || []).slice(0, 4);
-                    return `
-                    <tr>
-                      <td>${renderEpStatusPill(s.status)}</td>
-                      <td>
-                        <div><code>${esc(s.client_ip)}</code></div>
-                        <div class="muted" style="font-size:11px;">${esc(s.node_tag || "")} · ${esc(formatDateTime(s.last_seen_unix || 0))}</div>
-                      </td>
-                      <td><code>${esc(s.persona_hostname)}</code><div class="muted" style="font-size:11px;">Epoch #${esc(s.epoch_id)}</div></td>
-                      <td><div>Reqs: <b>${esc(s.total_trapped_requests)}</b></div><div class="muted" style="font-size:11px;">SQLi: ${esc(s.sqli_probes)} (pos:${esc(s.sqli_distinct_positions)}) · Canary: <b>${esc(s.canary_triggers)}</b></div></td>
-                      <td style="max-width:260px;word-break:break-all;">
-                        ${cmds.map((c) => `<div><code>$ ${esc(c)}</code></div>`).join("")}
-                        ${iocs.map((i) => `<div><span class="pill err">${esc(i)}</span></div>`).join("")}
-                        ${!cmds.length && !iocs.length ? `<span class="muted">—</span>` : ""}
-                      </td>
-                      <td>${s.tarpit_bytes_consumed > 0 ? `${esc(formatBytesShort(s.tarpit_bytes_consumed))} <span class="muted">(${esc(s.tarpit_max_duration_ms)}ms)</span>` : `<span class="muted">—</span>`}</td>
-                      <td style="max-width:280px;word-break:break-all;">${evs.length ? evs.map((e) => `<div style="font-size:11px;"><code>${esc(e)}</code></div>`).join("") : `<span class="muted">—</span>`}</td>
-                    </tr>`;
-                  })
-                  .join("") || `<tr><td colspan="7" class="muted">—</td></tr>`
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-header"><h3>${esc(t("ep.events.title"))} (${events.length})</h3></div>
-        <div class="table-scroll">
-          <table class="table">
-            <thead><tr><th>Time</th><th>${esc(t("ep.col.status"))}</th><th>${esc(t("ep.col.ip"))}</th><th>Trap</th><th>Detail</th></tr></thead>
-            <tbody>
-              ${
-                events
-                  .slice(0, 60)
-                  .map(
-                    (ev) => `
-                  <tr>
-                    <td style="white-space:nowrap;">${esc(formatDateTime(ev.timestamp_unix || 0))}</td>
-                    <td>${renderEpStatusPill(ev.verification_status)}</td>
-                    <td><code>${esc(ev.client_ip)}</code> <span class="muted">(${esc(ev.node_tag || "")})</span></td>
-                    <td><code>${esc(ev.trap_kind)}</code></td>
-                    <td style="max-width:420px;word-break:break-all;"><code>${esc(ev.detail)}</code></td>
-                  </tr>`
-                  )
-                  .join("") || `<tr><td colspan="5" class="muted">—</td></tr>`
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>`
-      }
-    `;
-
-    el("btn-ep-unban-manual")?.addEventListener("click", () => {
-      const kind = el("ep-unban-kind")?.value || "ip";
-      const target = el("ep-unban-target")?.value.trim() || "";
-      const node = el("ep-unban-node")?.value || null;
-      if (!target) {
-        showToast("Enter an IP or fingerprint target to unban", true);
-        return;
-      }
-      submitUnban(kind, target, node);
-    });
-    el("btn-ep-unban-clear")?.addEventListener("click", () => {
-      const node = el("ep-unban-node")?.value || null;
-      if (!window.confirm(t("ep.unban.clear_confirm"))) return;
-      submitUnban("all", "*", node);
-    });
-    container.querySelectorAll("[data-unban-kind]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        submitUnban(btn.dataset.unbanKind, btn.dataset.unbanTarget, btn.dataset.unbanNode || null);
-      });
-    });
-  }
-
   function render() {
     const root = el("tab-security");
     if (!root) return;
@@ -1844,9 +1604,6 @@ export function createSecurityView({ api, store }) {
     const bucketCnt = Object.keys(store.spec.bucket_templates || {}).length;
     const antibotCnt = Object.keys(store.spec.antibot_templates || {}).length;
     const wafCnt = Object.keys(store.spec.waf_templates || {}).length;
-    const verifiedCount = evilpotData?.summary?.verified_attack_sessions || 0;
-    const trackedCount = evilpotData?.summary?.tracked_sessions || 0;
-    const banCount = evilpotData?.active_bans?.length || 0;
 
     root.innerHTML = `
       <div class="subtabs-bar">
@@ -1863,9 +1620,6 @@ export function createSecurityView({ api, store }) {
           <button type="button" class="subtab-btn ${subTab === "geoip" ? "active" : ""}" data-sec-sub="geoip">
             ${esc(t("sec.tab.geoip"))}
           </button>
-          <button type="button" class="subtab-btn ${subTab === "evilpot" ? "active" : ""}" data-sec-sub="evilpot">
-            ${esc(t("sec.tab.evilpot"))} ${trackedCount > 0 || banCount > 0 ? `<span class="subtab-count">${banCount > 0 ? `${banCount} bans` : `${verifiedCount}/${trackedCount}`}</span>` : ""}
-          </button>
           <button type="button" class="subtab-btn ${subTab === "pages" ? "active" : ""}" data-sec-sub="pages">
             ${esc(t("sec.tab.pages"))}
           </button>
@@ -1880,7 +1634,6 @@ export function createSecurityView({ api, store }) {
               : ""
           }
           ${subTab === "geoip" ? `<button type="button" id="btn-sec-geoip-sync" class="btn sm primary" ${geoipSyncing ? "disabled" : ""}>${esc(geoipSyncing ? t("geo.db.syncing") : t("geo.db.sync_now"))}</button>` : ""}
-          ${subTab === "evilpot" ? `<button type="button" id="btn-sec-ep-pull" class="btn sm primary" ${evilpotLoading ? "disabled" : ""}>${esc(t("ep.pull_refresh"))}</button>` : ""}
           ${subTab === "pages" ? `<button type="button" id="btn-sec-reset-pages" class="btn sm">${esc(t("sec.pages.reset"))}</button>` : ""}
         </div>
       </div>
@@ -1890,8 +1643,7 @@ export function createSecurityView({ api, store }) {
     root.querySelectorAll("[data-sec-sub]").forEach((btn) => {
       btn.addEventListener("click", () => {
         subTab = btn.dataset.secSub;
-        if (subTab === "evilpot") loadEvilpot(false);
-        else if (subTab === "waf" && !wafRulesData) loadWafRules();
+        if (subTab === "waf" && !wafRulesData) loadWafRules();
         else if (subTab === "geoip" && !geoipData) loadGeoIpStatus();
         render();
       });
@@ -1902,7 +1654,6 @@ export function createSecurityView({ api, store }) {
     else if (subTab === "antibot") renderAntibotSubTab(body);
     else if (subTab === "waf") renderWafSubTab(body);
     else if (subTab === "geoip") renderGeoIpSubTab(body);
-    else if (subTab === "evilpot") renderEvilpotSubTab(body);
     else renderPagesSubTab(body);
   }
 
@@ -1910,13 +1661,9 @@ export function createSecurityView({ api, store }) {
     if (opts.subTab) {
       if (opts.subTab === "waf-rules") subTab = "waf";
       else if (opts.subTab === "guards") subTab = "antibot";
-      else subTab = opts.subTab;
+      else if (["buckets", "antibot", "waf", "geoip", "pages"].includes(opts.subTab)) subTab = opts.subTab;
     }
     if (!store.loaded) await store.loadTopology(false);
-    if (subTab === "evilpot") {
-      await loadEvilpot(false);
-      return;
-    }
     if (subTab === "waf") {
       await loadWafRules();
       return;

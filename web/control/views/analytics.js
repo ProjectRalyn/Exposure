@@ -11,7 +11,7 @@ import {
   themeColors,
 } from "../charts.js";
 import { t } from "../i18n.js";
-import { el, esc, openModal } from "../ui.js";
+import { el, esc, openModal, showToast } from "../ui.js";
 
 function downloadJson(filename, payload) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -84,14 +84,22 @@ function wirePaginationBar(prefix, state, total, onChange) {
   });
 }
 
-export function createAnalyticsViews({ api, store, navigate }) {
+export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams }) {
   let obsHeroMetric = "requests";
   let obsNode = "all";
   let obsSvc = "all";
-  let obsWin = -1;
   let bucketPageState = { offset: 0, limit: 50 };
 
-  let loggingSubTab = "access"; // access | visitors
+  // Apply the single global topbar time window (preset or custom from/to) to a query string.
+  function applyGlobalTimeRange(qs) {
+    if (typeof getTimeRangeParams === "function") {
+      const range = getTimeRangeParams();
+      if (range && typeof range.applyTo === "function") range.applyTo(qs);
+    }
+    return qs;
+  }
+
+  let loggingSubTab = "access"; // access | evilpot | visitors | alerts | audit
   const defaultLogFilters = () => ({
     q: "",
     ip: "",
@@ -103,7 +111,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
     status: "all",
     action: "all",
     country: "all",
-    window_secs: 0,
     offset: 0,
     limit: 50,
   });
@@ -124,6 +131,40 @@ export function createAnalyticsViews({ api, store, navigate }) {
   });
   let fpFilters = defaultFpFilters();
   let fpData = null;
+
+  const defaultBanFilters = () => ({
+    node: "all",
+    status: "all",
+    kind: "all",
+    q: "",
+    offset: 0,
+    limit: 50,
+  });
+  let banFilters = defaultBanFilters();
+  let banData = null;
+  let unbanBusy = false;
+
+  const defaultAlertFilters = () => ({
+    node: "all",
+    severity: "all",
+    q: "",
+    offset: 0,
+    limit: 50,
+  });
+  let alertFilters = defaultAlertFilters();
+  let alertData = null;
+
+  const defaultAuditFilters = () => ({
+    actor: "",
+    action: "",
+    q: "",
+    offset: 0,
+    limit: 50,
+  });
+  let auditFilters = defaultAuditFilters();
+  let auditData = null;
+  let evilpotData = null;
+  let evilpotEventPage = { offset: 0, limit: 25 };
 
   /* ==================== ANALYTICS ==================== */
 
@@ -150,22 +191,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             ${svcs.map((s) => `<option value="${esc(s)}" ${obsSvc === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
           </select>
         </label>
-        <label class="filter-inline">
-          <span>Window</span>
-          <select id="obs-window-filter">
-            <option value="-1" ${obsWin === -1 ? "selected" : ""}>Global Window</option>
-            <option value="60" ${obsWin === 60 ? "selected" : ""}>1m</option>
-            <option value="300" ${obsWin === 300 ? "selected" : ""}>5m</option>
-            <option value="900" ${obsWin === 900 ? "selected" : ""}>15m</option>
-            <option value="1800" ${obsWin === 1800 ? "selected" : ""}>30m</option>
-            <option value="3600" ${obsWin === 3600 ? "selected" : ""}>1h</option>
-            <option value="21600" ${obsWin === 21600 ? "selected" : ""}>6h</option>
-            <option value="43200" ${obsWin === 43200 ? "selected" : ""}>12h</option>
-            <option value="86400" ${obsWin === 86400 ? "selected" : ""}>24h</option>
-            <option value="604800" ${obsWin === 604800 ? "selected" : ""}>7d</option>
-            <option value="0" ${obsWin === 0 ? "selected" : ""}>All</option>
-          </select>
-        </label>
+        <span class="muted-sm">Time range: global window (top bar)</span>
       </div>
 
       <div class="panel cf-hero-panel">
@@ -262,12 +288,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
 
     el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
     el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
-    el("obs-window-filter")?.addEventListener("change", (ev) => {
-      const v = Number(ev.target.value);
-      obsWin = Number.isFinite(v) ? v : -1;
-      bucketPageState.offset = 0;
-      refreshAnalytics();
-    });
     el("btn-open-access-logs")?.addEventListener("click", () => navigate("logging", { subTab: "access", service: obsSvc !== "all" ? obsSvc : undefined }));
     el("btn-open-fp-explorer")?.addEventListener("click", () => navigate("logging", { subTab: "visitors", service: obsSvc !== "all" ? obsSvc : undefined }));
     root.querySelectorAll("[data-cf-metric]").forEach((btn) => {
@@ -447,8 +467,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const qs = new URLSearchParams();
     if (obsNode !== "all") qs.set("node", obsNode);
     if (obsSvc !== "all") qs.set("service", obsSvc);
-    const effectiveWin = obsWin >= 0 ? obsWin : Number(el("sel-time-window")?.value || 0);
-    if (effectiveWin > 0) qs.set("window_secs", String(effectiveWin));
+    applyGlobalTimeRange(qs);
     const data = await api(`/api/telemetry${qs.toString() ? `?${qs}` : ""}`);
     store.telemetry = data;
     renderAnalyticsCharts();
@@ -458,36 +477,43 @@ export function createAnalyticsViews({ api, store, navigate }) {
   /* ==================== UNIFIED LOGGING WORKSPACE ==================== */
 
   function renderLoggingSubtabsBar() {
-    const logCnt = logData ? Number(logData.total_matched ?? (logData.items || []).length ?? 0) : null;
-    const fpCnt = fpData ? Number(fpData.total_matched ?? (fpData.items || []).length ?? 0) : null;
+    const countOf = (d) => (d ? Number(d.total_matched ?? (d.items || []).length ?? 0) : null);
+    const tabs = [
+      ["access", t("logging.tab.access"), countOf(logData)],
+      ["evilpot", t("logging.tab.evilpot"), countOf(banData)],
+      ["visitors", t("logging.tab.visitors"), countOf(fpData)],
+      ["alerts", t("logging.tab.alerts"), countOf(alertData)],
+      ["audit", t("logging.tab.audit"), countOf(auditData)],
+    ];
     return `
       <div class="subtabs-bar">
         <div class="subtabs-list">
-          <button type="button" class="subtab-btn ${loggingSubTab === "access" ? "active" : ""}" data-log-sub="access">
-            ${esc(t("logging.tab.access"))} ${logCnt != null ? `<span class="subtab-count">${logCnt}</span>` : ""}
-          </button>
-          <button type="button" class="subtab-btn ${loggingSubTab === "visitors" ? "active" : ""}" data-log-sub="visitors">
-            ${esc(t("logging.tab.visitors"))} ${fpCnt != null ? `<span class="subtab-count">${fpCnt}</span>` : ""}
-          </button>
+          ${tabs
+            .map(
+              ([key, label, cnt]) => `
+            <button type="button" class="subtab-btn ${loggingSubTab === key ? "active" : ""}" data-log-sub="${key}">
+              ${esc(label)} ${cnt != null ? `<span class="subtab-count">${cnt}</span>` : ""}
+            </button>`
+            )
+            .join("")}
         </div>
       </div>
     `;
   }
 
+  function openLoggingSubTab(key) {
+    if (key === loggingSubTab) return;
+    loggingSubTab = key;
+    if (key === "access") { renderLogs(); refreshLogs(); }
+    else if (key === "evilpot") { renderBans(); refreshBans(); }
+    else if (key === "visitors") { renderVisitors(); refreshVisitors(); }
+    else if (key === "alerts") { renderAlerts(); refreshAlerts(); }
+    else if (key === "audit") { renderAudit(); refreshAudit(); }
+  }
+
   function wireLoggingSubtabs(root) {
     root.querySelectorAll("[data-log-sub]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const next = btn.dataset.logSub;
-        if (next === loggingSubTab) return;
-        loggingSubTab = next;
-        if (loggingSubTab === "access") {
-          renderLogs();
-          refreshLogs();
-        } else {
-          renderVisitors();
-          refreshVisitors();
-        }
-      });
+      btn.addEventListener("click", () => openLoggingSubTab(btn.dataset.logSub));
     });
   }
 
@@ -559,18 +585,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
             <select id="log-country-filter" class="select-sm">
               <option value="all">${esc(t("logs.all_countries"))}</option>
               ${countries.map((c) => `<option value="${esc(c)}" ${logFilters.country === c ? "selected" : ""}>${esc(c)}</option>`).join("")}
-            </select>
-            <select id="log-window-filter" class="select-sm">
-              <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>Global Window</option>
-              <option value="60" ${logFilters.window_secs === 60 ? "selected" : ""}>1m</option>
-              <option value="300" ${logFilters.window_secs === 300 ? "selected" : ""}>5m</option>
-              <option value="900" ${logFilters.window_secs === 900 ? "selected" : ""}>15m</option>
-              <option value="1800" ${logFilters.window_secs === 1800 ? "selected" : ""}>30m</option>
-              <option value="3600" ${logFilters.window_secs === 3600 ? "selected" : ""}>1h</option>
-              <option value="21600" ${logFilters.window_secs === 21600 ? "selected" : ""}>6h</option>
-              <option value="43200" ${logFilters.window_secs === 43200 ? "selected" : ""}>12h</option>
-              <option value="86400" ${logFilters.window_secs === 86400 ? "selected" : ""}>24h</option>
-              <option value="604800" ${logFilters.window_secs === 604800 ? "selected" : ""}>7d</option>
             </select>
           </div>
         </div>
@@ -673,7 +687,6 @@ export function createAnalyticsViews({ api, store, navigate }) {
       logFilters.node = el("log-node-filter")?.value || "all";
       logFilters.service = el("log-svc-filter")?.value || "all";
       logFilters.country = el("log-country-filter")?.value || "all";
-      logFilters.window_secs = Number(el("log-window-filter")?.value || 0);
       logFilters.offset = 0;
       refreshLogs();
     };
@@ -683,7 +696,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
         if (ev.key === "Enter") { ev.preventDefault(); triggerLogSearch(); }
       });
     });
-    ["log-method-filter", "log-role-filter", "log-node-filter", "log-svc-filter", "log-country-filter", "log-window-filter"].forEach((id) => {
+    ["log-method-filter", "log-role-filter", "log-node-filter", "log-svc-filter", "log-country-filter"].forEach((id) => {
       el(id)?.addEventListener("change", triggerLogSearch);
     });
     el("btn-log-clear")?.addEventListener("click", () => {
@@ -805,8 +818,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     if (logFilters.country && logFilters.country !== "all") qs.set("country", logFilters.country);
     qs.set("offset", String(logFilters.offset || 0));
     qs.set("limit", String(logFilters.limit || 50));
-    const winSec = logFilters.window_secs > 0 ? logFilters.window_secs : Number(el("sel-time-window")?.value || 0);
-    if (winSec > 0) qs.set("window_secs", String(winSec));
+    applyGlobalTimeRange(qs);
     logData = await api(`/api/logs${qs.toString() ? `?${qs}` : ""}`);
     if (loggingSubTab === "access") renderLogs();
     return logData;
@@ -1047,20 +1059,473 @@ export function createAnalyticsViews({ api, store, navigate }) {
     if (fpFilters.risk !== "all") qs.set("risk", fpFilters.risk);
     qs.set("offset", String(fpFilters.offset || 0));
     qs.set("limit", String(fpFilters.limit || 50));
-    const winSec = Number(el("sel-time-window")?.value || 0);
-    if (winSec > 0) qs.set("window_secs", String(winSec));
+    applyGlobalTimeRange(qs);
     fpData = await api(`/api/fingerprints${qs.toString() ? `?${qs}` : ""}`);
     if (loggingSubTab === "visitors") renderVisitors();
     return fpData;
   }
 
+  /* ---------- Evilpot & Bans ---------- */
+
+  async function submitUnban(kind, target, nodeTag = null) {
+    if (unbanBusy) return;
+    unbanBusy = true;
+    try {
+      const res = await api("/api/security/unban", {
+        method: "POST",
+        body: JSON.stringify({ kind, target, node_tag: nodeTag || null }),
+      });
+      showToast(`Unbanned ${res.kind || kind}: ${res.target || target}`);
+      await refreshBans();
+    } catch (e) {
+      showToast(e.message, true);
+    } finally {
+      unbanBusy = false;
+    }
+  }
+
+  async function refreshBans() {
+    const qs = new URLSearchParams();
+    if (banFilters.node !== "all") qs.set("node", banFilters.node);
+    if (banFilters.status !== "all") qs.set("status", banFilters.status);
+    if (banFilters.kind !== "all") qs.set("kind", banFilters.kind);
+    if (banFilters.q) qs.set("q", banFilters.q);
+    qs.set("offset", String(banFilters.offset || 0));
+    qs.set("limit", String(banFilters.limit || 50));
+    applyGlobalTimeRange(qs);
+
+    const epQs = new URLSearchParams();
+    if (banFilters.node !== "all") epQs.set("node", banFilters.node);
+    if (banFilters.q) epQs.set("q", banFilters.q);
+    epQs.set("sessions_offset", "0");
+    epQs.set("sessions_limit", "50");
+    epQs.set("events_offset", String(evilpotEventPage.offset || 0));
+    epQs.set("events_limit", String(evilpotEventPage.limit || 25));
+    applyGlobalTimeRange(epQs);
+
+    const [b, ep] = await Promise.all([
+      api(`/api/bans${qs.toString() ? `?${qs}` : ""}`),
+      api(`/api/evilpot${epQs.toString() ? `?${epQs}` : ""}`),
+    ]);
+    banData = b;
+    evilpotData = ep;
+    if (loggingSubTab === "evilpot") renderBans();
+    return b;
+  }
+
+  function renderBans() {
+    const root = el("tab-logging");
+    if (!root) return;
+    const data = banData || {};
+    const ep = evilpotData || {};
+    const sum = data.summary || {};
+    const items = data.items || [];
+    const nodes = (data.available_nodes || []).slice().sort();
+    const totalMatched = Number(data.total_matched ?? items.length) || 0;
+    const sessions = ep.sessions || [];
+    const events = ep.recent_events || [];
+
+    const statusPill = (s) =>
+      s === "active"
+        ? `<span class="pill err">active</span>`
+        : s === "unbanned"
+        ? `<span class="pill info">unbanned</span>`
+        : `<span class="pill">expired</span>`;
+    const epStatusPill = (s) =>
+      s === "verified_exploit"
+        ? `<span class="pill err">verified</span>`
+        : s === "multi_step_exploitation"
+        ? `<span class="pill warn">multi-step</span>`
+        : `<span class="pill info">probing</span>`;
+
+    root.innerHTML = `
+      ${renderLoggingSubtabsBar()}
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">Active IP / FP Bans</div><div class="kpi-val">${formatCompact(sum.active_ip_bans || 0)} / ${formatCompact(sum.active_fp_bans || 0)}</div><div class="kpi-sub">${formatCompact(sum.total_bans || 0)} total records</div></div>
+        <div class="kpi"><div class="kpi-label">Hits Blocked</div><div class="kpi-val">${formatCompact(sum.total_hits_blocked || 0)}</div><div class="kpi-sub">${formatCompact(sum.expired_bans || 0)} expired · ${formatCompact(sum.unbanned_bans || 0)} unbanned</div></div>
+        <div class="kpi"><div class="kpi-label">Evilpot Sessions</div><div class="kpi-val">${formatCompact(ep.sessions_total || 0)}</div><div class="kpi-sub">${formatCompact(ep.summary?.verified_attack_sessions || 0)} verified · ${formatCompact(ep.summary?.canary_verifications || 0)} canary</div></div>
+        <div class="kpi"><div class="kpi-label">Evilpot Events</div><div class="kpi-val">${formatCompact(ep.events_total || 0)}</div><div class="kpi-sub">${formatCompact(ep.summary?.traps_triggered || 0)} traps · ${formatCompact(ep.summary?.active_tarpit_connections || 0)} tarpits</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="fp-search-bar" style="margin-bottom:0;">
+          <label style="flex:1.4;"><span>Search (target / reason)</span><input id="ban-search-q" value="${esc(banFilters.q)}" placeholder="IP, fingerprint hash, reason…" /></label>
+          <label><span>Status</span>
+            <select id="ban-status-filter">
+              ${["all", "active", "expired", "unbanned"].map((s) => `<option value="${s}" ${banFilters.status === s ? "selected" : ""}>${s}</option>`).join("")}
+            </select>
+          </label>
+          <label><span>Kind</span>
+            <select id="ban-kind-filter">
+              ${["all", "ip", "js_fp", "composite_fp"].map((s) => `<option value="${s}" ${banFilters.kind === s ? "selected" : ""}>${s}</option>`).join("")}
+            </select>
+          </label>
+          <label><span>Host</span>
+            <select id="ban-node-filter">
+              <option value="all">${esc(t("ana.all_nodes"))}</option>
+              ${nodes.map((n) => `<option value="${n}" ${banFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
+            </select>
+          </label>
+          <div class="btn-row">
+            <button type="button" id="btn-ban-search" class="btn primary">${esc(t("common.search"))}</button>
+            <button type="button" id="btn-ban-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h3>Ban History (${totalMatched})</h3><span class="muted-sm">Active bans can be lifted instantly; history rows are retained per retention policy</span></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead><tr><th>Status</th><th>Kind</th><th>Target</th><th>Reason</th><th>Host</th><th>Offense</th><th>Banned</th><th>Expires</th><th>Hits</th><th>Action</th></tr></thead>
+            <tbody>
+              ${
+                items
+                  .map(
+                    (b, i) => `
+                <tr>
+                  <td>${statusPill(b.status)}</td>
+                  <td><code>${esc(b.kind)}</code></td>
+                  <td><code>${esc(b.target)}</code></td>
+                  <td>${esc(b.reason || "-")}</td>
+                  <td><code>${esc(b.node_tag)}</code></td>
+                  <td>${esc(b.offense_level)}</td>
+                  <td class="muted-sm">${esc(formatDateTime(b.banned_at_unix))}</td>
+                  <td class="muted-sm">${b.expires_at_unix ? esc(formatDateTime(b.expires_at_unix)) : "—"}</td>
+                  <td><strong>${formatCompact(b.hits_blocked || 0)}</strong></td>
+                  <td>
+                    <div class="btn-row">
+                      ${
+                        b.kind === "ip"
+                          ? `<button type="button" class="btn sm ghost" data-ban-access="${i}">Access</button>`
+                          : ""
+                      }
+                      ${
+                        b.status === "active"
+                          ? `<button type="button" class="btn sm danger" data-ban-unban="${i}" ${unbanBusy ? "disabled" : ""}>Unban</button>`
+                          : b.status === "unbanned" && b.unbanned_by
+                          ? `<span class="muted-sm">by ${esc(b.unbanned_by)}</span>`
+                          : "—"
+                      }
+                    </div>
+                  </td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="10" class="muted">No ban records in this window</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        ${renderPaginationBar("ban", { total: totalMatched, offset: banFilters.offset, limit: banFilters.limit })}
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h3>Evilpot Sessions (${formatCompact(ep.sessions_total || 0)})</h3><span class="muted-sm">Persisted attacker deception sessions</span></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead><tr><th>Status</th><th>Client</th><th>Host</th><th>Persona</th><th>Trapped</th><th>Canary</th><th>SQLi</th><th>RCE</th><th>Last Seen</th></tr></thead>
+            <tbody>
+              ${
+                sessions
+                  .map(
+                    (s) => `
+                <tr>
+                  <td>${epStatusPill(s.status)}</td>
+                  <td><code>${esc(s.client_ip)}</code></td>
+                  <td><code>${esc(s.node_tag)}</code></td>
+                  <td class="muted-sm">${esc(s.persona_hostname || "-")}</td>
+                  <td>${formatCompact(s.total_trapped_requests || 0)}</td>
+                  <td>${formatCompact(s.canary_triggers || 0)}</td>
+                  <td>${formatCompact(s.sqli_probes || 0)}</td>
+                  <td>${formatCompact((s.rce_commands_executed || []).length)}</td>
+                  <td class="muted-sm">${esc(formatDateTime(s.last_seen_unix))}</td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="9" class="muted">No evilpot sessions in this window</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h3>Evilpot Events (${formatCompact(ep.events_total || 0)})</h3></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead><tr><th>Time</th><th>Host</th><th>Client</th><th>Verification</th><th>Trap</th><th>Detail</th></tr></thead>
+            <tbody>
+              ${
+                events
+                  .map(
+                    (e) => `
+                <tr>
+                  <td class="muted-sm">${esc(formatDateTime(e.timestamp_unix))}</td>
+                  <td><code>${esc(e.node_tag)}</code></td>
+                  <td><code>${esc(e.client_ip)}</code></td>
+                  <td>${epStatusPill(e.verification_status)}</td>
+                  <td><code>${esc(e.trap_kind || "-")}</code></td>
+                  <td>${esc(e.detail || "-")}</td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="6" class="muted">No evilpot events in this window</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        ${renderPaginationBar("evt", { total: ep.events_total || 0, offset: evilpotEventPage.offset, limit: evilpotEventPage.limit })}
+      </div>
+    `;
+
+    wireLoggingSubtabs(root);
+    wirePaginationBar("ban", banFilters, totalMatched, refreshBans);
+    wirePaginationBar("evt", evilpotEventPage, ep.events_total || 0, refreshBans);
+
+    const applyBanFilters = () => {
+      banFilters.q = el("ban-search-q")?.value.trim() || "";
+      banFilters.status = el("ban-status-filter")?.value || "all";
+      banFilters.kind = el("ban-kind-filter")?.value || "all";
+      banFilters.node = el("ban-node-filter")?.value || "all";
+      banFilters.offset = 0;
+      refreshBans();
+    };
+    el("btn-ban-search")?.addEventListener("click", applyBanFilters);
+    el("ban-search-q")?.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); applyBanFilters(); }
+    });
+    ["ban-status-filter", "ban-kind-filter", "ban-node-filter"].forEach((id) =>
+      el(id)?.addEventListener("change", applyBanFilters)
+    );
+    el("btn-ban-clear")?.addEventListener("click", () => {
+      banFilters = defaultBanFilters();
+      evilpotEventPage.offset = 0;
+      refreshBans();
+    });
+    root.querySelectorAll("[data-ban-access]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const rec = items[Number(btn.dataset.banAccess)];
+        if (!rec) return;
+        logFilters.ip = rec.target;
+        logFilters.offset = 0;
+        loggingSubTab = "access";
+        renderLogs();
+        refreshLogs();
+      });
+    });
+    root.querySelectorAll("[data-ban-unban]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const rec = items[Number(btn.dataset.banUnban)];
+        if (!rec) return;
+        openModal({
+          title: "Confirm Unban",
+          bodyHtml: `<p>Lift the active <code>${esc(rec.kind)}</code> ban on <code>${esc(rec.target)}</code>?</p><p class="muted-sm">Node: ${esc(rec.node_tag)} · reason: ${esc(rec.reason || "-")}</p>`,
+          actions: [
+            { label: t("common.cancel"), cls: "ghost" },
+            { label: "Unban", cls: "danger", onClick: () => submitUnban(rec.kind, rec.target, rec.node_tag) },
+          ],
+        });
+      });
+    });
+  }
+
+  /* ---------- Alerts ---------- */
+
+  async function refreshAlerts() {
+    const qs = new URLSearchParams();
+    if (alertFilters.node !== "all") qs.set("node", alertFilters.node);
+    if (alertFilters.severity !== "all") qs.set("severity", alertFilters.severity);
+    if (alertFilters.q) qs.set("q", alertFilters.q);
+    qs.set("offset", String(alertFilters.offset || 0));
+    qs.set("limit", String(alertFilters.limit || 50));
+    applyGlobalTimeRange(qs);
+    alertData = await api(`/api/alerts${qs.toString() ? `?${qs}` : ""}`);
+    if (loggingSubTab === "alerts") renderAlerts();
+    return alertData;
+  }
+
+  function renderAlerts() {
+    const root = el("tab-logging");
+    if (!root) return;
+    const data = alertData || {};
+    const items = data.items || [];
+    const counts = data.severity_counts || {};
+    const sources = (data.available_sources || []).slice().sort();
+    const totalMatched = Number(data.total_matched ?? items.length) || 0;
+    const sevPill = (sev) => {
+      const s = sev === "warn" ? "warning" : sev || "info";
+      const cls = s === "critical" || s === "error" ? "err" : s === "warning" ? "warn" : "info";
+      return `<span class="pill ${cls}">${esc(s)}</span>`;
+    };
+
+    root.innerHTML = `
+      ${renderLoggingSubtabsBar()}
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">Critical</div><div class="kpi-val">${formatCompact(counts.critical || 0)}</div><div class="kpi-sub">error: ${formatCompact(counts.error || 0)}</div></div>
+        <div class="kpi"><div class="kpi-label">Warning</div><div class="kpi-val">${formatCompact(counts.warning || 0)}</div><div class="kpi-sub">info: ${formatCompact(counts.info || 0)}</div></div>
+        <div class="kpi"><div class="kpi-label">Matched Alerts</div><div class="kpi-val">${formatCompact(totalMatched)}</div><div class="kpi-sub">${esc(data.last_pulled_at ? formatDateTime(data.last_pulled_at) : "-")}</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="fp-search-bar" style="margin-bottom:0;">
+          <label style="flex:1.4;"><span>Search</span><input id="alr-search-q" value="${esc(alertFilters.q)}" placeholder="message or source…" /></label>
+          <label><span>Severity</span>
+            <select id="alr-severity-filter">
+              ${["all", "info", "warning", "error", "critical"].map((s) => `<option value="${s}" ${alertFilters.severity === s ? "selected" : ""}>${s}</option>`).join("")}
+            </select>
+          </label>
+          <label><span>Source</span>
+            <select id="alr-node-filter">
+              <option value="all">All sources</option>
+              ${sources.map((s) => `<option value="${s}" ${alertFilters.node === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
+            </select>
+          </label>
+          <div class="btn-row">
+            <button type="button" id="btn-alr-search" class="btn primary">${esc(t("common.search"))}</button>
+            <button type="button" id="btn-alr-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h3>Alerts (${formatCompact(totalMatched)})</h3></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead><tr><th>Time</th><th>Source</th><th>Severity</th><th>Message</th></tr></thead>
+            <tbody>
+              ${
+                items
+                  .map(
+                    (a) => `
+                <tr>
+                  <td class="muted-sm">${esc(formatDateTime(a.timestamp_ms ? Number(a.timestamp_ms) / 1000 : a.timestamp))}</td>
+                  <td><code>${esc(a.source)}</code></td>
+                  <td>${sevPill(a.severity)}</td>
+                  <td>${esc(a.message)}</td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="4" class="muted">No alerts in this window</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        ${renderPaginationBar("alr", { total: totalMatched, offset: alertFilters.offset, limit: alertFilters.limit })}
+      </div>
+    `;
+
+    wireLoggingSubtabs(root);
+    wirePaginationBar("alr", alertFilters, totalMatched, refreshAlerts);
+    const apply = () => {
+      alertFilters.q = el("alr-search-q")?.value.trim() || "";
+      alertFilters.severity = el("alr-severity-filter")?.value || "all";
+      alertFilters.node = el("alr-node-filter")?.value || "all";
+      alertFilters.offset = 0;
+      refreshAlerts();
+    };
+    el("btn-alr-search")?.addEventListener("click", apply);
+    el("alr-search-q")?.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); apply(); }
+    });
+    ["alr-severity-filter", "alr-node-filter"].forEach((id) => el(id)?.addEventListener("change", apply));
+    el("btn-alr-clear")?.addEventListener("click", () => {
+      alertFilters = defaultAlertFilters();
+      refreshAlerts();
+    });
+  }
+
+  /* ---------- Audit ---------- */
+
+  async function refreshAudit() {
+    const qs = new URLSearchParams();
+    if (auditFilters.actor) qs.set("actor", auditFilters.actor);
+    if (auditFilters.action) qs.set("action", auditFilters.action);
+    if (auditFilters.q) qs.set("q", auditFilters.q);
+    qs.set("offset", String(auditFilters.offset || 0));
+    qs.set("limit", String(auditFilters.limit || 50));
+    applyGlobalTimeRange(qs);
+    auditData = await api(`/api/audit${qs.toString() ? `?${qs}` : ""}`);
+    if (loggingSubTab === "audit") renderAudit();
+    return auditData;
+  }
+
+  function renderAudit() {
+    const root = el("tab-logging");
+    if (!root) return;
+    const data = auditData || {};
+    const items = data.items || data.logs || [];
+    const totalMatched = Number(data.total_matched ?? items.length) || 0;
+
+    root.innerHTML = `
+      ${renderLoggingSubtabsBar()}
+      <div class="panel">
+        <div class="fp-search-bar" style="margin-bottom:0;">
+          <label style="flex:1.2;"><span>Search</span><input id="aud-search-q" value="${esc(auditFilters.q)}" placeholder="detail / target…" /></label>
+          <label><span>Actor</span><input id="aud-actor" value="${esc(auditFilters.actor)}" placeholder="admin" /></label>
+          <label><span>Action</span><input id="aud-action" value="${esc(auditFilters.action)}" placeholder="config_apply…" /></label>
+          <div class="btn-row">
+            <button type="button" id="btn-aud-search" class="btn primary">${esc(t("common.search"))}</button>
+            <button type="button" id="btn-aud-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h3>Audit Log (${formatCompact(totalMatched)})</h3></div>
+        <div class="table-scroll">
+          <table class="table">
+            <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead>
+            <tbody>
+              ${
+                items
+                  .map(
+                    (l) => `
+                <tr>
+                  <td class="muted-sm">${esc(formatDateTime(l.created_at))}</td>
+                  <td>${esc(l.actor)}</td>
+                  <td><code>${esc(l.action)}</code></td>
+                  <td>${esc(l.target)}</td>
+                  <td><span class="pill ${l.success ? "ok" : "err"}">${l.success ? "OK" : "FAIL"}</span></td>
+                  <td>${esc(l.detail)}</td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="6" class="muted">No audit entries in this window</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        ${renderPaginationBar("aud", { total: totalMatched, offset: auditFilters.offset, limit: auditFilters.limit })}
+      </div>
+    `;
+
+    wireLoggingSubtabs(root);
+    wirePaginationBar("aud", auditFilters, totalMatched, refreshAudit);
+    const apply = () => {
+      auditFilters.q = el("aud-search-q")?.value.trim() || "";
+      auditFilters.actor = el("aud-actor")?.value.trim() || "";
+      auditFilters.action = el("aud-action")?.value.trim() || "";
+      auditFilters.offset = 0;
+      refreshAudit();
+    };
+    el("btn-aud-search")?.addEventListener("click", apply);
+    ["aud-search-q", "aud-actor", "aud-action"].forEach((id) =>
+      el(id)?.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") { ev.preventDefault(); apply(); }
+      })
+    );
+    el("btn-aud-clear")?.addEventListener("click", () => {
+      auditFilters = defaultAuditFilters();
+      refreshAudit();
+    });
+  }
+
   function renderLogging() {
-    if (loggingSubTab === "visitors") renderVisitors();
+    if (loggingSubTab === "evilpot") renderBans();
+    else if (loggingSubTab === "visitors") renderVisitors();
+    else if (loggingSubTab === "alerts") renderAlerts();
+    else if (loggingSubTab === "audit") renderAudit();
     else renderLogs();
   }
 
   async function refreshLogging(opts = {}) {
-    if (opts?.subTab === "visitors" || opts?.subTab === "access") {
+    if (["access", "evilpot", "visitors", "alerts", "audit"].includes(opts?.subTab)) {
       loggingSubTab = opts.subTab;
     }
     if (opts?.service) {
@@ -1073,9 +1538,18 @@ export function createAnalyticsViews({ api, store, navigate }) {
     }
     if (opts?.q) {
       if (loggingSubTab === "visitors") { fpFilters.q = opts.q; fpFilters.offset = 0; }
+      else if (loggingSubTab === "evilpot") { banFilters.q = opts.q; banFilters.offset = 0; }
+      else if (loggingSubTab === "alerts") { alertFilters.q = opts.q; alertFilters.offset = 0; }
       else { logFilters.q = opts.q; logFilters.offset = 0; }
     }
+    if (opts?.reload === false) {
+      renderLogging();
+      return null;
+    }
+    if (loggingSubTab === "evilpot") return refreshBans();
     if (loggingSubTab === "visitors") return refreshVisitors();
+    if (loggingSubTab === "alerts") return refreshAlerts();
+    if (loggingSubTab === "audit") return refreshAudit();
     return refreshLogs();
   }
 

@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,10 @@ use dashmap::DashMap;
 use exposure_core::config::AutoBanConfig;
 use exposure_core::crypto::short_sha256_hex;
 use exposure_core::routing::canonical_ip;
-use exposure_core::telemetry::ActiveBanInfo;
+use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic};
+use exposure_core::telemetry::{ActiveBanInfo, BanRecord};
+use exposure_core::Result;
+use serde::{Deserialize, Serialize};
 
 const MAX_BANNED_IPS: usize = 65_536;
 const MAX_BANNED_FPS: usize = 32_768;
@@ -132,17 +136,20 @@ pub struct OffenseContext<'a> {
     pub tls_ja3: Option<&'a str>,
     pub user_agent: &'a str,
     pub js_fp_hash: Option<&'a str>,
+    pub service_tag: Option<&'a str>,
+    pub host: Option<&'a str>,
     pub kind: OffenseKind,
     pub reason: &'a str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OffenseOutcome {
     pub newly_banned_ip: bool,
     pub newly_banned_js_fp: bool,
     pub newly_banned_composite_fp: bool,
     pub ban_ttl_secs: u64,
     pub offense_level: u8,
+    pub created_bans: Vec<BanRecord>,
 }
 
 impl OffenseOutcome {
@@ -153,11 +160,48 @@ impl OffenseOutcome {
 
 struct BanEntry {
     reason: String,
+    service_tag: Option<String>,
+    host: Option<String>,
     banned_at_unix: u64,
     expires_at: Instant,
     expires_at_unix: u64,
     offense_level: u8,
     hits_blocked: AtomicU64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedBanState {
+    #[serde(default)]
+    total_auto_bans: u64,
+    #[serde(default)]
+    total_ban_drops: u64,
+    #[serde(default)]
+    bans: Vec<BanRecord>,
+}
+
+fn clean_opt_meta(v: Option<&str>, max_chars: usize) -> Option<String> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(max_chars).collect())
+}
+
+fn ban_entry_to_record(node_tag: &str, kind: BanKind, target: String, e: &BanEntry) -> BanRecord {
+    BanRecord {
+        id: 0,
+        node_tag: node_tag.to_string(),
+        kind: kind.as_str().to_string(),
+        target,
+        reason: e.reason.clone(),
+        service_tag: e.service_tag.clone(),
+        host: e.host.clone(),
+        offense_level: e.offense_level,
+        banned_at_unix: e.banned_at_unix,
+        expires_at_unix: e.expires_at_unix,
+        unbanned_at_unix: None,
+        unbanned_by: None,
+        hits_blocked: e.hits_blocked.load(Ordering::Relaxed),
+        status: "active".to_string(),
+    }
 }
 
 struct OffenseTrackerEntry {
@@ -467,13 +511,7 @@ impl AutoBanManager {
 
     /// Record an observed attack/abuse offense and auto-ban IP + safe fingerprints once confirmed.
     pub fn record_offense(&self, ctx: OffenseContext<'_>) -> OffenseOutcome {
-        let mut outcome = OffenseOutcome {
-            newly_banned_ip: false,
-            newly_banned_js_fp: false,
-            newly_banned_composite_fp: false,
-            ban_ttl_secs: 0,
-            offense_level: 0,
-        };
+        let mut outcome = OffenseOutcome::default();
         if !self.enabled.load(Ordering::Relaxed) {
             return outcome;
         }
@@ -511,6 +549,8 @@ impl AutoBanManager {
         let expires_at = now + Duration::from_secs(ttl_secs);
         let expires_at_unix = now_unix.saturating_add(ttl_secs);
         let reason = clean_reason(ctx.reason);
+        let service_tag = clean_opt_meta(ctx.service_tag, 64);
+        let host = clean_opt_meta(ctx.host, 128);
 
         // 1. Ban exact attacker IP
         self.prune_if_needed(&self.banned_ips, MAX_BANNED_IPS, now);
@@ -519,17 +559,23 @@ impl AutoBanManager {
             .get(&ip)
             .map(|e| now < e.expires_at)
             .unwrap_or(false);
-        self.banned_ips.insert(
-            ip,
-            BanEntry {
-                reason: reason.clone(),
-                banned_at_unix: now_unix,
-                expires_at,
-                expires_at_unix,
-                offense_level: level,
-                hits_blocked: AtomicU64::new(0),
-            },
-        );
+        let ip_entry = BanEntry {
+            reason: reason.clone(),
+            service_tag: service_tag.clone(),
+            host: host.clone(),
+            banned_at_unix: now_unix,
+            expires_at,
+            expires_at_unix,
+            offense_level: level,
+            hits_blocked: AtomicU64::new(0),
+        };
+        outcome.created_bans.push(ban_entry_to_record(
+            "",
+            BanKind::Ip,
+            ip.to_string(),
+            &ip_entry,
+        ));
+        self.banned_ips.insert(ip, ip_entry);
         self.offenses.remove(&ip);
         if !ip_already_banned {
             outcome.newly_banned_ip = true;
@@ -548,17 +594,23 @@ impl AutoBanManager {
                         .get(js_h)
                         .map(|e| now < e.expires_at)
                         .unwrap_or(false);
-                    self.banned_js_fps.insert(
+                    let js_entry = BanEntry {
+                        reason: reason.clone(),
+                        service_tag: service_tag.clone(),
+                        host: host.clone(),
+                        banned_at_unix: now_unix,
+                        expires_at,
+                        expires_at_unix,
+                        offense_level: level,
+                        hits_blocked: AtomicU64::new(0),
+                    };
+                    outcome.created_bans.push(ban_entry_to_record(
+                        "",
+                        BanKind::JsFingerprint,
                         js_h.to_string(),
-                        BanEntry {
-                            reason: reason.clone(),
-                            banned_at_unix: now_unix,
-                            expires_at,
-                            expires_at_unix,
-                            offense_level: level,
-                            hits_blocked: AtomicU64::new(0),
-                        },
-                    );
+                        &js_entry,
+                    ));
+                    self.banned_js_fps.insert(js_h.to_string(), js_entry);
                     if !already {
                         outcome.newly_banned_js_fp = true;
                         self.total_auto_bans.fetch_add(1, Ordering::Relaxed);
@@ -574,17 +626,23 @@ impl AutoBanManager {
                         .get(&comp)
                         .map(|e| now < e.expires_at)
                         .unwrap_or(false);
-                    self.banned_composite_fps.insert(
-                        comp,
-                        BanEntry {
-                            reason,
-                            banned_at_unix: now_unix,
-                            expires_at,
-                            expires_at_unix,
-                            offense_level: level,
-                            hits_blocked: AtomicU64::new(0),
-                        },
-                    );
+                    let comp_entry = BanEntry {
+                        reason,
+                        service_tag,
+                        host,
+                        banned_at_unix: now_unix,
+                        expires_at,
+                        expires_at_unix,
+                        offense_level: level,
+                        hits_blocked: AtomicU64::new(0),
+                    };
+                    outcome.created_bans.push(ban_entry_to_record(
+                        "",
+                        BanKind::CompositeFingerprint,
+                        comp.clone(),
+                        &comp_entry,
+                    ));
+                    self.banned_composite_fps.insert(comp, comp_entry);
                     if !already {
                         outcome.newly_banned_composite_fp = true;
                         self.total_auto_bans.fetch_add(1, Ordering::Relaxed);
@@ -742,6 +800,102 @@ impl AutoBanManager {
             active_bans: list,
         }
     }
+
+    pub fn active_ban_records(&self, node_tag: &str) -> Vec<BanRecord> {
+        let now = Instant::now();
+        self.banned_ips.retain(|_, e| now < e.expires_at);
+        self.banned_js_fps.retain(|_, e| now < e.expires_at);
+        self.banned_composite_fps.retain(|_, e| now < e.expires_at);
+
+        let mut out = Vec::with_capacity(
+            self.banned_ips.len() + self.banned_js_fps.len() + self.banned_composite_fps.len(),
+        );
+        for e in self.banned_ips.iter() {
+            out.push(ban_entry_to_record(
+                node_tag,
+                BanKind::Ip,
+                e.key().to_string(),
+                e.value(),
+            ));
+        }
+        for e in self.banned_js_fps.iter() {
+            out.push(ban_entry_to_record(
+                node_tag,
+                BanKind::JsFingerprint,
+                e.key().clone(),
+                e.value(),
+            ));
+        }
+        for e in self.banned_composite_fps.iter() {
+            out.push(ban_entry_to_record(
+                node_tag,
+                BanKind::CompositeFingerprint,
+                e.key().clone(),
+                e.value(),
+            ));
+        }
+        out
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let state = PersistedBanState {
+            total_auto_bans: self.total_auto_bans.load(Ordering::Relaxed),
+            total_ban_drops: self.total_ban_drops.load(Ordering::Relaxed),
+            bans: self.active_ban_records(""),
+        };
+        write_json_snapshot_atomic(path, &state)
+    }
+
+    pub fn load_from_file(&self, path: &Path) -> Result<usize> {
+        let Some(state) = read_json_snapshot::<PersistedBanState>(path)? else {
+            return Ok(0);
+        };
+        if state.total_auto_bans > 0 {
+            self.total_auto_bans
+                .fetch_max(state.total_auto_bans, Ordering::Relaxed);
+        }
+        if state.total_ban_drops > 0 {
+            self.total_ban_drops
+                .fetch_max(state.total_ban_drops, Ordering::Relaxed);
+        }
+        let now = Instant::now();
+        let now_unix = now_unix_secs();
+        let mut loaded = 0usize;
+        for b in state.bans {
+            if b.expires_at_unix <= now_unix {
+                continue;
+            }
+            let remaining_secs = (b.expires_at_unix - now_unix).min(7 * 86_400);
+            let entry = BanEntry {
+                reason: clean_reason(&b.reason),
+                service_tag: b.service_tag,
+                host: b.host,
+                banned_at_unix: b.banned_at_unix,
+                expires_at: now + Duration::from_secs(remaining_secs),
+                expires_at_unix: b.expires_at_unix,
+                offense_level: b.offense_level.max(1),
+                hits_blocked: AtomicU64::new(b.hits_blocked),
+            };
+            match b.kind.as_str() {
+                "ip" => {
+                    if let Ok(ip) = b.target.parse::<IpAddr>() {
+                        self.banned_ips.insert(canonical_ip(ip), entry);
+                        loaded += 1;
+                    }
+                }
+                "js_fp" if !b.target.is_empty() => {
+                    self.banned_js_fps.insert(b.target, entry);
+                    loaded += 1;
+                }
+                "composite_fp" if !b.target.is_empty() => {
+                    self.banned_composite_fps.insert(b.target, entry);
+                    loaded += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(loaded)
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +928,8 @@ mod tests {
             tls_ja3: Some(chrome_ja3),
             user_agent: chrome_ua,
             js_fp_hash: Some("jsfp-attacker-1"),
+            service_tag: None,
+            host: None,
             kind: OffenseKind::WafAttackProbe,
             reason: "waf:sqli",
         });
@@ -787,6 +943,8 @@ mod tests {
             tls_ja3: Some(chrome_ja3),
             user_agent: chrome_ua,
             js_fp_hash: Some("jsfp-attacker-1"),
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:canary",
         });
@@ -825,6 +983,8 @@ mod tests {
             tls_ja3: Some(bot_ja3),
             user_agent: bot_ua,
             js_fp_hash: None,
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:rce",
         });
@@ -858,6 +1018,8 @@ mod tests {
             tls_ja3: None,
             user_agent: "scanner",
             js_fp_hash: None,
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
         });
@@ -869,6 +1031,8 @@ mod tests {
             tls_ja3: None,
             user_agent: "scanner",
             js_fp_hash: None,
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce-again",
         });
@@ -892,6 +1056,8 @@ mod tests {
             tls_ja3: Some("ja3bad"),
             user_agent: "BadBot/1.0",
             js_fp_hash: Some("jsfpdeadbeef"),
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
         });
@@ -908,6 +1074,8 @@ mod tests {
             tls_ja3: None,
             user_agent: "BadBot/1.0",
             js_fp_hash: None,
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce-2",
         });
@@ -953,6 +1121,8 @@ mod tests {
             tls_ja3: Some(ja3),
             user_agent: ua,
             js_fp_hash: None,
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
         });
@@ -969,10 +1139,51 @@ mod tests {
             tls_ja3: None,
             user_agent: "Chrome",
             js_fp_hash: Some("shared-js-fp"),
+            service_tag: None,
+            host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
         });
         assert!(o2.newly_banned_ip);
         assert!(!o2.newly_banned_js_fp);
+    }
+
+    #[test]
+    fn persists_active_bans_to_disk_and_reloads_across_restart() {
+        let dir = std::env::temp_dir().join(format!("exp-ban-persist-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("node-bans-edge1.json");
+        let cfg = AutoBanConfig {
+            enabled: true,
+            ban_ttl_secs: 900,
+            max_ban_ttl_secs: 3600,
+            confirm_hits: 2,
+            ban_fingerprints: true,
+            drop_at_tcp: true,
+        };
+        let mgr1 = AutoBanManager::new(&cfg);
+        let attacker: IpAddr = "64.227.75.77".parse().unwrap();
+        let out = mgr1.record_offense(OffenseContext {
+            client_ip: attacker,
+            tls_ja3: Some("deadbeef1234"),
+            user_agent: "BadScanner/1.0",
+            js_fp_hash: Some("js-evil-1"),
+            service_tag: Some("www-static"),
+            host: Some("jincaituanwei.com"),
+            kind: OffenseKind::VerifiedExploit,
+            reason: "evilpot:verified_exploit:rce",
+        });
+        assert_eq!(out.created_bans.len(), 3);
+        assert_eq!(out.created_bans[0].service_tag.as_deref(), Some("www-static"));
+        mgr1.save_to_file(&path).unwrap();
+
+        let mgr2 = AutoBanManager::new(&cfg);
+        let loaded = mgr2.load_from_file(&path).unwrap();
+        assert_eq!(loaded, 3);
+        assert!(mgr2.is_ip_banned_for_tcp(attacker));
+        let active = mgr2.active_ban_records("edge-1");
+        assert_eq!(active.len(), 3);
+        assert!(active.iter().all(|b| b.node_tag == "edge-1" && b.service_tag.as_deref() == Some("www-static")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

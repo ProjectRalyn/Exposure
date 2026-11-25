@@ -1,5 +1,5 @@
-// System View — Cluster Defaults, Config Versions & Rollback, Audit Log, Raw YAML Source
-import { formatDateTime } from "../charts.js";
+// System View — Cluster Defaults, Storage & Retention, Git-style Releases, Raw YAML Source
+import { formatBytes, formatCompact, formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
   defaultAbuseIpDbConfig,
@@ -21,12 +21,16 @@ import {
 } from "../ui.js";
 
 export function createSystemView({ api, store }) {
-  let subTab = "defaults"; // defaults | versions | audit | yaml
-  let auditSearch = "";
-  let auditStatus = "all";
+  let subTab = "defaults"; // defaults | storage | releases | yaml
   let abuseTestIp = "118.25.6.39";
   let abuseTestResult = null;
   let abuseTesting = false;
+
+  let storageData = null;
+  let storageDraft = null;
+  let storageBusy = false;
+  let releasesData = null;
+  let releasesBusy = false;
 
   function render() {
     const root = el("tab-system");
@@ -36,10 +40,10 @@ export function createSystemView({ api, store }) {
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "defaults" ? "active" : ""}" data-sys-sub="defaults">${esc(t("sys.tab.defaults"))}</button>
-          <button type="button" class="subtab-btn ${subTab === "versions" ? "active" : ""}" data-sys-sub="versions">
-            ${esc(t("sys.tab.versions"))} <span class="subtab-count">${(store.versions || []).length}</span>
+          <button type="button" class="subtab-btn ${subTab === "storage" ? "active" : ""}" data-sys-sub="storage">${esc(t("sys.tab.storage"))}</button>
+          <button type="button" class="subtab-btn ${subTab === "releases" ? "active" : ""}" data-sys-sub="releases">
+            ${esc(t("sys.tab.releases"))} <span class="subtab-count">${(releasesData?.items || []).length}</span>
           </button>
-          <button type="button" class="subtab-btn ${subTab === "audit" ? "active" : ""}" data-sys-sub="audit">${esc(t("sys.tab.audit"))}</button>
           <button type="button" class="subtab-btn ${subTab === "yaml" ? "active" : ""}" data-sys-sub="yaml">${esc(t("sys.tab.yaml"))}</button>
         </div>
       </div>
@@ -49,16 +53,16 @@ export function createSystemView({ api, store }) {
     root.querySelectorAll("[data-sys-sub]").forEach((btn) => {
       btn.addEventListener("click", () => {
         subTab = btn.dataset.sysSub;
-        if (subTab === "versions") loadVersions();
-        else if (subTab === "audit") loadAudit();
+        if (subTab === "storage") loadStorage();
+        else if (subTab === "releases") loadReleases();
         render();
       });
     });
 
     const body = el("sys-sub-body");
     if (subTab === "defaults") renderDefaults(body);
-    else if (subTab === "versions") renderVersions(body);
-    else if (subTab === "audit") renderAudit(body);
+    else if (subTab === "storage") renderStorage(body);
+    else if (subTab === "releases") renderReleases(body);
     else renderYaml(body);
   }
 
@@ -485,43 +489,248 @@ export function createSystemView({ api, store }) {
     el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
   }
 
-  async function loadVersions() {
+  /* ==================== STORAGE & RETENTION ==================== */
+
+  async function loadStorage() {
     try {
-      const data = await api("/api/config-versions");
-      store.versions = data.versions || [];
-      if (subTab === "versions") render();
+      storageData = await api("/api/storage/retention");
+      storageDraft = {
+        control: JSON.parse(JSON.stringify(storageData.control_retention || {})),
+        maintainer: JSON.parse(JSON.stringify(storageData.maintainer_retention || {})),
+      };
+      if (subTab === "storage") render();
     } catch (e) {
       showToast(e.message, true);
     }
   }
 
-  function renderVersions(container) {
-    const list = store.versions || [];
+  function renderStorage(container) {
+    if (!storageData) {
+      container.innerHTML = `<div class="panel muted">Loading storage stats…</div>`;
+      loadStorage();
+      return;
+    }
+    const c = storageDraft?.control || storageData.control_retention || {};
+    const m = storageDraft?.maintainer || storageData.maintainer_retention || {};
+    const cs = storageData.control_stats || {};
+    const maintStats = storageData.maintainer_stats || [];
+
+    const num = (attr, key, val, min = 0, extra = "") =>
+      `<label><span>${esc(attr)}</span><input type="number" min="${min}" data-${extra || "cret"}="${key}" value="${esc(val ?? "")}" /></label>`;
+    const mret = (label, key, val, min = 0) =>
+      `<label><span>${esc(label)}</span><input type="number" min="${min}" data-mret="${key}" value="${esc(val ?? "")}" /></label>`;
+
     container.innerHTML = `
       <div class="panel">
-        <div class="panel-header"><h3>${esc(t("sys.tab.versions"))} (${list.length})</h3></div>
+        <div class="panel-header">
+          <h3>Control Plane Storage</h3>
+          <span class="muted-sm">SQLite live usage · ${formatBytes((cs.db_bytes || 0) + (cs.wal_bytes || 0))}</span>
+        </div>
+        <div class="kpi-grid" style="margin-bottom:12px;">
+          <div class="kpi"><div class="kpi-label">DB</div><div class="kpi-val">${formatBytes(cs.db_bytes || 0)}</div><div class="kpi-sub">WAL ${formatBytes(cs.wal_bytes || 0)}</div></div>
+          <div class="kpi"><div class="kpi-label">Releases</div><div class="kpi-val">${formatCompact(cs.config_releases_rows || 0)}</div><div class="kpi-sub">legacy versions: ${formatCompact(cs.config_versions_rows || 0)}</div></div>
+          <div class="kpi"><div class="kpi-label">Audit Logs</div><div class="kpi-val">${formatCompact(cs.audit_logs_rows || 0)}</div><div class="kpi-sub">Nodes: ${formatCompact(cs.nodes_rows || 0)}</div></div>
+          <div class="kpi"><div class="kpi-label">Last Cleanup</div><div class="kpi-val" style="font-size:14px;">${esc(cs.last_cleanup_at ? formatDateTime(cs.last_cleanup_at) : "never")}</div><div class="kpi-sub">interval: ${esc(c.control_cleanup_interval_mins ?? 60)}m</div></div>
+        </div>
+        <div class="inspector-row">
+          ${num("Releases retention (days, 0 = off)", "config_releases_retention_days", c.config_releases_retention_days, 0)}
+          ${num("Releases max count", "config_releases_max_count", c.config_releases_max_count, 1)}
+          ${num("Audit logs retention (days)", "audit_logs_retention_days", c.audit_logs_retention_days, 0)}
+          ${num("Audit logs max rows", "audit_logs_max_rows", c.audit_logs_max_rows, 1)}
+        </div>
+        <div class="inspector-row">
+          ${num("Expired passphrase retention (hours)", "expired_passphrases_retention_hours", c.expired_passphrases_retention_hours, 0)}
+          ${num("Cleanup interval (mins)", "control_cleanup_interval_mins", c.control_cleanup_interval_mins, 1)}
+        </div>
+        <div class="btn-row" style="margin-top:12px;">
+          <button type="button" id="btn-storage-save" class="btn primary" ${storageBusy ? "disabled" : ""}>Save &amp; Push</button>
+          <button type="button" id="btn-storage-cleanup" class="btn" ${storageBusy ? "disabled" : ""}>Run Cleanup Now</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Maintainer Storage &amp; Retention</h3>
+          <span class="muted-sm">Hot-reloaded to every Maintainer via a signed topology release</span>
+        </div>
+        <div class="table-scroll" style="margin-bottom:12px;">
+          <table class="table">
+            <thead><tr><th>Maintainer</th><th>DB</th><th>WAL</th><th>Access</th><th>Summaries</th><th>Fingerprints</th><th>Evilpot</th><th>Bans</th><th>Alerts</th></tr></thead>
+            <tbody>
+              ${
+                maintStats
+                  .map(
+                    (s) => `
+                <tr>
+                  <td><code>${esc(s.maintainer_tag || "-")}</code></td>
+                  <td>${formatBytes(s.db_bytes || 0)}</td>
+                  <td>${formatBytes(s.wal_bytes || 0)}</td>
+                  <td>${formatCompact(s.access_logs_rows || 0)}</td>
+                  <td>${formatCompact(s.minute_summaries_rows || 0)}</td>
+                  <td>${formatCompact(s.fingerprints_rows || 0)}</td>
+                  <td>${formatCompact(s.evilpot_sessions_rows || 0)} / ${formatCompact(s.evilpot_events_rows || 0)}</td>
+                  <td>${formatCompact(s.ban_records_rows || 0)}</td>
+                  <td>${formatCompact(s.alerts_rows || 0)}</td>
+                </tr>`
+                  )
+                  .join("") || `<tr><td colspan="9" class="muted">No Maintainer storage stats reported yet</td></tr>`
+              }
+            </tbody>
+          </table>
+        </div>
+        <div class="inspector-row">
+          ${mret("Access logs retention (hours)", "access_logs_retention_hours", m.access_logs_retention_hours, 0)}
+          ${mret("Access logs max rows", "access_logs_max_rows", m.access_logs_max_rows, 1)}
+          ${mret("Stats retention (days)", "stats_retention_days", m.stats_retention_days, 0)}
+          ${mret("Max minute summaries", "max_summaries", m.max_summaries, 1)}
+        </div>
+        <div class="inspector-row">
+          ${mret("Fingerprint retention (days)", "fingerprints_retention_days", m.fingerprints_retention_days, 0)}
+          ${mret("Max fingerprints", "max_fingerprints", m.max_fingerprints, 1)}
+          ${mret("Evilpot retention (days)", "evilpot_retention_days", m.evilpot_retention_days, 0)}
+          ${mret("Max evilpot events", "evilpot_max_events", m.evilpot_max_events, 1)}
+          ${mret("Max evilpot sessions", "evilpot_max_sessions", m.evilpot_max_sessions, 1)}
+        </div>
+        <div class="inspector-row">
+          ${mret("Ban history retention (days)", "bans_retention_days", m.bans_retention_days, 0)}
+          ${mret("Max ban rows", "bans_max_rows", m.bans_max_rows, 1)}
+          ${mret("Alert retention (days)", "alerts_retention_days", m.alerts_retention_days, 0)}
+          ${mret("Max alert rows", "alerts_max_rows", m.alerts_max_rows, 1)}
+        </div>
+        <div class="inspector-row">
+          <label><span>Max DB size (MiB)</span><input type="number" min="16" data-mret-mib="max_db_bytes" value="${esc(m.max_db_bytes ? Math.round(m.max_db_bytes / 1048576) : 1024)}" /></label>
+          ${mret("Cleanup interval (mins)", "cleanup_interval_mins", m.cleanup_interval_mins, 1)}
+        </div>
+      </div>
+    `;
+
+    const collect = () => {
+      const nextControl = {};
+      container.querySelectorAll("[data-cret]").forEach((inp) => {
+        nextControl[inp.dataset.cret] = parseNum(inp.value, 0, 0);
+      });
+      const nextMaint = {};
+      container.querySelectorAll("[data-mret]").forEach((inp) => {
+        nextMaint[inp.dataset.mret] = parseNum(inp.value, 0, 0);
+      });
+      const mib = container.querySelector("[data-mret-mib]");
+      if (mib) nextMaint.max_db_bytes = parseNum(mib.value, 1024, 16) * 1048576;
+      return { control_retention: nextControl, maintainer_retention: nextMaint };
+    };
+
+    el("btn-storage-save")?.addEventListener("click", async () => {
+      if (storageBusy) return;
+      storageBusy = true;
+      try {
+        const payload = { ...collect(), push: true };
+        const res = await api("/api/storage/retention", { method: "PUT", body: JSON.stringify(payload) });
+        if ((res.push_errors || []).length) {
+          showToast(`Saved, but ${res.push_errors.length} node(s) failed to apply`, true);
+        } else {
+          showToast(res.release?.revision ? `Saved · release ${res.release.revision}` : "Retention policy saved");
+        }
+        await loadStorage();
+      } catch (e) {
+        showToast(e.message, true);
+      } finally {
+        storageBusy = false;
+        render();
+      }
+    });
+    el("btn-storage-cleanup")?.addEventListener("click", async () => {
+      if (storageBusy) return;
+      storageBusy = true;
+      try {
+        const res = await api("/api/storage/cleanup", { method: "POST" });
+        const cc = res.control_cleanup || {};
+        const maint = (res.maintainer_cleanups || []).filter((x) => x.ok).length;
+        showToast(`Cleanup done · ${cc.deleted_audit_logs ?? 0} audit rows, ${cc.deleted_releases ?? 0} releases, ${maint} maintainer(s)`);
+        await loadStorage();
+      } catch (e) {
+        showToast(e.message, true);
+      } finally {
+        storageBusy = false;
+        render();
+      }
+    });
+  }
+
+  /* ==================== GIT-STYLE RELEASES ==================== */
+
+  async function loadReleases() {
+    try {
+      releasesData = await api("/api/config-releases?limit=100");
+      if (subTab === "releases") render();
+    } catch (e) {
+      showToast(e.message, true);
+    }
+  }
+
+  function renderReleases(container) {
+    const data = releasesData || {};
+    const list = data.releases || [];
+    const latestRev = data.latest_revision || "";
+    if (!releasesData) {
+      container.innerHTML = `<div class="panel muted">Loading releases…</div>`;
+      loadReleases();
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Global Releases (${list.length})</h3>
+          <div class="btn-row">
+            <span class="muted-sm">Latest <code>${esc(latestRev || "-")}</code></span>
+            <button type="button" id="btn-releases-refresh" class="btn sm">Refresh</button>
+          </div>
+        </div>
         <div class="table-scroll">
           <table class="table">
-            <thead><tr><th>Seq</th><th>Host Tag</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Revision</th><th>Seq</th><th>Parent</th><th>Time</th><th>Actor</th><th>Trigger</th><th>Nodes</th><th>Actions</th></tr></thead>
             <tbody>
               ${
                 list
-                  .map(
-                    (v) => `
-                  <tr>
-                    <td><strong>#${esc(v.sequence)}</strong></td>
-                    <td><code>${esc(v.node_tag)}</code></td>
-                    <td>${esc(formatDateTime(v.created_at))}</td>
-                    <td><span class="pill ${v.status === "applied" ? "ok" : v.status === "failed" ? "err" : "warn"}">${esc(v.status)}</span></td>
-                    <td>
-                      <div class="btn-row">
-                        <button type="button" class="btn sm" data-ver-prev="${esc(v.id)}">Preview</button>
-                        <button type="button" class="btn sm danger" data-ver-rb="${esc(v.id)}">Rollback</button>
+                  .map((r) => {
+                    const nodes = r.nodes || [];
+                    const applied = nodes.filter((n) => n.status === "applied").length;
+                    const failed = nodes.filter((n) => n.status === "failed").length;
+                    const pill = failed
+                      ? `<span class="pill err">${applied}/${nodes.length} applied</span>`
+                      : applied === nodes.length && nodes.length
+                      ? `<span class="pill ok">${applied}/${nodes.length} applied</span>`
+                      : `<span class="pill warn">${applied}/${nodes.length} applied</span>`;
+                    return `
+                <tr>
+                  <td><span class="rev-badge">${esc(r.revision)}</span>${r.revision === latestRev ? ` <span class="pill ok">latest</span>` : ""}</td>
+                  <td>#${esc(r.release_seq)}</td>
+                  <td>${r.parent_revision ? `<span class="rev-badge">${esc(r.parent_revision)}</span>` : "—"}</td>
+                  <td class="muted-sm">${esc(formatDateTime(r.created_at))}</td>
+                  <td>${esc(r.pushed_by || "-")}</td>
+                  <td class="muted-sm">${esc(r.trigger_kind || "-")}</td>
+                  <td>
+                    <details>
+                      <summary class="muted-sm" style="cursor:pointer;">${pill}</summary>
+                      <div style="margin-top:6px;display:flex;flex-direction:column;gap:3px;">
+                        ${
+                          nodes
+                            .map(
+                              (n) => `<span class="muted-sm"><code>${esc(n.node_tag)}</code> · <span class="pill ${n.status === "applied" ? "ok" : n.status === "failed" ? "err" : "warn"}">${esc(n.status)}</span>${n.error ? ` · ${esc(n.error)}` : ""}</span>`
+                            )
+                            .join("") || `<span class="muted-sm">no per-node records</span>`
+                        }
                       </div>
-                    </td>
-                  </tr>`
-                  )
-                  .join("") || `<tr><td colspan="5" class="muted">No config history</td></tr>`
+                    </details>
+                  </td>
+                  <td>
+                    <div class="btn-row">
+                      <button type="button" class="btn sm" data-rel-details="${esc(r.revision)}">Details</button>
+                      <button type="button" class="btn sm danger" data-rel-rb="${esc(r.revision)}" ${releasesBusy || r.revision === latestRev ? "disabled" : ""}>Rollback</button>
+                    </div>
+                  </td>
+                </tr>`;
+                  })
+                  .join("") || `<tr><td colspan="8" class="muted">No releases yet — deploy a topology to create the first one</td></tr>`
               }
             </tbody>
           </table>
@@ -529,103 +738,63 @@ export function createSystemView({ api, store }) {
       </div>
     `;
 
-    container.querySelectorAll("[data-ver-prev]").forEach((btn) => {
+    el("btn-releases-refresh")?.addEventListener("click", loadReleases);
+    container.querySelectorAll("[data-rel-details]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const rec = list.find((v) => String(v.id) === btn.dataset.verPrev);
+        const rec = list.find((r) => r.revision === btn.dataset.relDetails);
         if (!rec) return;
-        let pretty = rec.config_json;
-        try { pretty = JSON.stringify(JSON.parse(rec.config_json), null, 2); } catch {}
+        const rows = (rec.nodes || [])
+          .map((n) => `<tr><td><code>${esc(n.node_tag)}</code></td><td><span class="pill ${n.status === "applied" ? "ok" : n.status === "failed" ? "err" : "warn"}">${esc(n.status)}</span></td><td class="muted-sm">${esc(n.updated_at || "-")}</td><td>${esc(n.error || "-")}</td></tr>`)
+          .join("");
         openModal({
-          title: `Snapshot #${rec.sequence} — ${rec.node_tag}`,
-          bodyHtml: `<pre class="output-box" style="max-height:55vh;">${esc(pretty)}</pre>`,
+          title: `Release ${rec.revision} (#${rec.release_seq})`,
+          bodyHtml: `
+            <div class="fp-detail-grid">
+              <div class="fp-kv"><div class="fp-kv-lbl">Full Hash</div><div class="fp-kv-val"><code style="word-break:break-all;">${esc(rec.revision_full)}</code></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Parent / Trigger</div><div class="fp-kv-val">${esc(rec.parent_revision || "—")} · ${esc(rec.trigger_kind || "-")}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">Actor / Time</div><div class="fp-kv-val">${esc(rec.pushed_by || "-")} · ${esc(formatDateTime(rec.created_at))}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">CRS Version</div><div class="fp-kv-val"><code>${esc(rec.crs_version || "-")}</code></div></div>
+            </div>
+            <p class="muted-sm" style="margin-top:8px;">${esc(rec.message || "")}</p>
+            <div class="table-scroll" style="margin-top:8px;">
+              <table class="table">
+                <thead><tr><th>Node</th><th>Status</th><th>Updated</th><th>Error</th></tr></thead>
+                <tbody>${rows || `<tr><td colspan="4" class="muted">no per-node records</td></tr>`}</tbody>
+              </table>
+            </div>`,
           actions: [{ label: t("common.close") }],
         });
       });
     });
-
-    container.querySelectorAll("[data-ver-rb]").forEach((btn) => {
+    container.querySelectorAll("[data-rel-rb]").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const rec = list.find((v) => String(v.id) === btn.dataset.verRb);
-        if (!rec) return;
+        const rev = btn.dataset.relRb;
         openModal({
-          title: `Confirm Rollback — ${rec.node_tag}`,
-          bodyHtml: `<p>Push snapshot <b>#${esc(rec.sequence)}</b> as a new signed revision to <code>${esc(rec.node_tag)}</code>?</p>`,
+          title: `Rollback to ${rev}`,
+          bodyHtml: `<p>Create a new forward release that reverts the cluster to <span class="rev-badge">${esc(rev)}</span>?</p><p class="muted-sm">This pushes a brand-new globally-signed release to every node.</p>`,
           actions: [
             { label: t("common.cancel"), cls: "ghost" },
             {
-              label: "Confirm Rollback",
+              label: "Rollback",
               cls: "danger",
               onClick: async () => {
+                releasesBusy = true;
                 try {
-                  await api(`/api/config-versions/${encodeURIComponent(rec.id)}/rollback`, { method: "POST" });
-                  showToast(`Rollback pushed to ${rec.node_tag}`);
-                  loadVersions();
-                } catch (e) { showToast(e.message, true); }
+                  const res = await api(`/api/config-releases/${encodeURIComponent(rev)}/rollback`, { method: "POST" });
+                  showToast(`Rolled back as ${res.revision}`);
+                  await loadReleases();
+                } catch (e) {
+                  showToast(e.message, true);
+                } finally {
+                  releasesBusy = false;
+                  render();
+                }
               },
             },
           ],
         });
       });
     });
-  }
-
-  async function loadAudit() {
-    try {
-      const data = await api("/api/audit");
-      store.audit = data.logs || [];
-      if (subTab === "audit") render();
-    } catch (e) {
-      showToast(e.message, true);
-    }
-  }
-
-  function renderAudit(container) {
-    const filtered = (store.audit || []).filter((l) => {
-      if (auditStatus === "ok" && !l.success) return false;
-      if (auditStatus === "fail" && l.success) return false;
-      if (auditSearch && !`${l.actor} ${l.action} ${l.target} ${l.detail}`.toLowerCase().includes(auditSearch.toLowerCase())) return false;
-      return true;
-    });
-
-    container.innerHTML = `
-      <div class="panel">
-        <div class="panel-header">
-          <h3>${esc(t("sys.tab.audit"))} (${filtered.length})</h3>
-          <div class="btn-row">
-            <input id="sys-aud-q" class="input-sm" type="search" value="${esc(auditSearch)}" placeholder="${esc(t("common.search"))}" />
-            <select id="sys-aud-st" class="select-sm">
-              <option value="all" ${auditStatus === "all" ? "selected" : ""}>All</option>
-              <option value="ok" ${auditStatus === "ok" ? "selected" : ""}>OK</option>
-              <option value="fail" ${auditStatus === "fail" ? "selected" : ""}>Failed</option>
-            </select>
-          </div>
-        </div>
-        <div class="table-scroll">
-          <table class="table">
-            <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead>
-            <tbody>
-              ${
-                filtered
-                  .map(
-                    (l) => `
-                  <tr>
-                    <td>${esc(formatDateTime(l.created_at))}</td>
-                    <td>${esc(l.actor)}</td>
-                    <td><code>${esc(l.action)}</code></td>
-                    <td>${esc(l.target)}</td>
-                    <td><span class="pill ${l.success ? "ok" : "err"}">${l.success ? "OK" : "FAIL"}</span></td>
-                    <td>${esc(l.detail)}</td>
-                  </tr>`
-                  )
-                  .join("") || `<tr><td colspan="6" class="muted">No audit entries</td></tr>`
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-    el("sys-aud-q")?.addEventListener("input", (ev) => { auditSearch = ev.target.value; render(); el("sys-aud-q")?.focus(); });
-    el("sys-aud-st")?.addEventListener("change", (ev) => { auditStatus = ev.target.value; render(); });
   }
 
   function renderYaml(container) {
@@ -664,8 +833,8 @@ export function createSystemView({ api, store }) {
   async function refresh(opts = {}) {
     if (opts.subTab) subTab = opts.subTab;
     if (!store.loaded) await store.loadTopology(false);
-    if (subTab === "versions") await loadVersions();
-    else if (subTab === "audit") await loadAudit();
+    if (subTab === "storage") await loadStorage();
+    else if (subTab === "releases") await loadReleases();
     else if (subTab === "yaml" && store.dirty) {
       try { await store.validate(null); } catch {}
     }

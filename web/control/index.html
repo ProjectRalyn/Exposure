@@ -116,7 +116,6 @@
         </div>
         <div class="topbar-actions">
           <select id="sel-time-window" class="select-sm" title="Stats time window">
-            <option value="60" data-i18n="topbar.window.1m">Window: 1m</option>
             <option value="300" data-i18n="topbar.window.5m">Window: 5m</option>
             <option value="900" data-i18n="topbar.window.15m">Window: 15m</option>
             <option value="1800" data-i18n="topbar.window.30m">Window: 30m</option>
@@ -125,8 +124,16 @@
             <option value="43200" data-i18n="topbar.window.12h">Window: 12h</option>
             <option value="86400" data-i18n="topbar.window.24h">Window: 24h</option>
             <option value="604800" data-i18n="topbar.window.7d">Window: 7d</option>
+            <option value="2592000" data-i18n="topbar.window.30d">Window: 30d</option>
             <option value="0" data-i18n="topbar.window.all">Window: All</option>
+            <option value="custom" data-i18n="topbar.window.custom">Window: Custom…</option>
           </select>
+          <div id="time-custom-wrap" class="time-custom-wrap hidden">
+            <input id="inp-time-from" type="datetime-local" class="input-sm" title="Start time" />
+            <span class="muted-sm">→</span>
+            <input id="inp-time-to" type="datetime-local" class="input-sm" title="End time" />
+            <button id="btn-time-apply" type="button" class="btn sm primary" data-i18n="topbar.window.apply">Apply</button>
+          </div>
           <select id="sel-auto-refresh" class="select-sm" title="Auto refresh interval">
             <option value="0" data-i18n="topbar.auto.off">Auto: Off</option>
             <option value="10000" data-i18n="topbar.auto.10s">Auto: 10s</option>

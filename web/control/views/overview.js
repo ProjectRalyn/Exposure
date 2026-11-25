@@ -13,7 +13,7 @@ import {
 import { t } from "../i18n.js";
 import { el, esc } from "../ui.js";
 
-export function createOverviewView({ api, store, navigate }) {
+export function createOverviewView({ api, store, navigate, getTimeRangeParams }) {
   let alertSeverity = "all";
 
   function renderShell() {
@@ -96,11 +96,16 @@ export function createOverviewView({ api, store, navigate }) {
         <div class="panel">
           <div class="panel-header">
             <h3>${esc(t("ov.recent_alerts"))}</h3>
-            <select id="ov-alert-filter" class="select-sm">
-              <option value="all" ${alertSeverity === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
-              <option value="error" ${alertSeverity === "error" ? "selected" : ""}>Error</option>
-              <option value="warn" ${alertSeverity === "warn" ? "selected" : ""}>Warn</option>
-            </select>
+            <div class="btn-row">
+              <select id="ov-alert-filter" class="select-sm">
+                <option value="all" ${alertSeverity === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
+                <option value="critical" ${alertSeverity === "critical" ? "selected" : ""}>Critical</option>
+                <option value="error" ${alertSeverity === "error" ? "selected" : ""}>Error</option>
+                <option value="warning" ${alertSeverity === "warning" ? "selected" : ""}>Warning</option>
+                <option value="info" ${alertSeverity === "info" ? "selected" : ""}>Info</option>
+              </select>
+              <button type="button" id="btn-ov-view-alerts" class="btn sm ghost">${esc(t("ov.view_all_alerts"))} →</button>
+            </div>
           </div>
           <div id="ov-maintainer-strip" class="maint-strip hidden"></div>
           <div class="table-scroll">
@@ -116,27 +121,33 @@ export function createOverviewView({ api, store, navigate }) {
       alertSeverity = ev.target.value;
       renderAlerts();
     });
+    el("btn-ov-view-alerts")?.addEventListener("click", () => {
+      navigate("logging", { subTab: "alerts" });
+    });
   }
 
   function renderAlerts() {
     const ov = store.overview;
     const tbody = el("alerts-tbody");
     if (!ov || !tbody) return;
-    const rows = (ov.alerts || []).filter((a) => alertSeverity === "all" || a.severity === alertSeverity);
+    const normSev = (s) => (s === "warn" ? "warning" : s || "info");
+    const rows = (ov.alerts || []).filter(
+      (a) => alertSeverity === "all" || normSev(a.severity) === alertSeverity
+    );
+    const pillCls = (sev) => (sev === "critical" || sev === "error" ? "err" : sev === "warning" ? "warn" : "info");
     tbody.innerHTML =
       rows
-        .slice()
-        .reverse()
         .slice(0, 50)
-        .map(
-          (a) => `
+        .map((a) => {
+          const sv = normSev(a.severity);
+          return `
       <tr>
         <td>${esc(formatDateTime(a.timestamp))}</td>
         <td><code>${esc(a.source)}</code></td>
-        <td><span class="pill ${a.severity === "error" ? "err" : "warn"}">${esc(a.severity)}</span></td>
+        <td><span class="pill ${pillCls(sv)}">${esc(sv)}</span></td>
         <td>${esc(a.message)}</td>
-      </tr>`
-        )
+      </tr>`;
+        })
         .join("") || `<tr><td colspan="4" class="muted">${esc(t("ov.no_alerts"))}</td></tr>`;
   }
 
@@ -164,8 +175,13 @@ export function createOverviewView({ api, store, navigate }) {
     el("kpi-latency-sub").textContent = `p99: ${(tr.p99_ms || 0).toFixed(1)} ms`;
 
     const cs = ov.certificates_summary || {};
-    el("kpi-certs").textContent = `#${ov.latest_sequence ?? 0}`;
-    el("kpi-certs-sub").textContent = `${cs.valid ?? 0}/${cs.total ?? 0} valid certs · ${(ov.alerts || []).length} alerts`;
+    const rev = ov.latest_revision || "";
+    const revSeq = ov.latest_release_seq ?? ov.latest_sequence ?? 0;
+    const driftedCount = (ov.nodes || []).filter(
+      (n) => rev && n.config_revision && n.config_revision !== rev
+    ).length;
+    el("kpi-certs").textContent = rev ? `${rev}` : `#${revSeq}`;
+    el("kpi-certs-sub").textContent = `#${revSeq}${driftedCount ? ` (${driftedCount} drifted)` : ""} · ${cs.valid ?? 0}/${cs.total ?? 0} certs · ${ov.alerts_total ?? (ov.alerts || []).length} alerts`;
 
     const tc = themeColors();
     const ts = ov.timeseries || [];
@@ -230,8 +246,9 @@ export function createOverviewView({ api, store, navigate }) {
   }
 
   async function refresh() {
-    const winSec = Number(el("sel-time-window")?.value ?? 3600);
-    const ov = await api(`/api/overview?window_secs=${winSec}`);
+    const qs = new URLSearchParams();
+    if (getTimeRangeParams) getTimeRangeParams().applyTo(qs);
+    const ov = await api(`/api/overview?${qs}`);
     store.overview = ov;
     if (!store.loaded && ov.spec) {
       store.setFromServer({ spec: ov.spec, live_nodes: ov.nodes, live_links: ov.links }, false);

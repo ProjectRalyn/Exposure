@@ -185,7 +185,17 @@ export function createHostsView({ api, store, navigate }) {
                     <td><div class="tag-list">${roleChips || '<span class="muted-sm">-</span>'}</div></td>
                     <td><div class="tag-list">${ipHtml}</div></td>
                     <td>${live ? esc(formatUptime(live.uptime_secs)) : "-"}</td>
-                    <td>${live ? `#${esc(live.config_seq)}` : "-"}</td>
+                    <td>${
+                      live
+                        ? `<div><code>#${esc(live.config_seq)}</code></div>${
+                            live.config_revision
+                              ? `<div style="margin-top:3px;"><span class="rev-badge ${store.latestRevision && live.config_revision !== store.latestRevision ? "drift" : ""}">${esc(live.config_revision)}</span></div>`
+                              : store.latestRevision
+                              ? `<div style="margin-top:3px;"><span class="rev-badge drift">outdated</span></div>`
+                              : ""
+                          }`
+                        : "-"
+                    }</td>
                     <td>${statusBadge}</td>
                     <td>
                       <div class="btn-row">
@@ -939,6 +949,8 @@ export function createHostsView({ api, store, navigate }) {
     ]);
     store.liveNodes = nodesData.nodes || [];
     store.liveLinks = nodesData.links || [];
+    store.latestRevision = nodesData.latest_revision || "";
+    store.latestReleaseSeq = Number(nodesData.latest_release_seq) || 0;
     if (subTab === "onboarding") await loadPassphrases();
     render();
     if (opts.editHost && store.spec.nodes[opts.editHost]) {

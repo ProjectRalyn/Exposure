@@ -783,6 +783,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "rusqlite",
  "rustls",
  "rustls-pemfile",
  "rustls-webpki",

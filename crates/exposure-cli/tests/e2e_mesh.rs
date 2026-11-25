@@ -137,6 +137,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         }),
         bootstrap_tunnel_addr: None,
         config_sequence: 0,
+        config_revision: String::new(),
     };
     let maint_rt = NodeRuntime::new(maint_cfg, None, None).await.unwrap();
     let (maint_link_addr, _) = maint_rt.start().await.unwrap();
@@ -211,6 +212,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         maintainer: None,
         bootstrap_tunnel_addr: None,
         config_sequence: 0,
+        config_revision: String::new(),
     };
     let relay_rt = NodeRuntime::new(relay_cfg, None, None).await.unwrap();
     let (relay_link_addr, _) = relay_rt.start().await.unwrap();
@@ -297,6 +299,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         maintainer: None,
         bootstrap_tunnel_addr: None,
         config_sequence: 0,
+        config_revision: String::new(),
     };
     let egress_rt = NodeRuntime::new(egress_cfg, None, None).await.unwrap();
     egress_rt.start().await.unwrap();
@@ -485,6 +488,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         maintainer: None,
         bootstrap_tunnel_addr: None,
         config_sequence: 0,
+        config_revision: String::new(),
     };
     let ingress_rt = NodeRuntime::new(ingress_cfg, None, Some(boot_passphrase.clone()))
         .await
@@ -879,6 +883,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             records: recs,
             minute_summaries: sums,
             fingerprints: fps,
+            evilpot_sessions: vec![],
+            evilpot_events: vec![],
+            ban_records: vec![],
+            alerts: vec![],
         },
     );
     let log_ack = ingress_rt

@@ -10,6 +10,7 @@ pub mod honeypot;
 pub mod ingress;
 pub mod logger;
 pub mod maintainer;
+pub mod maintainer_db;
 pub mod runtime;
 pub mod tls;
 pub mod waf;

@@ -12,8 +12,10 @@ use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret}
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic, SegmentWriter};
 use exposure_core::telemetry::{
-    is_cache_served_status, is_security_block_action, sanitize_log_text, AlertRecord,
-    ClientJsFingerprint, FingerprintObservation, LogProtectionStats, MinuteSummary, SessionSummary,
+    is_autoban_action, is_cache_served_status, is_evilpot_action, is_security_block_action,
+    normalize_alert_severity, sanitize_log_text, AlertRecord, BanRecord, ClientJsFingerprint,
+    EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation, LogProtectionStats,
+    MinuteSummary, SessionSummary,
 };
 use exposure_core::Result;
 use rand::Rng;
@@ -100,7 +102,12 @@ enum LogPriority {
 
 impl LogPriority {
     fn classify(status: u16, rate_limited: bool, action: Option<&str>) -> Self {
-        if status >= 500 || matches!(action, Some("evilpot_canary" | "upstream_error")) {
+        if status >= 500
+            || matches!(
+                action,
+                Some("evilpot" | "evilpot_canary" | "geo_evilpot" | "upstream_error")
+            )
+        {
             return Self::High;
         }
         if rate_limited
@@ -110,11 +117,9 @@ impl LogPriority {
                     "autoban"
                         | "unmatched"
                         | "waf_block"
-                        | "evilpot"
                         | "guard_reject"
                         | "abuseipdb"
                         | "geo_block"
-                        | "geo_evilpot"
                         | "geo_challenge"
                         | "challenge"
                         | "rate_limit"
@@ -548,6 +553,29 @@ impl LogDoSGuard {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct DrainedLogBatch {
+    pub records: Vec<SessionSummary>,
+    pub summaries: Vec<MinuteSummary>,
+    pub fingerprints: Vec<FingerprintObservation>,
+    pub evilpot_sessions: Vec<EvilpotSessionInfo>,
+    pub evilpot_events: Vec<EvilpotEventInfo>,
+    pub ban_records: Vec<BanRecord>,
+    pub alerts: Vec<AlertRecord>,
+}
+
+impl DrainedLogBatch {
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+            && self.summaries.is_empty()
+            && self.fingerprints.is_empty()
+            && self.evilpot_sessions.is_empty()
+            && self.evilpot_events.is_empty()
+            && self.ban_records.is_empty()
+            && self.alerts.is_empty()
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct NodeLoggerCheckpoint {
     #[serde(default)]
@@ -556,6 +584,14 @@ struct NodeLoggerCheckpoint {
     fingerprints: Vec<FingerprintObservation>,
     #[serde(default)]
     alerts: Vec<AlertRecord>,
+    #[serde(default)]
+    pending_evilpot_sessions: Vec<EvilpotSessionInfo>,
+    #[serde(default)]
+    pending_evilpot_events: Vec<EvilpotEventInfo>,
+    #[serde(default)]
+    pending_ban_records: Vec<BanRecord>,
+    #[serde(default)]
+    pending_alerts: Vec<AlertRecord>,
 }
 
 fn node_checkpoint_path(dir: &str, node_tag: &str) -> PathBuf {
@@ -624,6 +660,10 @@ pub struct NodeLogger {
     recent_records: Arc<Mutex<Vec<SessionSummary>>>,
     recent_bytes: Arc<Mutex<usize>>,
     alerts: Arc<Mutex<Vec<AlertRecord>>>,
+    pending_evilpot_sessions: Arc<Mutex<HashMap<String, EvilpotSessionInfo>>>,
+    pending_evilpot_events: Arc<Mutex<Vec<EvilpotEventInfo>>>,
+    pending_ban_records: Arc<Mutex<Vec<BanRecord>>>,
+    pending_alerts: Arc<Mutex<Vec<AlertRecord>>>,
     dos_guard: Arc<LogDoSGuard>,
     flush_notify: Arc<Notify>,
     dirty: AtomicBool,
@@ -636,10 +676,14 @@ impl NodeLogger {
         let writer = SegmentWriter::new(cfg.segment.clone(), &tag)?;
         let dos_guard = Arc::new(LogDoSGuard::new(&cfg.protection));
 
-        // Restore unsent summaries, fingerprints, and alerts from disk checkpoint on restart
+        // Restore unsent summaries, fingerprints, alerts, evilpot/ban deltas from disk checkpoint on restart
         let mut init_buckets = HashMap::new();
         let mut init_fps = HashMap::new();
         let mut init_alerts = Vec::new();
+        let mut init_ep_sessions = HashMap::new();
+        let mut init_ep_events = Vec::new();
+        let mut init_ban_records = Vec::new();
+        let mut init_pending_alerts = Vec::new();
         let cp_path = node_checkpoint_path(&cfg.segment.dir, &tag);
         let retention_secs = (cfg.segment.retention_hours.max(1) as i64).saturating_mul(3600);
         let cutoff = Utc::now().timestamp().saturating_sub(retention_secs);
@@ -658,6 +702,12 @@ impl NodeLogger {
                 }
             }
             init_alerts = cp.alerts.into_iter().take(200).collect();
+            for s in cp.pending_evilpot_sessions.into_iter().take(512) {
+                init_ep_sessions.insert(s.client_ip.clone(), s);
+            }
+            init_ep_events = cp.pending_evilpot_events.into_iter().take(1024).collect();
+            init_ban_records = cp.pending_ban_records.into_iter().take(1024).collect();
+            init_pending_alerts = cp.pending_alerts.into_iter().take(512).collect();
         }
 
         Ok(Arc::new(Self {
@@ -672,6 +722,10 @@ impl NodeLogger {
             recent_records: Arc::new(Mutex::new(Vec::new())),
             recent_bytes: Arc::new(Mutex::new(0)),
             alerts: Arc::new(Mutex::new(init_alerts)),
+            pending_evilpot_sessions: Arc::new(Mutex::new(init_ep_sessions)),
+            pending_evilpot_events: Arc::new(Mutex::new(init_ep_events)),
+            pending_ban_records: Arc::new(Mutex::new(init_ban_records)),
+            pending_alerts: Arc::new(Mutex::new(init_pending_alerts)),
             dos_guard,
             flush_notify: Arc::new(Notify::new()),
             dirty: AtomicBool::new(false),
@@ -845,6 +899,12 @@ impl NodeLogger {
             {
                 entry.blocked = entry.blocked.saturating_add(1);
             }
+            if is_evilpot_action(meta.action) {
+                entry.evilpot_hits = entry.evilpot_hits.saturating_add(1);
+            }
+            if is_autoban_action(meta.action) {
+                entry.autoban_hits = entry.autoban_hits.saturating_add(1);
+            }
             if challenge_passed {
                 entry.challenges_passed = entry.challenges_passed.saturating_add(1);
             }
@@ -874,7 +934,10 @@ impl NodeLogger {
         }
         self.dirty.store(true, Ordering::Relaxed);
 
-        let sampled = if cfg.sample_rate >= 1.0 || priority == LogPriority::High {
+        let never_sample = priority == LogPriority::High
+            || is_security_block_action(meta.action)
+            || meta.action == Some("waf_monitor");
+        let sampled = if cfg.sample_rate >= 1.0 || never_sample {
             true
         } else if cfg.sample_rate <= 0.0 {
             false
@@ -1052,26 +1115,85 @@ impl NodeLogger {
     pub async fn emit_alert(&self, severity: &str, message: impl Into<String>) {
         let raw_msg = message.into();
         let clean_msg = sanitize_alert_msg(raw_msg);
+        let norm_sev = normalize_alert_severity(severity);
         let prot_enabled = self
             .cfg
             .try_read()
             .map(|c| c.protection.enabled)
             .unwrap_or(true);
-        if !self.dos_guard.should_emit_alert(severity, &clean_msg, prot_enabled) {
+        if !self.dos_guard.should_emit_alert(norm_sev, &clean_msg, prot_enabled) {
             return;
         }
-        let mut alerts = self.alerts.lock().await;
-        alerts.push(AlertRecord {
-            timestamp: Utc::now().to_rfc3339(),
+        let now = Utc::now();
+        let rec = AlertRecord {
+            timestamp_ms: now.timestamp_millis(),
+            timestamp: now.to_rfc3339(),
             source: self.node_tag.clone(),
-            severity: severity.to_string(),
+            severity: norm_sev.to_string(),
             message: clean_msg,
-        });
-        if alerts.len() > 200 {
-            let drain = alerts.len() - 200;
-            alerts.drain(0..drain);
+        };
+        {
+            let mut alerts = self.alerts.lock().await;
+            alerts.push(rec.clone());
+            if alerts.len() > 200 {
+                let drain = alerts.len() - 200;
+                alerts.drain(0..drain);
+            }
+        }
+        {
+            let mut pending = self.pending_alerts.lock().await;
+            if pending.len() < 512 {
+                pending.push(rec);
+            }
         }
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    pub async fn record_evilpot_interaction(
+        &self,
+        mut session: EvilpotSessionInfo,
+        mut event: EvilpotEventInfo,
+    ) {
+        if session.node_tag.is_empty() {
+            session.node_tag = self.node_tag.clone();
+        }
+        if event.node_tag.is_empty() {
+            event.node_tag = self.node_tag.clone();
+        }
+        {
+            let mut sess = self.pending_evilpot_sessions.lock().await;
+            if sess.len() < 1024 || sess.contains_key(&session.client_ip) {
+                sess.insert(session.client_ip.clone(), session);
+            }
+        }
+        {
+            let mut evs = self.pending_evilpot_events.lock().await;
+            if evs.len() < 2048 {
+                evs.push(event);
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.flush_notify.notify_one();
+    }
+
+    pub async fn record_ban_records(&self, bans: Vec<BanRecord>) {
+        if bans.is_empty() {
+            return;
+        }
+        {
+            let mut pending = self.pending_ban_records.lock().await;
+            for mut b in bans {
+                if pending.len() >= 2048 {
+                    break;
+                }
+                if b.node_tag.is_empty() {
+                    b.node_tag = self.node_tag.clone();
+                }
+                pending.push(b);
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        self.flush_notify.notify_one();
     }
 
     pub async fn recent_alerts(&self) -> Vec<AlertRecord> {
@@ -1103,6 +1225,16 @@ impl NodeLogger {
                 summaries: self.minute_buckets.lock().await.values().cloned().collect(),
                 fingerprints: self.fp_observations.lock().await.values().cloned().collect(),
                 alerts: self.alerts.lock().await.clone(),
+                pending_evilpot_sessions: self
+                    .pending_evilpot_sessions
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect(),
+                pending_evilpot_events: self.pending_evilpot_events.lock().await.clone(),
+                pending_ban_records: self.pending_ban_records.lock().await.clone(),
+                pending_alerts: self.pending_alerts.lock().await.clone(),
             })
         } else {
             None
@@ -1358,14 +1490,8 @@ impl NodeLogger {
         }
     }
 
-    /// Drain pending minute summaries, sampled records, and fingerprint observations to send to Maintainer.
-    pub async fn drain_for_maintainer(
-        &self,
-    ) -> (
-        Vec<SessionSummary>,
-        Vec<MinuteSummary>,
-        Vec<FingerprintObservation>,
-    ) {
+    /// Drain all pending telemetry, access logs, fingerprints, Evilpot interactions, Bans & Alerts to send to Maintainer.
+    pub async fn drain_batch_for_maintainer(&self) -> DrainedLogBatch {
         self.promote_expired_folded(false).await;
         let records = {
             let mut r = self.recent_records.lock().await;
@@ -1381,10 +1507,114 @@ impl NodeLogger {
             let mut f = self.fp_observations.lock().await;
             f.drain().map(|(_, v)| v).collect::<Vec<_>>()
         };
-        if !summaries.is_empty() || !fingerprints.is_empty() {
+        let evilpot_sessions = {
+            let mut s = self.pending_evilpot_sessions.lock().await;
+            s.drain().map(|(_, v)| v).collect::<Vec<_>>()
+        };
+        let evilpot_events = {
+            let mut e = self.pending_evilpot_events.lock().await;
+            std::mem::take(&mut *e)
+        };
+        let ban_records = {
+            let mut b = self.pending_ban_records.lock().await;
+            std::mem::take(&mut *b)
+        };
+        let alerts = {
+            let mut a = self.pending_alerts.lock().await;
+            std::mem::take(&mut *a)
+        };
+        if !summaries.is_empty()
+            || !fingerprints.is_empty()
+            || !evilpot_sessions.is_empty()
+            || !evilpot_events.is_empty()
+            || !ban_records.is_empty()
+            || !alerts.is_empty()
+        {
             self.dirty.store(true, Ordering::Relaxed);
         }
-        (records, summaries, fingerprints)
+        DrainedLogBatch {
+            records,
+            summaries,
+            fingerprints,
+            evilpot_sessions,
+            evilpot_events,
+            ban_records,
+            alerts,
+        }
+    }
+
+    /// Drain pending minute summaries, sampled records, and fingerprint observations to send to Maintainer.
+    pub async fn drain_for_maintainer(
+        &self,
+    ) -> (
+        Vec<SessionSummary>,
+        Vec<MinuteSummary>,
+        Vec<FingerprintObservation>,
+    ) {
+        let batch = self.drain_batch_for_maintainer().await;
+        if !batch.evilpot_sessions.is_empty()
+            || !batch.evilpot_events.is_empty()
+            || !batch.ban_records.is_empty()
+            || !batch.alerts.is_empty()
+        {
+            self.requeue_batch_for_maintainer(DrainedLogBatch {
+                records: Vec::new(),
+                summaries: Vec::new(),
+                fingerprints: Vec::new(),
+                evilpot_sessions: batch.evilpot_sessions,
+                evilpot_events: batch.evilpot_events,
+                ban_records: batch.ban_records,
+                alerts: batch.alerts,
+            })
+            .await;
+        }
+        (batch.records, batch.summaries, batch.fingerprints)
+    }
+
+    /// Requeue drained batch items if pushing a LogBatch to Maintainer fails transiently.
+    pub async fn requeue_batch_for_maintainer(&self, batch: DrainedLogBatch) {
+        self.requeue_for_maintainer(batch.records, batch.summaries, batch.fingerprints)
+            .await;
+        if !batch.evilpot_sessions.is_empty() {
+            let mut s = self.pending_evilpot_sessions.lock().await;
+            for sess in batch.evilpot_sessions {
+                if s.len() >= 1024 && !s.contains_key(&sess.client_ip) {
+                    break;
+                }
+                s.entry(sess.client_ip.clone()).or_insert(sess);
+            }
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        if !batch.evilpot_events.is_empty() {
+            let mut e = self.pending_evilpot_events.lock().await;
+            for ev in batch.evilpot_events {
+                if e.len() >= 2048 {
+                    break;
+                }
+                e.push(ev);
+            }
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        if !batch.ban_records.is_empty() {
+            let mut b = self.pending_ban_records.lock().await;
+            for br in batch.ban_records {
+                if b.len() >= 2048 {
+                    break;
+                }
+                b.push(br);
+            }
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        if !batch.alerts.is_empty() {
+            let mut a = self.pending_alerts.lock().await;
+            for al in batch.alerts {
+                if a.len() >= 512 {
+                    break;
+                }
+                a.push(al);
+            }
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Requeue drained records, summaries, and fingerprints if pushing a LogBatch to Maintainer fails transiently.

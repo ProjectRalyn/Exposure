@@ -132,8 +132,8 @@ export function renderAreaLineChart(
       if (fv > rawMax) rawMax = fv;
     }
   }
-  const yMax = niceMax(rawMax);
-  const ticks = 4;
+  const { yMax, step } = niceScale(rawMax, 4);
+  const ticks = Math.max(1, Math.round(yMax / step));
 
   const isSparse = labels.length <= 2;
   const xAt = (i) =>
@@ -147,12 +147,12 @@ export function renderAreaLineChart(
   let defs = "";
   let gridSvg = "";
   for (let t = 0; t <= ticks; t++) {
-    const val = (yMax / ticks) * t;
+    const val = step * t;
     const y = yAt(val);
     gridSvg += `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" class="chart-grid" />`;
     const lbl =
       unit === "ms"
-        ? `${val.toFixed(val < 10 ? 1 : 0)}`
+        ? `${val.toFixed(step < 1 ? 1 : 0)}`
         : unit === "bytes"
         ? formatBytes(val)
         : formatCompact(val);
@@ -295,14 +295,25 @@ export function renderAreaLineChart(
   });
 }
 
-function niceMax(val) {
-  if (val <= 1) return 1;
-  const exp = Math.pow(10, Math.floor(Math.log10(val)));
-  const norm = val / exp;
-  if (norm <= 1.2) return 1.2 * exp;
-  if (norm <= 2) return 2 * exp;
-  if (norm <= 5) return 5 * exp;
-  return 10 * exp;
+/**
+ * Pick a human-friendly axis step (1 / 2 / 2.5 / 5 / 10 × 10^n) so tick labels are
+ * uniform rounded values instead of arbitrary fractions like 12.5 / 37.5 (a common
+ * source of "the Y axis looks wrong" reports on latency charts).
+ */
+function niceScale(maxVal, targetTicks = 4) {
+  const raw = Number.isFinite(maxVal) && maxVal > 0 ? maxVal : 1;
+  const rough = raw / Math.max(1, targetTicks);
+  const exp = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / exp;
+  let mult;
+  if (norm <= 1) mult = 1;
+  else if (norm <= 2) mult = 2;
+  else if (norm <= 2.5) mult = 2.5;
+  else if (norm <= 5) mult = 5;
+  else mult = 10;
+  const step = mult * exp;
+  const yMax = Math.ceil(raw / step) * step;
+  return { yMax: Math.max(yMax, step), step };
 }
 
 /**

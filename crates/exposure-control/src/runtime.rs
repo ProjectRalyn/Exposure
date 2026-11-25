@@ -139,7 +139,7 @@ impl ControlRuntime {
             let mut rx = self.shutdown_tx.subscribe();
             tokio::spawn(async move {
                 let interval = Duration::from_secs(this.cfg.telemetry_pull_interval_secs.max(5));
-                let mut tick_count: u64 = 0;
+                let mut last_cleanup = std::time::Instant::now();
                 loop {
                     tokio::select! {
                         _ = rx.changed() => {
@@ -154,9 +154,17 @@ impl ControlRuntime {
                             warn!(error = %e, "periodic telemetry pull failed");
                         }
                     }
-                    tick_count = tick_count.wrapping_add(1);
-                    if tick_count % 60 == 0 {
-                        if let Err(e) = this.client.db().prune_old_records().await {
+                    let ret = this
+                        .client
+                        .db()
+                        .get_control_retention_config()
+                        .await
+                        .unwrap_or_default();
+                    let cleanup_every =
+                        Duration::from_secs(u64::from(ret.control_cleanup_interval_mins.max(5)) * 60);
+                    if last_cleanup.elapsed() >= cleanup_every {
+                        last_cleanup = std::time::Instant::now();
+                        if let Err(e) = this.client.db().prune_old_records(&ret).await {
                             warn!(error = %e, "periodic sqlite pruning failed");
                         }
                     }

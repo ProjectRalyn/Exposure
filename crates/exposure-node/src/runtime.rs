@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,11 +18,12 @@ use exposure_core::crypto::{
 use exposure_core::protocol::{
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
     dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes,
-    pull_telemetry_req_signing_bytes, unban_req_signing_bytes, DiscoveryNeighbor, DnsManageOp,
-    DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot, PreflightCheckItem,
-    PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
+    pull_telemetry_req_signing_bytes, query_maintainer_req_signing_bytes, unban_req_signing_bytes,
+    DiscoveryNeighbor, DnsManageOp, DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot,
+    PreflightCheckItem, PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::routing::is_public_routable_ip;
+use exposure_core::telemetry::BanRecord;
 use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
 use rand::RngCore;
@@ -32,7 +34,7 @@ use uuid::Uuid;
 use crate::egress::EgressHandler;
 use crate::forwarder::{Forwarder, IncomingSpecialFrame};
 use crate::ingress::IngressServer;
-use crate::logger::NodeLogger;
+use crate::logger::{DrainedLogBatch, NodeLogger};
 use crate::maintainer::MaintainerService;
 use crate::tls::DynamicCertResolver;
 
@@ -426,10 +428,16 @@ impl NodeRuntime {
                     None
                 } else {
                     let seq = bundle.sequence;
+                    let rev = if bundle.config_revision.is_empty() {
+                        bundle.config.config_revision.clone()
+                    } else {
+                        bundle.config_revision.clone()
+                    };
                     match self.apply_signed_config_with_watchdog(*bundle).await {
                         Ok(()) => Some(SpecialPayload::ConfigAck {
                             node_tag: self.node_tag(),
                             sequence: seq,
+                            config_revision: rev,
                             applied: true,
                             error: None,
                         }),
@@ -439,6 +447,7 @@ impl NodeRuntime {
                             Some(SpecialPayload::ConfigAck {
                                 node_tag: self.node_tag(),
                                 sequence: seq,
+                                config_revision: rev,
                                 applied: false,
                                 error: Some(e.to_string()),
                             })
@@ -484,6 +493,7 @@ impl NodeRuntime {
                         roles: cfg.roles,
                         public_key: pk,
                         config_sequence: cfg.config_sequence,
+                        config_revision: cfg.config_revision,
                         neighbors,
                         signature,
                     })
@@ -494,12 +504,25 @@ impl NodeRuntime {
                 records,
                 minute_summaries,
                 fingerprints,
+                evilpot_sessions,
+                evilpot_events,
+                ban_records,
+                alerts,
             } => {
                 if !incoming.authenticated {
                     None
                 } else if let Some(maint) = self.maintainer.read().await.clone() {
                     let accepted = maint
-                        .ingest_log_batch(&from_node, records, minute_summaries, fingerprints)
+                        .ingest_log_batch(
+                            &from_node,
+                            records,
+                            minute_summaries,
+                            fingerprints,
+                            evilpot_sessions,
+                            evilpot_events,
+                            ban_records,
+                            alerts,
+                        )
                         .await;
                     Some(SpecialPayload::LogAck { accepted })
                 } else {
@@ -568,6 +591,7 @@ impl NodeRuntime {
                         node_tag: cfg.node_tag,
                         roles: cfg.roles,
                         config_sequence: cfg.config_sequence,
+                        config_revision: cfg.config_revision,
                         last_reload_ok: ok,
                         last_reload_error: err,
                         uptime_secs: self.started_at.elapsed().as_secs(),
@@ -616,6 +640,71 @@ impl NodeRuntime {
                     } else {
                         Some(SpecialPayload::ErrorReply {
                             message: "node is not maintainer".into(),
+                        })
+                    }
+                }
+            }
+            SpecialPayload::QueryMaintainerReq {
+                request_id,
+                issued_at,
+                expires_at,
+                maintainer_tag,
+                query,
+                control_signature,
+            } => {
+                if !incoming.authenticated {
+                    None
+                } else {
+                    let signing = query_maintainer_req_signing_bytes(
+                        &request_id,
+                        issued_at,
+                        expires_at,
+                        &maintainer_tag,
+                        &query,
+                    );
+                    if let Err(msg) = self
+                        .verify_control_signed_cmd(
+                            "QueryMaintainerReq",
+                            &request_id,
+                            issued_at,
+                            expires_at,
+                            &maintainer_tag,
+                            &signing,
+                            &control_signature,
+                        )
+                        .await
+                    {
+                        Some(SpecialPayload::QueryMaintainerResp {
+                            request_id,
+                            maintainer_tag: self.node_tag(),
+                            ok: false,
+                            data: serde_json::Value::Null,
+                            error: Some(msg),
+                        })
+                    } else if let Some(maint) = self.maintainer.read().await.clone() {
+                        match maint.handle_query(query).await {
+                            Ok(data) => Some(SpecialPayload::QueryMaintainerResp {
+                                request_id,
+                                maintainer_tag: self.node_tag(),
+                                ok: true,
+                                data,
+                                error: None,
+                            }),
+                            Err(e) => Some(SpecialPayload::QueryMaintainerResp {
+                                request_id,
+                                maintainer_tag: self.node_tag(),
+                                ok: false,
+                                data: serde_json::Value::Null,
+                                error: Some(e.to_string()),
+                            }),
+                        }
+                    } else {
+                        Some(SpecialPayload::QueryMaintainerResp {
+                            request_id,
+                            maintainer_tag: self.node_tag(),
+                            ok: false,
+                            data: serde_json::Value::Null,
+                            error: Some("node is not maintainer".into()),
                         })
                     }
                 }
@@ -1295,6 +1384,9 @@ impl NodeRuntime {
             };
         }
         let removed = self.ingress.auto_ban().unban(&kind, &target);
+        if removed {
+            self.ingress.persist_active_bans_async();
+        }
         info!(
             node = %self.node_tag(),
             kind = %kind,
@@ -1756,6 +1848,9 @@ impl NodeRuntime {
             }
         }
         new_cfg.config_sequence = bundle.sequence;
+        if !bundle.config_revision.is_empty() {
+            new_cfg.config_revision = bundle.config_revision;
+        }
         if new_cfg.control_public_key.is_none() {
             new_cfg.control_public_key = Some(control_pk);
         }
@@ -1996,33 +2091,97 @@ impl NodeRuntime {
         const MAX_RECS_PER_BATCH: usize = 250;
         const MAX_SUMS_PER_BATCH: usize = 200;
         const MAX_FPS_PER_BATCH: usize = 200;
+        const MAX_MISC_PER_BATCH: usize = 250;
 
+        let self_tag = self.node_tag();
         let hops = self.config.read().await.maintainer_hops.clone();
-        if hops.len() < 2 {
-            return;
-        }
-        let (mut records, mut summaries, mut fingerprints) = self.logger.drain_for_maintainer().await;
-        if records.is_empty() && summaries.is_empty() && fingerprints.is_empty() {
+        let local_maint = self.maintainer.read().await.clone();
+        let is_local_maint =
+            local_maint.is_some() && (hops.len() < 2 || hops.last() == Some(&self_tag));
+        if !is_local_maint && hops.len() < 2 {
             return;
         }
 
-        while !records.is_empty() || !summaries.is_empty() || !fingerprints.is_empty() {
-            let r_n = records.len().min(MAX_RECS_PER_BATCH);
-            let s_n = summaries.len().min(MAX_SUMS_PER_BATCH);
-            let f_n = fingerprints.len().min(MAX_FPS_PER_BATCH);
-            let rec_chunk: Vec<_> = records.drain(..r_n).collect();
-            let sum_chunk: Vec<_> = summaries.drain(..s_n).collect();
-            let fp_chunk: Vec<_> = fingerprints.drain(..f_n).collect();
+        let mut batch = self.logger.drain_batch_for_maintainer().await;
+        let active_bans = self.ingress.auto_ban().active_ban_records(&self_tag);
+        if !active_bans.is_empty() || !batch.ban_records.is_empty() {
+            let mut merged: HashMap<(String, String, String, u64), BanRecord> = HashMap::new();
+            for b in batch.ban_records.drain(..).chain(active_bans.into_iter()) {
+                let k = (
+                    b.node_tag.clone(),
+                    b.kind.clone(),
+                    b.target.clone(),
+                    b.banned_at_unix,
+                );
+                merged
+                    .entry(k)
+                    .and_modify(|cur| {
+                        cur.hits_blocked = cur.hits_blocked.max(b.hits_blocked);
+                        cur.expires_at_unix = cur.expires_at_unix.max(b.expires_at_unix);
+                        cur.offense_level = cur.offense_level.max(b.offense_level);
+                        if cur.service_tag.is_none() {
+                            cur.service_tag = b.service_tag.clone();
+                        }
+                        if cur.host.is_none() {
+                            cur.host = b.host.clone();
+                        }
+                    })
+                    .or_insert(b);
+            }
+            batch.ban_records = merged.into_values().collect();
+        }
+        if batch.is_empty() {
+            return;
+        }
+
+        if is_local_maint {
+            if let Some(maint) = local_maint {
+                let _ = maint
+                    .ingest_log_batch(
+                        &self_tag,
+                        batch.records,
+                        batch.summaries,
+                        batch.fingerprints,
+                        batch.evilpot_sessions,
+                        batch.evilpot_events,
+                        batch.ban_records,
+                        batch.alerts,
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        while !batch.is_empty() {
+            let r_n = batch.records.len().min(MAX_RECS_PER_BATCH);
+            let s_n = batch.summaries.len().min(MAX_SUMS_PER_BATCH);
+            let f_n = batch.fingerprints.len().min(MAX_FPS_PER_BATCH);
+            let es_n = batch.evilpot_sessions.len().min(MAX_MISC_PER_BATCH);
+            let ee_n = batch.evilpot_events.len().min(MAX_MISC_PER_BATCH);
+            let b_n = batch.ban_records.len().min(MAX_MISC_PER_BATCH);
+            let a_n = batch.alerts.len().min(MAX_MISC_PER_BATCH);
+
+            let rec_chunk: Vec<_> = batch.records.drain(..r_n).collect();
+            let sum_chunk: Vec<_> = batch.summaries.drain(..s_n).collect();
+            let fp_chunk: Vec<_> = batch.fingerprints.drain(..f_n).collect();
+            let es_chunk: Vec<_> = batch.evilpot_sessions.drain(..es_n).collect();
+            let ee_chunk: Vec<_> = batch.evilpot_events.drain(..ee_n).collect();
+            let ban_chunk: Vec<_> = batch.ban_records.drain(..b_n).collect();
+            let alert_chunk: Vec<_> = batch.alerts.drain(..a_n).collect();
 
             let frame = SpecialFrame::new(
                 Uuid::new_v4().to_string(),
                 hops.clone(),
                 16,
                 SpecialPayload::LogBatch {
-                    from_node: self.node_tag(),
+                    from_node: self_tag.clone(),
                     records: rec_chunk.clone(),
                     minute_summaries: sum_chunk.clone(),
                     fingerprints: fp_chunk.clone(),
+                    evilpot_sessions: es_chunk.clone(),
+                    evilpot_events: ee_chunk.clone(),
+                    ban_records: ban_chunk.clone(),
+                    alerts: alert_chunk.clone(),
                 },
             );
             let acked = match self
@@ -2044,14 +2203,20 @@ impl NodeRuntime {
                 }
             };
             if !acked {
-                let mut rem_recs = rec_chunk;
-                rem_recs.append(&mut records);
-                let mut rem_sums = sum_chunk;
-                rem_sums.append(&mut summaries);
-                let mut rem_fps = fp_chunk;
-                rem_fps.append(&mut fingerprints);
+                fn prepend<T>(mut head: Vec<T>, mut tail: Vec<T>) -> Vec<T> {
+                    head.append(&mut tail);
+                    head
+                }
                 self.logger
-                    .requeue_for_maintainer(rem_recs, rem_sums, rem_fps)
+                    .requeue_batch_for_maintainer(DrainedLogBatch {
+                        records: prepend(rec_chunk, batch.records),
+                        summaries: prepend(sum_chunk, batch.summaries),
+                        fingerprints: prepend(fp_chunk, batch.fingerprints),
+                        evilpot_sessions: prepend(es_chunk, batch.evilpot_sessions),
+                        evilpot_events: prepend(ee_chunk, batch.evilpot_events),
+                        ban_records: prepend(ban_chunk, batch.ban_records),
+                        alerts: prepend(alert_chunk, batch.alerts),
+                    })
                     .await;
                 break;
             }
@@ -2109,6 +2274,11 @@ impl NodeRuntime {
     /// Graceful shutdown hook (SIGINT / SIGTERM): pushes pending logs and flushes segments & checkpoints atomically.
     pub async fn shutdown(&self) {
         info!(node = %self.node_tag(), "flushing logs and segments before shutdown");
+        let ingress = Arc::clone(&self.ingress);
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = ingress.persist_active_bans_blocking();
+        })
+        .await;
         let _ = tokio::time::timeout(
             Duration::from_secs(2),
             self.push_pending_logs_to_maintainer(),

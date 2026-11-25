@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -7,10 +8,11 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use chrono::Utc;
 use dashmap::DashMap;
 use evilpot::{
-    AdminPanelConfig, AttackSignal, EvilpotBody, EvilpotConfig, EvilpotEngine,
-    ExploitVerificationStatus, VerificationEvidence,
+    AdminPanelConfig, AttackSignal, AttackerSessionReport, EvilpotBody, EvilpotConfig,
+    EvilpotEngine, ExploitVerificationStatus, TrapVerdict, VerificationEvidence,
 };
 use exposure_core::config::EvilpotNodeConfig;
 use exposure_core::telemetry::{EvilpotEventInfo, EvilpotNodeReport, EvilpotSessionInfo};
@@ -24,6 +26,7 @@ use tracing::{info, warn};
 
 use crate::ban::{evict_half, AutoBanManager, OffenseContext, OffenseKind};
 use crate::egress::ProxyBody;
+use crate::logger::NodeLogger;
 use crate::waf::WafFinding;
 
 /// Hard bounds on telemetry snapshots so malicious traffic can never bloat `NodeStatusSnapshot`.
@@ -63,6 +66,11 @@ const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
 pub struct TarpitBanHook {
     pub engine: Arc<EvilpotEngine>,
     pub auto_ban: Arc<AutoBanManager>,
+    pub logger: Arc<NodeLogger>,
+    pub node_tag: String,
+    pub service_tag: String,
+    pub host: String,
+    pub ban_file: PathBuf,
     pub client_ip: IpAddr,
     pub tls_ja3: Option<String>,
     pub user_agent: String,
@@ -105,11 +113,13 @@ impl Drop for BoundedEvilpotBody {
         if let Some(hook) = self.ban_hook.take() {
             if let Some(session) = hook.engine.session_report(hook.client_ip) {
                 if session.status == ExploitVerificationStatus::VerifiedExploit {
-                    let outcome = hook.auto_ban.record_offense(OffenseContext {
+                    let mut outcome = hook.auto_ban.record_offense(OffenseContext {
                         client_ip: hook.client_ip,
                         tls_ja3: hook.tls_ja3.as_deref(),
                         user_agent: &hook.user_agent,
                         js_fp_hash: hook.js_fp_hash.as_deref(),
+                        service_tag: Some(&hook.service_tag),
+                        host: Some(&hook.host),
                         kind: OffenseKind::VerifiedExploit,
                         reason: "evilpot:verified_exploit:tarpit",
                     });
@@ -122,6 +132,60 @@ impl Drop for BoundedEvilpotBody {
                             banned_comp_fp = outcome.newly_banned_composite_fp,
                             "auto-banned confirmed attacker after sustained evilpot tarpit verification"
                         );
+                    }
+                    let sess_info = session_report_to_info(&hook.node_tag, &session);
+                    let event_info = EvilpotEventInfo {
+                        node_tag: hook.node_tag.clone(),
+                        timestamp_unix: Utc::now().timestamp().max(0) as u64,
+                        epoch_id: sess_info.epoch_id,
+                        persona_hostname: sess_info.persona_hostname.clone(),
+                        client_ip: sess_info.client_ip.clone(),
+                        verification_status: sess_info.status.clone(),
+                        trap_kind: "SustainedTarpitRead".to_string(),
+                        detail: truncate_clean(
+                            &format!("tarpit verified on {} [service={}]", hook.host, hook.service_tag),
+                            MAX_ITEM_CHARS,
+                        ),
+                        evidence: sess_info
+                            .evidence
+                            .iter()
+                            .take(MAX_EVENT_EVIDENCE_ITEMS)
+                            .cloned()
+                            .collect(),
+                    };
+                    for b in &mut outcome.created_bans {
+                        b.node_tag = hook.node_tag.clone();
+                    }
+                    let newly_banned = outcome.any_banned();
+                    let created_bans = outcome.created_bans;
+                    let alert_msg = if newly_banned {
+                        Some(format!(
+                            "AutoBan triggered for {} on {} [service={}, reason=evilpot:verified_exploit:tarpit, ttl={}s, ip={}, js_fp={}, comp_fp={}]",
+                            hook.client_ip,
+                            hook.host,
+                            hook.service_tag,
+                            outcome.ban_ttl_secs,
+                            outcome.newly_banned_ip,
+                            outcome.newly_banned_js_fp,
+                            outcome.newly_banned_composite_fp,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let auto_ban = hook.auto_ban;
+                        let logger = hook.logger;
+                        let ban_file = hook.ban_file;
+                        handle.spawn(async move {
+                            logger.record_evilpot_interaction(sess_info, event_info).await;
+                            if !created_bans.is_empty() {
+                                logger.record_ban_records(created_bans).await;
+                                let _ = tokio::task::spawn_blocking(move || auto_ban.save_to_file(&ban_file)).await;
+                            }
+                            if let Some(msg) = alert_msg {
+                                logger.emit_alert("warning", msg).await;
+                            }
+                        });
                     }
                 }
             }
@@ -378,46 +442,7 @@ impl EvilpotManager {
         let sessions: Vec<EvilpotSessionInfo> = raw_sessions
             .into_iter()
             .take(MAX_REPORT_SESSIONS)
-            .map(|s| EvilpotSessionInfo {
-                client_ip: truncate_clean(&s.client_ip, 64),
-                epoch_id: s.epoch_id,
-                persona_hostname: truncate_clean(&s.persona_hostname, 128),
-                first_seen_unix: s.first_seen_unix,
-                last_seen_unix: s.last_seen_unix,
-                total_trapped_requests: s.total_trapped_requests,
-                status: verification_status_label(s.status).to_string(),
-                canary_triggers: s.canary_triggers,
-                sqli_probes: s.sqli_probes,
-                sqli_distinct_positions: s.sqli_distinct_positions,
-                rce_commands_executed: s
-                    .rce_commands_executed
-                    .into_iter()
-                    .rev()
-                    .take(MAX_SESSION_ITEMS)
-                    .map(|c| truncate_clean(&c, MAX_ITEM_CHARS))
-                    .collect(),
-                captured_iocs: s
-                    .captured_iocs
-                    .into_iter()
-                    .take(MAX_SESSION_ITEMS)
-                    .map(|i| truncate_clean(&i, MAX_ITEM_CHARS))
-                    .collect(),
-                distinct_paths: s
-                    .distinct_paths
-                    .into_iter()
-                    .take(MAX_SESSION_ITEMS)
-                    .map(|p| truncate_clean(&p, MAX_PATH_CHARS))
-                    .collect(),
-                tarpit_bytes_consumed: s.tarpit_bytes_consumed,
-                tarpit_max_duration_ms: s.tarpit_max_duration_ms,
-                evidence: s
-                    .evidence
-                    .iter()
-                    .rev()
-                    .take(MAX_SESSION_ITEMS)
-                    .map(|ev| truncate_clean(&format_evidence(ev), MAX_ITEM_CHARS))
-                    .collect(),
-            })
+            .map(|s| session_report_to_info(&self.node_tag, &s))
             .collect();
 
         let recent_events: Vec<EvilpotEventInfo> = engine
@@ -426,6 +451,7 @@ impl EvilpotManager {
             .rev()
             .take(MAX_REPORT_EVENTS)
             .map(|e| EvilpotEventInfo {
+                node_tag: self.node_tag.clone(),
                 timestamp_unix: e.timestamp_unix,
                 epoch_id: e.epoch_id,
                 persona_hostname: truncate_clean(&e.persona_hostname, 128),
@@ -555,6 +581,80 @@ pub fn format_evidence(ev: &VerificationEvidence) -> String {
             bytes_read,
             duration_ms,
         } => format!("tarpit:bytes={bytes_read},ms={duration_ms}"),
+    }
+}
+
+pub fn session_report_to_info(node_tag: &str, s: &AttackerSessionReport) -> EvilpotSessionInfo {
+    EvilpotSessionInfo {
+        node_tag: node_tag.to_string(),
+        client_ip: truncate_clean(&s.client_ip, 64),
+        epoch_id: s.epoch_id,
+        persona_hostname: truncate_clean(&s.persona_hostname, 128),
+        first_seen_unix: s.first_seen_unix,
+        last_seen_unix: s.last_seen_unix,
+        total_trapped_requests: s.total_trapped_requests,
+        status: verification_status_label(s.status).to_string(),
+        canary_triggers: s.canary_triggers,
+        sqli_probes: s.sqli_probes,
+        sqli_distinct_positions: s.sqli_distinct_positions,
+        rce_commands_executed: s
+            .rce_commands_executed
+            .iter()
+            .rev()
+            .take(MAX_SESSION_ITEMS)
+            .map(|c| truncate_clean(c, MAX_ITEM_CHARS))
+            .collect(),
+        captured_iocs: s
+            .captured_iocs
+            .iter()
+            .take(MAX_SESSION_ITEMS)
+            .map(|i| truncate_clean(i, MAX_ITEM_CHARS))
+            .collect(),
+        distinct_paths: s
+            .distinct_paths
+            .iter()
+            .take(MAX_SESSION_ITEMS)
+            .map(|p| truncate_clean(p, MAX_PATH_CHARS))
+            .collect(),
+        tarpit_bytes_consumed: s.tarpit_bytes_consumed,
+        tarpit_max_duration_ms: s.tarpit_max_duration_ms,
+        evidence: s
+            .evidence
+            .iter()
+            .rev()
+            .take(MAX_SESSION_ITEMS)
+            .map(|ev| truncate_clean(&format_evidence(ev), MAX_ITEM_CHARS))
+            .collect(),
+    }
+}
+
+pub fn trap_outcome_to_event_info(
+    node_tag: &str,
+    session: &AttackerSessionReport,
+    verdict: &TrapVerdict,
+    detail: &str,
+) -> EvilpotEventInfo {
+    let raw_dbg = format!("{verdict:?}");
+    let trap_kind = raw_dbg
+        .split([' ', '{', '('])
+        .next()
+        .unwrap_or(&raw_dbg);
+    EvilpotEventInfo {
+        node_tag: node_tag.to_string(),
+        timestamp_unix: session.last_seen_unix.max(Utc::now().timestamp().max(0) as u64),
+        epoch_id: session.epoch_id,
+        persona_hostname: truncate_clean(&session.persona_hostname, 128),
+        client_ip: truncate_clean(&session.client_ip, 64),
+        verification_status: verification_status_label(session.status).to_string(),
+        trap_kind: truncate_clean(trap_kind, 128),
+        detail: truncate_clean(detail, MAX_ITEM_CHARS),
+        evidence: session
+            .evidence
+            .iter()
+            .rev()
+            .take(MAX_EVENT_EVIDENCE_ITEMS)
+            .map(|ev| truncate_clean(&format_evidence(ev), MAX_ITEM_CHARS))
+            .collect(),
     }
 }
 

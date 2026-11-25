@@ -30,7 +30,7 @@ function rectAnchor(rect, target) {
   return { x: cx + dx * k, y: cy + dy * k };
 }
 
-export function createTopologyView({ store, navigate }) {
+export function createTopologyView({ api, store, navigate }) {
   const state = {
     positions: loadPositions(),
     nodeHeights: {},
@@ -473,7 +473,11 @@ export function createTopologyView({ store, navigate }) {
             <span class="live-dot ${dotCls}"></span>
             <span>${esc(tag)}</span>
           </div>
-          <span class="topo-node-seq">${live ? `#${esc(live.config_seq)}` : "draft"}</span>
+          <span class="topo-node-seq">${
+            live
+              ? `<span class="rev-badge ${store.latestRevision && live.config_revision !== store.latestRevision ? "drift" : ""}">${esc(live.config_revision || `#${live.config_seq}`)}</span>`
+              : "draft"
+          }</span>
         </div>
         <div class="topo-node-roles">${roles || '<span class="muted-sm">no roles</span>'}</div>
         <div class="topo-node-meta">
@@ -945,6 +949,16 @@ export function createTopologyView({ store, navigate }) {
 
   async function refresh(opts = {}) {
     if (!store.loaded) await store.loadTopology(false);
+    if (!(store.liveNodes || []).length) {
+      try {
+        const nd = await api("/api/nodes");
+        store.liveNodes = nd.nodes || [];
+        store.liveLinks = nd.links || [];
+        store.latestRevision = nd.latest_revision || "";
+      } catch {
+        /* topology still renders the saved draft without live state */
+      }
+    }
     if (opts.traceService != null) state.tracedService = opts.traceService;
     render();
     if (opts.focusNode) focusNode(opts.focusNode);

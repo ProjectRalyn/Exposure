@@ -423,13 +423,29 @@ impl EdgeCache {
         };
         // Cache-poisoning guard: if the client content-negotiated (compression / language) or
         // sent cookies, but the upstream did NOT declare the matching `Vary` dimension, storing
-        // this response would serve one client's variant to another. Refuse to store instead.
+        // this response could serve one client's variant to another. Refuse to store instead —
+        // except when doing so is provably safe:
+        //   * identity (uncompressed) bodies can be served to any client, so a missing
+        //     `Vary: Accept-Encoding` is harmless;
+        //   * an explicit shared-cache lifetime (`public`/`s-maxage`/`max-age`) means the origin
+        //     itself declared the response non-personalized, so request cookies do not make it
+        //     per-user (previously this guard made the edge cache a no-op for virtually every
+        //     browser request that carried a cookie).
+        let response_is_encoded = resp_headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|ce| !ce.trim().is_empty() && !ce.eq_ignore_ascii_case("identity"))
+            .unwrap_or(false);
         if !vary_includes(&vary_headers, "accept-encoding")
+            && response_is_encoded
             && request_has_nonidentity_accept_encoding(req_headers)
         {
             return false;
         }
-        if !vary_includes(&vary_headers, "cookie") && req_headers.contains_key(header::COOKIE) {
+        if !vary_includes(&vary_headers, "cookie")
+            && req_headers.contains_key(header::COOKIE)
+            && !explicit_shared_ttl(resp_headers)
+        {
             return false;
         }
         let Some(ttl_secs) = resolve_ttl_secs(policy, resp_headers) else {
@@ -776,6 +792,17 @@ fn vary_includes(vary_headers: &[String], name: &str) -> bool {
     vary_headers.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
+/// True when the origin explicitly declares a shared-cache lifetime (`s-maxage` / `max-age`)
+/// without `private` / `no-store` / `no-cache`. Such a response is meant to be reused for
+/// multiple clients, so a request `Cookie` header does not imply a personalized body.
+fn explicit_shared_ttl(resp_headers: &HeaderMap) -> bool {
+    let cc = parse_cache_control(resp_headers);
+    !cc.private
+        && !cc.no_store
+        && !cc.no_cache
+        && (cc.s_maxage.unwrap_or(0) > 0 || cc.max_age.unwrap_or(0) > 0)
+}
+
 /// True if the request accepts any content coding other than `identity`
 /// (gzip/br/deflate/zstd/...), i.e. a compressed response body must be variant-keyed.
 fn request_has_nonidentity_accept_encoding(req_headers: &HeaderMap) -> bool {
@@ -946,6 +973,65 @@ mod tests {
         assert_eq!(r_head.status(), StatusCode::OK);
         assert_eq!(r_head.headers().get(header::CONTENT_LENGTH).unwrap(), "8");
         assert!(r_head.into_body().collect().await.unwrap().to_bytes().is_empty());
+    }
+
+    #[test]
+    fn cache_stores_common_browser_responses_without_being_disabled_by_cookies() {
+        let policy = enabled_policy();
+        let cache = EdgeCache::new(policy.max_memory_bytes, policy.max_entries);
+
+        let mut req = HeaderMap::new();
+        req.insert(header::COOKIE, HeaderValue::from_static("_ga=1; theme=dark"));
+        req.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br"));
+
+        // Identity body + explicit shared lifetime: request cookies must NOT prevent caching a
+        // response the origin marked as publicly cacheable (regression: edge cache was a no-op).
+        let mut resp_h = HeaderMap::new();
+        resp_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+        assert!(cache.store(
+            &policy,
+            "web|example.com|/index.html",
+            &req,
+            StatusCode::OK,
+            &resp_h,
+            Bytes::from_static(b"<html></html>"),
+        ));
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "example.com", "/index.html", &req),
+            CacheLookup::Hit { .. }
+        ));
+
+        // Without an explicit shared TTL a cookie-bearing request is still refused (safe default).
+        assert!(!cache.store(
+            &policy,
+            "web|example.com|/private.html",
+            &req,
+            StatusCode::OK,
+            &HeaderMap::new(),
+            Bytes::from_static(b"secret"),
+        ));
+
+        // Compressed bodies still require an explicit `Vary: Accept-Encoding`.
+        let mut gz_h = HeaderMap::new();
+        gz_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+        gz_h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(!cache.store(
+            &policy,
+            "web|example.com|/app.js",
+            &req,
+            StatusCode::OK,
+            &gz_h,
+            Bytes::from_static(b"gz"),
+        ));
+        gz_h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        assert!(cache.store(
+            &policy,
+            "web|example.com|/app.js",
+            &req,
+            StatusCode::OK,
+            &gz_h,
+            Bytes::from_static(b"gz"),
+        ));
     }
 
     #[test]

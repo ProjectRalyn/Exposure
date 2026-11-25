@@ -30,7 +30,7 @@ const LEGACY_TAB_MAP = {
   observability: { tab: "analytics" },
   fingerprints: { tab: "logging", subTab: "visitors" },
   logs: { tab: "logging", subTab: "access" },
-  audit: { tab: "system", subTab: "audit" },
+  audit: { tab: "logging", subTab: "audit" },
 };
 
 const appState = {
@@ -38,7 +38,10 @@ const appState = {
   activeTab: "overview",
   autoRefreshMs: 30000,
   refreshTimer: null,
+  heartbeatTimer: null,
 };
+
+const SIDEBAR_HEARTBEAT_MS = 30000;
 
 try { localStorage.removeItem("exposure_token"); } catch {}
 
@@ -66,16 +69,58 @@ async function api(path, opts = {}) {
 const store = createControlStore({ api });
 
 function navigate(tab, opts = {}) {
-  switchTab(tab, opts);
+  const normalized = typeof opts === "string" ? { subTab: opts } : opts;
+  switchTab(tab, normalized);
 }
 
-const overviewView = createOverviewView({ api, store, navigate });
+function toLocalDatetimeInputValue(ms) {
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function getTimeRangeParams() {
+  const val = el("sel-time-window")?.value ?? "3600";
+  if (val === "custom") {
+    const rawFrom = el("inp-time-from")?.value || localStorage.getItem("exposure_time_from") || "";
+    const rawTo = el("inp-time-to")?.value || localStorage.getItem("exposure_time_to") || "";
+    const fMs = rawFrom ? Date.parse(rawFrom) : NaN;
+    const tMs = rawTo ? Date.parse(rawTo) : NaN;
+    const from_ms = Number.isFinite(fMs) ? Math.floor(fMs) : Date.now() - 86400 * 1000;
+    const to_ms = Number.isFinite(tMs) ? Math.floor(tMs) : Date.now();
+    return {
+      mode: "custom",
+      from_ms,
+      to_ms,
+      window_secs: null,
+      applyTo(qs) {
+        qs.set("from_ms", String(from_ms));
+        qs.set("to_ms", String(to_ms));
+        return qs;
+      },
+    };
+  }
+  const win = Number(val);
+  const window_secs = Number.isFinite(win) && win >= 0 ? win : 3600;
+  return {
+    mode: "preset",
+    from_ms: null,
+    to_ms: null,
+    window_secs,
+    applyTo(qs) {
+      qs.set("window_secs", String(window_secs));
+      return qs;
+    },
+  };
+}
+
+const overviewView = createOverviewView({ api, store, navigate, getTimeRangeParams });
 const hostsView = createHostsView({ api, store, navigate });
 const servicesView = createServicesView({ store, navigate });
 const domainsView = createDomainsView({ api, store });
 const securityView = createSecurityView({ api, store });
-const topologyView = createTopologyView({ store, navigate });
-const analyticsViews = createAnalyticsViews({ api, store, navigate });
+const topologyView = createTopologyView({ api, store, navigate });
+const analyticsViews = createAnalyticsViews({ api, store, navigate, getTimeRangeParams });
 const systemView = createSystemView({ api, store });
 
 /* ==================== AUTH & SHELL STATE ==================== */
@@ -83,6 +128,7 @@ const systemView = createSystemView({ api, store });
 function resetToLogin(opts = {}) {
   appState.authenticated = false;
   stopAutoRefresh();
+  stopHeartbeat();
   closeModal();
   closeDrawer();
   if (el("login-pass")) el("login-pass").value = "";
@@ -233,6 +279,9 @@ function switchTab(tab, opts = {}) {
     }
   }
   refreshCurrentTab(opts);
+  // Tabs other than overview/hosts don't return cluster bootstrap state, so refresh the
+  // sidebar badge independently instead of leaving it stale until the user opens Overview.
+  if (targetTab !== "overview" && targetTab !== "hosts") sidebarHeartbeat();
 }
 
 function renderActiveTabOnly() {
@@ -446,6 +495,28 @@ function stopAutoRefresh() {
   if (appState.refreshTimer) { clearInterval(appState.refreshTimer); appState.refreshTimer = null; }
 }
 
+// Lightweight cluster heartbeat: keeps the sidebar "Bootstrap Link" card and the topbar
+// "updated at" timestamp fresh no matter which tab is currently selected.
+async function sidebarHeartbeat() {
+  if (!appState.authenticated) return;
+  try {
+    const nd = await api("/api/nodes", { method: "GET" });
+    updateBootstrapBadge(nd.bootstrap_node);
+    if (nd.last_pulled_at) updateTopbarTimestamp(nd.last_pulled_at);
+  } catch {
+    /* transient network/auth errors are surfaced by the active tab refresh instead */
+  }
+}
+function startHeartbeat() {
+  stopHeartbeat();
+  if (!appState.authenticated) return;
+  sidebarHeartbeat();
+  appState.heartbeatTimer = setInterval(sidebarHeartbeat, SIDEBAR_HEARTBEAT_MS);
+}
+function stopHeartbeat() {
+  if (appState.heartbeatTimer) { clearInterval(appState.heartbeatTimer); appState.heartbeatTimer = null; }
+}
+
 /* ==================== WIRE GLOBAL EVENTS ==================== */
 
 initOverlayControls();
@@ -495,9 +566,40 @@ el("sel-auto-refresh")?.addEventListener("change", (ev) => {
   startAutoRefresh();
 });
 const savedWin = localStorage.getItem("exposure_time_window");
-if (savedWin !== null && el("sel-time-window")) el("sel-time-window").value = savedWin;
+const savedFrom = localStorage.getItem("exposure_time_from");
+const savedTo = localStorage.getItem("exposure_time_to");
+function syncCustomTimeVisibility() {
+  const isCustom = el("sel-time-window")?.value === "custom";
+  el("time-custom-wrap")?.classList.toggle("hidden", !isCustom);
+  if (isCustom) {
+    if (el("inp-time-from") && !el("inp-time-from").value) {
+      el("inp-time-from").value = savedFrom || toLocalDatetimeInputValue(Date.now() - 86400 * 1000);
+    }
+    if (el("inp-time-to") && !el("inp-time-to").value) {
+      el("inp-time-to").value = savedTo || toLocalDatetimeInputValue(Date.now());
+    }
+  }
+}
+if (savedWin !== null && el("sel-time-window")) {
+  const validOpt = Array.from(el("sel-time-window").options).some((o) => o.value === savedWin);
+  el("sel-time-window").value = validOpt ? savedWin : "3600";
+}
+if (el("inp-time-from") && savedFrom) el("inp-time-from").value = savedFrom;
+if (el("inp-time-to") && savedTo) el("inp-time-to").value = savedTo;
+syncCustomTimeVisibility();
+
 el("sel-time-window")?.addEventListener("change", (ev) => {
   localStorage.setItem("exposure_time_window", ev.target.value);
+  syncCustomTimeVisibility();
+  if (ev.target.value !== "custom") {
+    refreshCurrentTab();
+  }
+});
+el("btn-time-apply")?.addEventListener("click", () => {
+  const f = el("inp-time-from")?.value || "";
+  const tVal = el("inp-time-to")?.value || "";
+  if (f) localStorage.setItem("exposure_time_from", f);
+  if (tVal) localStorage.setItem("exposure_time_to", tVal);
   refreshCurrentTab();
 });
 
@@ -535,6 +637,7 @@ el("login-form")?.addEventListener("submit", async (ev) => {
     const route = getRouteFromLocation();
     switchTab(route.tab, { subTab: route.subTab, replaceHistory: true });
     startAutoRefresh();
+    startHeartbeat();
   } catch (e) {
     if (el("login-error")) {
       el("login-error").textContent = e.message;
@@ -560,6 +663,7 @@ async function bootstrapSession() {
     const route = getRouteFromLocation();
     switchTab(route.tab, { subTab: route.subTab, replaceHistory: true });
     startAutoRefresh();
+    startHeartbeat();
   } catch {
     resetToLogin();
   }

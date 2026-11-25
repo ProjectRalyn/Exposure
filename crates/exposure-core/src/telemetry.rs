@@ -556,6 +556,26 @@ pub fn is_cache_served_status(cache_status: Option<&str>) -> bool {
     matches!(cache_status, Some("HIT" | "STALE" | "REVALIDATED"))
 }
 
+/// Whether an access log `action` represents diverting traffic into Evilpot.
+pub fn is_evilpot_action(action: Option<&str>) -> bool {
+    matches!(action, Some("evilpot" | "evilpot_canary" | "geo_evilpot"))
+}
+
+/// Whether an access log `action` represents dropping a request via AutoBan.
+pub fn is_autoban_action(action: Option<&str>) -> bool {
+    action == Some("autoban")
+}
+
+/// Normalize alert severity labels into `"info" | "warning" | "error" | "critical"`.
+pub fn normalize_alert_severity(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "warn" | "warning" => "warning",
+        "crit" | "critical" => "critical",
+        "err" | "error" => "error",
+        _ => "info",
+    }
+}
+
 /// Aggregated summary per `(node_tag, role, minute_epoch, service_tag)` pushed to Maintainer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinuteSummary {
@@ -572,6 +592,10 @@ pub struct MinuteSummary {
     pub challenges_passed: u64,
     #[serde(default)]
     pub blocked: u64,
+    #[serde(default)]
+    pub evilpot_hits: u64,
+    #[serde(default)]
+    pub autoban_hits: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub uv_hll: HyperLogLog,
@@ -611,6 +635,8 @@ impl MinuteSummary {
             challenges_issued: 0,
             challenges_passed: 0,
             blocked: 0,
+            evilpot_hits: 0,
+            autoban_hits: 0,
             bytes_in: 0,
             bytes_out: 0,
             uv_hll: HyperLogLog::new(hll_precision, hll_seed),
@@ -639,6 +665,12 @@ impl MinuteSummary {
             && is_security_block_action(rec.action.as_deref())
         {
             self.blocked = self.blocked.saturating_add(1);
+        }
+        if is_evilpot_action(rec.action.as_deref()) {
+            self.evilpot_hits = self.evilpot_hits.saturating_add(1);
+        }
+        if is_autoban_action(rec.action.as_deref()) {
+            self.autoban_hits = self.autoban_hits.saturating_add(1);
         }
         if rec.challenge_passed {
             self.challenges_passed = self.challenges_passed.saturating_add(1);
@@ -675,6 +707,8 @@ impl MinuteSummary {
         self.challenges_issued = self.challenges_issued.saturating_add(other.challenges_issued);
         self.challenges_passed = self.challenges_passed.saturating_add(other.challenges_passed);
         self.blocked = self.blocked.saturating_add(other.blocked);
+        self.evilpot_hits = self.evilpot_hits.saturating_add(other.evilpot_hits);
+        self.autoban_hits = self.autoban_hits.saturating_add(other.autoban_hits);
         self.client_fp_verified = self.client_fp_verified.saturating_add(other.client_fp_verified);
         for (k, v) in &other.device_counts {
             if self.device_counts.len() < 64 || self.device_counts.contains_key(k) {
@@ -1293,6 +1327,8 @@ pub struct CertStatusInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertRecord {
+    #[serde(default)]
+    pub timestamp_ms: i64,
     pub timestamp: String,
     pub source: String,
     pub severity: String,
@@ -1302,6 +1338,8 @@ pub struct AlertRecord {
 /// Attacker deception & exploit-verification session report collected by `evilpot` on an Ingress node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvilpotSessionInfo {
+    #[serde(default)]
+    pub node_tag: String,
     pub client_ip: String,
     pub epoch_id: u64,
     pub persona_hostname: String,
@@ -1328,6 +1366,8 @@ pub struct EvilpotSessionInfo {
 /// Individual deception / exploit-verification threat event recorded by `evilpot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvilpotEventInfo {
+    #[serde(default)]
+    pub node_tag: String,
     pub timestamp_unix: u64,
     pub epoch_id: u64,
     pub persona_hostname: String,
@@ -1337,6 +1377,68 @@ pub struct EvilpotEventInfo {
     pub detail: String,
     #[serde(default)]
     pub evidence: Vec<String>,
+}
+
+/// Persisted full-lifecycle AutoBan record stored on Maintainer (active, expired, and manually unbanned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanRecord {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub node_tag: String,
+    pub kind: String,
+    pub target: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub offense_level: u8,
+    pub banned_at_unix: u64,
+    pub expires_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbanned_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unbanned_by: Option<String>,
+    pub hits_blocked: u64,
+    /// `"active"` | `"expired"` | `"unbanned"`
+    #[serde(default = "default_ban_status")]
+    pub status: String,
+}
+
+fn default_ban_status() -> String {
+    "active".into()
+}
+
+/// Maintainer SQLite WAL database storage usage and table row-count diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MaintainerStorageStats {
+    #[serde(default)]
+    pub maintainer_tag: String,
+    #[serde(default)]
+    pub db_bytes: u64,
+    #[serde(default)]
+    pub wal_bytes: u64,
+    #[serde(default)]
+    pub access_logs_rows: u64,
+    #[serde(default)]
+    pub minute_summaries_rows: u64,
+    #[serde(default)]
+    pub fingerprints_rows: u64,
+    #[serde(default)]
+    pub evilpot_sessions_rows: u64,
+    #[serde(default)]
+    pub evilpot_events_rows: u64,
+    #[serde(default)]
+    pub ban_records_rows: u64,
+    #[serde(default)]
+    pub active_bans_rows: u64,
+    #[serde(default)]
+    pub alerts_rows: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cleanup_at: Option<String>,
+    #[serde(default)]
+    pub max_db_bytes: u64,
 }
 
 /// Active auto-ban entry for a confirmed attacker IP or fingerprint.

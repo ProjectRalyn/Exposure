@@ -6,10 +6,10 @@ use exposure_core::config::{
     CertOrderConfig, CrsUpdateConfig, CustomPagesConfig, DomainLineRecordType, EgressConfig,
     EgressDefaults, EgressServiceConfig, EvilpotNodeConfig, GeoIpConfig, GeoPolicyConfig,
     GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
-    LinkListenerDefaults, LinkMode, LoggerConfig, NodeCacheConfig, NodeConfig, PeerConfig,
-    ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode,
-    ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection, WafConfig,
-    WafMode,
+    LinkListenerDefaults, LinkMode, LoggerConfig, MaintainerRetentionConfig, NodeCacheConfig,
+    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
+    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
+    TunnelDirection, WafConfig, WafMode,
 };
 use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
@@ -2063,6 +2063,7 @@ pub fn compile_topology_full(
         effective_logger.protection.dedup_window_secs.clamp(0, 300);
     effective_logger.protection.warn_rate_per_sec =
         effective_logger.protection.warn_rate_per_sec.clamp(1, 1000);
+    clamp_maintainer_retention(&mut effective_logger.retention);
     if effective_logger.hmac_key.trim().is_empty() {
         if let Some(ck) = cluster_hmac_key.filter(|k| !k.trim().is_empty()) {
             effective_logger.hmac_key = ck.to_string();
@@ -2079,7 +2080,7 @@ pub fn compile_topology_full(
                 .and_then(|t| topo.maintainer_templates.get(t))
                 .cloned()
                 .unwrap_or_default();
-            // Propagate cluster logger settings (hmac_key, store_raw_ip, DoS protection & recent log retention) into Maintainer unless explicitly set
+            // Propagate cluster logger settings (hmac_key, store_raw_ip, DoS protection, recent log & retention policies) into Maintainer unless explicitly set
             if mc.logger.hmac_key.trim().is_empty() {
                 mc.logger.hmac_key = effective_logger.hmac_key.clone();
             }
@@ -2092,6 +2093,11 @@ pub fn compile_topology_full(
             } else {
                 mc.logger.segment.max_recent_logs =
                     mc.logger.segment.max_recent_logs.clamp(100, 10_000);
+            }
+            if mc.logger.retention == MaintainerRetentionConfig::default() {
+                mc.logger.retention = effective_logger.retention.clone();
+            } else {
+                clamp_maintainer_retention(&mut mc.logger.retention);
             }
             mc.logger.protection = effective_logger.protection.clone();
             if mc.is_primary_cert_manager {
@@ -2212,6 +2218,12 @@ pub fn compile_topology_full(
             RelayConfig::default()
         };
 
+        let resolved_maintainer_hops = if spec.maintainer_hops.is_empty() && !spec.roles.maintainer {
+            find_nearest_maintainer_hops(node_tag, &adj, topo).unwrap_or_default()
+        } else {
+            spec.maintainer_hops.clone()
+        };
+
         let node_cfg = NodeConfig {
             node_tag: node_tag.clone(),
             identity_secret_key: String::new(),
@@ -2222,7 +2234,7 @@ pub fn compile_topology_full(
             peers: peer_map.get(node_tag).cloned().unwrap_or_default(),
             probe: spec.probe.clone().unwrap_or_else(ProbeConfig::default),
             default_ttl: 16,
-            maintainer_hops: spec.maintainer_hops.clone(),
+            maintainer_hops: resolved_maintainer_hops,
             trusted_maintainers: if spec.roles.ingress {
                 trusted_maintainers.clone()
             } else {
@@ -2236,6 +2248,7 @@ pub fn compile_topology_full(
             maintainer: maint_cfg,
             bootstrap_tunnel_addr: None,
             config_sequence: 0,
+            config_revision: String::new(),
         };
         compiled.insert(node_tag.clone(), node_cfg);
     }
@@ -2248,6 +2261,57 @@ pub fn compile_topology_full(
         paths,
     };
     (report, compiled)
+}
+
+fn clamp_maintainer_retention(r: &mut MaintainerRetentionConfig) {
+    r.cleanup_interval_mins = r.cleanup_interval_mins.clamp(5, 10_080);
+    r.access_logs_retention_hours = r.access_logs_retention_hours.min(87_600);
+    r.access_logs_max_rows = r.access_logs_max_rows.min(100_000_000);
+    r.stats_retention_days = r.stats_retention_days.min(3_650);
+    r.max_summaries = r.max_summaries.min(50_000_000);
+    r.fingerprints_retention_days = r.fingerprints_retention_days.min(3_650);
+    r.max_fingerprints = r.max_fingerprints.min(50_000_000);
+    r.evilpot_retention_days = r.evilpot_retention_days.min(3_650);
+    r.evilpot_max_sessions = r.evilpot_max_sessions.min(10_000_000);
+    r.evilpot_max_events = r.evilpot_max_events.min(50_000_000);
+    r.bans_retention_days = r.bans_retention_days.min(3_650);
+    r.bans_max_rows = r.bans_max_rows.min(10_000_000);
+    r.alerts_retention_days = r.alerts_retention_days.min(3_650);
+    r.alerts_max_rows = r.alerts_max_rows.min(10_000_000);
+}
+
+fn find_nearest_maintainer_hops(
+    start: &str,
+    adj: &HashMap<String, HashSet<String>>,
+    topo: &TopologySpec,
+) -> Option<Vec<String>> {
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start.to_string());
+    queue.push_back(vec![start.to_string()]);
+    while let Some(path) = queue.pop_front() {
+        if path.len() >= MAX_HOP_PATH_LEN {
+            continue;
+        }
+        let cur = path.last()?;
+        let Some(nbs) = adj.get(cur) else {
+            continue;
+        };
+        let mut sorted: Vec<&String> = nbs.iter().collect();
+        sorted.sort();
+        for nb in sorted {
+            if !visited.insert(nb.clone()) {
+                continue;
+            }
+            let mut next_path = path.clone();
+            next_path.push(nb.clone());
+            if topo.nodes.get(nb).map(|n| n.roles.maintainer).unwrap_or(false) {
+                return Some(next_path);
+            }
+            queue.push_back(next_path);
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

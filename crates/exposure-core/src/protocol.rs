@@ -5,8 +5,9 @@ use crate::config::{NodeRoles, SignedConfigBundle};
 use crate::crypto::push_len_prefixed;
 use crate::error::{ExposureError, Result};
 use crate::telemetry::{
-    AlertRecord, CertStatusInfo, EvilpotNodeReport, FingerprintObservation, GeoIpStatusSnapshot,
-    LinkStatusSnapshot, LogProtectionStats, MinuteSummary, SessionSummary,
+    AlertRecord, BanRecord, CertStatusInfo, EvilpotEventInfo, EvilpotNodeReport,
+    EvilpotSessionInfo, FingerprintObservation, GeoIpStatusSnapshot, LinkStatusSnapshot,
+    LogProtectionStats, MaintainerStorageStats, MinuteSummary, SessionSummary,
 };
 
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -293,6 +294,8 @@ pub struct NodeStatusSnapshot {
     pub node_tag: String,
     pub roles: NodeRoles,
     pub config_sequence: u64,
+    #[serde(default)]
+    pub config_revision: String,
     pub last_reload_ok: bool,
     #[serde(default)]
     pub last_reload_error: Option<String>,
@@ -320,6 +323,168 @@ pub struct MaintainerTelemetrySnapshot {
     pub segment_backlog: usize,
     pub merge_latency_ms: f64,
     pub alerts: Vec<AlertRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_stats: Option<MaintainerStorageStats>,
+}
+
+/// Time-windowed, paginated query routed from Control to Maintainer's SQLite WAL database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+pub enum MaintainerQuery {
+    Overview {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+    },
+    Telemetry {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        service: Option<String>,
+        #[serde(default)]
+        bucket_offset: usize,
+        #[serde(default)]
+        bucket_limit: usize,
+    },
+    AccessLogs {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        service: Option<String>,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        method: Option<String>,
+        #[serde(default)]
+        action: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        ip: Option<String>,
+        #[serde(default)]
+        ip_hmac: Option<String>,
+        #[serde(default)]
+        country: Option<String>,
+        #[serde(default)]
+        ray_id: Option<String>,
+        #[serde(default)]
+        q: Option<String>,
+        #[serde(default)]
+        q_ip_hmac: Option<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+    },
+    Fingerprints {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        service: Option<String>,
+        #[serde(default)]
+        country: Option<String>,
+        #[serde(default)]
+        verified: Option<String>,
+        #[serde(default)]
+        risk: Option<String>,
+        #[serde(default)]
+        ip: Option<String>,
+        #[serde(default)]
+        ip_hmac: Option<String>,
+        #[serde(default)]
+        fp: Option<String>,
+        #[serde(default)]
+        q: Option<String>,
+        #[serde(default)]
+        q_ip_hmac: Option<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+    },
+    Evilpot {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        ip: Option<String>,
+        #[serde(default)]
+        q: Option<String>,
+        #[serde(default)]
+        sessions_offset: usize,
+        #[serde(default)]
+        sessions_limit: usize,
+        #[serde(default)]
+        events_offset: usize,
+        #[serde(default)]
+        events_limit: usize,
+    },
+    Bans {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        q: Option<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+    },
+    Alerts {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        to_ms: Option<i64>,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        severity: Option<String>,
+        #[serde(default)]
+        q: Option<String>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+    },
+    StorageStats,
+    RunCleanup,
+    MarkUnbanned {
+        #[serde(default)]
+        node_tag: Option<String>,
+        ban_kind: String,
+        target: String,
+        actor: String,
+        unbanned_at_unix: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,6 +642,8 @@ pub enum SpecialPayload {
     ConfigAck {
         node_tag: String,
         sequence: u64,
+        #[serde(default)]
+        config_revision: String,
         applied: bool,
         #[serde(default)]
         error: Option<String>,
@@ -491,6 +658,8 @@ pub enum SpecialPayload {
         roles: NodeRoles,
         public_key: String,
         config_sequence: u64,
+        #[serde(default)]
+        config_revision: String,
         neighbors: Vec<DiscoveryNeighbor>,
         signature: String,
     },
@@ -500,6 +669,14 @@ pub enum SpecialPayload {
         minute_summaries: Vec<MinuteSummary>,
         #[serde(default)]
         fingerprints: Vec<FingerprintObservation>,
+        #[serde(default)]
+        evilpot_sessions: Vec<EvilpotSessionInfo>,
+        #[serde(default)]
+        evilpot_events: Vec<EvilpotEventInfo>,
+        #[serde(default)]
+        ban_records: Vec<BanRecord>,
+        #[serde(default)]
+        alerts: Vec<AlertRecord>,
     },
     LogAck {
         accepted: usize,
@@ -664,6 +841,24 @@ pub enum SpecialPayload {
         continent: Option<String>,
         is_private: bool,
         db_loaded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Control-signed query/command executed against Maintainer's SQLite WAL observability store.
+    QueryMaintainerReq {
+        request_id: String,
+        issued_at: i64,
+        expires_at: i64,
+        maintainer_tag: String,
+        query: MaintainerQuery,
+        control_signature: String,
+    },
+    QueryMaintainerResp {
+        request_id: String,
+        maintainer_tag: String,
+        ok: bool,
+        #[serde(default)]
+        data: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -832,6 +1027,24 @@ pub fn pull_telemetry_req_signing_bytes(
         }
         None => out.push(0),
     }
+    out
+}
+
+pub fn query_maintainer_req_signing_bytes(
+    request_id: &str,
+    issued_at: i64,
+    expires_at: i64,
+    maintainer_tag: &str,
+    query: &MaintainerQuery,
+) -> Vec<u8> {
+    let q_json = serde_json::to_vec(query).unwrap_or_default();
+    let mut out = Vec::with_capacity(192 + q_json.len());
+    out.extend_from_slice(b"exposure-query-maintainer-v1:");
+    push_len_prefixed(&mut out, request_id.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    push_len_prefixed(&mut out, maintainer_tag.as_bytes());
+    push_len_prefixed(&mut out, &q_json);
     out
 }
 

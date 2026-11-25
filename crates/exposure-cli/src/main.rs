@@ -198,6 +198,7 @@ async fn main() -> Result<()> {
                 },
                 bootstrap_tunnel_addr: bootstrap,
                 config_sequence: 0,
+                config_revision: String::new(),
             };
 
             let yaml = serde_yaml::to_string(&cfg)?;

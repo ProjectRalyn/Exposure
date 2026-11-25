@@ -12,8 +12,8 @@
   --border: #1e1e24;
   --border-hi: #2d2d36;
   --text: #fafafa;
-  --text-2: #a1a1aa;
-  --muted: #71717a;
+  --text-2: #b0b0ba;
+  --muted: #909099;
 
   --accent: #5b9bd5;
   --accent-hi: #7cb4e8;
@@ -87,7 +87,8 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
-  font-size: 13.5px;
+  font-size: 14px;
+  font-weight: 450;
   line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -100,7 +101,7 @@ code, pre, .mono {
 
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
-.muted-sm { color: var(--muted); font-size: 12px; }
+.muted-sm { color: var(--muted); font-size: 12.5px; font-weight: 500; }
 
 /* Login */
 .login-shell {
@@ -371,7 +372,7 @@ input:focus, select:focus, textarea:focus {
 .kpi-label {
   font-family: var(--font-mono);
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 11.5px;
   text-transform: uppercase;
   letter-spacing: 0.07em;
   margin-bottom: 6px;
@@ -388,7 +389,7 @@ input:focus, select:focus, textarea:focus {
 .kpi-sub {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--muted);
   margin-top: 5px;
 }
@@ -497,7 +498,7 @@ input:focus, select:focus, textarea:focus {
 details[open] > .panel-summary::before { content: "▾ "; }
 
 .table-scroll { overflow-x: auto; overflow-y: visible; }
-.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .table th, .table td {
   text-align: left;
   padding: 9px 10px;
@@ -1870,3 +1871,29 @@ details[open] > .panel-summary::before { content: "▾ "; }
   background: var(--bg-subtle);
 }
 .empty-state-box p { margin: 0 0 12px; }
+.time-custom-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.time-custom-wrap input[type="datetime-local"] {
+  max-width: 175px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.rev-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: var(--r-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.rev-badge.drift {
+  background: var(--warn-dim);
+  border-color: var(--warn);
+  color: var(--warn);
+}

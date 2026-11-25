@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::crs::WafRuleDescriptor;
 
@@ -1337,6 +1338,158 @@ impl Default for LogProtectionConfig {
     }
 }
 
+fn default_ret_access_hours() -> u64 {
+    72
+}
+fn default_ret_access_rows() -> usize {
+    500_000
+}
+fn default_ret_stats_days() -> u64 {
+    30
+}
+fn default_ret_max_summaries() -> usize {
+    200_000
+}
+fn default_ret_fp_days() -> u64 {
+    14
+}
+fn default_ret_max_fps() -> usize {
+    100_000
+}
+fn default_ret_evilpot_days() -> u64 {
+    30
+}
+fn default_ret_evilpot_events() -> usize {
+    100_000
+}
+fn default_ret_evilpot_sessions() -> usize {
+    20_000
+}
+fn default_ret_bans_days() -> u64 {
+    30
+}
+fn default_ret_bans_rows() -> usize {
+    100_000
+}
+fn default_ret_alerts_days() -> u64 {
+    30
+}
+fn default_ret_alerts_rows() -> usize {
+    50_000
+}
+fn default_ret_max_db_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_ret_cleanup_mins() -> u64 {
+    30
+}
+
+/// Maintainer SQLite WAL storage retention & periodic cleanup policy (hot-reloaded via Topology).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaintainerRetentionConfig {
+    #[serde(default = "default_ret_access_hours")]
+    pub access_logs_retention_hours: u64,
+    #[serde(default = "default_ret_access_rows")]
+    pub access_logs_max_rows: usize,
+    #[serde(default = "default_ret_stats_days")]
+    pub stats_retention_days: u64,
+    #[serde(default = "default_ret_max_summaries")]
+    pub max_summaries: usize,
+    #[serde(default = "default_ret_fp_days")]
+    pub fingerprints_retention_days: u64,
+    #[serde(default = "default_ret_max_fps")]
+    pub max_fingerprints: usize,
+    #[serde(default = "default_ret_evilpot_days")]
+    pub evilpot_retention_days: u64,
+    #[serde(default = "default_ret_evilpot_events")]
+    pub evilpot_max_events: usize,
+    #[serde(default = "default_ret_evilpot_sessions")]
+    pub evilpot_max_sessions: usize,
+    #[serde(default = "default_ret_bans_days")]
+    pub bans_retention_days: u64,
+    #[serde(default = "default_ret_bans_rows")]
+    pub bans_max_rows: usize,
+    #[serde(default = "default_ret_alerts_days")]
+    pub alerts_retention_days: u64,
+    #[serde(default = "default_ret_alerts_rows")]
+    pub alerts_max_rows: usize,
+    #[serde(default = "default_ret_max_db_bytes")]
+    pub max_db_bytes: u64,
+    #[serde(default = "default_ret_cleanup_mins")]
+    pub cleanup_interval_mins: u64,
+}
+
+impl Default for MaintainerRetentionConfig {
+    fn default() -> Self {
+        Self {
+            access_logs_retention_hours: default_ret_access_hours(),
+            access_logs_max_rows: default_ret_access_rows(),
+            stats_retention_days: default_ret_stats_days(),
+            max_summaries: default_ret_max_summaries(),
+            fingerprints_retention_days: default_ret_fp_days(),
+            max_fingerprints: default_ret_max_fps(),
+            evilpot_retention_days: default_ret_evilpot_days(),
+            evilpot_max_events: default_ret_evilpot_events(),
+            evilpot_max_sessions: default_ret_evilpot_sessions(),
+            bans_retention_days: default_ret_bans_days(),
+            bans_max_rows: default_ret_bans_rows(),
+            alerts_retention_days: default_ret_alerts_days(),
+            alerts_max_rows: default_ret_alerts_rows(),
+            max_db_bytes: default_ret_max_db_bytes(),
+            cleanup_interval_mins: default_ret_cleanup_mins(),
+        }
+    }
+}
+
+fn default_ctrl_rel_days() -> u64 {
+    90
+}
+fn default_ctrl_rel_max() -> usize {
+    200
+}
+fn default_ctrl_audit_days() -> u64 {
+    90
+}
+fn default_ctrl_audit_rows() -> usize {
+    50_000
+}
+fn default_ctrl_pass_hours() -> u64 {
+    24
+}
+fn default_ctrl_cleanup_mins() -> u64 {
+    60
+}
+
+/// Control SQLite retention & cleanup policy (persisted in Control DB, configurable from Web UI).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlRetentionConfig {
+    #[serde(default = "default_ctrl_rel_days")]
+    pub config_releases_retention_days: u64,
+    #[serde(default = "default_ctrl_rel_max")]
+    pub config_releases_max_count: usize,
+    #[serde(default = "default_ctrl_audit_days")]
+    pub audit_logs_retention_days: u64,
+    #[serde(default = "default_ctrl_audit_rows")]
+    pub audit_logs_max_rows: usize,
+    #[serde(default = "default_ctrl_pass_hours")]
+    pub expired_passphrases_retention_hours: u64,
+    #[serde(default = "default_ctrl_cleanup_mins")]
+    pub control_cleanup_interval_mins: u64,
+}
+
+impl Default for ControlRetentionConfig {
+    fn default() -> Self {
+        Self {
+            config_releases_retention_days: default_ctrl_rel_days(),
+            config_releases_max_count: default_ctrl_rel_max(),
+            audit_logs_retention_days: default_ctrl_audit_days(),
+            audit_logs_max_rows: default_ctrl_audit_rows(),
+            expired_passphrases_retention_hours: default_ctrl_pass_hours(),
+            control_cleanup_interval_mins: default_ctrl_cleanup_mins(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggerConfig {
     /// HMAC key for pseudonymizing client IPs (auto-generated randomly if left empty on standalone nodes).
@@ -1357,6 +1510,9 @@ pub struct LoggerConfig {
     /// Anti-DoS protection & URL/query redaction settings for detailed access logs.
     #[serde(default)]
     pub protection: LogProtectionConfig,
+    /// Maintainer SQLite retention & cleanup policy.
+    #[serde(default)]
+    pub retention: MaintainerRetentionConfig,
 }
 
 impl Default for LoggerConfig {
@@ -1370,6 +1526,7 @@ impl Default for LoggerConfig {
             histogram_buckets_ms: default_histogram_buckets(),
             segment: SegmentConfig::default(),
             protection: LogProtectionConfig::default(),
+            retention: MaintainerRetentionConfig::default(),
         }
     }
 }
@@ -1666,6 +1823,33 @@ pub struct NodeConfig {
     /// Config sequence currently applied (monotonic anti-rollback).
     #[serde(default)]
     pub config_sequence: u64,
+    /// Git-style short revision hash shared across all nodes in the same cluster release.
+    #[serde(default)]
+    pub config_revision: String,
+}
+
+/// Compute Git-style `(short_8_hex, full_64_hex)` SHA-256 release hash for a cluster deploy/rollback.
+pub fn compute_release_revision(
+    topology_yaml: &str,
+    crs_version: &str,
+    parent_revision: Option<&str>,
+    release_seq: u64,
+    created_at_ms: i64,
+) -> (String, String) {
+    let mut h = Sha256::new();
+    h.update(b"exposure-release-v1\n");
+    h.update(topology_yaml.as_bytes());
+    h.update(b"\n");
+    h.update(crs_version.as_bytes());
+    h.update(b"\n");
+    h.update(parent_revision.unwrap_or("").as_bytes());
+    h.update(b"\n");
+    h.update(release_seq.to_string().as_bytes());
+    h.update(b"\n");
+    h.update(created_at_ms.to_string().as_bytes());
+    let full = hex::encode(h.finalize());
+    let short = full[..8].to_string();
+    (short, full)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1683,6 +1867,8 @@ pub struct SignedConfigBundle {
     pub node_tag: String,
     pub sequence: u64,
     pub min_sequence: u64,
+    #[serde(default)]
+    pub config_revision: String,
     pub issued_at: i64,
     pub expires_at: i64,
     pub config: NodeConfig,
@@ -1697,6 +1883,8 @@ impl SignedConfigBundle {
             node_tag: &'a str,
             sequence: u64,
             min_sequence: u64,
+            #[serde(skip_serializing_if = "str::is_empty")]
+            config_revision: &'a str,
             issued_at: i64,
             expires_at: i64,
             config: &'a NodeConfig,
@@ -1710,6 +1898,7 @@ impl SignedConfigBundle {
             node_tag: &self.node_tag,
             sequence: self.sequence,
             min_sequence: self.min_sequence,
+            config_revision: &self.config_revision,
             issued_at: self.issued_at,
             expires_at: self.expires_at,
             config: &self.config,
