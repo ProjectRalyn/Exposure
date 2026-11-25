@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,6 +119,8 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
     let apps = [
         ("control", "app.js", "/"),
         ("challenge", "pow.js", "/cdn-cgi/"),
+        // CSS-only intercept page: no JS entry.
+        ("error", "", "/"),
     ];
 
     for (app, entry_js, base) in apps {
@@ -129,15 +132,16 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
             return false;
         }
 
-        let js_ok = Command::new(&esbuild)
-            .arg(src.join(entry_js))
-            .arg("--bundle")
-            .arg("--format=esm")
-            .arg("--minify")
-            .arg(format!("--outfile={}", assets.join("app.min.js").display()))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let js_ok = entry_js.is_empty()
+            || Command::new(&esbuild)
+                .arg(src.join(entry_js))
+                .arg("--bundle")
+                .arg("--format=esm")
+                .arg("--minify")
+                .arg(format!("--outfile={}", assets.join("app.min.js").display()))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
 
         let css_ok = Command::new(&esbuild)
             .arg(src.join("styles.css"))
@@ -157,20 +161,23 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
         let Ok(html) = fs::read_to_string(src.join("index.html")) else {
             return false;
         };
-        let patched = html
+        let mut patched = html
             .replace("./styles.css", &format!("{base}assets/styles.min.css"))
-            .replace(
-                &format!("./{entry_js}"),
-                &format!("{base}assets/app.min.js"),
-            )
             .replace(
                 "/cdn-cgi/styles.css",
                 &format!("{base}assets/styles.min.css"),
-            )
-            .replace(
-                &format!("/cdn-cgi/{entry_js}"),
-                &format!("{base}assets/app.min.js"),
             );
+        if !entry_js.is_empty() {
+            patched = patched
+                .replace(
+                    &format!("./{entry_js}"),
+                    &format!("{base}assets/app.min.js"),
+                )
+                .replace(
+                    &format!("/cdn-cgi/{entry_js}"),
+                    &format!("{base}assets/app.min.js"),
+                );
+        }
         if fs::write(dst.join("index.html"), patched).is_err() {
             return false;
         }
@@ -243,7 +250,8 @@ fn main() {
         fs::write(
             &dest,
             "pub fn get_embedded(_app: &str, _path: &str) -> Option<&'static [u8]> { None }\n\
-             pub fn get_embedded_encoded(_app: &str, _path: &str, _encoding: &str) -> Option<&'static [u8]> { None }\n",
+             pub fn get_embedded_encoded(_app: &str, _path: &str, _encoding: &str) -> Option<&'static [u8]> { None }\n\
+             pub fn embedded_script_hash(_app: &str) -> Option<&'static str> { None }\n",
         )
         .unwrap();
         return;
@@ -254,13 +262,15 @@ fn main() {
 
     let effective_dist = if (vite_ok
         && stage_dir.join("control").exists()
-        && stage_dir.join("challenge").exists())
+        && stage_dir.join("challenge").exists()
+        && stage_dir.join("error").exists())
         || build_with_native_esbuild(&web_dir, &stage_dir)
     {
         stage_dir
     } else if env::var("EXPOSURE_USE_PREBUILT_WEB").ok().as_deref() == Some("1")
         && web_dir.join("dist").join("control").exists()
         && web_dir.join("dist").join("challenge").exists()
+        && web_dir.join("dist").join("error").exists()
     {
         println!(
             "cargo:warning=Using prebuilt web/dist assets because EXPOSURE_USE_PREBUILT_WEB=1"
@@ -274,16 +284,34 @@ fn main() {
 
     let dist_control = effective_dist.join("control");
     let dist_challenge = effective_dist.join("challenge");
+    let dist_error = effective_dist.join("error");
 
     let mut control_files = Vec::new();
     let mut challenge_files = Vec::new();
+    let mut error_files = Vec::new();
     collect_files(&dist_control, &dist_control, &mut control_files);
     collect_files(&dist_challenge, &dist_challenge, &mut challenge_files);
+    collect_files(&dist_error, &dist_error, &mut error_files);
 
-    // The built-in PoW page ships as ONE self-contained document: the dist `index.html` with its
-    // CSS and JS inlined. The separate `assets/app.min.js` / `assets/styles.min.css` stay embedded
-    // too, so operator-provisioned pages may still reference those stable paths.
-    let single_pow_page = build_single_file_page(&dist_challenge, &out_dir.join("web_single"));
+    // The built-in PoW and intercept pages each ship as ONE self-contained document: the dist
+    // `index.html` with its CSS (and, for the PoW page, its JS) inlined. The separate
+    // `assets/app.min.js` / `assets/styles.min.css` stay embedded too, so operator-provisioned
+    // pages may still reference those stable paths.
+    let single_dir = out_dir.join("web_single");
+    let mut single_pages: BTreeMap<&str, PathBuf> = BTreeMap::new();
+    let mut script_hashes: BTreeMap<&str, String> = BTreeMap::new();
+    for (app, dist, name) in [
+        ("challenge", &dist_challenge, "challenge-index.html"),
+        ("error", &dist_error, "error-index.html"),
+    ] {
+        let Some((page, hash)) = build_single_file_page(dist, &single_dir, name) else {
+            panic!("failed to assemble the built-in single-file `{app}` page from the web build");
+        };
+        single_pages.insert(app, page);
+        if let Some(hash) = hash {
+            script_hashes.insert(app, hash);
+        }
+    }
 
     let compressed_root = out_dir.join("web_compressed");
     let mut code = String::from(
@@ -292,11 +320,15 @@ fn main() {
     let mut encoded = String::from(
         "pub fn get_embedded_encoded(app: &str, path: &str, encoding: &str) -> Option<&'static [u8]> {\n    match (app, path, encoding) {\n",
     );
-    for (app_name, files) in [("control", control_files), ("challenge", challenge_files)] {
+    for (app_name, files) in [
+        ("control", control_files),
+        ("challenge", challenge_files),
+        ("error", error_files),
+    ] {
         for (rel, full) in files {
             let abs = fs::canonicalize(&full).unwrap();
-            let served = match (&single_pow_page, app_name, rel.as_str()) {
-                (Some(page), "challenge", "index.html") => page.clone(),
+            let served = match single_pages.get(app_name) {
+                Some(page) if rel == "index.html" => page.clone(),
                 _ => abs,
             };
             code.push_str(&format!(
@@ -321,6 +353,12 @@ fn main() {
     code.push_str("        _ => None,\n    }\n}\n");
     code.push_str(&encoded);
     code.push_str("        _ => None,\n    }\n}\n");
+    // CSP source hash for pages whose script was inlined (release builds only).
+    code.push_str("pub fn embedded_script_hash(app: &str) -> Option<&'static str> {\n    match app {\n");
+    for (app, hash) in &script_hashes {
+        code.push_str(&format!("        {:?} => Some({:?}),\n", app, hash));
+    }
+    code.push_str("        _ => None,\n    }\n}\n");
     fs::write(&dest, code).unwrap();
 }
 
@@ -343,31 +381,48 @@ fn splice_tag(html: &str, needle: &str, replacement: &str) -> String {
     out
 }
 
-/// Assemble the built-in PoW page as a single self-contained document (CSS + JS inlined).
+/// Assemble a built-in page as a single self-contained document (`styles.min.css` and, when
+/// present, `app.min.js` inlined).
+///
+/// Returns the assembled page plus — when a script was inlined — the CSP source hash
+/// (`sha256-<base64>`) the serving node must allow in order to run it.
 ///
 /// The inline `<script>`/`<style>` bodies must not contain their own closing sequence; if the
 /// minified bundle ever does, that asset is left as an external reference instead of producing a
 /// broken inline page.
-fn build_single_file_page(dist: &Path, out_dir: &Path) -> Option<PathBuf> {
+fn build_single_file_page(
+    dist: &Path,
+    out_dir: &Path,
+    file_name: &str,
+) -> Option<(PathBuf, Option<String>)> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
     let mut html = fs::read_to_string(dist.join("index.html")).ok()?;
     let css = fs::read_to_string(dist.join("assets").join("styles.min.css")).unwrap_or_default();
     let js = fs::read_to_string(dist.join("assets").join("app.min.js")).unwrap_or_default();
 
     if !css.is_empty() && !css.contains("</style") {
-        html = splice_tag(&html, "styles.min.css", &format!("<style>{css}</style>"));
+        html = splice_tag(&html, "rel=\"stylesheet\"", &format!("<style>{css}</style>"));
     }
+    let mut script_hash = None;
     if !js.is_empty() && !js.contains("</script") {
         html = splice_tag(
             &html,
             "app.min.js",
             &format!("<script type=\"module\">{js}</script>"),
         );
+        let digest = sha2::Sha256::digest(js.as_bytes());
+        script_hash = Some(format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        ));
     }
 
     fs::create_dir_all(out_dir).ok()?;
-    let dst = out_dir.join("challenge-index.html");
+    let dst = out_dir.join(file_name);
     fs::write(&dst, html).ok()?;
-    fs::canonicalize(&dst).ok()
+    Some((fs::canonicalize(&dst).ok()?, script_hash))
 }
 
 /// Payloads below this size are dominated by the coding's own framing overhead.

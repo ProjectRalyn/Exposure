@@ -7,7 +7,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use dashmap::DashMap;
-use exposure_core::assets::{WebApp, load_web_asset_negotiated, maybe_gzip_body};
+use exposure_core::assets::{
+    WebApp, embedded_page_script_hash, load_web_asset_negotiated, maybe_gzip_body,
+};
 use exposure_core::config::{AntibotMode, GuardProfile, RateLimitBucket, ResolvedPages};
 use exposure_core::crypto::{
     ClearanceClaims, FpCookieClaims, ct_eq_hashed, keyed_short_hmac_hex, short_sha256_hex,
@@ -37,7 +39,25 @@ const FP_INJECT_COOLDOWN: Duration = Duration::from_secs(15);
 const ADAPTIVE_WINDOW: Duration = Duration::from_secs(60);
 const VERIFY_FAILURE_WINDOW: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_HTML_RESPONSES: u32 = 3;
-const CHALLENGE_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
+
+/// CSP for `/cdn-cgi/*` responses.
+///
+/// The built-in PoW page inlines its script, so `script-src` must allow it by **hash** (the build
+/// records the digest of the exact bytes it inlined) — never by blanket `'unsafe-inline'`.
+/// Operator-provisioned single-file pages are arbitrary documents, so they get `'unsafe-inline'`
+/// instead; note CSP ignores `'unsafe-inline'` when a hash is also present, so the two modes are
+/// mutually exclusive.
+fn challenge_csp(inline_scripts_allowed: bool) -> String {
+    let script_src = if inline_scripts_allowed {
+        "script-src 'self' 'unsafe-inline'".to_string()
+    } else {
+        match embedded_page_script_hash("challenge") {
+            Some(hash) => format!("script-src 'self' '{hash}'"),
+            None => "script-src 'self'".to_string(),
+        }
+    };
+    format!("default-src 'self'; style-src 'self' 'unsafe-inline'; {script_src}; frame-ancestors 'self'")
+}
 
 fn profile_binding_hash(profile: Option<&GuardProfile>) -> String {
     let def = GuardProfile::default();
@@ -106,7 +126,7 @@ fn c_sec_headers() -> Vec<(String, String)> {
     vec![
         ("X-Content-Type-Options".into(), "nosniff".into()),
         ("X-Frame-Options".into(), "SAMEORIGIN".into()),
-        ("Content-Security-Policy".into(), CHALLENGE_CSP.into()),
+        ("Content-Security-Policy".into(), challenge_csp(false)),
     ]
 }
 
@@ -1059,8 +1079,19 @@ impl GuardEngine {
             vec![
                 ("X-Content-Type-Options".into(), "nosniff".into()),
                 ("X-Frame-Options".into(), "SAMEORIGIN".into()),
-                ("Content-Security-Policy".into(), CHALLENGE_CSP.into()),
+                ("Content-Security-Policy".into(), challenge_csp(false)),
             ]
+        };
+        // A provisioned single-file page may carry its own inline script/style, which the strict
+        // hash-based policy above would block.
+        let custom_page_headers = || -> Vec<(String, String)> {
+            let mut extra = sec_headers();
+            for (name, value) in extra.iter_mut() {
+                if name.eq_ignore_ascii_case("content-security-policy") {
+                    *value = challenge_csp(true);
+                }
+            }
+            extra
         };
 
         let rate_limit_resp =
@@ -1536,7 +1567,7 @@ impl GuardEngine {
         if asset_path.is_empty() || asset_path == "index.html" {
             if let Some(pow) = custom_pages.and_then(|p| p.pow.as_deref()) {
                 let (body, encoding) = maybe_gzip_body(pow.as_bytes().to_vec(), accept_enc);
-                let mut extra = sec_headers();
+                let mut extra = custom_page_headers();
                 extra.push(("Cache-Control".into(), "no-cache".into()));
                 extra.push(("Vary".into(), "Accept-Encoding".into()));
                 if let Some(encoding) = encoding {
@@ -2065,6 +2096,22 @@ mod tests {
                 }
                 _ => panic!("expected RateLimited on hit {hit}"),
             }
+        }
+    }
+
+    #[test]
+    fn csp_allows_inline_scripts_only_for_custom_pages() {
+        let custom = challenge_csp(true);
+        assert!(custom.contains("script-src 'self' 'unsafe-inline'"), "{custom}");
+        let builtin = challenge_csp(false);
+        assert!(
+            !builtin.contains("script-src 'self' 'unsafe-inline'"),
+            "{builtin}"
+        );
+        assert!(builtin.contains("script-src 'self'"), "{builtin}");
+        // The inlined built-in script must be allowed by hash, never by blanket inline scripts.
+        if let Some(hash) = exposure_core::assets::embedded_page_script_hash("challenge") {
+            assert!(builtin.contains(&format!("'{hash}'")), "{builtin}");
         }
     }
 

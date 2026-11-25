@@ -10,14 +10,16 @@ const baseOutDir = process.env.EXPOSURE_WEB_OUT_DIR
 const apps = [
   { name: "control", root: resolve(__dirname, "control"), outDir: resolve(baseOutDir, "control") },
   { name: "challenge", root: resolve(__dirname, "challenge"), outDir: resolve(baseOutDir, "challenge") },
+  { name: "error", root: resolve(__dirname, "error"), outDir: resolve(baseOutDir, "error") },
 ];
 
 for (const app of apps) {
   console.log(`[exposure-web] Building ${app.name} -> ${app.outDir}`);
   // The challenge app is served behind `/cdn-cgi/`, where the Node intercepts fixed asset paths
   // (`assets/app.min.js`, `assets/styles.min.css`) to honour Control-provisioned custom page
-  // HTML/CSS — keep those names stable instead of hashing them.
-  const stableNames = app.name === "challenge";
+  // HTML/CSS — keep those names stable instead of hashing them. The error page is inlined into
+  // one document at build time, so its stable names only have to be predictable.
+  const stableNames = app.name !== "control";
   await build({
     root: app.root,
     base: app.name === "challenge" ? "/cdn-cgi/" : "/",
