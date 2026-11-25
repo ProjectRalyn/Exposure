@@ -645,7 +645,10 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                     const act = r.action || "allow";
                     const actCls = actionPillCls(act, st);
                     const repeat = Number(r.repeat_count) || 1;
-                    const tsSec = Math.floor((Number(r.timestamp_ms) || 0) / 1000);
+                    // Sort/display time = when the request entered ingress (falls back to the
+                    // earliest hop when the ingress record is missing).
+                    const enteredMs = Number(r.ray_entered_ms) || Number(r.timestamp_ms) || 0;
+                    const tsSec = Math.floor(enteredMs / 1000);
                     return `
                   <tr class="fp-table-row" data-log-idx="${idx}">
                     <td><div>${esc(formatDateTime(tsSec))}</div><div class="muted-sm" title="${esc(r.ray_id || "")}"><code>${esc(r.ray_id ? (r.ray_id.length > 20 ? `${r.ray_id.slice(0, 16)}…` : r.ray_id) : "-")}</code></div></td>
@@ -663,8 +666,16 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                       ${r.waf_category || r.error ? `<div class="muted-sm">${esc(r.waf_category || r.error || "")}</div>` : ""}
                     </td>
                     <td><div>${esc(r.raw_ip || "-")} ${r.client_country ? `<span class="pill info">${esc(r.client_country)}</span>` : ""}</div><div class="muted-sm"><span class="fp-code">${esc((r.ip_hmac || "").slice(0, 14))}</span></div></td>
-                    <td><div><code>${esc(r.service_tag)}</code></div><div class="muted-sm">${esc(r.node_tag)} · ${esc(r.role)}</div></td>
-                    <td><div>${(Number(r.latency_ms) || 0).toFixed(1)} ms</div><div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div></td>
+                    <td>
+                      <div><code>${esc(r.service_tag)}</code></div>
+                      <div class="muted-sm">${esc(r.role)} · ${esc(r.node_tag)}${Number(r.hops) > 1 ? ` <span class="pill">${Number(r.hops)} hops</span>` : ""}</div>
+                      ${r.egress ? `<div class="muted-sm">→ egress · ${esc(r.egress.node_tag || "-")}</div>` : ""}
+                    </td>
+                    <td>
+                      <div>${(Number(r.latency_ms) || 0).toFixed(1)} ms</div>
+                      ${r.egress && Number(r.egress.latency_ms) ? `<div class="muted-sm">egress ${(Number(r.egress.latency_ms) || 0).toFixed(1)} ms</div>` : ""}
+                      <div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div>
+                    </td>
                   </tr>`;
                   })
                   .join("") || `<tr><td colspan="8" class="muted">${esc(t("logs.empty"))}</td></tr>`
@@ -793,6 +804,14 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
               <div class="fp-kv"><div class="fp-kv-lbl">WAF / Suspicion</div><div class="fp-kv-val">rule: ${esc(r.waf_rule_id != null ? String(r.waf_rule_id) : "-")} · cat: ${esc(r.waf_category || "-")}<br/><span class="muted-sm">suspicion: ${esc(r.suspicion_score != null ? String(r.suspicion_score) : "-")} · JA3: ${esc(r.tls_ja3 || "-")}</span></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Client IP / HMAC</div><div class="fp-kv-val">${esc(r.raw_ip || "-")} ${r.client_country ? `<span class="pill info">${esc(r.client_country)}</span>` : ""}<br/><code>${esc(r.ip_hmac || "-")}</code></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Node · Service · Perf</div><div class="fp-kv-val">${esc(r.node_tag)} (${esc(r.role)}) → <code>${esc(r.service_tag)}</code><br/><span class="muted-sm">${(Number(r.latency_ms) || 0).toFixed(2)} ms · in ${formatBytes(r.bytes_in || 0)} · out ${formatBytes(r.bytes_out || 0)}</span></div></div>
+              ${
+                r.egress
+                  ? `<div class="fp-kv"><div class="fp-kv-lbl">Hops (same Ray ID)</div><div class="fp-kv-val">
+                      <strong>ingress</strong> ${esc(r.node_tag)} · ${esc(r.status)} · ${(Number(r.latency_ms) || 0).toFixed(2)} ms · ${esc(r.protocol || "-")}<br/>
+                      <span class="muted-sm">→ <strong>egress</strong> ${esc(r.egress.node_tag || "-")} · ${esc(r.egress.status ?? "-")} · ${(Number(r.egress.latency_ms) || 0).toFixed(2)} ms · ${esc(r.egress.protocol || "-")}</span>
+                    </div></div>`
+                  : ""
+              }
             </div>
             <div style="margin-top:8px;"><strong>Referer:</strong> <code>${esc(r.referer || "-")}</code></div>
             <div class="fp-ua-box" style="margin-top:8px;">${esc(r.user_agent || "(empty User-Agent)")}</div>

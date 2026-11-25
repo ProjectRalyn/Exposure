@@ -2196,16 +2196,51 @@ impl MaintainerDb {
             let avail_actions = Self::distinct_strings(conn, "SELECT DISTINCT action FROM access_logs WHERE action IS NOT NULL AND action != '' ORDER BY 1")?;
             let avail_countries = Self::distinct_strings(conn, "SELECT DISTINCT UPPER(client_country) FROM access_logs WHERE client_country IS NOT NULL AND client_country != '' ORDER BY 1")?;
 
-            // Aggregate metrics in a single streaming pass over matched rows using SQLite
+            // One client request produces one row per hop (ingress + egress) sharing the same
+            // Ray ID. Collapse each Ray ID into a single logical request whose primary row is
+            // the ingress hop (falling back to the earliest hop if ingress never logged), and
+            // order the list by the ingress arrival time so a request that failed before
+            // reaching egress still sorts correctly.
+            let cte = format!(
+                "WITH filtered AS (SELECT * FROM access_logs{where_sql}),
+                      grp AS (
+                          SELECT *, COALESCE(NULLIF(ray_id, ''), 'row:' || id) AS ray_key
+                          FROM filtered
+                      ),
+                      primary_rows AS (
+                          SELECT * FROM (
+                              SELECT g.*,
+                                     ROW_NUMBER() OVER (
+                                         PARTITION BY ray_key
+                                         ORDER BY (LOWER(role) = 'ingress') DESC, timestamp_ms ASC, id ASC
+                                     ) AS rn,
+                                     COUNT(*) OVER (PARTITION BY ray_key) AS hop_count,
+                                     MIN(CASE WHEN LOWER(role) = 'ingress' THEN timestamp_ms END)
+                                         OVER (PARTITION BY ray_key) AS ingress_ts_ms,
+                                     MIN(timestamp_ms) OVER (PARTITION BY ray_key) AS first_ts_ms,
+                                     MAX(CASE WHEN LOWER(role) = 'egress' THEN node_tag END)
+                                         OVER (PARTITION BY ray_key) AS egress_node_tag,
+                                     MAX(CASE WHEN LOWER(role) = 'egress' THEN status END)
+                                         OVER (PARTITION BY ray_key) AS egress_status,
+                                     MAX(CASE WHEN LOWER(role) = 'egress' THEN latency_ms END)
+                                         OVER (PARTITION BY ray_key) AS egress_latency_ms,
+                                     MAX(CASE WHEN LOWER(role) = 'egress' THEN protocol END)
+                                         OVER (PARTITION BY ray_key) AS egress_protocol
+                              FROM grp g
+                          ) WHERE rn = 1
+                      )"
+            );
+
+            // Aggregate metrics over one primary row per logical request (no ingress+egress double count).
             let count_sql = format!(
-                "SELECT COUNT(*),
+                "{cte} SELECT COUNT(*),
                         COALESCE(SUM(MAX(repeat_count, 1)), 0),
                         COALESCE(SUM(MAX(repeat_count - 1, 0)), 0),
                         COALESCE(SUM(CASE WHEN status >= 500 THEN MAX(repeat_count, 1) ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN cache_status IN ('HIT','STALE','REVALIDATED') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
                         COUNT(DISTINCT ip_hmac),
                         COUNT(DISTINCT CASE WHEN path IS NOT NULL AND path != '' THEN COALESCE(host,'') || '|' || path END)
-                 FROM access_logs{where_sql}"
+                 FROM primary_rows"
             );
             let (total_matched, total_requests, folded_requests, error_5xx_requests, cache_hits, unique_ips, unique_paths): (
                 i64, i64, i64, i64, i64, i64, i64,
@@ -2224,9 +2259,9 @@ impl MaintainerDb {
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
 
             let blocked_sql = format!(
-                "SELECT COALESCE(SUM(MAX(repeat_count, 1)), 0)
-                 FROM access_logs{where_sql}
-                 AND (rate_limited = 1 OR challenged = 1
+                "{cte} SELECT COALESCE(SUM(MAX(repeat_count, 1)), 0)
+                 FROM primary_rows
+                 WHERE (rate_limited = 1 OR challenged = 1
                       OR LOWER(COALESCE(action,'')) IN ('autoban','waf_block','evilpot','evilpot_canary','guard_reject','abuseipdb','geo_block','geo_evilpot','rate_limit','challenge','geo_challenge')
                       OR (action IS NULL AND status IN (403, 429)))"
             );
@@ -2235,8 +2270,8 @@ impl MaintainerDb {
                 .unwrap_or(0);
 
             let act_sql = format!(
-                "SELECT COALESCE(NULLIF(action,''), 'allow'), COALESCE(SUM(MAX(repeat_count, 1)), 0)
-                 FROM access_logs{where_sql}
+                "{cte} SELECT COALESCE(NULLIF(action,''), 'allow'), COALESCE(SUM(MAX(repeat_count, 1)), 0)
+                 FROM primary_rows
                  GROUP BY 1"
             );
             let mut action_counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -2254,8 +2289,8 @@ impl MaintainerDb {
             }
 
             let sc_sql = format!(
-                "SELECT (status / 100) || 'xx', COALESCE(SUM(MAX(repeat_count, 1)), 0)
-                 FROM access_logs{where_sql}
+                "{cte} SELECT (status / 100) || 'xx', COALESCE(SUM(MAX(repeat_count, 1)), 0)
+                 FROM primary_rows
                  GROUP BY 1"
             );
             let mut status_class_counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -2273,14 +2308,14 @@ impl MaintainerDb {
             }
 
             let tp_sql = format!(
-                "SELECT COALESCE(host,''), path,
+                "{cte} SELECT COALESCE(host,''), path,
                         COALESCE(SUM(MAX(repeat_count, 1)), 0) AS hits,
                         COALESCE(SUM(CASE WHEN (rate_limited = 1 OR challenged = 1
                             OR LOWER(COALESCE(action,'')) IN ('autoban','waf_block','evilpot','evilpot_canary','guard_reject','abuseipdb','geo_block','geo_evilpot','rate_limit','challenge','geo_challenge')
                             OR (action IS NULL AND status IN (403, 429))) THEN MAX(repeat_count, 1) ELSE 0 END), 0) AS blk,
                         COALESCE(SUM(CASE WHEN status >= 500 THEN MAX(repeat_count, 1) ELSE 0 END), 0) AS e5
-                 FROM access_logs{where_sql}
-                 AND path IS NOT NULL AND path != ''
+                 FROM primary_rows
+                 WHERE path IS NOT NULL AND path != ''
                  GROUP BY 1, 2
                  ORDER BY hits DESC
                  LIMIT 12"
@@ -2309,22 +2344,24 @@ impl MaintainerDb {
             page_args.push(Value::Integer(lim as i64));
             page_args.push(Value::Integer(offset as i64));
             let page_sql = format!(
-                "SELECT timestamp_ms, node_tag, role, service_tag, status, latency_ms,
+                "{cte} SELECT timestamp_ms, node_tag, role, service_tag, status, latency_ms,
                         bytes_in, bytes_out, ip_hmac, raw_ip, client_country, rate_limited,
                         challenged, challenge_passed, error, device_type, browser_family,
                         os_family, client_fp_verified, ray_id, method, host, path, query,
                         protocol, scheme, user_agent, referer, action, cache_status, tls_ja3,
-                        waf_rule_id, waf_category, suspicion_score, repeat_count
-                 FROM access_logs{where_sql}
-                 ORDER BY timestamp_ms DESC, id DESC
+                        waf_rule_id, waf_category, suspicion_score, repeat_count,
+                        hop_count, ingress_ts_ms, first_ts_ms,
+                        egress_node_tag, egress_status, egress_latency_ms, egress_protocol
+                 FROM primary_rows
+                 ORDER BY COALESCE(ingress_ts_ms, first_ts_ms) DESC, id DESC
                  LIMIT ? OFFSET ?"
             );
-            let mut items = Vec::new();
+            let mut items: Vec<serde_json::Value> = Vec::new();
             {
                 let mut st = conn.prepare(&page_sql).map_err(|e| ExposureError::Storage(e.to_string()))?;
                 let rows = st
                     .query_map(rusqlite::params_from_iter(page_args), |r| {
-                        Ok(SessionSummary {
+                        let summary = SessionSummary {
                             timestamp_ms: r.get(0)?,
                             node_tag: r.get(1)?,
                             role: r.get(2)?,
@@ -2360,7 +2397,37 @@ impl MaintainerDb {
                             waf_category: r.get(32)?,
                             suspicion_score: r.get::<_, Option<i64>>(33)?.map(|v| v.clamp(0, 255) as u8),
                             repeat_count: r.get::<_, i64>(34)?.clamp(1, u32::MAX as i64) as u32,
-                        })
+                        };
+                        let hops = r.get::<_, i64>(35)?.max(1) as u32;
+                        let ingress_ts_ms: Option<i64> = r.get(36)?;
+                        let first_ts_ms: Option<i64> = r.get(37)?;
+                        let egress_node_tag: Option<String> = r.get(38)?;
+                        let egress_status: Option<i64> = r.get(39)?;
+                        let egress_latency_ms: Option<f64> = r.get(40)?;
+                        let egress_protocol: Option<String> = r.get(41)?;
+
+                        let mut val = serde_json::to_value(&summary).unwrap_or_default();
+                        if let Some(o) = val.as_object_mut() {
+                            o.insert("hops".into(), serde_json::json!(hops));
+                            o.insert(
+                                "ray_entered_ms".into(),
+                                serde_json::json!(
+                                    ingress_ts_ms.or(first_ts_ms).unwrap_or(summary.timestamp_ms)
+                                ),
+                            );
+                            if hops > 1 {
+                                o.insert(
+                                    "egress".into(),
+                                    serde_json::json!({
+                                        "node_tag": egress_node_tag,
+                                        "status": egress_status.map(|v| v.clamp(0, u16::MAX as i64)),
+                                        "latency_ms": egress_latency_ms,
+                                        "protocol": egress_protocol,
+                                    }),
+                                );
+                            }
+                        }
+                        Ok(val)
                     })
                     .map_err(|e| ExposureError::Storage(e.to_string()))?;
                 for r in rows {
@@ -3386,6 +3453,86 @@ mod tests {
         let cleanup = db.run_cleanup(&MaintainerRetentionConfig::default()).await.unwrap();
         assert!(cleanup.storage_stats.db_bytes > 0);
         assert_eq!(cleanup.storage_stats.access_logs_rows, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn access_logs_collapse_hops_by_ray_id_and_sort_by_ingress_time() {
+        let dir = std::env::temp_dir().join(format!("exp-mdb-ray-{}", uuid::Uuid::new_v4()));
+        let dir_s = dir.to_string_lossy().to_string();
+        let db = MaintainerDb::open(&dir_s, "maint-1").unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        let mk = |role: &'static str, ts: i64, ray: &str, status: u16, latency: f64| SessionSummary {
+            timestamp_ms: ts,
+            node_tag: if role == "ingress" { "ing-1" } else { "egr-1" }.into(),
+            role: role.into(),
+            service_tag: "web".into(),
+            status,
+            latency_ms: latency,
+            ip_hmac: "hmac".into(),
+            method: Some("GET".into()),
+            host: Some("app.test".into()),
+            path: Some("/x".into()),
+            action: Some("allow".into()),
+            ray_id: Some(ray.into()),
+            ..Default::default()
+        };
+
+        // r1: ingress + egress (one client request, must collapse to a single row)
+        // r2: ingress only (upstream failed before egress logged)
+        // r3: egress only (ingress record missing) -> must still sort by its own timestamp
+        let recs = vec![
+            mk("ingress", now_ms - 30_000, "r1", 200, 12.0),
+            mk("egress", now_ms - 29_000, "r1", 200, 6.0),
+            mk("ingress", now_ms - 20_000, "r2", 502, 40.0),
+            mk("egress", now_ms - 10_000, "r3", 200, 5.0),
+        ];
+        db.ingest_batch(
+            "ing-1",
+            true,
+            &MaintainerRetentionConfig::default(),
+            recs,
+            Vec::<MinuteSummary>::new(),
+            Vec::<FingerprintObservation>::new(),
+            Vec::<EvilpotSessionInfo>::new(),
+            Vec::<EvilpotEventInfo>::new(),
+            Vec::<BanRecord>::new(),
+            Vec::<AlertRecord>::new(),
+        )
+        .await
+        .unwrap();
+
+        let res = db
+            .query_access_logs(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, 0, 50,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res["total_matched"], 3, "one row per Ray ID, not per hop");
+        assert_eq!(
+            res["summary"]["total_requests"], 3,
+            "ingress+egress hops must not be double counted"
+        );
+        let items = res["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let rays: Vec<&str> = items.iter().filter_map(|i| i["ray_id"].as_str()).collect();
+        assert_eq!(rays, vec!["r3", "r2", "r1"], "newest entry first, ingress time preferred");
+
+        let r1 = items.iter().find(|i| i["ray_id"] == "r1").unwrap();
+        assert_eq!(r1["hops"], 2);
+        assert_eq!(r1["role"], "ingress");
+        assert_eq!(r1["node_tag"], "ing-1");
+        assert_eq!(r1["latency_ms"].as_f64().unwrap(), 12.0);
+        assert_eq!(r1["egress"]["node_tag"], "egr-1");
+        assert_eq!(r1["egress"]["latency_ms"].as_f64().unwrap(), 6.0);
+
+        let r2 = items.iter().find(|i| i["ray_id"] == "r2").unwrap();
+        assert_eq!(r2["hops"], 1);
+        assert!(r2.get("egress").is_none(), "no egress hop to report");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

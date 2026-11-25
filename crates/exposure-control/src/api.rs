@@ -3973,7 +3973,19 @@ async fn list_logs(
 
     if maint_replies.len() == 1 {
         let mut val = maint_replies[0].clone();
+        // The Maintainer was asked for rows [0, offset+limit) so a single request can serve
+        // the current page; slice locally here (it returns the requested window only).
+        let total = val["total_matched"].as_u64().unwrap_or(0) as usize;
+        if offset > 0 {
+            if let Some(items) = val.get_mut("items").and_then(|v| v.as_array_mut()) {
+                let sliced: Vec<_> = std::mem::take(items).into_iter().skip(offset).take(limit).collect();
+                *items = sliced;
+            }
+        }
         if let Some(obj) = val.as_object_mut() {
+            obj.insert("offset".into(), serde_json::json!(offset));
+            obj.insert("limit".into(), serde_json::json!(limit));
+            obj.insert("has_more".into(), serde_json::json!(offset.saturating_add(limit) < total));
             obj.insert("last_pulled_at".into(), serde_json::json!(tel.last_pulled_at));
             obj.insert("store_raw_ip_enabled".into(), serde_json::json!(store_raw_ip_enabled));
             obj.insert("log_protection".into(), serde_json::json!(log_protection_totals(&tel)));
@@ -4092,7 +4104,8 @@ fn build_logs_response_json(
         }
     }
 
-    let mut matched = Vec::new();
+    // Raw (possibly multi-hop) rows that passed the filters; collapsed per Ray ID below.
+    let mut matched: Vec<exposure_core::telemetry::SessionSummary> = Vec::new();
     let mut total_requests: u64 = 0;
     let mut blocked_requests: u64 = 0;
     let mut error_5xx_requests: u64 = 0;
@@ -4296,6 +4309,80 @@ fn build_logs_response_json(
             }
         }
 
+        matched.push(rec.clone());
+    }
+
+    // Collapse the ingress + egress rows that share a Ray ID into one logical request.
+    let mut groups: Vec<Vec<exposure_core::telemetry::SessionSummary>> = Vec::new();
+    let mut group_index: HashMap<String, usize> = HashMap::new();
+    for rec in matched {
+        let key = rec
+            .ray_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("ray:{s}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "row:{}:{}:{}:{}",
+                    rec.node_tag, rec.role, rec.timestamp_ms, rec.ip_hmac
+                )
+            });
+        let slot = *group_index.entry(key).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[slot].push(rec);
+    }
+
+    struct LogicalRequest {
+        primary: exposure_core::telemetry::SessionSummary,
+        hops: u32,
+        entered_ms: i64,
+        egress: Option<serde_json::Value>,
+    }
+
+    let mut logical: Vec<LogicalRequest> = Vec::with_capacity(groups.len());
+    for mut hops in groups {
+        // Primary = ingress hop (fallback: earliest hop) so status/protocol describe the
+        // client-facing leg.
+        hops.sort_by(|a, b| {
+            let ai = u8::from(!a.role.eq_ignore_ascii_case("ingress"));
+            let bi = u8::from(!b.role.eq_ignore_ascii_case("ingress"));
+            ai.cmp(&bi).then_with(|| a.timestamp_ms.cmp(&b.timestamp_ms))
+        });
+        let hop_count = hops.len() as u32;
+        let entered_ms = hops
+            .iter()
+            .find(|r| r.role.eq_ignore_ascii_case("ingress"))
+            .map(|r| r.timestamp_ms)
+            .or_else(|| hops.iter().map(|r| r.timestamp_ms).min())
+            .unwrap_or(0);
+        let egress = hops
+            .iter()
+            .find(|r| r.role.eq_ignore_ascii_case("egress"))
+            .map(|e| {
+                serde_json::json!({
+                    "node_tag": e.node_tag,
+                    "status": e.status,
+                    "latency_ms": e.latency_ms,
+                    "protocol": e.protocol,
+                })
+            });
+        let primary = hops.remove(0);
+        logical.push(LogicalRequest {
+            primary,
+            hops: hop_count,
+            entered_ms,
+            egress,
+        });
+    }
+    // Newest client entry first; requests that never reached egress still sort by ingress time.
+    logical.sort_by(|a, b| b.entered_ms.cmp(&a.entered_ms));
+
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(logical.len());
+    for l in &logical {
+        let rec = &l.primary;
+        let is_blocked_rec = is_mitigated_record(rec);
         let weight = u64::from(rec.repeat_count.max(1));
         total_requests = total_requests.saturating_add(weight);
         folded_requests = folded_requests.saturating_add(u64::from(rec.repeat_count.saturating_sub(1)));
@@ -4327,7 +4414,16 @@ fn build_logs_response_json(
                 }
             }
         }
-        matched.push(rec);
+
+        let mut val = serde_json::to_value(rec).unwrap_or_default();
+        if let Some(o) = val.as_object_mut() {
+            o.insert("hops".into(), serde_json::json!(l.hops));
+            o.insert("ray_entered_ms".into(), serde_json::json!(l.entered_ms));
+            if let Some(ref e) = l.egress {
+                o.insert("egress".into(), e.clone());
+            }
+        }
+        items.push(val);
     }
 
     let mut top_paths: Vec<_> = path_stats
@@ -4363,8 +4459,8 @@ fn build_logs_response_json(
             .saturating_add(st.warn_suppressed);
     }
 
-    let (matched, total_matched, offset, limit, has_more) =
-        paginate_items(matched, q.offset, q.limit);
+    let (items, total_matched, offset, limit, has_more) =
+        paginate_items(items, q.offset, q.limit);
 
     serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
@@ -4393,7 +4489,7 @@ fn build_logs_response_json(
         "available_hosts": available_hosts.into_iter().collect::<Vec<_>>(),
         "available_actions": available_actions.into_iter().collect::<Vec<_>>(),
         "available_countries": available_countries.into_iter().collect::<Vec<_>>(),
-        "items": matched,
+        "items": items,
     })
 }
 
@@ -4972,6 +5068,58 @@ async fn serve_web_panel(uri: Uri) -> Response {
 mod tests {
     use super::*;
     use exposure_core::telemetry::SessionSummary;
+
+    #[test]
+    fn logs_fallback_collapses_ingress_and_egress_hops_by_ray_id() {
+        let mk = |role: &'static str, ts: i64, ray: &str, status: u16, latency: f64| {
+            let mut r = SessionSummary {
+                timestamp_ms: ts,
+                node_tag: if role == "ingress" { "ing-1" } else { "egr-1" }.into(),
+                role: role.into(),
+                service_tag: "svc".into(),
+                status,
+                latency_ms: latency,
+                ip_hmac: "ip1".into(),
+                ray_id: Some(ray.into()),
+                action: Some("allow".into()),
+                ..Default::default()
+            };
+            r.sanitize();
+            r
+        };
+        let tel = crate::client::CachedTelemetry {
+            recent_logs: vec![
+                mk("ingress", 1_700_000_030_000, "r1", 200, 12.0),
+                mk("egress", 1_700_000_029_000, "r1", 200, 6.0),
+                // upstream failure: ingress only, must still be sortable by entry time
+                mk("ingress", 1_700_000_020_000, "r2", 502, 40.0),
+                // ingress record lost: egress only
+                mk("egress", 1_700_000_010_000, "r3", 200, 5.0),
+            ],
+            ..Default::default()
+        };
+
+        let res = build_logs_response_json(&tel, None, false, &LogQuery::default());
+        assert_eq!(res["total_matched"], 3, "one row per Ray ID, not per hop");
+        assert_eq!(
+            res["summary"]["total_requests"], 3,
+            "ingress+egress hops must not be double counted"
+        );
+        let items = res["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        let rays: Vec<&str> = items.iter().filter_map(|i| i["ray_id"].as_str()).collect();
+        assert_eq!(rays, vec!["r1", "r2", "r3"]);
+
+        assert_eq!(items[0]["hops"], 2);
+        assert_eq!(items[0]["role"], "ingress");
+        assert_eq!(items[0]["node_tag"], "ing-1");
+        assert_eq!(items[0]["latency_ms"].as_f64().unwrap(), 12.0);
+        assert_eq!(items[0]["egress"]["node_tag"], "egr-1");
+        assert_eq!(items[0]["egress"]["latency_ms"].as_f64().unwrap(), 6.0);
+
+        assert_eq!(items[1]["hops"], 1);
+        assert!(items[1].get("egress").is_none());
+    }
 
     #[test]
     fn logs_query_finds_full_ray_id_and_separates_waf_from_5xx() {
