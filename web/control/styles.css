@@ -1897,3 +1897,12 @@ details[open] > .panel-summary::before { content: "▾ "; }
   border-color: var(--warn);
   color: var(--warn);
 }
+.lang-select {
+  width: auto;
+  min-width: 92px;
+}
+.login-head-row .lang-select {
+  height: 28px;
+  padding: 2px 6px;
+  font-size: 12px;
+}

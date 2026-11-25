@@ -134,20 +134,20 @@ export function createDomainsView({ api, store }) {
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "domains" ? "active" : ""}" data-dns-sub="domains">
-            ${esc(t("dns.tab.domains"))} <span class="subtab-count">${domainKeys.length}</span>
+            ${esc(t("Domains & Smart DNS"))} <span class="subtab-count">${domainKeys.length}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "certs" ? "active" : ""}" data-dns-sub="certs">
-            ${esc(t("dns.tab.certs"))} <span class="subtab-count">${liveCerts.length}</span>
+            ${esc(t("TLS Certificates"))} <span class="subtab-count">${liveCerts.length}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "providers" ? "active" : ""}" data-dns-sub="providers">
-            ${esc(t("dns.tab.providers"))} <span class="subtab-count">${provKeys.length}</span>
+            ${esc(t("DNS Providers"))} <span class="subtab-count">${provKeys.length}</span>
           </button>
         </div>
         <div class="btn-row">
           ${
             subTab === "domains"
-              ? `<button type="button" id="btn-dns-sync-all" class="btn sm">${esc(t("dns.sync_all"))}</button>
-                 <button type="button" id="btn-dns-add-dom" class="btn sm primary">${esc(t("dns.add_domain"))}</button>`
+              ? `<button type="button" id="btn-dns-sync-all" class="btn sm">${esc(t("Sync All DNS"))}</button>
+                 <button type="button" id="btn-dns-add-dom" class="btn sm primary">${esc(t("+ Bind Domain"))}</button>`
               : ""
           }
         </div>
@@ -173,7 +173,7 @@ export function createDomainsView({ api, store }) {
   function openAddDomainModal() {
     const provKeys = Object.keys(store.spec.dns_providers || {});
     openModal({
-      title: t("dns.add_domain"),
+      title: t("+ Bind Domain"),
       bodyHtml: `
         <div class="form-grid">
           <label><span>Domain (e.g. app.example.com or example.com)</span>
@@ -190,9 +190,9 @@ export function createDomainsView({ api, store }) {
           </label>
         </div>`,
       actions: [
-        { label: t("common.cancel"), cls: "ghost" },
+        { label: t("Cancel"), cls: "ghost" },
         {
-          label: t("common.create"),
+          label: t("Create"),
           cls: "primary",
           close: false,
           onClick: () => {
@@ -232,10 +232,10 @@ export function createDomainsView({ api, store }) {
     if (!domainKeys.length) {
       container.innerHTML = `
         <div class="empty-state-box">
-          <p>${esc(t("dns.no_domains"))}</p>
+          <p>${esc(t("No domains bound yet. Add a DNS provider account first, then bind domains for smart DNS sync and ACME DNS-01 certificates."))}</p>
           <div class="btn-row" style="justify-content:center;">
             ${!provKeys.length ? `<button type="button" id="btn-go-prov" class="btn">Configure DNS Provider →</button>` : ""}
-            <button type="button" id="btn-empty-add-dom" class="btn primary">${esc(t("dns.add_domain"))}</button>
+            <button type="button" id="btn-empty-add-dom" class="btn primary">${esc(t("+ Bind Domain"))}</button>
           </div>
         </div>`;
       el("btn-go-prov")?.addEventListener("click", () => { subTab = "providers"; render(); });
@@ -341,11 +341,11 @@ export function createDomainsView({ api, store }) {
                   <option value="auto" ${lr.record_type !== "cname" ? "selected" : ""}>A / AAAA (Host IPs)</option>
                   <option value="cname" ${lr.record_type === "cname" ? "selected" : ""}>CNAME</option>
                 </select>
-                <label class="check-inline"><input type="checkbox" data-lr-en="${idx}" ${lr.enabled !== false ? "checked" : ""} /> ${esc(t("common.enabled"))}</label>
+                <label class="check-inline"><input type="checkbox" data-lr-en="${idx}" ${lr.enabled !== false ? "checked" : ""} /> ${esc(t("Enabled"))}</label>
               </div>
               <div class="btn-row">
                 <input class="input-sm" type="number" min="1" style="width:82px;" data-lr-ttl="${idx}" value="${lr.ttl ?? ""}" placeholder="TTL ${cfg.ttl ?? 600}" title="TTL override (s)" />
-                <button type="button" class="btn sm danger" data-lr-del="${idx}">${esc(t("common.remove"))}</button>
+                <button type="button" class="btn sm danger" data-lr-del="${idx}">${esc(t("Remove"))}</button>
               </div>
             </div>
             ${
@@ -375,10 +375,10 @@ export function createDomainsView({ api, store }) {
           (d) => d.record_type === rec.record_type && d.line.toLowerCase() === (rec.line || "default").toLowerCase()
         );
         let statePill = "";
-        if (!rec.enabled) statePill = `<span class="pill warn">${esc(t("dns.state.paused"))}</span>`;
-        else if (inDesired) statePill = `<span class="pill ok">${esc(t("dns.state.synced"))}</span>`;
-        else if (sameLineDesired) statePill = `<span class="pill err">${esc(t("dns.state.drift"))}</span>`;
-        else statePill = `<span class="pill">${esc(t("dns.state.extra"))}</span>`;
+        if (!rec.enabled) statePill = `<span class="pill warn">${esc(t("Paused"))}</span>`;
+        else if (inDesired) statePill = `<span class="pill ok">${esc(t("Synced"))}</span>`;
+        else if (sameLineDesired) statePill = `<span class="pill err">${esc(t("Drift"))}</span>`;
+        else statePill = `<span class="pill">${esc(t("Remote Only"))}</span>`;
 
         return `
           <tr>
@@ -392,17 +392,17 @@ export function createDomainsView({ api, store }) {
               <div class="btn-row">
                 ${
                   caps.supports_remote_edit
-                    ? `<button type="button" class="btn sm" data-rem-edit="${esc(rec.record_id)}">${esc(t("common.edit"))}</button>`
+                    ? `<button type="button" class="btn sm" data-rem-edit="${esc(rec.record_id)}">${esc(t("Edit"))}</button>`
                     : ""
                 }
                 ${
                   caps.supports_status_toggle
-                    ? `<button type="button" class="btn sm" data-rem-toggle="${esc(rec.record_id)}" data-rem-en="${rec.enabled ? "1" : "0"}">${esc(rec.enabled ? t("common.disable") : t("common.enable"))}</button>`
+                    ? `<button type="button" class="btn sm" data-rem-toggle="${esc(rec.record_id)}" data-rem-en="${rec.enabled ? "1" : "0"}">${esc(rec.enabled ? t("Disable") : t("Enable"))}</button>`
                     : ""
                 }
                 ${
                   caps.supports_remote_edit
-                    ? `<button type="button" class="btn sm danger" data-rem-del="${esc(rec.record_id)}">${esc(t("common.delete"))}</button>`
+                    ? `<button type="button" class="btn sm danger" data-rem-del="${esc(rec.record_id)}">${esc(t("Delete"))}</button>`
                     : ""
                 }
               </div>
@@ -428,16 +428,16 @@ export function createDomainsView({ api, store }) {
                 <h3 style="margin-bottom:4px;">${esc(dom)}</h3>
                 <div class="tag-list">
                   <span class="pill">${esc(cfg.provider || "(no provider)")} · ${esc(provType || "?")}</span>
-                  ${caps.supports_lines ? `<span class="pill ok">${esc(t("dns.cap.lines"))}</span>` : ""}
-                  ${caps.supports_proxied ? `<span class="pill info">${esc(t("dns.cap.proxied"))}</span>` : ""}
-                  ${caps.supports_status_toggle ? `<span class="pill">${esc(t("dns.cap.status"))}</span>` : ""}
-                  ${!caps.supports_remote_edit ? `<span class="pill">${esc(t("dns.cap.readonly"))}</span>` : ""}
+                  ${caps.supports_lines ? `<span class="pill ok">${esc(t("Split Lines Supported"))}</span>` : ""}
+                  ${caps.supports_proxied ? `<span class="pill info">${esc(t("Cloudflare Proxy"))}</span>` : ""}
+                  ${caps.supports_status_toggle ? `<span class="pill">${esc(t("Record Enable/Pause"))}</span>` : ""}
+                  ${!caps.supports_remote_edit ? `<span class="pill">${esc(t("Declarative Sync Only"))}</span>` : ""}
                 </div>
               </div>
               <div class="btn-row">
-                <button type="button" id="btn-dom-inspect" class="btn sm" ${remoteLoading ? "disabled" : ""}>${esc(remoteLoading ? t("common.loading") : t("dns.fetch_remote"))}</button>
-                <button type="button" id="btn-dom-sync-one" class="btn sm primary">${esc(t("dns.sync_domain"))}</button>
-                <button type="button" id="btn-dom-delete" class="btn sm danger">${esc(t("common.delete"))}</button>
+                <button type="button" id="btn-dom-inspect" class="btn sm" ${remoteLoading ? "disabled" : ""}>${esc(remoteLoading ? t("Loading…") : t("Fetch Remote Records"))}</button>
+                <button type="button" id="btn-dom-sync-one" class="btn sm primary">${esc(t("Sync This Domain"))}</button>
+                <button type="button" id="btn-dom-delete" class="btn sm danger">${esc(t("Delete"))}</button>
               </div>
             </div>
             <div class="inspector-row">
@@ -470,10 +470,10 @@ export function createDomainsView({ api, store }) {
           <div class="panel" style="margin-bottom:0;">
             <div class="panel-header">
               <div>
-                <h3>${esc(t("dns.section.declarative"))}</h3>
-                <div class="muted-sm">${esc(t("dns.section.declarative_sub"))}</div>
+                <h3>${esc(t("Declarative Split-Horizon Routing (Bound to Exposure Hosts)"))}</h3>
+                <div class="muted-sm">${esc(t("Map provider resolution lines (e.g., Aliyun Default / Telecom / Unicom / Mobile / Overseas) to Exposure Ingress hosts or manual CNAME/IP values."))}</div>
               </div>
-              <button type="button" id="btn-add-line-route" class="btn sm primary">${esc(t("dns.add_line_route"))}</button>
+              <button type="button" id="btn-add-line-route" class="btn sm primary">${esc(t("+ Add Line Route"))}</button>
             </div>
             ${
               !lineRoutes.length && cfg.target_nodes?.length
@@ -492,20 +492,20 @@ export function createDomainsView({ api, store }) {
           <div class="panel" style="margin-bottom:0;">
             <div class="panel-header">
               <div>
-                <h3>${esc(t("dns.section.remote"))}</h3>
-                <div class="muted-sm">${esc(t("dns.section.remote_sub"))}</div>
+                <h3>${esc(t("Live Remote Exposure Records (A / AAAA / CNAME)"))}</h3>
+                <div class="muted-sm">${esc(t("Fetched directly from DNS provider via Primary Maintainer. Strictly scoped to A, AAAA, and CNAME records for this domain."))}</div>
               </div>
               <div class="btn-row">
                 ${
                   caps.supports_remote_edit
-                    ? `<button type="button" id="btn-rem-add" class="btn sm primary">${esc(t("dns.add_remote_rec"))}</button>`
+                    ? `<button type="button" id="btn-rem-add" class="btn sm primary">${esc(t("+ Add Remote Record"))}</button>`
                     : ""
                 }
               </div>
             </div>
             ${
               store.dirty
-                ? `<div class="muted-sm" style="margin-bottom:8px;">${esc(t("dns.save_before_remote"))}</div>`
+                ? `<div class="muted-sm" style="margin-bottom:8px;">${esc(t("Note: Save/Deploy DNS provider & domain bindings to Maintainer before querying remote records."))}</div>`
                 : ""
             }
             ${
@@ -517,17 +517,17 @@ export function createDomainsView({ api, store }) {
               <table class="table">
                 <thead>
                   <tr>
-                    <th>${esc(t("dns.col.type"))}</th>
-                    <th>${esc(t("dns.col.line"))}</th>
-                    <th>${esc(t("dns.col.value"))}</th>
-                    <th>${esc(t("dns.col.ttl"))}</th>
+                    <th>${esc(t("Type"))}</th>
+                    <th>${esc(t("Resolution Line"))}</th>
+                    <th>${esc(t("Value"))}</th>
+                    <th>${esc(t("TTL"))}</th>
                     ${caps.supports_proxied ? `<th>Proxy</th>` : ""}
-                    <th>${esc(t("dns.col.sync_state"))}</th>
-                    <th>${esc(t("common.actions"))}</th>
+                    <th>${esc(t("Sync Status"))}</th>
+                    <th>${esc(t("Actions"))}</th>
                   </tr>
                 </thead>
                 <tbody>
-                  ${remoteRowsHtml || `<tr><td colspan="${caps.supports_proxied ? 7 : 6}" class="muted">${esc(t("dns.remote_empty"))}</td></tr>`}
+                  ${remoteRowsHtml || `<tr><td colspan="${caps.supports_proxied ? 7 : 6}" class="muted">${esc(t("No A / AAAA / CNAME records found on remote provider for this domain (or click Fetch Remote Records)."))}</td></tr>`}
                 </tbody>
               </table>
             </div>
@@ -687,9 +687,9 @@ export function createDomainsView({ api, store }) {
           title: `Delete Remote DNS Record`,
           bodyHtml: `<p>Delete <code>${esc(rec?.record_type || "")} ${esc(rec?.value || recId)}</code> (line: <code>${esc(rec?.line || "default")}</code>) from remote DNS provider?</p>`,
           actions: [
-            { label: t("common.cancel"), cls: "ghost" },
+            { label: t("Cancel"), cls: "ghost" },
             {
-              label: t("common.delete"),
+              label: t("Delete"),
               cls: "danger",
               onClick: async () => {
                 try {
@@ -723,21 +723,21 @@ export function createDomainsView({ api, store }) {
       <div class="step-card">
         <div class="step-card-head"><span>${esc(dom)} · Exposure DNS Record</span></div>
         <div class="inspector-row">
-          <label><span>${esc(t("dns.col.type"))} (A / AAAA / CNAME)</span>
+          <label><span>${esc(t("Type"))} (A / AAAA / CNAME)</span>
             <select id="rr-type">
               <option value="A" ${(existingRec?.record_type || "A") === "A" ? "selected" : ""}>A (IPv4)</option>
               <option value="AAAA" ${existingRec?.record_type === "AAAA" ? "selected" : ""}>AAAA (IPv6)</option>
               <option value="CNAME" ${existingRec?.record_type === "CNAME" ? "selected" : ""}>CNAME</option>
             </select>
           </label>
-          <label><span>${esc(t("dns.col.ttl"))} (s)</span>
+          <label><span>${esc(t("TTL"))} (s)</span>
             <input id="rr-ttl" type="number" min="1" value="${existingRec?.ttl ?? 600}" />
           </label>
         </div>
         ${
           caps.supports_lines
             ? `<div class="inspector-row">
-                <label><span>${esc(t("dns.col.line"))}</span>
+                <label><span>${esc(t("Resolution Line"))}</span>
                   <select id="rr-line">${lineOpts}</select>
                 </label>
                 <label><span>Or Custom Line Code</span>
@@ -746,7 +746,7 @@ export function createDomainsView({ api, store }) {
               </div>`
             : ""
         }
-        <label><span>${esc(t("dns.col.value"))} *</span>
+        <label><span>${esc(t("Value"))} *</span>
           <input id="rr-value" value="${esc(existingRec?.value || "")}" placeholder="203.0.113.10 or target.example.net" />
         </label>
         ${
@@ -768,12 +768,12 @@ export function createDomainsView({ api, store }) {
     `;
 
     const drawer = openDrawer({
-      title: isNew ? t("dns.add_remote_rec") : `Edit Remote Record`,
+      title: isNew ? t("+ Add Remote Record") : `Edit Remote Record`,
       subtitle: dom,
       bodyHtml,
       footerHtml: `
-        <button type="button" id="rr-cancel" class="btn sm ghost">${esc(t("common.cancel"))}</button>
-        <button type="button" id="rr-submit" class="btn sm primary">${esc(t("common.save"))}</button>
+        <button type="button" id="rr-cancel" class="btn sm ghost">${esc(t("Cancel"))}</button>
+        <button type="button" id="rr-submit" class="btn sm primary">${esc(t("Save"))}</button>
       `,
     });
     if (!drawer) return;
@@ -872,7 +872,7 @@ export function createDomainsView({ api, store }) {
               <span>Order #${i + 1}: <strong>${esc(o.domain || "(unset)")}</strong></span>
               <div class="btn-row">
                 <button type="button" class="btn sm" data-cert-hops="${i}">Auto Hops</button>
-                <button type="button" class="btn sm danger" data-cert-del="${i}">${esc(t("common.remove"))}</button>
+                <button type="button" class="btn sm danger" data-cert-del="${i}">${esc(t("Remove"))}</button>
               </div>
             </div>
             <div class="inspector-row">
@@ -896,25 +896,25 @@ export function createDomainsView({ api, store }) {
 
     container.innerHTML = `
       <div class="panel">
-        <div class="panel-header"><h3>${esc(t("dns.certs.live"))}</h3></div>
+        <div class="panel-header"><h3>${esc(t("Live Certificate Status (Maintainer Telemetry)"))}</h3></div>
         <div class="certs-grid">${liveCardsHtml}</div>
       </div>
 
       <div class="panel">
         <div class="panel-header">
           <div>
-            <h3>${esc(t("dns.certs.orders"))}</h3>
+            <h3>${esc(t("ACME Certificate Orders"))}</h3>
             ${maintTag ? `<div class="muted-sm">Maintainer: <code>${esc(maintTag)}</code> · Template: <code>${esc(tplName)}</code></div>` : ""}
           </div>
           ${
             maintTag
-              ? `<button type="button" id="btn-cert-add" class="btn sm primary">${esc(t("dns.certs.add_order"))}</button>`
+              ? `<button type="button" id="btn-cert-add" class="btn sm primary">${esc(t("+ Add Cert Order"))}</button>`
               : ""
           }
         </div>
         ${
           !maintTag
-            ? `<div class="muted-sm">${esc(t("dns.certs.no_maint"))}</div>`
+            ? `<div class="muted-sm">${esc(t("No Primary Maintainer configured yet. Enable the Maintainer role on a host in Hosts first."))}</div>`
             : !tpl
             ? `<button type="button" id="btn-cert-init-tpl" class="btn sm primary">Initialize ACME Template</button>`
             : `<div class="inspector-row" style="margin-bottom:12px;">
@@ -1020,7 +1020,7 @@ export function createDomainsView({ api, store }) {
               <input class="inline-name" data-dp-rename="${esc(pName)}" value="${esc(pName)}" />
               <span class="pill">${esc(p.type)}</span>
             </div>
-            <button type="button" class="btn sm danger" data-dp-del="${esc(pName)}">${esc(t("common.remove"))}</button>
+            <button type="button" class="btn sm danger" data-dp-del="${esc(pName)}">${esc(t("Remove"))}</button>
           </div>
           ${
             p.type === "cloudflare"
@@ -1049,7 +1049,7 @@ export function createDomainsView({ api, store }) {
     container.innerHTML = `
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("dns.tab.providers"))} (${provKeys.length})</h3>
+          <h3>${esc(t("DNS Providers"))} (${provKeys.length})</h3>
           <div class="btn-row">
             <button type="button" id="btn-dp-ali" class="btn sm primary">+ Aliyun DNS</button>
             <button type="button" id="btn-dp-cf" class="btn sm">+ Cloudflare</button>
@@ -1057,7 +1057,7 @@ export function createDomainsView({ api, store }) {
             <button type="button" id="btn-dp-ex" class="btn sm">+ Exec</button>
           </div>
         </div>
-        ${cardsHtml ? `<div class="tpl-card-grid">${cardsHtml}</div>` : `<div class="empty-state-box"><p>${esc(t("dns.no_providers"))}</p></div>`}
+        ${cardsHtml ? `<div class="tpl-card-grid">${cardsHtml}</div>` : `<div class="empty-state-box"><p>${esc(t("No DNS provider accounts configured yet."))}</p></div>`}
       </div>
     `;
 

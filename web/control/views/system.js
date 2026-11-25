@@ -39,12 +39,12 @@ export function createSystemView({ api, store }) {
     root.innerHTML = `
       <div class="subtabs-bar">
         <div class="subtabs-list">
-          <button type="button" class="subtab-btn ${subTab === "defaults" ? "active" : ""}" data-sys-sub="defaults">${esc(t("sys.tab.defaults"))}</button>
-          <button type="button" class="subtab-btn ${subTab === "storage" ? "active" : ""}" data-sys-sub="storage">${esc(t("sys.tab.storage"))}</button>
+          <button type="button" class="subtab-btn ${subTab === "defaults" ? "active" : ""}" data-sys-sub="defaults">${esc(t("Cluster Defaults"))}</button>
+          <button type="button" class="subtab-btn ${subTab === "storage" ? "active" : ""}" data-sys-sub="storage">${esc(t("Storage & Retention"))}</button>
           <button type="button" class="subtab-btn ${subTab === "releases" ? "active" : ""}" data-sys-sub="releases">
-            ${esc(t("sys.tab.releases"))} <span class="subtab-count">${(releasesData?.items || []).length}</span>
+            ${esc(t("Releases"))} <span class="subtab-count">${(releasesData?.items || []).length}</span>
           </button>
-          <button type="button" class="subtab-btn ${subTab === "yaml" ? "active" : ""}" data-sys-sub="yaml">${esc(t("sys.tab.yaml"))}</button>
+          <button type="button" class="subtab-btn ${subTab === "yaml" ? "active" : ""}" data-sys-sub="yaml">${esc(t("YAML Source"))}</button>
         </div>
       </div>
       <div id="sys-sub-body"></div>
@@ -151,7 +151,7 @@ export function createSystemView({ api, store }) {
           <label><span>Shared Clearance Secret</span>
             <div style="display:flex;gap:6px;">
               <input id="sd-ig-sec" type="password" autocomplete="off" value="${esc(ig.clearance_secret || "")}" />
-              <button type="button" id="sd-gen-sec" class="btn sm">${esc(t("common.generate"))}</button>
+              <button type="button" id="sd-gen-sec" class="btn sm">${esc(t("Generate"))}</button>
             </div>
           </label>
           <div class="tri-stack" style="margin-top:8px;">
@@ -192,24 +192,24 @@ export function createSystemView({ api, store }) {
           </div>
           <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
             <div class="inspector-row">
-              <label><span>${esc(t("waf.mode"))}</span>
+              <label><span>${esc(t("WAF Mode"))}</span>
                 <select id="sd-waf-mode">
-                  <option value="off" ${dwaf.mode === "off" ? "selected" : ""}>${esc(t("waf.mode.off"))}</option>
-                  <option value="monitor" ${dwaf.mode === "monitor" ? "selected" : ""}>${esc(t("waf.mode.monitor"))}</option>
-                  <option value="block" ${dwaf.mode === "block" ? "selected" : ""}>${esc(t("waf.mode.block"))}</option>
-                  <option value="evilpot" ${dwaf.mode === "evilpot" ? "selected" : ""}>${esc(t("waf.mode.evilpot"))}</option>
+                  <option value="off" ${dwaf.mode === "off" ? "selected" : ""}>${esc(t("Off"))}</option>
+                  <option value="monitor" ${dwaf.mode === "monitor" ? "selected" : ""}>${esc(t("Monitor (Log Only)"))}</option>
+                  <option value="block" ${dwaf.mode === "block" ? "selected" : ""}>${esc(t("Block (403 Forbidden)"))}</option>
+                  <option value="evilpot" ${dwaf.mode === "evilpot" ? "selected" : ""}>${esc(t("Evilpot (Honeypot & Behavior Analysis)"))}</option>
                 </select>
               </label>
-              <label><span>${esc(t("waf.max_body_kb"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
-              <label><span>${esc(t("waf.crs.paranoia"))}</span>
+              <label><span>${esc(t("Max Body Inspection (KiB)"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
+              <label><span>${esc(t("CRS Paranoia Level"))}</span>
                 <select id="sd-waf-pl">
                   ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(dwaf.crs_paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
                 </select>
               </label>
             </div>
             <div class="tri-stack" style="margin-top:6px;">
-              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: dwaf.inspect_headers !== false })}
-              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("waf.inspect_body"), val: dwaf.inspect_body !== false })}
+              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("Inspect Headers (UA / Referer / Cookie)"), val: dwaf.inspect_headers !== false })}
+              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("Inspect Text / JSON / Form Bodies"), val: dwaf.inspect_body !== false })}
             </div>
           </div>
         </div>
@@ -241,45 +241,45 @@ export function createSystemView({ api, store }) {
             ${renderBinSlider({ attrName: "data-sd-ll-bin", attrVal: "allow_tunnel", label: "Allow Reverse Tunnels", val: ll.allow_tunnel })}
             ${renderBinSlider({ attrName: "data-sd-ll-bin", attrVal: "allow_bootstrap", label: "Allow Bootstrap Onboarding", val: ll.allow_bootstrap })}
             ${renderBinSlider({ attrName: "data-sd-log-bin", attrVal: "store_raw_ip", label: "Store Raw Client IP in Fingerprints & Logs", val: Boolean(gl.store_raw_ip) })}
-            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "enabled", label: t("log.prot_enable"), sub: t("log.prot_enable_sub"), val: prot.enabled })}
-            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "log_query_string", label: t("log.prot_query"), sub: t("log.prot_query_sub"), val: prot.log_query_string })}
-            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "access_log_stdout", label: t("log.prot_stdout"), val: prot.access_log_stdout })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "enabled", label: t("Enable Log DoS Protection"), sub: t("Token-bucket rate limit, byte ceiling & duplicate flood folding (metrics stay 100% exact)"), val: prot.enabled })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "log_query_string", label: t("Log Redacted URL Query Strings"), sub: t("Records sanitized URL ?query parameters while auto-redacting secret keys (token, password, key, auth)"), val: prot.log_query_string })}
+            ${renderBinSlider({ attrName: "data-sd-logp-bin", attrVal: "access_log_stdout", label: t("Emit Stdout Access Logs"), val: prot.access_log_stdout })}
           </div>
           <div class="inspector-row" style="margin-top:8px;">
             <label><span>Sample Rate</span><input id="sd-log-sr" type="number" step="0.05" min="0.01" max="1" value="${gl.sample_rate ?? 1.0}" /></label>
-            <label><span>${esc(t("log.flush_secs"))}</span><input id="sd-log-flush" type="number" min="5" value="${seg.flush_interval_secs ?? 30}" /></label>
-            <label><span>${esc(t("log.max_batch_rec"))}</span><input id="sd-log-brec" type="number" min="50" value="${seg.max_batch_records ?? 500}" /></label>
-            <label><span>${esc(t("log.max_batch_kb"))}</span><input id="sd-log-bkb" type="number" min="16" value="${Math.max(16, Math.round((seg.max_batch_bytes ?? 1048576) / 1024))}" /></label>
+            <label><span>${esc(t("Node Push Interval (s)"))}</span><input id="sd-log-flush" type="number" min="5" value="${seg.flush_interval_secs ?? 30}" /></label>
+            <label><span>${esc(t("Early Flush Records"))}</span><input id="sd-log-brec" type="number" min="50" value="${seg.max_batch_records ?? 500}" /></label>
+            <label><span>${esc(t("Early Flush Size (KiB)"))}</span><input id="sd-log-bkb" type="number" min="16" value="${Math.max(16, Math.round((seg.max_batch_bytes ?? 1048576) / 1024))}" /></label>
           </div>
           <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("log.retention_h"))}</span><input id="sd-log-ret" type="number" min="1" value="${seg.retention_hours ?? 72}" /></label>
-            <label><span>${esc(t("log.max_disk_mb"))}</span><input id="sd-log-disk" type="number" min="16" value="${Math.max(16, Math.round((seg.max_disk_bytes ?? 536870912) / 1048576))}" /></label>
-            <label><span>${esc(t("log.max_summaries"))}</span><input id="sd-log-maxsum" type="number" min="500" value="${seg.max_summaries ?? 50000}" /></label>
-            <label><span>${esc(t("log.max_fps"))}</span><input id="sd-log-maxfp" type="number" min="500" value="${seg.max_fingerprints ?? 20000}" /></label>
-            <label><span>${esc(t("log.max_recent"))}</span><input id="sd-log-maxrec" type="number" min="100" max="10000" value="${seg.max_recent_logs ?? 2000}" /></label>
+            <label><span>${esc(t("Maintainer Retention (h)"))}</span><input id="sd-log-ret" type="number" min="1" value="${seg.retention_hours ?? 72}" /></label>
+            <label><span>${esc(t("Maintainer Max Disk (MiB)"))}</span><input id="sd-log-disk" type="number" min="16" value="${Math.max(16, Math.round((seg.max_disk_bytes ?? 536870912) / 1048576))}" /></label>
+            <label><span>${esc(t("Max Summaries in Store"))}</span><input id="sd-log-maxsum" type="number" min="500" value="${seg.max_summaries ?? 50000}" /></label>
+            <label><span>${esc(t("Max Fingerprints in Store"))}</span><input id="sd-log-maxfp" type="number" min="500" value="${seg.max_fingerprints ?? 20000}" /></label>
+            <label><span>${esc(t("Recent URL Logs Cap"))}</span><input id="sd-log-maxrec" type="number" min="100" max="10000" value="${seg.max_recent_logs ?? 2000}" /></label>
           </div>
           <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("log.prot_rps"))}</span><input id="sd-logp-rps" type="number" min="10" max="100000" value="${prot.max_records_per_sec ?? 500}" /></label>
-            <label><span>${esc(t("log.prot_iprps"))}</span><input id="sd-logp-iprps" type="number" min="1" max="50000" value="${prot.max_per_ip_per_sec ?? 20}" /></label>
-            <label><span>${esc(t("log.prot_mbmin"))}</span><input id="sd-logp-mbmin" type="number" min="1" max="512" value="${Math.max(1, Math.round((prot.max_bytes_per_min ?? 8388608) / 1048576))}" /></label>
-            <label><span>${esc(t("log.prot_dedup"))}</span><input id="sd-logp-dedup" type="number" min="0" max="300" value="${prot.dedup_window_secs ?? 10}" /></label>
-            <label><span>${esc(t("log.prot_warn"))}</span><input id="sd-logp-warn" type="number" min="1" max="1000" value="${prot.warn_rate_per_sec ?? 20}" /></label>
+            <label><span>${esc(t("Global Log Cap (rec/s)"))}</span><input id="sd-logp-rps" type="number" min="10" max="100000" value="${prot.max_records_per_sec ?? 500}" /></label>
+            <label><span>${esc(t("Per-IP Log Cap (rec/s)"))}</span><input id="sd-logp-iprps" type="number" min="1" max="50000" value="${prot.max_per_ip_per_sec ?? 20}" /></label>
+            <label><span>${esc(t("Log Byte Cap (MiB/min)"))}</span><input id="sd-logp-mbmin" type="number" min="1" max="512" value="${Math.max(1, Math.round((prot.max_bytes_per_min ?? 8388608) / 1048576))}" /></label>
+            <label><span>${esc(t("Flood Fold Window (s)"))}</span><input id="sd-logp-dedup" type="number" min="0" max="300" value="${prot.dedup_window_secs ?? 10}" /></label>
+            <label><span>${esc(t("Warn Log Cap (/s)"))}</span><input id="sd-logp-warn" type="number" min="1" max="1000" value="${prot.warn_rate_per_sec ?? 20}" /></label>
           </div>
         </div>
 
         <div class="panel" style="margin-bottom:0;">
-          <div class="panel-header"><h3>${esc(t("abuse.title"))}</h3></div>
+          <div class="panel-header"><h3>${esc(t("AbuseIPDB IP Reputation"))}</h3></div>
           <div class="tri-stack" style="margin-bottom:8px;">
-            ${renderBinSlider({ attrName: "data-sd-ab-bin", attrVal: "enabled", label: t("abuse.enable"), sub: t("abuse.enable_sub"), val: ab.enabled })}
+            ${renderBinSlider({ attrName: "data-sd-ab-bin", attrVal: "enabled", label: t("Enable AbuseIPDB Automatic IP Scoring"), sub: t("Queries AbuseIPDB v2 with your own API key; high abuse scores raise server suspicion or trigger automatic mitigation"), val: ab.enabled })}
           </div>
           <div class="inspector-row">
-            <label style="flex:1.5;"><span>${esc(t("abuse.api_key"))}</span>
+            <label style="flex:1.5;"><span>${esc(t("AbuseIPDB API Key"))}</span>
               <input id="sd-ab-key" type="password" autocomplete="off" value="${esc(ab.api_key || "")}" placeholder="AbuseIPDB v2 API Key" />
             </label>
-            <label><span>${esc(t("abuse.test_ip"))}</span>
+            <label><span>${esc(t("Test IP Address"))}</span>
               <div style="display:flex;gap:6px;">
                 <input id="sd-ab-test-ip" value="${esc(abuseTestIp)}" placeholder="118.25.6.39" />
-                <button type="button" id="sd-ab-test-btn" class="btn sm primary" ${abuseTesting ? "disabled" : ""}>${esc(abuseTesting ? t("abuse.testing") : t("abuse.test_btn"))}</button>
+                <button type="button" id="sd-ab-test-btn" class="btn sm primary" ${abuseTesting ? "disabled" : ""}>${esc(abuseTesting ? t("Testing…") : t("Test Key"))}</button>
               </div>
             </label>
           </div>
@@ -296,22 +296,22 @@ export function createSystemView({ api, store }) {
               : ""
           }
           <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("abuse.action"))}</span>
+            <label><span>${esc(t("High-Risk Action (≥ Block Score)"))}</span>
               <select id="sd-ab-act">
-                <option value="off" ${ab.high_risk_action === "off" ? "selected" : ""}>${esc(t("abuse.action.off"))}</option>
-                <option value="monitor" ${ab.high_risk_action === "monitor" ? "selected" : ""}>${esc(t("abuse.action.monitor"))}</option>
-                <option value="challenge" ${ab.high_risk_action === "challenge" ? "selected" : ""}>${esc(t("abuse.action.challenge"))}</option>
-                <option value="block" ${(ab.high_risk_action || "block") === "block" ? "selected" : ""}>${esc(t("abuse.action.block"))}</option>
-                <option value="evilpot" ${ab.high_risk_action === "evilpot" ? "selected" : ""}>${esc(t("abuse.action.evilpot"))}</option>
+                <option value="off" ${ab.high_risk_action === "off" ? "selected" : ""}>${esc(t("off — Score Only"))}</option>
+                <option value="monitor" ${ab.high_risk_action === "monitor" ? "selected" : ""}>${esc(t("monitor — Log Only"))}</option>
+                <option value="challenge" ${ab.high_risk_action === "challenge" ? "selected" : ""}>${esc(t("challenge — Force PoW"))}</option>
+                <option value="block" ${(ab.high_risk_action || "block") === "block" ? "selected" : ""}>${esc(t("block — HTTP 403"))}</option>
+                <option value="evilpot" ${ab.high_risk_action === "evilpot" ? "selected" : ""}>${esc(t("evilpot — Divert to Honeypot"))}</option>
               </select>
             </label>
-            <label><span>${esc(t("abuse.challenge_th"))}</span><input id="sd-ab-ch" type="number" min="0" max="100" value="${ab.challenge_threshold ?? 25}" /></label>
-            <label><span>${esc(t("abuse.block_th"))}</span><input id="sd-ab-blk" type="number" min="0" max="100" value="${ab.block_threshold ?? 75}" /></label>
+            <label><span>${esc(t("Challenge Score (0-100)"))}</span><input id="sd-ab-ch" type="number" min="0" max="100" value="${ab.challenge_threshold ?? 25}" /></label>
+            <label><span>${esc(t("Block Score (0-100)"))}</span><input id="sd-ab-blk" type="number" min="0" max="100" value="${ab.block_threshold ?? 75}" /></label>
           </div>
           <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("abuse.max_age"))}</span><input id="sd-ab-age" type="number" min="1" max="365" value="${ab.max_age_days ?? 90}" /></label>
-            <label><span>${esc(t("abuse.cache_ttl"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
-            <label><span>${esc(t("abuse.daily_limit"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
+            <label><span>${esc(t("Max Age (days)"))}</span><input id="sd-ab-age" type="number" min="1" max="365" value="${ab.max_age_days ?? 90}" /></label>
+            <label><span>${esc(t("Cache TTL (s)"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
+            <label><span>${esc(t("Daily Quota Cap / Node"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
           </div>
         </div>
 
@@ -334,18 +334,18 @@ export function createSystemView({ api, store }) {
         </div>
 
         <div class="panel" style="margin-bottom:0;">
-          <div class="panel-header"><h3>${esc(t("ep.defaults.title"))}</h3></div>
+          <div class="panel-header"><h3>${esc(t("Evilpot Honeypot Engine Defaults"))}</h3></div>
           <div class="inspector-row">
-            <label><span>${esc(t("ep.defaults.rotation"))}</span><input id="sd-ep-rot" type="number" min="60" value="${ep.rotation_interval_secs ?? 300}" /></label>
-            <label><span>${esc(t("ep.defaults.slots"))}</span><input id="sd-ep-slots" type="number" min="1" max="32" value="${ep.persona_slots ?? 16}" /></label>
-            <label><span>${esc(t("ep.defaults.tarpit_conns"))}</span><input id="sd-ep-tconns" type="number" min="1" max="256" value="${ep.max_tarpit_connections ?? 256}" /></label>
+            <label><span>${esc(t("Persona Rotation (s)"))}</span><input id="sd-ep-rot" type="number" min="60" value="${ep.rotation_interval_secs ?? 300}" /></label>
+            <label><span>${esc(t("Persona Slots"))}</span><input id="sd-ep-slots" type="number" min="1" max="32" value="${ep.persona_slots ?? 16}" /></label>
+            <label><span>${esc(t("Max Tarpit Conns"))}</span><input id="sd-ep-tconns" type="number" min="1" max="256" value="${ep.max_tarpit_connections ?? 256}" /></label>
           </div>
           <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("ep.defaults.drip_bps"))}</span><input id="sd-ep-drip" type="number" min="16" max="16384" value="${ep.tarpit_drip_bytes_per_sec ?? 256}" /></label>
-            <label><span>${esc(t("ep.defaults.sqli_delay"))}</span><input id="sd-ep-sqli" type="number" min="100" max="5000" value="${ep.sqli_time_delay_ms ?? 2500}" /></label>
-            <label><span>${esc(t("ep.defaults.max_sessions"))}</span><input id="sd-ep-maxs" type="number" min="16" max="4096" value="${ep.max_tracked_sessions ?? 2048}" /></label>
+            <label><span>${esc(t("Tarpit Drip (B/s)"))}</span><input id="sd-ep-drip" type="number" min="16" max="16384" value="${ep.tarpit_drip_bytes_per_sec ?? 256}" /></label>
+            <label><span>${esc(t("SQLi Blind Delay (ms)"))}</span><input id="sd-ep-sqli" type="number" min="100" max="5000" value="${ep.sqli_time_delay_ms ?? 2500}" /></label>
+            <label><span>${esc(t("Max Tracked Sessions"))}</span><input id="sd-ep-maxs" type="number" min="16" max="4096" value="${ep.max_tracked_sessions ?? 2048}" /></label>
           </div>
-          <label style="margin-top:8px;"><span>${esc(t("ep.defaults.canary_url"))}</span>
+          <label style="margin-top:8px;"><span>${esc(t("Canary Webhook Base URL"))}</span>
             <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
           </label>
         </div>
@@ -573,7 +573,7 @@ export function createSystemView({ api, store }) {
                   <td>${formatCompact(s.alerts_rows || 0)}</td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="9" class="muted">No Maintainer storage stats reported yet</td></tr>`
+                  .join("") || `<tr><td colspan="9" class="muted">${esc(t("No Maintainer storage stats reported yet"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -730,7 +730,7 @@ export function createSystemView({ api, store }) {
                   </td>
                 </tr>`;
                   })
-                  .join("") || `<tr><td colspan="8" class="muted">No releases yet — deploy a topology to create the first one</td></tr>`
+                  .join("") || `<tr><td colspan="8" class="muted">${esc(t("No releases yet — deploy a topology to create the first one"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -762,7 +762,7 @@ export function createSystemView({ api, store }) {
                 <tbody>${rows || `<tr><td colspan="4" class="muted">no per-node records</td></tr>`}</tbody>
               </table>
             </div>`,
-          actions: [{ label: t("common.close") }],
+          actions: [{ label: t("Close") }],
         });
       });
     });
@@ -773,7 +773,7 @@ export function createSystemView({ api, store }) {
           title: `Rollback to ${rev}`,
           bodyHtml: `<p>Create a new forward release that reverts the cluster to <span class="rev-badge">${esc(rev)}</span>?</p><p class="muted-sm">This pushes a brand-new globally-signed release to every node.</p>`,
           actions: [
-            { label: t("common.cancel"), cls: "ghost" },
+            { label: t("Cancel"), cls: "ghost" },
             {
               label: "Rollback",
               cls: "danger",
@@ -802,12 +802,12 @@ export function createSystemView({ api, store }) {
       <div class="panel">
         <div class="panel-header">
           <div>
-            <h3>${esc(t("sys.tab.yaml"))}</h3>
-            <div class="muted-sm">${esc(t("sys.yaml_hint"))}</div>
+            <h3>${esc(t("YAML Source"))}</h3>
+            <div class="muted-sm">${esc(t("Advanced raw TopologySpec YAML editor. Changes here sync with all visual tabs when applied."))}</div>
           </div>
           <div class="btn-row">
             <button type="button" id="btn-yaml-sync-from-draft" class="btn sm">Refresh from Draft</button>
-            <button type="button" id="btn-yaml-apply" class="btn sm primary">${esc(t("sys.yaml_apply"))}</button>
+            <button type="button" id="btn-yaml-apply" class="btn sm primary">${esc(t("Parse & Apply YAML to Draft"))}</button>
           </div>
         </div>
         <textarea id="sys-yaml-editor" class="code-editor" spellcheck="false">${esc(store.yaml || "")}</textarea>

@@ -36,7 +36,7 @@ export function generateRandomSecretHex(bytes = 32) {
 export async function copyToClipboard(text) {
   try {
     await navigator.clipboard.writeText(text);
-    showToast(t("common.copied"));
+    showToast(t("Copied to clipboard"));
     return true;
   } catch {
     showToast("Clipboard unavailable", true);
@@ -146,8 +146,8 @@ export function initOverlayControls() {
 
 export function renderTriSlider({ attrName, attrVal, label, sub = "", val = null, inherited = false }) {
   const cur = val === true ? "on" : val === false ? "off" : "default";
-  const inhText = inherited ? t("common.on") : t("common.off");
-  const defText = `${t("common.default")} (${inhText})`;
+  const inhText = inherited ? t("On") : t("Off");
+  const defText = `${t("Default")} (${inhText})`;
   return `
     <div class="tri-row">
       <div class="tri-label-wrap">
@@ -156,8 +156,8 @@ export function renderTriSlider({ attrName, attrVal, label, sub = "", val = null
       </div>
       <div class="tri-slider" role="radiogroup" aria-label="${esc(label)}" ${attrName}="${esc(attrVal)}">
         <button type="button" class="tri-opt ${cur === "default" ? "active" : ""}" data-tri-val="default">${esc(defText)}</button>
-        <button type="button" class="tri-opt ${cur === "off" ? "active" : ""}" data-tri-val="off">${esc(t("common.off"))}</button>
-        <button type="button" class="tri-opt ${cur === "on" ? "active" : ""}" data-tri-val="on">${esc(t("common.on"))}</button>
+        <button type="button" class="tri-opt ${cur === "off" ? "active" : ""}" data-tri-val="off">${esc(t("Off"))}</button>
+        <button type="button" class="tri-opt ${cur === "on" ? "active" : ""}" data-tri-val="on">${esc(t("On"))}</button>
       </div>
     </div>`;
 }
@@ -171,8 +171,8 @@ export function renderBinSlider({ attrName, attrVal, label, sub = "", val = fals
         ${sub ? `<span class="tri-sub">${esc(sub)}</span>` : ""}
       </div>
       <div class="bin-slider" role="radiogroup" aria-label="${esc(label)}" ${attrName}="${esc(attrVal)}">
-        <button type="button" class="bin-opt ${!on ? "active" : ""}" data-bin-val="off">${esc(t("common.off"))}</button>
-        <button type="button" class="bin-opt ${on ? "active" : ""}" data-bin-val="on">${esc(t("common.on"))}</button>
+        <button type="button" class="bin-opt ${!on ? "active" : ""}" data-bin-val="off">${esc(t("Off"))}</button>
+        <button type="button" class="bin-opt ${on ? "active" : ""}" data-bin-val="on">${esc(t("On"))}</button>
       </div>
     </div>`;
 }

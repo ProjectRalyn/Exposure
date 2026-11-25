@@ -22,32 +22,32 @@ export function createOverviewView({ api, store, navigate, getTimeRangeParams })
     root.innerHTML = `
       <div class="kpi-grid">
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.nodes"))}</div>
+          <div class="kpi-label">${esc(t("Mesh Hosts"))}</div>
           <div id="kpi-nodes" class="kpi-val">0 / 0</div>
           <div id="kpi-nodes-sub" class="kpi-sub">-</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.links"))}</div>
+          <div class="kpi-label">${esc(t("Link Health"))}</div>
           <div id="kpi-links" class="kpi-val">0 / 0 / 0</div>
           <div id="kpi-links-sub" class="kpi-sub">UP / DEGRADED / DOWN</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.requests"))}</div>
+          <div class="kpi-label">${esc(t("Total Requests"))}</div>
           <div id="kpi-requests" class="kpi-val">0</div>
           <div id="kpi-requests-sub" class="kpi-sub">-</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.uv"))}</div>
+          <div class="kpi-label">${esc(t("Unique Visitors (HLL)"))}</div>
           <div id="kpi-uv" class="kpi-val">0</div>
           <div id="kpi-uv-sub" class="kpi-sub">-</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.latency"))}</div>
+          <div class="kpi-label">${esc(t("Latency (p50 / p95)"))}</div>
           <div id="kpi-latency" class="kpi-val">0 / 0 ms</div>
           <div id="kpi-latency-sub" class="kpi-sub">p99: 0.0 ms</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("ov.kpi.certs"))}</div>
+          <div class="kpi-label">${esc(t("Release & Certs"))}</div>
           <div id="kpi-certs" class="kpi-val">#0</div>
           <div id="kpi-certs-sub" class="kpi-sub">-</div>
         </div>
@@ -56,15 +56,15 @@ export function createOverviewView({ api, store, navigate, getTimeRangeParams })
       <div class="dashboard-grid-2">
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("ov.traffic_trend"))}</h3>
-            <span class="muted-sm">${esc(t("ov.traffic_sub"))}</span>
+            <h3>${esc(t("Traffic & Protection Trend"))}</h3>
+            <span class="muted-sm">${esc(t("Aggregated per minute"))}</span>
           </div>
           <div id="ov-traffic-chart" class="chart-box"></div>
         </div>
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("ov.latency_pct"))}</h3>
-            <span class="muted-sm">${esc(t("ov.latency_sub"))}</span>
+            <h3>${esc(t("Latency Percentiles (ms)"))}</h3>
+            <span class="muted-sm">${esc(t("Merged histogram quantiles"))}</span>
           </div>
           <div id="ov-latency-chart" class="chart-box"></div>
         </div>
@@ -73,14 +73,14 @@ export function createOverviewView({ api, store, navigate, getTimeRangeParams })
       <div class="dashboard-grid-3">
         <div class="panel span-2">
           <div class="panel-header">
-            <h3>${esc(t("ov.mesh_map"))}</h3>
-            <span class="muted-sm">${esc(t("ov.mesh_map_sub"))}</span>
+            <h3>${esc(t("Live Mesh Health Map"))}</h3>
+            <span class="muted-sm">${esc(t("Click a host to inspect in Topology"))}</span>
           </div>
           <div id="ov-mini-topo" class="mini-topo-box"></div>
         </div>
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("ov.link_mix"))}</h3>
+            <h3>${esc(t("Link Status Mix"))}</h3>
           </div>
           <div id="ov-link-donut"></div>
         </div>
@@ -89,22 +89,22 @@ export function createOverviewView({ api, store, navigate, getTimeRangeParams })
       <div class="dashboard-grid-2">
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("ov.top_services"))}</h3>
+            <h3>${esc(t("Top Services by Traffic"))}</h3>
           </div>
           <div id="ov-top-services"></div>
         </div>
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("ov.recent_alerts"))}</h3>
+            <h3>${esc(t("Recent Alerts"))}</h3>
             <div class="btn-row">
               <select id="ov-alert-filter" class="select-sm">
-                <option value="all" ${alertSeverity === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
+                <option value="all" ${alertSeverity === "all" ? "selected" : ""}>${esc(t("All"))}</option>
                 <option value="critical" ${alertSeverity === "critical" ? "selected" : ""}>Critical</option>
                 <option value="error" ${alertSeverity === "error" ? "selected" : ""}>Error</option>
                 <option value="warning" ${alertSeverity === "warning" ? "selected" : ""}>Warning</option>
                 <option value="info" ${alertSeverity === "info" ? "selected" : ""}>Info</option>
               </select>
-              <button type="button" id="btn-ov-view-alerts" class="btn sm ghost">${esc(t("ov.view_all_alerts"))} →</button>
+              <button type="button" id="btn-ov-view-alerts" class="btn sm ghost">${esc(t("View all alerts"))} →</button>
             </div>
           </div>
           <div id="ov-maintainer-strip" class="maint-strip hidden"></div>
@@ -148,7 +148,7 @@ export function createOverviewView({ api, store, navigate, getTimeRangeParams })
         <td>${esc(a.message)}</td>
       </tr>`;
         })
-        .join("") || `<tr><td colspan="4" class="muted">${esc(t("ov.no_alerts"))}</td></tr>`;
+        .join("") || `<tr><td colspan="4" class="muted">${esc(t("No active alerts"))}</td></tr>`;
   }
 
   function renderData() {

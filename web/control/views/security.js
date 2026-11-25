@@ -24,6 +24,25 @@ import {
   wireTriSliders,
 } from "../ui.js";
 
+// Literal t() calls (instead of `t(\`waf.cat.${c}\`)`) so `pnpm i18n:extract` can see them.
+function wafCategoryLabel(cat) {
+  switch (cat) {
+    case "sql-injection": return t("SQLi");
+    case "xss": return t("XSS");
+    case "path-traversal": return t("Path Traversal");
+    case "command-injection": return t("Cmd Injection");
+    case "nosql-injection": return t("NoSQLi");
+    case "ssrf": return t("SSRF");
+    case "ssti": return t("SSTI / Code");
+    case "xxe": return t("XXE / XML");
+    case "ldap-injection": return t("LDAPi");
+    case "crlf-injection": return t("CRLF");
+    case "deserialization": return t("JNDI / Deser");
+    case "buffer-overflow": return t("Overflow");
+    default: return cat;
+  }
+}
+
 const QUICK_GEO_TOKENS = [
   "CN",
   "HK",
@@ -259,7 +278,7 @@ export function createSecurityView({ api, store }) {
       s.guard_templates = {};
     });
     render();
-    showToast(t("sec.migrate.done"));
+    showToast(t("Migrated legacy guards into Bucket / Antibot / WAF sets in draft"));
   }
 
   function isValidSetName(name) {
@@ -276,7 +295,7 @@ export function createSecurityView({ api, store }) {
     }
     if (!isValidSetName(newN)) {
       inp.value = oldN;
-      showToast(t("common.invalidName"), true);
+      showToast(t("Invalid name (use 1-64 letters, digits, ., _, -)"), true);
       return;
     }
     if (cur[newN]) {
@@ -316,10 +335,10 @@ export function createSecurityView({ api, store }) {
     return `
       <div class="panel" style="border-color:var(--warn);margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
         <div>
-          <strong style="color:var(--warn);">${esc(t("sec.migrate.title"))}</strong>
-          <div class="muted-sm">${esc(t("sec.migrate.desc", { count: gCount }))}</div>
+          <strong style="color:var(--warn);">${esc(t("Legacy Guard Policies Detected"))}</strong>
+          <div class="muted-sm">${esc(t("{count} legacy monolithic guard profile(s) can be cleanly split into modular Bucket / Antibot / WAF sets.", { count: gCount }))}</div>
         </div>
-        <button type="button" id="btn-sec-migrate-guards" class="btn sm primary">${esc(t("sec.migrate.btn"))}</button>
+        <button type="button" id="btn-sec-migrate-guards" class="btn sm primary">${esc(t("Migrate to Modular Sets"))}</button>
       </div>
     `;
   }
@@ -342,9 +361,9 @@ export function createSecurityView({ api, store }) {
           <h3>${esc(t(titleKey))}</h3>
           <div class="btn-row">
             <label style="flex-direction:row;align-items:center;gap:6px;">
-              <span class="muted-sm">${esc(t("sec.assign.scope"))}</span>
+              <span class="muted-sm">${esc(t("Edit Scope"))}</span>
               <select id="sec-set-scope" class="select-sm" style="width:auto;min-width:170px;">
-                <option value="cluster" ${setScope === "cluster" ? "selected" : ""}>${esc(t("sec.assign.cluster_tpl"))}</option>
+                <option value="cluster" ${setScope === "cluster" ? "selected" : ""}>${esc(t("Cluster Templates"))}</option>
                 ${ingNodes
                   .map(([tag, n]) => {
                     const cnt = Object.keys(n.ingress?.[mapKey] || {}).length;
@@ -357,14 +376,14 @@ export function createSecurityView({ api, store }) {
         </div>
         <div class="inspector-row" style="margin-bottom:${ingNodes.length ? "10px" : "0"};">
           <label>
-            <span>${esc(t("sec.assign.cluster_default"))}</span>
+            <span>${esc(t("Cluster Default Set"))}</span>
             <select id="sec-def-cluster-${esc(kind)}">
-              <option value="">${esc(t("common.none"))}</option>
+              <option value="">${esc(t("(none)"))}</option>
               ${clusterOpts.map((k) => `<option value="${esc(k)}" ${clusterDef === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
             </select>
           </label>
           <div style="display:flex;align-items:end;">
-            <div class="muted-sm">${esc(t("sec.assign.hint"))}</div>
+            <div class="muted-sm">${esc(t("Configure sets globally or per-Ingress node; override individually on any Service."))}</div>
           </div>
         </div>
         ${
@@ -383,7 +402,7 @@ export function createSecurityView({ api, store }) {
                       ${localCnt ? `<span class="pill info">${localCnt} local</span>` : `<span class="muted-sm">cluster</span>`}
                     </span>
                     <select data-sec-node-def="${esc(tag)}">
-                      <option value="">(${esc(t("sec.assign.inherit"))}: ${esc(clusterDef || t("common.none"))})</option>
+                      <option value="">(${esc(t("Inherit Cluster"))}: ${esc(clusterDef || t("(none)"))})</option>
                       ${opts.map((k) => `<option value="${esc(k)}" ${val === k ? "selected" : ""}>${esc(k)}</option>`).join("")}
                     </select>
                   </label>
@@ -391,7 +410,7 @@ export function createSecurityView({ api, store }) {
               })
               .join("")}
           </div>`
-            : `<div class="muted-sm">${esc(t("sec.assign.no_ingress"))}</div>`
+            : `<div class="muted-sm">${esc(t("No Ingress nodes defined yet."))}</div>`
         }
       </div>
     `;
@@ -438,7 +457,7 @@ export function createSecurityView({ api, store }) {
                 <input class="inline-name" data-bk-rename="${esc(bName)}" value="${esc(bName)}" />
                 <span class="pill ${used > 0 ? "ok" : ""}">Used: ${used}</span>
               </div>
-              <button type="button" class="btn sm danger" data-bk-del="${esc(bName)}">${esc(t("common.remove"))}</button>
+              <button type="button" class="btn sm danger" data-bk-del="${esc(bName)}">${esc(t("Remove"))}</button>
             </div>
             <div class="inspector-row">
               <label><span>Burst Capacity (tokens)</span><input type="number" min="1" data-bk-cap="${esc(bName)}" value="${b.capacity ?? 60}" /></label>
@@ -451,11 +470,11 @@ export function createSecurityView({ api, store }) {
 
     container.innerHTML = `
       ${renderLegacyMigrationBanner()}
-      ${renderScopeAndAssignmentCard("bucket", "sec.assign.buckets")}
+      ${renderScopeAndAssignmentCard("bucket", "Per-Ingress Bucket Set Assignment")}
       ${
         cardsHtml
           ? `<div class="tpl-card-grid">${cardsHtml}</div>`
-          : `<div class="empty-state-box"><p>${esc(t("sec.empty.buckets"))}</p></div>`
+          : `<div class="empty-state-box"><p>${esc(t("No rate-limit bucket sets in this scope yet."))}</p></div>`
       }
     `;
 
@@ -524,11 +543,11 @@ export function createSecurityView({ api, store }) {
       <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
           <div style="display:flex;align-items:center;gap:8px;">
-            <strong style="font-size:12px;letter-spacing:.03em;">${esc(t("geo.policy.title"))}</strong>
-            ${g.enabled ? `<span class="pill ok">${esc(t("common.enabled"))}</span>` : `<span class="pill">${esc(t("common.disabled"))}</span>`}
+            <strong style="font-size:12px;letter-spacing:.03em;">${esc(t("GeoIP Region-Targeting"))}</strong>
+            ${g.enabled ? `<span class="pill ok">${esc(t("Enabled"))}</span>` : `<span class="pill">${esc(t("Disabled"))}</span>`}
             ${rules.length ? `<span class="pill info">${rules.length} rules</span>` : ""}
           </div>
-          <button type="button" class="btn sm ghost" data-ab-geo-toggle="${esc(abName)}">${isOpen ? "▾" : "▸"} ${esc(t("geo.policy.configure"))}</button>
+          <button type="button" class="btn sm ghost" data-ab-geo-toggle="${esc(abName)}">${isOpen ? "▾" : "▸"} ${esc(t("Regions & Rules"))}</button>
         </div>
         ${
           !isOpen
@@ -537,16 +556,16 @@ export function createSecurityView({ api, store }) {
           <div style="display:flex;flex-direction:column;gap:8px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:8px;">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
               <div style="flex:1;min-width:190px;">
-                ${renderBinSlider({ attrName: `data-ab-geo-bin-${abName}`, attrVal: "enabled", label: t("geo.policy.enable"), val: Boolean(g.enabled) })}
+                ${renderBinSlider({ attrName: `data-ab-geo-bin-${abName}`, attrVal: "enabled", label: t("Enable GeoIP Region Policy"), val: Boolean(g.enabled) })}
               </div>
               <div class="btn-row">
-                <span class="muted-sm">${esc(t("geo.policy.quick_target"))}:</span>
-                <button type="button" class="btn sm ${quickMode === "deny" ? "primary" : "ghost"}" data-ab-geo-qtarget="${esc(abName)}" data-qval="deny">${esc(t("geo.policy.deny_list"))}</button>
-                <button type="button" class="btn sm ${quickMode === "allow" ? "primary" : "ghost"}" data-ab-geo-qtarget="${esc(abName)}" data-qval="allow">${esc(t("geo.policy.allow_list"))}</button>
+                <span class="muted-sm">${esc(t("Chip adds to"))}:</span>
+                <button type="button" class="btn sm ${quickMode === "deny" ? "primary" : "ghost"}" data-ab-geo-qtarget="${esc(abName)}" data-qval="deny">${esc(t("Deny List"))}</button>
+                <button type="button" class="btn sm ${quickMode === "allow" ? "primary" : "ghost"}" data-ab-geo-qtarget="${esc(abName)}" data-qval="allow">${esc(t("Allow List"))}</button>
               </div>
             </div>
             <div>
-              <div class="muted-sm" style="margin-bottom:4px;">${esc(t("geo.policy.quick_chips"))}</div>
+              <div class="muted-sm" style="margin-bottom:4px;">${esc(t("Quick-Pick Country / Continent Codes (click to toggle)"))}</div>
               <div style="display:flex;flex-wrap:wrap;gap:4px;">
                 ${QUICK_GEO_TOKENS.map((tok) => {
                   const inTarget = quickMode === "deny" ? activeDeny.has(tok) : activeAllow.has(tok);
@@ -555,21 +574,21 @@ export function createSecurityView({ api, store }) {
               </div>
             </div>
             <div class="inspector-row">
-              <label><span>${esc(t("geo.policy.allow_regions"))}</span><input data-ab-geo-csv="${esc(abName)}" data-gk="allow_regions" value="${esc((g.allow_regions || []).join(", "))}" placeholder="CN, HK, CONTINENT:AS" /></label>
-              <label><span>${esc(t("geo.policy.deny_regions"))}</span><input data-ab-geo-csv="${esc(abName)}" data-gk="deny_regions" value="${esc((g.deny_regions || []).join(", "))}" placeholder="RU, CONTINENT:AF" /></label>
+              <label><span>${esc(t("Allow Regions CSV (non-matching trigger Deny Action if non-empty)"))}</span><input data-ab-geo-csv="${esc(abName)}" data-gk="allow_regions" value="${esc((g.allow_regions || []).join(", "))}" placeholder="CN, HK, CONTINENT:AS" /></label>
+              <label><span>${esc(t("Deny Regions CSV (e.g. CN, RU, CONTINENT:AF)"))}</span><input data-ab-geo-csv="${esc(abName)}" data-gk="deny_regions" value="${esc((g.deny_regions || []).join(", "))}" placeholder="RU, CONTINENT:AF" /></label>
             </div>
             <div class="inspector-row">
-              <label><span>${esc(t("geo.policy.deny_action"))}</span>
+              <label><span>${esc(t("Deny Action"))}</span>
                 <select data-ab-geo-act="${esc(abName)}" data-gk="deny_action">
                   ${GEO_RULE_ACTIONS.map((a) => `<option value="${a}" ${g.deny_action === a ? "selected" : ""}>${a}</option>`).join("")}
                 </select>
               </label>
-              <label><span>${esc(t("geo.policy.default_action"))}</span>
+              <label><span>${esc(t("Default Action"))}</span>
                 <select data-ab-geo-act="${esc(abName)}" data-gk="default_action">
                   ${GEO_RULE_ACTIONS.map((a) => `<option value="${a}" ${g.default_action === a ? "selected" : ""}>${a}</option>`).join("")}
                 </select>
               </label>
-              <label><span>${esc(t("geo.policy.unknown_action"))}</span>
+              <label><span>${esc(t("Unknown / Unallocated IP Action"))}</span>
                 <select data-ab-geo-act="${esc(abName)}" data-gk="unknown_action">
                   ${GEO_RULE_ACTIONS.map((a) => `<option value="${a}" ${g.unknown_action === a ? "selected" : ""}>${a}</option>`).join("")}
                 </select>
@@ -577,8 +596,8 @@ export function createSecurityView({ api, store }) {
             </div>
             <div style="margin-top:4px;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                <span class="muted-sm"><strong>${esc(t("geo.policy.rules_title"))}</strong> (${rules.length})</span>
-                <button type="button" class="btn sm" data-ab-geo-add-rule="${esc(abName)}">+ ${esc(t("geo.policy.add_rule"))}</button>
+                <span class="muted-sm"><strong>${esc(t("Ordered Region Override Rules"))}</strong> (${rules.length})</span>
+                <button type="button" class="btn sm" data-ab-geo-add-rule="${esc(abName)}">+ ${esc(t("Add Rule"))}</button>
               </div>
               ${
                 rules.length
@@ -598,7 +617,7 @@ export function createSecurityView({ api, store }) {
                         )
                         .join("")}
                     </div>`
-                  : `<div class="muted-sm">${esc(t("geo.policy.no_rules"))}</div>`
+                  : `<div class="muted-sm">${esc(t("No per-region override rules yet."))}</div>`
               }
             </div>
           </div>`
@@ -630,7 +649,7 @@ export function createSecurityView({ api, store }) {
               </div>
               <div class="btn-row">
                 <button type="button" class="btn sm ${isUnderAttack ? "danger" : ""}" data-ab-ua="${esc(abName)}">⚡ ${isUnderAttack ? "Exit Attack" : "Under Attack"}</button>
-                <button type="button" class="btn sm danger" data-ab-del="${esc(abName)}">${esc(t("common.remove"))}</button>
+                <button type="button" class="btn sm danger" data-ab-del="${esc(abName)}">${esc(t("Remove"))}</button>
               </div>
             </div>
             <div class="inspector-row">
@@ -673,11 +692,11 @@ export function createSecurityView({ api, store }) {
 
     container.innerHTML = `
       ${renderLegacyMigrationBanner()}
-      ${renderScopeAndAssignmentCard("antibot", "sec.assign.antibot")}
+      ${renderScopeAndAssignmentCard("antibot", "Per-Ingress Antibot Set Assignment")}
       ${
         cardsHtml
           ? `<div class="tpl-card-grid">${cardsHtml}</div>`
-          : `<div class="empty-state-box"><p>${esc(t("sec.empty.antibot"))}</p></div>`
+          : `<div class="empty-state-box"><p>${esc(t("No Antibot / Geo policy sets in this scope yet."))}</p></div>`
       }
     `;
 
@@ -937,7 +956,7 @@ export function createSecurityView({ api, store }) {
     render();
     try {
       const res = await api("/api/waf/crs/sync", { method: "POST" });
-      showToast(t("waf.crs.synced_ok", { version: res.version || "latest", count: res.rules_count ?? 0 }));
+      showToast(t("Synced OWASP CRS {version} ({count} active rules)", { version: res.version || "latest", count: res.rules_count ?? 0 }));
       await loadWafRules();
     } catch (e) {
       showToast(e.message, true);
@@ -996,45 +1015,45 @@ export function createSecurityView({ api, store }) {
                 <span class="pill ${used > 0 ? "ok" : ""}">Used: ${used}</span>
                 ${w.mode === "block" ? `<span class="pill err">BLOCK</span>` : w.mode === "evilpot" ? `<span class="pill warn">EVILPOT</span>` : w.mode === "monitor" ? `<span class="pill info">MONITOR</span>` : `<span class="pill">OFF</span>`}
               </div>
-              <button type="button" class="btn sm danger" data-ws-del="${esc(wName)}">${esc(t("common.remove"))}</button>
+              <button type="button" class="btn sm danger" data-ws-del="${esc(wName)}">${esc(t("Remove"))}</button>
             </div>
             <div class="inspector-row">
-              <label><span>${esc(t("waf.mode"))}</span>
+              <label><span>${esc(t("WAF Mode"))}</span>
                 <select data-ws-mode="${esc(wName)}">
-                  <option value="off" ${w.mode === "off" ? "selected" : ""}>${esc(t("waf.mode.off"))}</option>
-                  <option value="monitor" ${w.mode === "monitor" ? "selected" : ""}>${esc(t("waf.mode.monitor"))}</option>
-                  <option value="block" ${w.mode === "block" ? "selected" : ""}>${esc(t("waf.mode.block"))}</option>
-                  <option value="evilpot" ${w.mode === "evilpot" ? "selected" : ""}>${esc(t("waf.mode.evilpot"))}</option>
+                  <option value="off" ${w.mode === "off" ? "selected" : ""}>${esc(t("Off"))}</option>
+                  <option value="monitor" ${w.mode === "monitor" ? "selected" : ""}>${esc(t("Monitor (Log Only)"))}</option>
+                  <option value="block" ${w.mode === "block" ? "selected" : ""}>${esc(t("Block (403 Forbidden)"))}</option>
+                  <option value="evilpot" ${w.mode === "evilpot" ? "selected" : ""}>${esc(t("Evilpot (Honeypot & Behavior Analysis)"))}</option>
                 </select>
               </label>
-              <label><span>${esc(t("waf.crs.paranoia"))}</span>
+              <label><span>${esc(t("CRS Paranoia Level"))}</span>
                 <select data-ws-pl="${esc(wName)}">
                   ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(w.crs_paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
                 </select>
               </label>
-              <label><span>${esc(t("waf.max_body_kb"))}</span>
+              <label><span>${esc(t("Max Body Inspection (KiB)"))}</span>
                 <input type="number" min="0" max="256" data-ws-bodykb="${esc(wName)}" value="${Math.round((w.max_body_bytes ?? 32768) / 1024)}" />
               </label>
             </div>
             <div class="tri-stack" style="margin-top:6px;">
-              ${renderBinSlider({ attrName: `data-ws-bin-${wName}`, attrVal: "inspect_headers", label: t("waf.inspect_headers"), val: w.inspect_headers !== false })}
-              ${renderBinSlider({ attrName: `data-ws-bin-${wName}`, attrVal: "inspect_body", label: t("waf.inspect_body"), val: w.inspect_body !== false })}
+              ${renderBinSlider({ attrName: `data-ws-bin-${wName}`, attrVal: "inspect_headers", label: t("Inspect Headers (UA / Referer / Cookie)"), val: w.inspect_headers !== false })}
+              ${renderBinSlider({ attrName: `data-ws-bin-${wName}`, attrVal: "inspect_body", label: t("Inspect Text / JSON / Form Bodies"), val: w.inspect_body !== false })}
             </div>
             <div class="inspector-row" style="margin-top:6px;">
-              <label><span>${esc(t("waf.exempt_paths"))}</span>
+              <label><span>${esc(t("Exempt Path Prefixes (CSV)"))}</span>
                 <input data-ws-exempt="${esc(wName)}" value="${esc((w.exempt_paths || []).join(", "))}" placeholder="/api/webhooks/, /cms/" />
               </label>
-              <label><span>${esc(t("waf.disabled_rule_ids"))}</span>
+              <label><span>${esc(t("Disabled CRS Rule IDs (CSV)"))}</span>
                 <input data-ws-disids="${esc(wName)}" value="${esc((w.disabled_rule_ids || []).join(", "))}" placeholder="942100, 932100" />
               </label>
             </div>
             <div style="margin-top:6px;">
-              <div class="muted" style="font-size:11px;margin-bottom:5px;">${esc(activeCats.length ? t("waf.categories") : t("waf.categories.all"))}</div>
+              <div class="muted" style="font-size:11px;margin-bottom:5px;">${esc(activeCats.length ? t("Attack Categories (empty = all 12)") : t("All 12 OWASP CRS Categories"))}</div>
               <div style="display:flex;flex-wrap:wrap;gap:4px;">
-                <button type="button" class="btn sm ${activeCats.length === 0 ? "primary" : "ghost"}" data-ws-cat-all="${esc(wName)}">${esc(t("common.all"))}</button>
+                <button type="button" class="btn sm ${activeCats.length === 0 ? "primary" : "ghost"}" data-ws-cat-all="${esc(wName)}">${esc(t("All"))}</button>
                 ${WAF_CATEGORIES.map((c) => {
                   const on = activeCats.includes(c);
-                  return `<button type="button" class="btn sm ${on ? "primary" : "ghost"}" data-ws-cat="${esc(wName)}" data-waf-c="${esc(c)}">${esc(t(`waf.cat.${c}`))}</button>`;
+                  return `<button type="button" class="btn sm ${on ? "primary" : "ghost"}" data-ws-cat="${esc(wName)}" data-waf-c="${esc(c)}">${esc(wafCategoryLabel(c))}</button>`;
                 }).join("")}
               </div>
             </div>
@@ -1044,31 +1063,31 @@ export function createSecurityView({ api, store }) {
 
     container.innerHTML = `
       ${renderLegacyMigrationBanner()}
-      ${renderScopeAndAssignmentCard("waf", "sec.assign.waf")}
+      ${renderScopeAndAssignmentCard("waf", "Per-Ingress WAF Set Assignment")}
       ${
         wafCardsHtml
           ? `<div class="tpl-card-grid" style="margin-bottom:16px;">${wafCardsHtml}</div>`
-          : `<div class="empty-state-box" style="margin-bottom:16px;"><p>${esc(t("sec.empty.waf"))}</p></div>`
+          : `<div class="empty-state-box" style="margin-bottom:16px;"><p>${esc(t("No OWASP CRS WAF sets in this scope yet."))}</p></div>`
       }
 
       <div class="kpi-grid" style="margin-bottom:14px;">
         <div class="kpi">
-          <div class="kpi-label">${esc(t("waf.crs.version"))}</div>
+          <div class="kpi-label">${esc(t("Active CRS Version"))}</div>
           <div class="kpi-val" style="font-size:18px;">${esc(meta.version || (wafRulesLoading ? "…" : "builtin"))}</div>
           <div class="kpi-sub"><a href="https://coreruleset.org/" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">coreruleset.org</a></div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("waf.crs.active_count"))}</div>
+          <div class="kpi-label">${esc(t("Active Rules"))}</div>
           <div class="kpi-val">${Math.max(0, allRules.length - disabledSet.size)} / ${allRules.length}</div>
-          <div class="kpi-sub">${esc(t("waf.crs.pure_engine"))}</div>
+          <div class="kpi-sub">${esc(t("Pure OWASP CRS Linear-Time Engine"))}</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("waf.crs.skipped_pcre"))}</div>
+          <div class="kpi-label">${esc(t("PCRE-only Skipped"))}</div>
           <div class="kpi-val">${meta.skipped_pcre ?? 0}</div>
           <div class="kpi-sub">Linear-time ReDoS-safe Rust regex</div>
         </div>
         <div class="kpi">
-          <div class="kpi-label">${esc(t("waf.crs.updated"))}</div>
+          <div class="kpi-label">${esc(t("Last Synced"))}</div>
           <div class="kpi-val" style="font-size:15px;">${esc(meta.updated_at ? formatDateTime(meta.updated_at) : "—")}</div>
           <div class="kpi-sub">${disabledSet.size} globally disabled</div>
         </div>
@@ -1077,36 +1096,36 @@ export function createSecurityView({ api, store }) {
       <div class="panel" style="margin-bottom:14px;">
         <div class="inspector-row" style="align-items:end;">
           <div style="flex:1.4;">
-            ${renderBinSlider({ attrName: "data-crs-bin", attrVal: "auto_update", label: t("waf.crs.auto_update"), val: crsCfg.auto_update !== false })}
+            ${renderBinSlider({ attrName: "data-crs-bin", attrVal: "auto_update", label: t("Auto-Update OWASP CRS"), val: crsCfg.auto_update !== false })}
           </div>
-          <label><span>${esc(t("waf.crs.interval_h"))}</span>
+          <label><span>${esc(t("Update Interval (hours)"))}</span>
             <input id="crs-interval-h" type="number" min="1" max="720" value="${crsCfg.update_interval_hours ?? 24}" />
           </label>
-          <label><span>${esc(t("waf.crs.paranoia"))}</span>
+          <label><span>${esc(t("CRS Paranoia Level"))}</span>
             <select id="crs-default-pl">
               ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(crsCfg.paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
             </select>
           </label>
         </div>
-        <div class="muted-sm" style="margin-top:8px;">${esc(t("waf.crs.deploy_hint"))}</div>
+        <div class="muted-sm" style="margin-top:8px;">${esc(t("Toggling rules updates cluster CRS defaults in draft — deploy to push changes to Ingress nodes."))}</div>
       </div>
 
       <div class="panel">
         <div class="fp-search-bar" style="margin-bottom:10px;">
-          <label style="flex:2;"><span>${esc(t("common.search"))}</span>
-            <input id="waf-rule-search" type="search" value="${esc(wafSearch)}" placeholder="${esc(t("waf.crs.search_ph"))}" />
+          <label style="flex:2;"><span>${esc(t("Search…"))}</span>
+            <input id="waf-rule-search" type="search" value="${esc(wafSearch)}" placeholder="${esc(t("Search rule ID, message, category, regex…"))}" />
           </label>
-          <label><span>${esc(t("waf.crs.col_pl"))}</span>
+          <label><span>${esc(t("PL"))}</span>
             <select id="waf-rule-pl">
-              <option value="all" ${wafPlFilter === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
+              <option value="all" ${wafPlFilter === "all" ? "selected" : ""}>${esc(t("All"))}</option>
               ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${String(wafPlFilter) === String(pl) ? "selected" : ""}>PL${pl}</option>`).join("")}
             </select>
           </label>
-          <label><span>${esc(t("waf.crs.col_state"))}</span>
+          <label><span>${esc(t("Enabled"))}</span>
             <select id="waf-rule-status">
-              <option value="all" ${wafStatusFilter === "all" ? "selected" : ""}>${esc(t("waf.crs.status_all"))}</option>
-              <option value="on" ${wafStatusFilter === "on" ? "selected" : ""}>${esc(t("waf.crs.status_on"))}</option>
-              <option value="off" ${wafStatusFilter === "off" ? "selected" : ""}>${esc(t("waf.crs.status_off"))}</option>
+              <option value="all" ${wafStatusFilter === "all" ? "selected" : ""}>${esc(t("All Status"))}</option>
+              <option value="on" ${wafStatusFilter === "on" ? "selected" : ""}>${esc(t("Enabled"))}</option>
+              <option value="off" ${wafStatusFilter === "off" ? "selected" : ""}>${esc(t("Disabled"))}</option>
             </select>
           </label>
         </div>
@@ -1115,12 +1134,12 @@ export function createSecurityView({ api, store }) {
           <table class="table">
             <thead>
               <tr>
-                <th>${esc(t("waf.crs.col_id"))}</th>
-                <th>${esc(t("waf.crs.col_pl"))}</th>
-                <th>${esc(t("waf.crs.col_cat"))}</th>
-                <th>${esc(t("waf.crs.col_sev"))}</th>
-                <th>${esc(t("waf.crs.col_desc"))}</th>
-                <th>${esc(t("waf.crs.col_state"))}</th>
+                <th>${esc(t("Rule ID"))}</th>
+                <th>${esc(t("PL"))}</th>
+                <th>${esc(t("Category"))}</th>
+                <th>${esc(t("Severity"))}</th>
+                <th>${esc(t("Description / Pattern"))}</th>
+                <th>${esc(t("Enabled"))}</th>
               </tr>
             </thead>
             <tbody>
@@ -1141,7 +1160,7 @@ export function createSecurityView({ api, store }) {
                     </td>
                     <td data-waf-toggle-cell="1">
                       <button type="button" class="btn sm ${isEnabled ? "primary" : "ghost"}" data-waf-rule-toggle="${esc(r.id)}">
-                        ${esc(isEnabled ? t("waf.crs.status_on") : t("waf.crs.status_off"))}
+                        ${esc(isEnabled ? t("Enabled") : t("Disabled"))}
                       </button>
                     </td>
                   </tr>`;
@@ -1333,7 +1352,7 @@ export function createSecurityView({ api, store }) {
             <div class="muted-sm" style="margin-top:8px;">Pattern</div>
             <pre class="output-box" style="max-height:180px;white-space:pre-wrap;word-break:break-all;">${esc(r.pattern || "")}</pre>
             ${r.tags?.length ? `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px;">${r.tags.map((tg) => `<span class="pill">${esc(tg)}</span>`).join("")}</div>` : ""}`,
-          actions: [{ label: t("common.close"), cls: "primary" }],
+          actions: [{ label: t("Close"), cls: "primary" }],
         });
       });
     });
@@ -1362,7 +1381,7 @@ export function createSecurityView({ api, store }) {
         body: JSON.stringify({ node_tag: nodeTag || null, force }),
       });
       const okCnt = (res.nodes || []).filter((n) => n.ok).length;
-      showToast(t("geo.db.synced_ok", { ok: okCnt, total: (res.nodes || []).length }));
+      showToast(t("GeoIP synced on {ok}/{total} Ingress node(s)", { ok: okCnt, total: (res.nodes || []).length }));
       await loadGeoIpStatus();
     } catch (e) {
       showToast(e.message, true);
@@ -1386,21 +1405,21 @@ export function createSecurityView({ api, store }) {
 
     container.innerHTML = `
       <div class="kpi-grid" style="margin-bottom:14px;">
-        <div class="kpi"><div class="kpi-label">${esc(t("geo.db.nodes_loaded"))}</div><div class="kpi-val">${esc(sum.loaded_nodes)} / ${esc(sum.total_ingress_nodes)}</div><div class="kpi-sub">CC0 IP-to-Country DB</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Nodes Loaded"))}</div><div class="kpi-val">${esc(sum.loaded_nodes)} / ${esc(sum.total_ingress_nodes)}</div><div class="kpi-sub">CC0 IP-to-Country DB</div></div>
         <div class="kpi"><div class="kpi-label">IPv4 Ranges</div><div class="kpi-val">${esc((sum.max_ipv4_ranges || 0).toLocaleString())}</div><div class="kpi-sub">O(log N) binary search</div></div>
         <div class="kpi"><div class="kpi-label">IPv6 Ranges</div><div class="kpi-val">${esc((sum.max_ipv6_ranges || 0).toLocaleString())}</div><div class="kpi-sub">Dual-stack lookup</div></div>
-        <div class="kpi"><div class="kpi-label">${esc(t("geo.db.last_pull"))}</div><div class="kpi-val" style="font-size:15px;">${geoipData?.last_pulled_at ? esc(formatDateTime(geoipData.last_pulled_at)) : (geoipLoading ? "…" : "—")}</div><div class="kpi-sub">${esc(t("geo.db.local_cache"))}</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Telemetry Updated"))}</div><div class="kpi-val" style="font-size:15px;">${geoipData?.last_pulled_at ? esc(formatDateTime(geoipData.last_pulled_at)) : (geoipLoading ? "…" : "—")}</div><div class="kpi-sub">${esc(t("Persisted geoip.bin disk cache"))}</div></div>
       </div>
 
       <div class="panel" style="margin-bottom:14px;">
-        <div class="panel-header"><h3>${esc(t("geo.db.settings_title"))}</h3><span class="muted-sm">${esc(t("waf.crs.deploy_hint"))}</span></div>
+        <div class="panel-header"><h3>${esc(t("Cluster GeoIP Auto-Pull Settings (CC0 Free DB)"))}</h3><span class="muted-sm">${esc(t("Toggling rules updates cluster CRS defaults in draft — deploy to push changes to Ingress nodes."))}</span></div>
         <div class="tri-stack" style="margin-bottom:10px;">
-          ${renderBinSlider({ attrName: "data-geoip-bin", attrVal: "enabled", label: t("geo.db.enabled"), val: gcfg.enabled !== false })}
-          ${renderBinSlider({ attrName: "data-geoip-bin", attrVal: "auto_update", label: t("geo.db.auto_update"), val: gcfg.auto_update !== false })}
+          ${renderBinSlider({ attrName: "data-geoip-bin", attrVal: "enabled", label: t("Enable Local GeoIP Engine on Ingress Nodes"), val: gcfg.enabled !== false })}
+          ${renderBinSlider({ attrName: "data-geoip-bin", attrVal: "auto_update", label: t("Background Auto-Update"), val: gcfg.auto_update !== false })}
         </div>
         <div class="inspector-row">
-          <label><span>${esc(t("geo.db.interval_h"))}</span><input id="geoip-interval" type="number" min="6" max="720" value="${gcfg.update_interval_hours ?? 168}" /></label>
-          <label><span>${esc(t("geo.db.cache_dir"))}</span><input id="geoip-cache-dir" value="${esc(gcfg.cache_dir || "")}" placeholder="(default: <segment_dir>/geoip)" /></label>
+          <label><span>${esc(t("Refresh Interval (hours, 6–720)"))}</span><input id="geoip-interval" type="number" min="6" max="720" value="${gcfg.update_interval_hours ?? 168}" /></label>
+          <label><span>${esc(t("Optional Cache Dir Override"))}</span><input id="geoip-cache-dir" value="${esc(gcfg.cache_dir || "")}" placeholder="(default: <segment_dir>/geoip)" /></label>
         </div>
         <div class="inspector-row">
           <label><span>Custom IPv4 CSV HTTPS URL</span><input id="geoip-v4-url" value="${esc(gcfg.ipv4_url || "")}" placeholder="(default built-in CC0 mirrors)" /></label>
@@ -1409,16 +1428,16 @@ export function createSecurityView({ api, store }) {
       </div>
 
       <div class="panel" style="margin-bottom:14px;">
-        <div class="panel-header"><h3>${esc(t("geo.db.lookup_title"))}</h3></div>
+        <div class="panel-header"><h3>${esc(t("Live Node GeoIP Lookup Tester"))}</h3></div>
         <div class="fp-search-bar" style="margin-bottom:0;">
           <label style="flex:1.4;"><span>IP Address</span><input id="geoip-test-ip" placeholder="1.1.1.1 / 114.114.114.114 / 2001:4860:4860::8888" /></label>
           <label><span>Ingress Node</span>
             <select id="geoip-test-node">
-              <option value="all">${esc(t("geo.db.any_loaded"))}</option>
+              <option value="all">${esc(t("Auto (First Loaded Ingress)"))}</option>
               ${ingNodes.map(([tag]) => `<option value="${esc(tag)}">${esc(tag)}</option>`).join("")}
             </select>
           </label>
-          <div class="btn-row"><button type="button" id="btn-geoip-lookup" class="btn primary">${esc(t("geo.db.lookup_btn"))}</button></div>
+          <div class="btn-row"><button type="button" id="btn-geoip-lookup" class="btn primary">${esc(t("Lookup IP"))}</button></div>
         </div>
         ${
           geoLookupResult
@@ -1433,7 +1452,7 @@ export function createSecurityView({ api, store }) {
       </div>
 
       <div class="panel">
-        <div class="panel-header"><h3>${esc(t("geo.db.node_table"))}</h3></div>
+        <div class="panel-header"><h3>${esc(t("Per-Ingress GeoIP Database Status"))}</h3></div>
         <div class="table-scroll">
           <table class="table">
             <thead><tr><th>Node</th><th>State</th><th>IPv4</th><th>IPv6</th><th>Updated</th><th>Source / Error</th><th>Action</th></tr></thead>
@@ -1539,19 +1558,19 @@ export function createSecurityView({ api, store }) {
     container.innerHTML = `
       <div class="page-editor-grid">
         <div class="panel" style="display:flex;flex-direction:column;gap:12px;margin-bottom:0;">
-          <label><span>${esc(t("sec.pages.error_html"))}</span>
+          <label><span>${esc(t("Custom Intercept Error Page HTML (403 / 429 / 5xx)"))}</span>
             <textarea id="pg-err-html" class="code-editor" style="min-height:120px;" spellcheck="false" placeholder="Leave empty for built-in 403 / 429 / 5xx error page">${esc(pages.error_html || "")}</textarea>
           </label>
-          <label><span>${esc(t("sec.pages.chal_html"))}</span>
+          <label><span>${esc(t("Custom PoW Challenge HTML (/cdn-cgi/)"))}</span>
             <textarea id="pg-chal-html" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for built-in PoW HTML">${esc(pages.challenge_html || "")}</textarea>
           </label>
-          <label><span>${esc(t("sec.pages.chal_css"))}</span>
+          <label><span>${esc(t("Custom PoW Challenge CSS (/cdn-cgi/styles.css)"))}</span>
             <textarea id="pg-chal-css" class="code-editor" style="min-height:100px;" spellcheck="false" placeholder="Leave empty for built-in PoW CSS">${esc(pages.challenge_css || "")}</textarea>
           </label>
         </div>
         <div class="panel" style="display:flex;flex-direction:column;gap:10px;margin-bottom:0;">
           <div class="panel-header" style="margin-bottom:0;">
-            <h3>${esc(t("sec.pages.preview"))}</h3>
+            <h3>${esc(t("Live Preview (Sandboxed)"))}</h3>
             <div class="seg-group">
               <button type="button" class="btn sm ${previewMode === "error" ? "primary" : ""}" data-pg-prev="error">429 Error</button>
               <button type="button" class="btn sm ${previewMode === "challenge" ? "primary" : ""}" data-pg-prev="challenge">PoW Page</button>
@@ -1609,32 +1628,32 @@ export function createSecurityView({ api, store }) {
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "buckets" ? "active" : ""}" data-sec-sub="buckets">
-            ${esc(t("sec.tab.buckets"))} <span class="subtab-count">${bucketCnt}</span>
+            ${esc(t("Buckets"))} <span class="subtab-count">${bucketCnt}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "antibot" ? "active" : ""}" data-sec-sub="antibot">
-            ${esc(t("sec.tab.antibot"))} <span class="subtab-count">${antibotCnt}</span>
+            ${esc(t("Antibot & Geo"))} <span class="subtab-count">${antibotCnt}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "waf" ? "active" : ""}" data-sec-sub="waf">
-            ${esc(t("sec.tab.waf"))} <span class="subtab-count">${wafCnt}</span>
+            ${esc(t("WAF (OWASP CRS)"))} <span class="subtab-count">${wafCnt}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "geoip" ? "active" : ""}" data-sec-sub="geoip">
-            ${esc(t("sec.tab.geoip"))}
+            ${esc(t("GeoIP DB"))}
           </button>
           <button type="button" class="subtab-btn ${subTab === "pages" ? "active" : ""}" data-sec-sub="pages">
-            ${esc(t("sec.tab.pages"))}
+            ${esc(t("Custom Error & PoW Pages"))}
           </button>
         </div>
         <div class="btn-row">
-          ${subTab === "buckets" ? `<button type="button" id="btn-sec-add-bucket" class="btn sm primary">${esc(t("sec.add_bucket"))}</button>` : ""}
-          ${subTab === "antibot" ? `<button type="button" id="btn-sec-add-antibot" class="btn sm primary">${esc(t("sec.add_antibot"))}</button>` : ""}
+          ${subTab === "buckets" ? `<button type="button" id="btn-sec-add-bucket" class="btn sm primary">${esc(t("+ New Bucket Set"))}</button>` : ""}
+          ${subTab === "antibot" ? `<button type="button" id="btn-sec-add-antibot" class="btn sm primary">${esc(t("+ New Antibot Set"))}</button>` : ""}
           ${
             subTab === "waf"
-              ? `<button type="button" id="btn-sec-add-waf" class="btn sm primary">${esc(t("sec.add_waf"))}</button>
-                 <button type="button" id="btn-sec-crs-sync" class="btn sm" ${wafSyncing ? "disabled" : ""}>${esc(wafSyncing ? t("waf.crs.syncing") : t("waf.crs.sync_now"))}</button>`
+              ? `<button type="button" id="btn-sec-add-waf" class="btn sm primary">${esc(t("+ New WAF Set"))}</button>
+                 <button type="button" id="btn-sec-crs-sync" class="btn sm" ${wafSyncing ? "disabled" : ""}>${esc(wafSyncing ? t("Syncing from coreruleset.org…") : t("Sync OWASP CRS Now"))}</button>`
               : ""
           }
-          ${subTab === "geoip" ? `<button type="button" id="btn-sec-geoip-sync" class="btn sm primary" ${geoipSyncing ? "disabled" : ""}>${esc(geoipSyncing ? t("geo.db.syncing") : t("geo.db.sync_now"))}</button>` : ""}
-          ${subTab === "pages" ? `<button type="button" id="btn-sec-reset-pages" class="btn sm">${esc(t("sec.pages.reset"))}</button>` : ""}
+          ${subTab === "geoip" ? `<button type="button" id="btn-sec-geoip-sync" class="btn sm primary" ${geoipSyncing ? "disabled" : ""}>${esc(geoipSyncing ? t("Syncing GeoIP…") : t("Sync GeoIP DB Now"))}</button>` : ""}
+          ${subTab === "pages" ? `<button type="button" id="btn-sec-reset-pages" class="btn sm">${esc(t("Reset to Built-in Defaults"))}</button>` : ""}
         </div>
       </div>
       <div id="sec-sub-body"></div>

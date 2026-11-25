@@ -62,20 +62,20 @@ export function createHostsView({ api, store, navigate }) {
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "nodes" ? "active" : ""}" data-hosts-sub="nodes">
-            ${esc(t("hosts.tab.nodes"))} <span class="subtab-count">${totalCount}</span>
+            ${esc(t("Hosts"))} <span class="subtab-count">${totalCount}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "links" ? "active" : ""}" data-hosts-sub="links">
-            ${esc(t("hosts.tab.links"))} <span class="subtab-count">${(store.liveLinks || []).length}</span>
+            ${esc(t("Observed Links"))} <span class="subtab-count">${(store.liveLinks || []).length}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "onboarding" ? "active" : ""}" data-hosts-sub="onboarding">
-            ${esc(t("hosts.tab.onboarding"))}
+            ${esc(t("Node Onboarding"))}
           </button>
         </div>
         ${
           subTab === "nodes"
             ? `<div class="btn-row">
-                <button type="button" id="btn-hosts-sync-live" class="btn sm">${esc(t("hosts.sync_live"))}</button>
-                <button type="button" id="btn-hosts-add" class="btn sm primary">${esc(t("hosts.add_host"))}</button>
+                <button type="button" id="btn-hosts-sync-live" class="btn sm">${esc(t("Import Live Hosts"))}</button>
+                <button type="button" id="btn-hosts-add" class="btn sm primary">${esc(t("+ Add Host"))}</button>
               </div>`
             : ""
         }
@@ -126,7 +126,7 @@ export function createHostsView({ api, store, navigate }) {
 
     container.innerHTML = `
       <div class="kpi-grid" style="margin-bottom:14px;">
-        <div class="kpi"><div class="kpi-label">${esc(t("hosts.tab.nodes"))}</div><div class="kpi-val">${stats.onlineCount} / ${stats.totalCount}</div><div class="kpi-sub">Online / Total</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Hosts"))}</div><div class="kpi-val">${stats.onlineCount} / ${stats.totalCount}</div><div class="kpi-sub">Online / Total</div></div>
         <div class="kpi"><div class="kpi-label">Ingress</div><div class="kpi-val">${stats.ingCount}</div><div class="kpi-sub">Edge entry hosts</div></div>
         <div class="kpi"><div class="kpi-label">Relay</div><div class="kpi-val">${stats.relCount}</div><div class="kpi-sub">Mesh forwarders</div></div>
         <div class="kpi"><div class="kpi-label">Egress</div><div class="kpi-val">${stats.egCount}</div><div class="kpi-sub">Origin connectors</div></div>
@@ -135,11 +135,11 @@ export function createHostsView({ api, store, navigate }) {
 
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("hosts.tab.nodes"))} (${rows.length})</h3>
+          <h3>${esc(t("Hosts"))} (${rows.length})</h3>
           <div class="btn-row">
-            <input id="hosts-search-inp" class="input-sm" type="search" value="${esc(searchQ)}" placeholder="${esc(t("hosts.search"))}" />
+            <input id="hosts-search-inp" class="input-sm" type="search" value="${esc(searchQ)}" placeholder="${esc(t("Filter by host tag or IP…"))}" />
             <select id="hosts-role-sel" class="select-sm">
-              <option value="all" ${roleFilter === "all" ? "selected" : ""}>${esc(t("hosts.all_roles"))}</option>
+              <option value="all" ${roleFilter === "all" ? "selected" : ""}>${esc(t("All Roles"))}</option>
               <option value="ingress" ${roleFilter === "ingress" ? "selected" : ""}>Ingress</option>
               <option value="relay" ${roleFilter === "relay" ? "selected" : ""}>Relay</option>
               <option value="egress" ${roleFilter === "egress" ? "selected" : ""}>Egress</option>
@@ -151,13 +151,13 @@ export function createHostsView({ api, store, navigate }) {
           <table class="table">
             <thead>
               <tr>
-                <th>${esc(t("hosts.col.tag"))}</th>
-                <th>${esc(t("hosts.col.roles"))}</th>
-                <th>${esc(t("hosts.col.ips"))}</th>
-                <th>${esc(t("hosts.col.uptime"))}</th>
-                <th>${esc(t("hosts.col.seq"))}</th>
-                <th>${esc(t("hosts.col.status"))}</th>
-                <th>${esc(t("common.actions"))}</th>
+                <th>${esc(t("Host Tag"))}</th>
+                <th>${esc(t("Roles"))}</th>
+                <th>${esc(t("External IPs"))}</th>
+                <th>${esc(t("Uptime"))}</th>
+                <th>${esc(t("Seq"))}</th>
+                <th>${esc(t("Status"))}</th>
+                <th>${esc(t("Actions"))}</th>
               </tr>
             </thead>
             <tbody>
@@ -173,8 +173,8 @@ export function createHostsView({ api, store, navigate }) {
                       ? ips.map((ip) => `<span class="host-pill">${esc(ip)}</span>`).join(" ")
                       : `<span class="muted-sm">-</span>`;
                     const statusBadge = live
-                      ? `<span class="pill ${live.online ? "ok" : "err"}">${esc(live.online ? t("common.online") : t("common.offline"))}</span>`
-                      : `<span class="pill warn">${esc(t("common.draft"))}</span>`;
+                      ? `<span class="pill ${live.online ? "ok" : "err"}">${esc(live.online ? t("ONLINE") : t("OFFLINE"))}</span>`
+                      : `<span class="pill warn">${esc(t("DRAFT"))}</span>`;
                     const inDraft = Boolean(spec);
                     return `
                   <tr>
@@ -199,14 +199,14 @@ export function createHostsView({ api, store, navigate }) {
                     <td>${statusBadge}</td>
                     <td>
                       <div class="btn-row">
-                        <button type="button" class="btn sm primary" data-cfg-host="${esc(tag)}">${esc(t("hosts.configure"))}</button>
-                        ${inDraft ? `<button type="button" class="btn sm" data-topo-host="${esc(tag)}">${esc(t("hosts.locate"))}</button>` : ""}
-                        ${live ? `<button type="button" class="btn sm" data-push-host="${esc(tag)}">${esc(t("hosts.push"))}</button>` : ""}
+                        <button type="button" class="btn sm primary" data-cfg-host="${esc(tag)}">${esc(t("Configure"))}</button>
+                        ${inDraft ? `<button type="button" class="btn sm" data-topo-host="${esc(tag)}">${esc(t("Topology"))}</button>` : ""}
+                        ${live ? `<button type="button" class="btn sm" data-push-host="${esc(tag)}">${esc(t("Push"))}</button>` : ""}
                       </div>
                     </td>
                   </tr>`;
                   })
-                  .join("") || `<tr><td colspan="7" class="muted">${esc(t("hosts.empty"))}</td></tr>`
+                  .join("") || `<tr><td colspan="7" class="muted">${esc(t("No hosts configured or discovered yet."))}</td></tr>`
               }
             </tbody>
           </table>
@@ -257,13 +257,13 @@ export function createHostsView({ api, store, navigate }) {
 
   function openAddHostModal() {
     openModal({
-      title: t("hosts.add_host"),
+      title: t("+ Add Host"),
       bodyHtml: `
         <div class="form-grid">
-          <label><span>${esc(t("hosts.col.tag"))}</span>
+          <label><span>${esc(t("Host Tag"))}</span>
             <input id="new-host-tag" type="text" placeholder="e.g. ingress-jp" autofocus />
           </label>
-          <label><span>${esc(t("hosts.drawer.ips"))}</span>
+          <label><span>${esc(t("External Public IPs (IPv4 / IPv6, one per line or CSV — used for DNS sync)"))}</span>
             <input id="new-host-ips" type="text" placeholder="203.0.113.20" />
           </label>
           <div class="acl-chips-row">
@@ -274,9 +274,9 @@ export function createHostsView({ api, store, navigate }) {
           </div>
         </div>`,
       actions: [
-        { label: t("common.cancel"), cls: "ghost" },
+        { label: t("Cancel"), cls: "ghost" },
         {
-          label: t("common.create"),
+          label: t("Create"),
           cls: "primary",
           close: false,
           onClick: () => {
@@ -370,10 +370,10 @@ export function createHostsView({ api, store, navigate }) {
       <div class="subcard">
         <div class="subcard-head">
           <span>Listener #${i + 1}</span>
-          <button type="button" class="btn sm danger" data-hd-del-lis="${i}">${esc(t("common.remove"))}</button>
+          <button type="button" class="btn sm danger" data-hd-del-lis="${i}">${esc(t("Remove"))}</button>
         </div>
         <div class="inspector-row">
-          <label><span>${esc(t("hosts.drawer.listen_addr"))}</span>
+          <label><span>${esc(t("Listen Address (host:port)"))}</span>
             <input data-hd-lis-addr="${i}" value="${esc(l.listen_addr || "")}" placeholder="0.0.0.0:443" />
           </label>
           <div style="align-self:end;">
@@ -396,7 +396,7 @@ export function createHostsView({ api, store, navigate }) {
 
     const bodyHtml = `
       <div class="step-card">
-        <div class="step-card-head"><span>${esc(t("hosts.drawer.roles"))}</span></div>
+        <div class="step-card-head"><span>${esc(t("Node Roles"))}</span></div>
         <div class="acl-chips-row">
           ${["ingress", "relay", "egress", "maintainer"]
             .map(
@@ -405,19 +405,19 @@ export function createHostsView({ api, store, navigate }) {
             )
             .join("")}
         </div>
-        <label><span>${esc(t("hosts.drawer.ips"))}</span>
+        <label><span>${esc(t("External Public IPs (IPv4 / IPv6, one per line or CSV — used for DNS sync)"))}</span>
           <input id="hd-ext-ips" value="${esc((node.external_ips || []).join(", "))}" placeholder="203.0.113.10, 2001:db8::10" />
         </label>
       </div>
 
       <div class="step-card">
         <div class="step-card-head">
-          <span>${esc(t("hosts.drawer.mesh_listener"))}</span>
-          <label class="check-inline"><input type="checkbox" id="hd-ll-en" ${node.link_listener ? "checked" : ""} /> ${esc(t("common.enabled"))}</label>
+          <span>${esc(t("Mesh Link Listener"))}</span>
+          <label class="check-inline"><input type="checkbox" id="hd-ll-en" ${node.link_listener ? "checked" : ""} /> ${esc(t("Enabled"))}</label>
         </div>
         ${
           node.link_listener
-            ? `<label><span>${esc(t("hosts.drawer.listen_addr"))}</span>
+            ? `<label><span>${esc(t("Listen Address (host:port)"))}</span>
                 <input id="hd-ll-addr" value="${esc(node.link_listener.listen_addr || "")}" placeholder="0.0.0.0:10802" />
               </label>
               <div class="tri-stack">
@@ -433,7 +433,7 @@ export function createHostsView({ api, store, navigate }) {
         node.roles.ingress
           ? `<div class="step-card">
               <div class="step-card-head">
-                <span>${esc(t("hosts.drawer.ingress_listeners"))} (${node.ingress.listeners.length})</span>
+                <span>${esc(t("Ingress HTTP/HTTPS Listeners"))} (${node.ingress.listeners.length})</span>
                 <button type="button" id="hd-add-lis" class="btn sm">+ Listener</button>
               </div>
               ${listenersHtml || '<div class="muted-sm">No HTTP/HTTPS listeners yet.</div>'}
@@ -453,7 +453,7 @@ export function createHostsView({ api, store, navigate }) {
                 <label><span>Clearance Secret (empty = Default)</span>
                   <div style="display:flex;gap:6px;">
                     <input id="hd-ig-secret" type="password" autocomplete="off" value="${esc(node.ingress.clearance_secret || "")}" placeholder="Inherited from Defaults" />
-                    <button type="button" id="hd-gen-secret" class="btn sm">${esc(t("common.generate"))}</button>
+                    <button type="button" id="hd-gen-secret" class="btn sm">${esc(t("Generate"))}</button>
                   </div>
                 </label>
                 <label><span>JS FP Cooldown TTL (s)</span>
@@ -495,7 +495,7 @@ export function createHostsView({ api, store, navigate }) {
         node.roles.maintainer
           ? `<div class="step-card">
               <div class="step-card-head">
-                <span>${esc(t("hosts.drawer.maint_tpl"))}</span>
+                <span>${esc(t("Maintainer Template & ACME"))}</span>
                 <button type="button" id="hd-open-certs" class="btn sm">Manage Certs &amp; DNS →</button>
               </div>
               <div class="inspector-row">
@@ -512,10 +512,10 @@ export function createHostsView({ api, store, navigate }) {
 
       <div class="step-card">
         <div class="step-card-head">
-          <span>${esc(t("hosts.drawer.maint_hops"))}</span>
+          <span>${esc(t("Telemetry Hop Path to Maintainer"))}</span>
           ${
             maintainerNodes.length
-              ? `<button type="button" id="hd-auto-mhops" class="btn sm">${esc(t("hosts.drawer.auto_hops"))}</button>`
+              ? `<button type="button" id="hd-auto-mhops" class="btn sm">${esc(t("Auto Hops"))}</button>`
               : ""
           }
         </div>
@@ -524,8 +524,8 @@ export function createHostsView({ api, store, navigate }) {
 
       <div class="step-card">
         <div class="step-card-head">
-          <span>${esc(t("hosts.drawer.services_hosted"))} (${hostedServices.length})</span>
-          <button type="button" id="hd-go-svcs" class="btn sm">${esc(t("topo.open_services"))}</button>
+          <span>${esc(t("Services on this Host"))} (${hostedServices.length})</span>
+          <button type="button" id="hd-go-svcs" class="btn sm">${esc(t("Manage Services →"))}</button>
         </div>
         ${
           hostedServices.length
@@ -541,12 +541,12 @@ export function createHostsView({ api, store, navigate }) {
     `;
 
     const drawer = openDrawer({
-      title: t("hosts.drawer.title", { tag }),
+      title: t("Configure Host: {tag}", { tag }),
       subtitle: ["ingress", "relay", "egress", "maintainer"].filter((r) => node.roles[r]).join(" · ") || "No roles",
       bodyHtml,
       footerHtml: `
-        <button type="button" id="hd-del-host" class="btn sm danger">${esc(t("hosts.drawer.delete_host"))}</button>
-        <button type="button" id="hd-done" class="btn sm primary">${esc(t("common.close"))}</button>
+        <button type="button" id="hd-del-host" class="btn sm danger">${esc(t("Delete Host from Draft"))}</button>
+        <button type="button" id="hd-done" class="btn sm primary">${esc(t("Close"))}</button>
       `,
     });
     if (!drawer) return;
@@ -744,11 +744,11 @@ export function createHostsView({ api, store, navigate }) {
     container.innerHTML = `
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("hosts.tab.links"))} (${links.length})</h3>
+          <h3>${esc(t("Observed Links"))} (${links.length})</h3>
           <div class="btn-row">
             <input id="hl-search" class="input-sm" type="search" value="${esc(linkSearchQ)}" placeholder="Filter host / peer…" />
             <select id="hl-state" class="select-sm">
-              <option value="all" ${linkStateFilter === "all" ? "selected" : ""}>${esc(t("common.all"))}</option>
+              <option value="all" ${linkStateFilter === "all" ? "selected" : ""}>${esc(t("All"))}</option>
               <option value="UP" ${linkStateFilter === "UP" ? "selected" : ""}>UP</option>
               <option value="DEGRADED" ${linkStateFilter === "DEGRADED" ? "selected" : ""}>DEGRADED</option>
               <option value="DOWN" ${linkStateFilter === "DOWN" ? "selected" : ""}>DOWN</option>
@@ -822,41 +822,41 @@ export function createHostsView({ api, store, navigate }) {
     container.innerHTML = `
       <div class="dashboard-grid-2">
         <div class="panel">
-          <h3>${esc(t("hosts.onboard.title"))}</h3>
+          <h3>${esc(t("Register One-Time Onboarding Passphrase"))}</h3>
           <form id="enroll-form" class="form-grid">
-            <label><span>${esc(t("hosts.onboard.node_tag"))}</span>
+            <label><span>${esc(t("Target Host Tag"))}</span>
               <input id="enroll-tag" type="text" placeholder="e.g. ingress-hk-1" required />
             </label>
-            <label><span>${esc(t("hosts.onboard.passphrase"))}</span>
+            <label><span>${esc(t("5-Word Passphrase"))}</span>
               <input id="enroll-passphrase" type="text" placeholder="amber-beacon-cedar-delta-echo" required />
             </label>
-            <label><span>${esc(t("hosts.onboard.mode"))}</span>
+            <label><span>${esc(t("Onboarding Mode"))}</span>
               <select id="enroll-mode">
-                <option value="active">${esc(t("hosts.onboard.mode_active"))}</option>
-                <option value="listening">${esc(t("hosts.onboard.mode_listening"))}</option>
+                <option value="active">${esc(t("Active (host dials bootstrap tunnel)"))}</option>
+                <option value="listening">${esc(t("Listening (mesh dials host)"))}</option>
               </select>
             </label>
-            <label><span>${esc(t("hosts.onboard.addr"))}</span>
+            <label><span>${esc(t("Target Address (Listening mode)"))}</span>
               <input id="enroll-addr" type="text" placeholder="198.51.100.10:10802" />
             </label>
-            <label><span>${esc(t("hosts.onboard.hops"))}</span>
+            <label><span>${esc(t("Via Hop Path (CSV, optional)"))}</span>
               <input id="enroll-hops" type="text" placeholder="bootstrap-1, relay-1" />
             </label>
             <div class="form-actions">
-              <button type="submit" class="btn primary">${esc(t("hosts.onboard.submit"))}</button>
+              <button type="submit" class="btn primary">${esc(t("Register & Enroll"))}</button>
             </div>
           </form>
         </div>
         <div class="panel">
           <div class="panel-header">
-            <h3>${esc(t("hosts.onboard.cli"))}</h3>
-            <button type="button" id="btn-copy-cli" class="btn sm">${esc(t("common.copy"))}</button>
+            <h3>${esc(t("Quick CLI Helper"))}</h3>
+            <button type="button" id="btn-copy-cli" class="btn sm">${esc(t("Copy"))}</button>
           </div>
           <pre id="enroll-cli-preview" class="output-box"></pre>
         </div>
       </div>
       <div class="panel">
-        <h3>${esc(t("hosts.onboard.registry"))}</h3>
+        <h3>${esc(t("Passphrase Registry"))}</h3>
         <table class="table">
           <thead><tr><th>Host Tag</th><th>Mode</th><th>Expires</th><th>Status</th><th>Action</th></tr></thead>
           <tbody>

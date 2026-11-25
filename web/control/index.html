@@ -11,20 +11,20 @@
   <section id="login-view" class="login-shell">
     <form id="login-form" class="login-card">
       <div class="login-head-row">
-        <div class="brand-tag" data-i18n="brand.tag">EXPOSURE CONTROL</div>
-        <button type="button" id="btn-login-lang" class="btn sm ghost">中文 / EN</button>
+        <div class="brand-tag">EXPOSURE CONTROL</div>
+        <select id="sel-lang-login" class="select-sm lang-select" title="Language"></select>
       </div>
-      <h1 data-i18n="login.title">Sign in to Control Plane</h1>
-      <p class="muted-sm" data-i18n="login.subtitle">Authenticate to manage hosts, services, smart DNS, security guards, and mesh topology.</p>
+      <h1>Sign in to Control Plane</h1>
+      <p class="muted-sm">Authenticate to manage hosts, services, smart DNS, security guards, and mesh topology.</p>
       <label>
-        <span data-i18n="login.username">Username</span>
+        <span>Username</span>
         <input id="login-user" type="text" autocomplete="username" required value="admin" />
       </label>
       <label>
-        <span data-i18n="login.password">Password</span>
+        <span>Password</span>
         <input id="login-pass" type="password" autocomplete="current-password" required />
       </label>
-      <button type="submit" class="btn primary" data-i18n="login.submit">Sign In</button>
+      <button type="submit" class="btn primary">Sign In</button>
       <p id="login-error" class="error hidden"></p>
     </form>
   </section>
@@ -33,62 +33,62 @@
   <div id="app-view" class="app-shell hidden">
     <aside class="sidebar">
       <div class="sidebar-head">
-        <div class="brand" data-i18n="brand.name">EXPOSURE</div>
+        <div class="brand">EXPOSURE</div>
         <span id="control-role-badge" class="pill ok">ACTIVE</span>
       </div>
 
       <div id="sidebar-bootstrap-status" class="bootstrap-card">
         <span class="live-dot draft"></span>
         <div class="bootstrap-card-text">
-          <div class="bootstrap-card-lbl" data-i18n="sidebar.bootstrap">Bootstrap Link</div>
-          <div class="bootstrap-card-val" data-i18n="sidebar.checking">Checking…</div>
+          <div class="bootstrap-card-lbl">Bootstrap Link</div>
+          <div class="bootstrap-card-val">Checking…</div>
         </div>
       </div>
 
       <nav class="nav">
-        <div class="nav-group-label" data-i18n="nav.group.monitor">Monitor</div>
+        <div class="nav-group-label">Monitor</div>
         <button class="nav-item active" data-tab="overview">
           <span class="nav-ic">◈</span>
-          <span class="nav-txt" data-i18n="nav.overview">Overview</span>
+          <span class="nav-txt">Overview</span>
         </button>
         <button class="nav-item" data-tab="analytics">
           <span class="nav-ic">▤</span>
-          <span class="nav-txt" data-i18n="nav.analytics">Analytics</span>
+          <span class="nav-txt">Analytics</span>
         </button>
         <button class="nav-item" data-tab="logging">
           <span class="nav-ic">◎</span>
-          <span class="nav-txt" data-i18n="nav.logging">Logging</span>
+          <span class="nav-txt">Logging</span>
         </button>
 
-        <div class="nav-group-label" data-i18n="nav.group.configure">Configure</div>
+        <div class="nav-group-label">Configure</div>
         <button class="nav-item" data-tab="hosts">
           <span class="nav-ic">◫</span>
-          <span class="nav-txt" data-i18n="nav.hosts">Hosts</span>
+          <span class="nav-txt">Hosts</span>
           <span id="nav-badge-hosts" class="nav-badge">0</span>
         </button>
         <button class="nav-item" data-tab="services">
           <span class="nav-ic">⚡</span>
-          <span class="nav-txt" data-i18n="nav.services">Services</span>
+          <span class="nav-txt">Services</span>
           <span id="nav-badge-services" class="nav-badge">0</span>
         </button>
         <button class="nav-item" data-tab="domains">
           <span class="nav-ic">◉</span>
-          <span class="nav-txt" data-i18n="nav.domains">Domains &amp; DNS</span>
+          <span class="nav-txt">Domains &amp; DNS</span>
           <span id="nav-badge-domains" class="nav-badge">0</span>
         </button>
         <button class="nav-item" data-tab="security">
           <span class="nav-ic">⛨</span>
-          <span class="nav-txt" data-i18n="nav.security">Security</span>
+          <span class="nav-txt">Security</span>
         </button>
         <button class="nav-item" data-tab="topology">
           <span class="nav-ic">❖</span>
-          <span class="nav-txt" data-i18n="nav.topology">Topology</span>
+          <span class="nav-txt">Topology</span>
         </button>
 
-        <div class="nav-group-label" data-i18n="nav.group.system">System</div>
+        <div class="nav-group-label">System</div>
         <button class="nav-item" data-tab="system">
           <span class="nav-ic">⚙</span>
-          <span class="nav-txt" data-i18n="nav.system">System</span>
+          <span class="nav-txt">System</span>
         </button>
       </nav>
 
@@ -98,12 +98,9 @@
             <button type="button" class="theme-btn" data-theme-val="dark">Dark</button>
             <button type="button" class="theme-btn" data-theme-val="light">Light</button>
           </div>
-          <div class="lang-switch" title="Language">
-            <button type="button" class="lang-btn" data-lang="zh-CN">中文</button>
-            <button type="button" class="lang-btn" data-lang="en">EN</button>
-          </div>
+          <select id="sel-lang" class="select-sm lang-select" title="Language"></select>
         </div>
-        <button id="btn-logout" class="btn ghost full" data-i18n="auth.signout">Sign Out</button>
+        <button id="btn-logout" class="btn ghost full">Sign Out</button>
       </div>
     </aside>
 
@@ -116,32 +113,32 @@
         </div>
         <div class="topbar-actions">
           <select id="sel-time-window" class="select-sm" title="Stats time window">
-            <option value="300" data-i18n="topbar.window.5m">Window: 5m</option>
-            <option value="900" data-i18n="topbar.window.15m">Window: 15m</option>
-            <option value="1800" data-i18n="topbar.window.30m">Window: 30m</option>
-            <option value="3600" selected data-i18n="topbar.window.1h">Window: 1h</option>
-            <option value="21600" data-i18n="topbar.window.6h">Window: 6h</option>
-            <option value="43200" data-i18n="topbar.window.12h">Window: 12h</option>
-            <option value="86400" data-i18n="topbar.window.24h">Window: 24h</option>
-            <option value="604800" data-i18n="topbar.window.7d">Window: 7d</option>
-            <option value="2592000" data-i18n="topbar.window.30d">Window: 30d</option>
-            <option value="0" data-i18n="topbar.window.all">Window: All</option>
-            <option value="custom" data-i18n="topbar.window.custom">Window: Custom…</option>
+            <option value="300">Window: 5m</option>
+            <option value="900">Window: 15m</option>
+            <option value="1800">Window: 30m</option>
+            <option value="3600" selected>Window: 1h</option>
+            <option value="21600">Window: 6h</option>
+            <option value="43200">Window: 12h</option>
+            <option value="86400">Window: 24h</option>
+            <option value="604800">Window: 7d</option>
+            <option value="2592000">Window: 30d</option>
+            <option value="0">Window: All</option>
+            <option value="custom">Window: Custom…</option>
           </select>
           <div id="time-custom-wrap" class="time-custom-wrap hidden">
             <input id="inp-time-from" type="datetime-local" class="input-sm" title="Start time" />
             <span class="muted-sm">→</span>
             <input id="inp-time-to" type="datetime-local" class="input-sm" title="End time" />
-            <button id="btn-time-apply" type="button" class="btn sm primary" data-i18n="topbar.window.apply">Apply</button>
+            <button id="btn-time-apply" type="button" class="btn sm primary">Apply</button>
           </div>
           <select id="sel-auto-refresh" class="select-sm" title="Auto refresh interval">
-            <option value="0" data-i18n="topbar.auto.off">Auto: Off</option>
-            <option value="10000" data-i18n="topbar.auto.10s">Auto: 10s</option>
-            <option value="30000" selected data-i18n="topbar.auto.30s">Auto: 30s</option>
+            <option value="0">Auto: Off</option>
+            <option value="10000">Auto: 10s</option>
+            <option value="30000" selected>Auto: 30s</option>
           </select>
-          <button id="btn-pull-all" class="btn sm" data-i18n="topbar.pull">Pull Telemetry</button>
-          <button id="btn-discover" class="btn sm" data-i18n="topbar.discover">Discover</button>
-          <button id="btn-refresh" class="btn sm primary" data-i18n="topbar.refresh">Refresh</button>
+          <button id="btn-pull-all" class="btn sm">Pull Telemetry</button>
+          <button id="btn-discover" class="btn sm">Discover</button>
+          <button id="btn-refresh" class="btn sm primary">Refresh</button>
         </div>
       </header>
 
@@ -152,16 +149,16 @@
           <div class="btn-row">
             <button id="btn-global-undo" class="btn sm ghost" disabled title="Undo (Ctrl+Z)">↶</button>
             <button id="btn-global-redo" class="btn sm ghost" disabled title="Redo (Ctrl+Y)">↷</button>
-            <button id="btn-global-diff" class="btn sm ghost hidden" data-i18n="deploy.diff">Diff</button>
-            <button id="btn-global-discard" class="btn sm ghost hidden" data-i18n="deploy.discard">Discard Draft</button>
+            <button id="btn-global-diff" class="btn sm ghost hidden">Diff</button>
+            <button id="btn-global-discard" class="btn sm ghost hidden">Discard Draft</button>
           </div>
         </div>
         <div class="deploy-bar-right">
-          <button id="btn-global-validate" class="btn sm" data-i18n="deploy.validate">Validate</button>
-          <button id="btn-global-preflight" class="btn sm" data-i18n="deploy.preflight">Preflight</button>
-          <button id="btn-global-save-draft" class="btn sm" data-i18n="deploy.save_draft">Save Draft</button>
-          <button id="btn-global-deploy" class="btn sm primary" data-i18n="deploy.push_all">Deploy &amp; Push</button>
-          <button id="btn-global-deploy-dns" class="btn sm accent-outline" data-i18n="deploy.push_and_dns">Deploy + Sync DNS</button>
+          <button id="btn-global-validate" class="btn sm">Validate</button>
+          <button id="btn-global-preflight" class="btn sm">Preflight</button>
+          <button id="btn-global-save-draft" class="btn sm">Save Draft</button>
+          <button id="btn-global-deploy" class="btn sm primary">Deploy &amp; Push</button>
+          <button id="btn-global-deploy-dns" class="btn sm accent-outline">Deploy + Sync DNS</button>
         </div>
       </div>
 

@@ -187,21 +187,21 @@ export function createServicesView({ store, navigate }) {
       <div class="subtabs-bar">
         <div class="subtabs-list">
           <button type="button" class="subtab-btn ${subTab === "catalog" ? "active" : ""}" data-svc-sub="catalog">
-            ${esc(t("svc.tab.catalog"))} <span class="subtab-count">${svcEntries.length}</span>
+            ${esc(t("Service Catalog"))} <span class="subtab-count">${svcEntries.length}</span>
           </button>
           <button type="button" class="subtab-btn ${subTab === "matrix" ? "active" : ""}" data-svc-sub="matrix">
-            ${esc(t("svc.tab.matrix"))} <span class="subtab-count">${compiledCount}</span>
+            ${esc(t("Compiled Routes"))} <span class="subtab-count">${compiledCount}</span>
           </button>
           ${
             legacyCount > 0 || subTab === "legacy"
               ? `<button type="button" class="subtab-btn ${subTab === "legacy" ? "active" : ""}" data-svc-sub="legacy">
-                  ${esc(t("svc.tab.legacy"))} <span class="subtab-count">${legacyCount}</span>
+                  ${esc(t("Legacy Node Rules"))} <span class="subtab-count">${legacyCount}</span>
                 </button>`
               : ""
           }
         </div>
         <div class="btn-row">
-          <button type="button" id="btn-svc-new" class="btn sm primary">${esc(t("svc.add"))}</button>
+          <button type="button" id="btn-svc-new" class="btn sm primary">${esc(t("+ New Service"))}</button>
         </div>
       </div>
 
@@ -209,9 +209,9 @@ export function createServicesView({ store, navigate }) {
         legacyCount > 0 && subTab === "catalog"
           ? `<div class="callout-banner warn">
               <div>
-                <strong>${esc(t("svc.migrate_banner", { count: legacyCount }))}</strong>
+                <strong>${esc(t("{count} legacy node-level service rule(s) detected. You can migrate them into unified Services with one click.", { count: legacyCount }))}</strong>
               </div>
-              <button type="button" id="btn-svc-migrate" class="btn sm primary">${esc(t("svc.migrate_btn"))}</button>
+              <button type="button" id="btn-svc-migrate" class="btn sm primary">${esc(t("Migrate Legacy Rules"))}</button>
             </div>`
           : ""
       }
@@ -245,8 +245,8 @@ export function createServicesView({ store, navigate }) {
     container.innerHTML = `
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("svc.tab.catalog"))} (${filtered.length})</h3>
-          <input id="svc-search-inp" class="input-sm" type="search" value="${esc(searchQ)}" placeholder="${esc(t("svc.search"))}" style="min-width:260px;" />
+          <h3>${esc(t("Service Catalog"))} (${filtered.length})</h3>
+          <input id="svc-search-inp" class="input-sm" type="search" value="${esc(searchQ)}" placeholder="${esc(t("Search service name, host, or backend…"))}" style="min-width:260px;" />
         </div>
         ${
           filtered.length
@@ -254,11 +254,11 @@ export function createServicesView({ store, navigate }) {
                 <table class="table">
                   <thead>
                     <tr>
-                      <th>${esc(t("svc.col.service"))}</th>
-                      <th>${esc(t("svc.col.ingress"))}</th>
-                      <th>${esc(t("svc.col.route"))}</th>
-                      <th>${esc(t("svc.col.security"))}</th>
-                      <th>${esc(t("common.actions"))}</th>
+                      <th>${esc(t("Service & Hosts"))}</th>
+                      <th>${esc(t("Ingress Scope"))}</th>
+                      <th>${esc(t("Mesh Route & Egress Backend"))}</th>
+                      <th>${esc(t("Guard & TLS"))}</th>
+                      <th>${esc(t("Actions"))}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -269,10 +269,10 @@ export function createServicesView({ store, navigate }) {
                         const allReachable = paths.length > 0 && paths.every((p) => p.hops);
                         const scopeLbl =
                           svc.ingress?.mode === "selected"
-                            ? t("svc.scope.selected", { count: targetIngs.length })
+                            ? t("Selected ({count})", { count: targetIngs.length })
                             : svc.ingress?.mode === "exclude"
-                            ? t("svc.scope.exclude", { count: (svc.ingress?.nodes || []).length })
-                            : t("svc.scope.all", { count: targetIngs.length });
+                            ? t("All Except ({count})", { count: (svc.ingress?.nodes || []).length })
+                            : t("All Ingress ({count})", { count: targetIngs.length });
                         const effBucket = svc.bucket || igDefs.default_bucket || "";
                         const effAntibot = svc.antibot || igDefs.default_antibot || "";
                         const effWaf = svc.waf || igDefs.default_waf || "";
@@ -286,7 +286,7 @@ export function createServicesView({ store, navigate }) {
                           .join(" ");
                         const samplePath = paths[0]?.hops
                           ? `<div class="hop-chain">${paths[0].hops.map((h) => `<span class="hop-node">${esc(h)}</span>`).join('<span class="hop-arrow">→</span>')}</div>`
-                          : `<span class="pill err">${esc(t("svc.route_unreachable"))}</span>`;
+                          : `<span class="pill err">${esc(t("Unreachable (no mesh link path)"))}</span>`;
 
                         return `
                       <tr style="${svc.enabled === false ? "opacity:0.55;" : ""}">
@@ -295,7 +295,7 @@ export function createServicesView({ store, navigate }) {
                             <span class="live-dot ${svc.enabled === false ? "draft" : allReachable ? "online" : "offline"}"></span>
                             <strong>${esc(name)}</strong>
                             ${svc.url_prefix ? `<code>${esc(svc.url_prefix)}</code>` : ""}
-                            ${svc.enabled === false ? `<span class="pill">${esc(t("common.disabled"))}</span>` : ""}
+                            ${svc.enabled === false ? `<span class="pill">${esc(t("Disabled"))}</span>` : ""}
                           </div>
                           <div class="tag-list">${hostPills || '<span class="muted-sm">-</span>'}</div>
                         </td>
@@ -312,7 +312,7 @@ export function createServicesView({ store, navigate }) {
                             ${effBucket ? `<span class="pill">B: ${esc(effBucket)}</span>` : ""}
                             ${effAntibot ? `<span class="pill info">A: ${esc(effAntibot)}</span>` : ""}
                             ${effWaf ? `<span class="pill warn">W: ${esc(effWaf)}</span>` : ""}
-                            ${!effBucket && !effAntibot && !effWaf && !effGuard ? `<span class="pill">${esc(t("common.none"))}</span>` : ""}
+                            ${!effBucket && !effAntibot && !effWaf && !effGuard ? `<span class="pill">${esc(t("(none)"))}</span>` : ""}
                             ${effGuard ? `<span class="pill warn">guard: ${esc(effGuard)}</span>` : ""}
                             ${svc.auto_tls ? `<span class="pill ok">Auto-TLS</span>` : ""}
                             ${(svc.cache?.enabled ?? igDefs.cache?.enabled) ? `<span class="pill info">Cache</span>` : ""}
@@ -320,9 +320,9 @@ export function createServicesView({ store, navigate }) {
                         </td>
                         <td>
                           <div class="btn-row">
-                            <button type="button" class="btn sm primary" data-edit-svc="${esc(name)}">${esc(t("common.edit"))}</button>
-                            <button type="button" class="btn sm" data-trace-svc="${esc(name)}">${esc(t("svc.trace"))}</button>
-                            <button type="button" class="btn sm danger" data-del-svc="${esc(name)}">${esc(t("common.delete"))}</button>
+                            <button type="button" class="btn sm primary" data-edit-svc="${esc(name)}">${esc(t("Edit"))}</button>
+                            <button type="button" class="btn sm" data-trace-svc="${esc(name)}">${esc(t("Trace"))}</button>
+                            <button type="button" class="btn sm danger" data-del-svc="${esc(name)}">${esc(t("Delete"))}</button>
                           </div>
                         </td>
                       </tr>`;
@@ -332,8 +332,8 @@ export function createServicesView({ store, navigate }) {
                 </table>
               </div>`
             : `<div class="empty-state-box">
-                <p>${esc(t("svc.empty"))}</p>
-                <button type="button" id="btn-svc-empty-new" class="btn primary">${esc(t("svc.add"))}</button>
+                <p>${esc(t("No declarative services yet. Create a service once to automatically expose it across all Ingress hosts."))}</p>
+                <button type="button" id="btn-svc-empty-new" class="btn primary">${esc(t("+ New Service"))}</button>
               </div>`
         }
       </div>
@@ -366,7 +366,7 @@ export function createServicesView({ store, navigate }) {
     container.innerHTML = `
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("svc.tab.matrix"))} (${paths.length})</h3>
+          <h3>${esc(t("Compiled Routes"))} (${paths.length})</h3>
           <span class="muted-sm">Verified by Control topology compiler</span>
         </div>
         <div class="table-scroll">
@@ -404,8 +404,8 @@ export function createServicesView({ store, navigate }) {
     container.innerHTML = `
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("svc.tab.legacy"))} (${rows.length})</h3>
-          ${rows.length ? `<button type="button" id="btn-leg-migrate" class="btn sm primary">${esc(t("svc.migrate_btn"))}</button>` : ""}
+          <h3>${esc(t("Legacy Node Rules"))} (${rows.length})</h3>
+          ${rows.length ? `<button type="button" id="btn-leg-migrate" class="btn sm primary">${esc(t("Migrate Legacy Rules"))}</button>` : ""}
         </div>
         <div class="table-scroll">
           <table class="table">
@@ -471,11 +471,11 @@ export function createServicesView({ store, navigate }) {
       const routePreviewHtml = previewPaths
         .map((p) => {
           if (!p.hops) {
-            return `<div class="diff-row"><code>${esc(p.ingress)}</code><span class="pill err">${esc(t("svc.route_unreachable"))}</span></div>`;
+            return `<div class="diff-row"><code>${esc(p.ingress)}</code><span class="pill err">${esc(t("Unreachable (no mesh link path)"))}</span></div>`;
           }
           const chain =
             p.mode === "local"
-              ? `<span class="pill ok">${esc(t("svc.route_local"))}</span>`
+              ? `<span class="pill ok">${esc(t("Local (co-located Ingress & Egress)"))}</span>`
               : `<div class="hop-chain">${p.hops.map((h) => `<span class="hop-node">${esc(h)}</span>`).join('<span class="hop-arrow">→</span>')}</div>`;
           return `
             <div class="diff-row" style="flex-direction:column;align-items:stretch;gap:6px;">
@@ -555,25 +555,25 @@ export function createServicesView({ store, navigate }) {
       const bodyHtml = `
         <div class="step-card">
           <div class="step-card-head">
-            <span>${esc(t("svc.step.entry"))}</span>
-            ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "enabled", label: t("common.enabled"), val: draft.enabled })}
+            <span>${esc(t("1. Entry & Domains"))}</span>
+            ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "enabled", label: t("Enabled"), val: draft.enabled })}
           </div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.name"))} *</span>
+            <label><span>${esc(t("Service ID / Tag"))} *</span>
               <input id="sd-name" value="${esc(workingName)}" placeholder="web-app" ${isNew ? "" : ""} />
             </label>
-            <label><span>${esc(t("svc.field.url_prefix"))}</span>
+            <label><span>${esc(t("URL Prefix (optional)"))}</span>
               <input id="sd-prefix" value="${esc(draft.url_prefix || "")}" placeholder="/api" />
             </label>
           </div>
-          <label><span>${esc(t("svc.field.hosts"))} *</span>
+          <label><span>${esc(t("Match Hosts (comma or newline separated, e.g. app.example.com)"))} *</span>
             <input id="sd-hosts" value="${esc((draft.hosts || []).join(", "))}" placeholder="app.example.com, www.example.com" />
           </label>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.sni"))}</span>
+            <label><span>${esc(t("TLS SNI Override (optional)"))}</span>
               <input id="sd-sni" value="${esc(draft.sni || "")}" placeholder="app.example.com" />
             </label>
-            <label><span>${esc(t("svc.field.cidrs"))}</span>
+            <label><span>${esc(t("Allowed Source CIDRs (optional CSV)"))}</span>
               <input id="sd-cidrs" value="${esc((draft.source_cidrs || []).join(", "))}" placeholder="optional CSV" />
             </label>
           </div>
@@ -581,14 +581,14 @@ export function createServicesView({ store, navigate }) {
 
         <div class="step-card">
           <div class="step-card-head">
-            <span>${esc(t("svc.step.scope"))}</span>
+            <span>${esc(t("2. Ingress Exposure Scope"))}</span>
             <span class="pill ok">${targetIngs.length} Ingress</span>
           </div>
-          <label><span>${esc(t("svc.field.scope_mode"))}</span>
+          <label><span>${esc(t("Expose On"))}</span>
             <select id="sd-scope-mode">
-              <option value="all" ${scopeMode === "all" ? "selected" : ""}>${esc(t("svc.field.scope_all"))}</option>
-              <option value="selected" ${scopeMode === "selected" ? "selected" : ""}>${esc(t("svc.field.scope_selected"))}</option>
-              <option value="exclude" ${scopeMode === "exclude" ? "selected" : ""}>${esc(t("svc.field.scope_exclude"))}</option>
+              <option value="all" ${scopeMode === "all" ? "selected" : ""}>${esc(t("All Ingress Hosts (auto-applies to future Ingress hosts)"))}</option>
+              <option value="selected" ${scopeMode === "selected" ? "selected" : ""}>${esc(t("Selected Ingress Hosts Only"))}</option>
+              <option value="exclude" ${scopeMode === "exclude" ? "selected" : ""}>${esc(t("All Ingress Hosts Except Selected"))}</option>
             </select>
           </label>
           ${
@@ -599,7 +599,7 @@ export function createServicesView({ store, navigate }) {
           ${
             targetIngs.length
               ? `<details style="margin-top:4px;">
-                  <summary class="muted-sm" style="cursor:pointer;font-weight:600;">${esc(t("svc.field.overrides"))}</summary>
+                  <summary class="muted-sm" style="cursor:pointer;font-weight:600;">${esc(t("Per-Ingress Overrides (optional)"))}</summary>
                   <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px;">${overridesHtml}</div>
                 </details>`
               : ""
@@ -607,27 +607,27 @@ export function createServicesView({ store, navigate }) {
         </div>
 
         <div class="step-card">
-          <div class="step-card-head"><span>${esc(t("svc.step.backend"))}</span></div>
+          <div class="step-card-head"><span>${esc(t("3. Egress Origin Backend"))}</span></div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.egress_node"))} *</span>
+            <label><span>${esc(t("Egress Host"))} *</span>
               <select id="sd-eg-node">
                 <option value="">(select egress host)</option>
                 ${allEgress.map((n) => `<option value="${esc(n)}" ${draft.egress.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
               </select>
             </label>
-            <label><span>${esc(t("svc.field.backend"))} *</span>
+            <label><span>${esc(t("Backend Address (IP:Port)"))} *</span>
               <input id="sd-eg-backend" value="${esc(draft.egress.backend || "")}" placeholder="192.168.1.3:10808" />
             </label>
           </div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.protocol"))}</span>
+            <label><span>${esc(t("Backend Protocol"))}</span>
               <select id="sd-eg-proto">
                 <option value="auto" ${draft.egress.protocol === "auto" ? "selected" : ""}>auto (h2/h1)</option>
                 <option value="http1" ${draft.egress.protocol === "http1" ? "selected" : ""}>http1</option>
                 <option value="h2" ${draft.egress.protocol === "h2" ? "selected" : ""}>h2</option>
               </select>
             </label>
-            <label><span>${esc(t("svc.field.timeout"))}</span>
+            <label><span>${esc(t("Timeout (ms, 0 = default)"))}</span>
               <input id="sd-eg-timeout" type="number" min="0" value="${draft.egress.timeout_ms ?? 0}" />
             </label>
           </div>
@@ -643,21 +643,21 @@ export function createServicesView({ store, navigate }) {
         </div>
 
         <div class="step-card">
-          <div class="step-card-head"><span>${esc(t("svc.step.routing"))}</span></div>
+          <div class="step-card-head"><span>${esc(t("4. Routing, Guard & Auto-TLS"))}</span></div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.bucket_set"))}</span>
+            <label><span>${esc(t("Bucket Set"))}</span>
               <select id="sd-bucket">
                 <option value="">(Default: ${esc(defs.ingress.default_bucket || "none")})</option>
                 ${bucketNames.map((b) => `<option value="${esc(b)}" ${draft.bucket === b ? "selected" : ""}>${esc(b)}</option>`).join("")}
               </select>
             </label>
-            <label><span>${esc(t("svc.field.antibot_set"))}</span>
+            <label><span>${esc(t("Antibot Set"))}</span>
               <select id="sd-antibot">
                 <option value="">(Default: ${esc(defs.ingress.default_antibot || "none")})</option>
                 ${antibotNames.map((a) => `<option value="${esc(a)}" ${draft.antibot === a ? "selected" : ""}>${esc(a)}</option>`).join("")}
               </select>
             </label>
-            <label><span>${esc(t("svc.field.waf_set"))}</span>
+            <label><span>${esc(t("WAF Set"))}</span>
               <select id="sd-waf">
                 <option value="">(Default: ${esc(defs.ingress.default_waf || "none")})</option>
                 ${wafNames.map((w) => `<option value="${esc(w)}" ${draft.waf === w ? "selected" : ""}>${esc(w)}</option>`).join("")}
@@ -665,15 +665,15 @@ export function createServicesView({ store, navigate }) {
             </label>
           </div>
           <div class="inspector-row">
-            <label><span>${esc(t("svc.field.routing_mode"))}</span>
+            <label><span>${esc(t("Mesh Routing Mode"))}</span>
               <select id="sd-route-mode">
-                <option value="auto" ${draft.routing.mode !== "pinned" ? "selected" : ""}>${esc(t("svc.field.routing_auto"))}</option>
-                <option value="pinned" ${draft.routing.mode === "pinned" ? "selected" : ""}>${esc(t("svc.field.routing_pinned"))}</option>
+                <option value="auto" ${draft.routing.mode !== "pinned" ? "selected" : ""}>${esc(t("Auto Shortest Path (recommended)"))}</option>
+                <option value="pinned" ${draft.routing.mode === "pinned" ? "selected" : ""}>${esc(t("Pinned Custom Hop Paths"))}</option>
               </select>
             </label>
             ${
               draft.guard || guardNames.length
-                ? `<label><span>${esc(t("svc.field.guard"))} (Legacy)</span>
+                ? `<label><span>${esc(t("Guard Policy"))} (Legacy)</span>
                     <select id="sd-guard">
                       <option value="">(None / Use modular sets)</option>
                       ${guardNames.map((g) => `<option value="${esc(g)}" ${draft.guard === g ? "selected" : ""}>${esc(g)}</option>`).join("")}
@@ -683,7 +683,7 @@ export function createServicesView({ store, navigate }) {
             }
           </div>
           <div class="tri-stack">
-            ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "auto_tls", label: t("svc.field.auto_tls"), sub: t("svc.field.auto_tls_sub"), val: draft.auto_tls })}
+            ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "auto_tls", label: t("Auto-TLS Certificate Coverage"), sub: t("Ensure Primary Maintainer issues & distributes TLS certs for these hosts"), val: draft.auto_tls })}
             ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "intercept_errors", label: "Ingress Intercept Errors (403/429/5xx)", val: draft.intercept_errors, inherited: defs.ingress.intercept_errors })}
             ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: draft.js_fp_beacon, inherited: defs.ingress.js_fp_beacon })}
             ${renderTriSlider({ attrName: "data-sd-ca-tri", attrVal: "enabled", label: "Edge HTTP Cache", sub: "Cache GET/HEAD responses in RAM on Ingress hosts", val: draft.cache?.enabled ?? null, inherited: Boolean(defs.ingress.cache?.enabled) })}
@@ -701,20 +701,20 @@ export function createServicesView({ store, navigate }) {
               : ""
           }
           <div>
-            <div class="muted-sm" style="margin-bottom:6px;font-weight:700;">${esc(t("svc.route_preview"))}</div>
+            <div class="muted-sm" style="margin-bottom:6px;font-weight:700;">${esc(t("Compiled Route Preview"))}</div>
             <div class="diff-list">${routePreviewHtml || '<div class="muted-sm">Select an Egress host and at least one Ingress host.</div>'}</div>
           </div>
         </div>
       `;
 
       const drawer = openDrawer({
-        title: isNew ? t("svc.drawer.new") : t("svc.drawer.edit", { name: existingName }),
+        title: isNew ? t("Create Service") : t("Edit Service: {name}", { name: existingName }),
         subtitle: `${targetIngs.length} Ingress → ${draft.egress.node || "?"} (${draft.egress.backend || "?"})`,
         bodyHtml,
         wide: true,
         footerHtml: `
-          <button type="button" id="sd-cancel" class="btn sm ghost">${esc(t("common.cancel"))}</button>
-          <button type="button" id="sd-save" class="btn sm primary">${esc(t("common.apply"))}</button>
+          <button type="button" id="sd-cancel" class="btn sm ghost">${esc(t("Cancel"))}</button>
+          <button type="button" id="sd-save" class="btn sm primary">${esc(t("Apply"))}</button>
         `,
       });
       if (!drawer) return;

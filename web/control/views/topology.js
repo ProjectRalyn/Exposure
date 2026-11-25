@@ -61,16 +61,16 @@ export function createTopologyView({ api, store, navigate }) {
       <div class="panel topo-panel">
         <div class="topo-toolbar">
           <div class="btn-row">
-            <button id="btn-topo-connect" class="btn sm">${esc(t("topo.connect"))}</button>
-            <button id="btn-topo-auto-layout" class="btn sm">${esc(t("topo.auto_layout"))}</button>
+            <button id="btn-topo-connect" class="btn sm">${esc(t("Connect"))}</button>
+            <button id="btn-topo-auto-layout" class="btn sm">${esc(t("Auto Layout"))}</button>
             <div class="toolbar-sep"></div>
             <select id="topo-trace-select" class="select-sm" title="Highlight compiled service path">
-              <option value="">${esc(t("topo.trace_off"))}</option>
+              <option value="">${esc(t("Trace Service: Off"))}</option>
             </select>
           </div>
           <div class="btn-row">
-            <button id="btn-topo-go-hosts" class="btn sm">${esc(t("topo.open_host"))}</button>
-            <button id="btn-topo-go-services" class="btn sm">${esc(t("topo.open_services"))}</button>
+            <button id="btn-topo-go-hosts" class="btn sm">${esc(t("Configure Host →"))}</button>
+            <button id="btn-topo-go-services" class="btn sm">${esc(t("Manage Services →"))}</button>
           </div>
         </div>
 
@@ -100,12 +100,12 @@ export function createTopologyView({ api, store, navigate }) {
               <button id="btn-zoom-out" class="btn sm">−</button>
               <span id="topo-zoom-label" class="zoom-lbl">100%</span>
               <button id="btn-zoom-in" class="btn sm">+</button>
-              <button id="btn-zoom-fit" class="btn sm">${esc(t("topo.fit"))}</button>
-              <button id="btn-toggle-grid" class="btn sm active">${esc(t("topo.grid"))}</button>
-              <button id="btn-toggle-live" class="btn sm active">${esc(t("topo.live"))}</button>
+              <button id="btn-zoom-fit" class="btn sm">${esc(t("Fit"))}</button>
+              <button id="btn-toggle-grid" class="btn sm active">${esc(t("Grid"))}</button>
+              <button id="btn-toggle-live" class="btn sm active">${esc(t("Live"))}</button>
             </div>
             <div id="topo-minimap" class="topo-minimap"></div>
-            <div id="topo-connect-hint" class="topo-hint hidden">${esc(t("topo.connect_hint"))}</div>
+            <div id="topo-connect-hint" class="topo-hint hidden">${esc(t("Click source host, then click target host to create a mesh link (Esc to cancel)"))}</div>
           </div>
           <aside id="topo-inspector" class="topo-inspector"></aside>
         </div>
@@ -115,14 +115,14 @@ export function createTopologyView({ api, store, navigate }) {
   }
 
   function updateToolbarLabels() {
-    if (el("btn-topo-connect")) el("btn-topo-connect").textContent = t("topo.connect");
-    if (el("btn-topo-auto-layout")) el("btn-topo-auto-layout").textContent = t("topo.auto_layout");
-    if (el("btn-topo-go-hosts")) el("btn-topo-go-hosts").textContent = t("topo.open_host");
-    if (el("btn-topo-go-services")) el("btn-topo-go-services").textContent = t("topo.open_services");
-    if (el("btn-zoom-fit")) el("btn-zoom-fit").textContent = t("topo.fit");
-    if (el("btn-toggle-grid")) el("btn-toggle-grid").textContent = t("topo.grid");
-    if (el("btn-toggle-live")) el("btn-toggle-live").textContent = t("topo.live");
-    if (el("topo-connect-hint")) el("topo-connect-hint").textContent = t("topo.connect_hint");
+    if (el("btn-topo-connect")) el("btn-topo-connect").textContent = t("Connect");
+    if (el("btn-topo-auto-layout")) el("btn-topo-auto-layout").textContent = t("Auto Layout");
+    if (el("btn-topo-go-hosts")) el("btn-topo-go-hosts").textContent = t("Configure Host →");
+    if (el("btn-topo-go-services")) el("btn-topo-go-services").textContent = t("Manage Services →");
+    if (el("btn-zoom-fit")) el("btn-zoom-fit").textContent = t("Fit");
+    if (el("btn-toggle-grid")) el("btn-toggle-grid").textContent = t("Grid");
+    if (el("btn-toggle-live")) el("btn-toggle-live").textContent = t("Live");
+    if (el("topo-connect-hint")) el("topo-connect-hint").textContent = t("Click source host, then click target host to create a mesh link (Esc to cancel)");
   }
 
   function screenToWorld(clientX, clientY) {
@@ -295,7 +295,7 @@ export function createTopologyView({ api, store, navigate }) {
     }
     const sorted = [...svcs].sort();
     sel.innerHTML =
-      `<option value="">${esc(t("topo.trace_off"))}</option>` +
+      `<option value="">${esc(t("Trace Service: Off"))}</option>` +
       sorted.map((s) => `<option value="${esc(s)}" ${state.tracedService === s ? "selected" : ""}>Trace: ${esc(s)}</option>`).join("");
   }
 
@@ -580,15 +580,15 @@ export function createTopologyView({ api, store, navigate }) {
       box.innerHTML = `
         <div class="inspector-empty">
           <h3>Mesh Topology</h3>
-          <p class="muted-sm">${esc(t("topo.empty_inspector"))}</p>
+          <p class="muted-sm">${esc(t("Select a host or mesh link on the canvas to inspect its connections. Use Hosts & Services tabs for detailed configuration."))}</p>
           <div class="inspector-stats">
             <div><strong>${nodeCnt}</strong><span>Hosts</span></div>
             <div><strong>${linkCnt}</strong><span>Links</span></div>
             <div><strong>${svcCnt}</strong><span>Services</span></div>
           </div>
           <div class="btn-row" style="justify-content:center;margin-top:14px;">
-            <button type="button" id="ins-go-hosts" class="btn sm">${esc(t("topo.open_host"))}</button>
-            <button type="button" id="ins-go-svcs" class="btn sm primary">${esc(t("topo.open_services"))}</button>
+            <button type="button" id="ins-go-hosts" class="btn sm">${esc(t("Configure Host →"))}</button>
+            <button type="button" id="ins-go-svcs" class="btn sm primary">${esc(t("Manage Services →"))}</button>
           </div>
         </div>`;
       el("ins-go-hosts")?.addEventListener("click", () => navigate("hosts"));
@@ -614,11 +614,11 @@ export function createTopologyView({ api, store, navigate }) {
             <h3>${esc(tag)}</h3>
             <span class="pill ${live?.online ? "ok" : live ? "err" : "warn"}">${live ? (live.online ? "ONLINE" : "OFFLINE") : "DRAFT"}</span>
           </div>
-          <button type="button" id="ins-edit-host" class="btn sm primary">${esc(t("topo.open_host"))}</button>
+          <button type="button" id="ins-edit-host" class="btn sm primary">${esc(t("Configure Host →"))}</button>
         </div>
         <div class="inspector-body">
           <div class="inspector-sec">
-            <div class="inspector-sec-head"><span>${esc(t("topo.node_summary"))}</span></div>
+            <div class="inspector-sec-head"><span>${esc(t("Host Summary"))}</span></div>
             <div class="tag-list" style="margin-bottom:8px;">
               ${["ingress", "relay", "egress", "maintainer"].filter((r) => node.roles?.[r]).map((r) => `<span class="role-chip ${r}">${r}</span>`).join("") || '<span class="muted-sm">No roles</span>'}
             </div>
@@ -644,7 +644,7 @@ export function createTopologyView({ api, store, navigate }) {
           <div class="inspector-sec">
             <div class="inspector-sec-head">
               <span>Services (${svcs.length})</span>
-              <button type="button" id="ins-edit-svcs" class="btn sm">${esc(t("topo.open_services"))}</button>
+              <button type="button" id="ins-edit-svcs" class="btn sm">${esc(t("Manage Services →"))}</button>
             </div>
             <div class="tag-list">
               ${svcs.map((s) => `<button type="button" class="acl-chip" data-ins-trace="${esc(s)}">${esc(s)}</button>`).join("") || '<span class="muted-sm">None</span>'}
@@ -694,10 +694,10 @@ export function createTopologyView({ api, store, navigate }) {
     box.innerHTML = `
       <div class="inspector-head">
         <div>
-          <h3>${esc(t("topo.link_title"))}</h3>
+          <h3>${esc(t("Mesh Link"))}</h3>
           <div class="muted-sm"><code>${esc(link.from)}</code> → <code>${esc(link.to)}</code></div>
         </div>
-        <button type="button" id="lk-del" class="btn sm danger">${esc(t("topo.delete_link"))}</button>
+        <button type="button" id="lk-del" class="btn sm danger">${esc(t("Delete Link"))}</button>
       </div>
       <div class="inspector-body">
         <div class="inspector-sec">
@@ -718,7 +718,7 @@ export function createTopologyView({ api, store, navigate }) {
               : `<label style="margin-top:6px;"><span>Expected Client IP/CIDR (optional)</span><input id="lk-exp-ip" value="${esc(link.expected_client_addr || "")}" placeholder="203.0.113.5" /></label>`
           }
           <div class="btn-row" style="margin-top:8px;">
-            <button type="button" id="lk-swap" class="btn sm">${esc(t("topo.reverse_dir"))}</button>
+            <button type="button" id="lk-swap" class="btn sm">${esc(t("Reverse Direction"))}</button>
           </div>
         </div>
 

@@ -6,7 +6,9 @@
   "scripts": {
     "build": "node build.mjs",
     "dev:control": "vite control",
-    "dev:challenge": "vite challenge"
+    "dev:challenge": "vite challenge",
+    "i18n:extract": "node scripts/i18n-extract.mjs",
+    "i18n:check": "node scripts/i18n-check.mjs"
   },
   "devDependencies": {
     "vite": "^6.0.0"

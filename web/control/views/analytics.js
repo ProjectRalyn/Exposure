@@ -37,17 +37,17 @@ function renderPaginationBar(prefix, { total, offset, limit }) {
   const atEnd = off + lim >= tot;
   return `
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px;">
-      <div class="muted-sm">${esc(t("logs.page.showing", { start, end, total: tot }))}</div>
+      <div class="muted-sm">${esc(t("Showing {start}–{end} of {total}", { start, end, total: tot }))}</div>
       <div class="btn-row">
         <label style="display:flex;align-items:center;gap:6px;">
-          <span class="muted-sm">${esc(t("logs.page.per_page"))}</span>
+          <span class="muted-sm">${esc(t("Per page"))}</span>
           <select id="${prefix}-pg-limit" class="select-sm">
             ${[25, 50, 100].map((n) => `<option value="${n}" ${lim === n ? "selected" : ""}>${n}</option>`).join("")}
           </select>
         </label>
         <button type="button" id="${prefix}-pg-first" class="btn sm" ${atStart ? "disabled" : ""}>&laquo;</button>
         <button type="button" id="${prefix}-pg-prev" class="btn sm" ${atStart ? "disabled" : ""}>&lsaquo;</button>
-        <span class="muted-sm">${esc(t("logs.page.of", { page, pages: totalPages }))}</span>
+        <span class="muted-sm">${esc(t("Page {page} / {pages}", { page, pages: totalPages }))}</span>
         <button type="button" id="${prefix}-pg-next" class="btn sm" ${atEnd ? "disabled" : ""}>&rsaquo;</button>
         <button type="button" id="${prefix}-pg-last" class="btn sm" ${atEnd ? "disabled" : ""}>&raquo;</button>
       </div>
@@ -180,14 +180,14 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
         <label class="filter-inline">
           <span>Host</span>
           <select id="obs-node-filter">
-            <option value="all">${esc(t("ana.all_nodes"))} (${nodes.length})</option>
+            <option value="all">${esc(t("All Hosts"))} (${nodes.length})</option>
             ${nodes.map((n) => `<option value="${esc(n)}" ${obsNode === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
           </select>
         </label>
         <label class="filter-inline">
           <span>Service</span>
           <select id="obs-svc-filter">
-            <option value="all">${esc(t("ana.all_services"))} (${svcs.length})</option>
+            <option value="all">${esc(t("All Services"))} (${svcs.length})</option>
             ${svcs.map((s) => `<option value="${esc(s)}" ${obsSvc === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
           </select>
         </label>
@@ -232,8 +232,8 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
 
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("ana.svc_latency_title"))}</h3>
-          <span class="muted-sm">${esc(t("ana.svc_latency_sub"))}</span>
+          <h3>${esc(t("Service Latency & Performance (p50 / p95 / p99)"))}</h3>
+          <span class="muted-sm">${esc(t("Click any service to filter analytics or inspect its URL logs"))}</span>
         </div>
         <div class="table-scroll">
           <table class="table">
@@ -267,8 +267,8 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           <h3>Client Fingerprints (Devices · Browsers · OS)</h3>
           <div class="btn-row">
             <span id="obs-fp-verified-badge" class="muted-sm"></span>
-            <button type="button" id="btn-open-access-logs" class="btn sm">${esc(t("logging.tab.access"))} →</button>
-            <button type="button" id="btn-open-fp-explorer" class="btn sm">${esc(t("ana.fp_explorer"))}</button>
+            <button type="button" id="btn-open-access-logs" class="btn sm">${esc(t("Access Logs"))} →</button>
+            <button type="button" id="btn-open-fp-explorer" class="btn sm">${esc(t("Open in Logging Workspace →"))}</button>
           </div>
         </div>
         <div id="obs-fp-breakdown" class="dashboard-grid-3" style="margin-bottom:0;"></div>
@@ -479,11 +479,11 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
   function renderLoggingSubtabsBar() {
     const countOf = (d) => (d ? Number(d.total_matched ?? (d.items || []).length ?? 0) : null);
     const tabs = [
-      ["access", t("logging.tab.access"), countOf(logData)],
-      ["evilpot", t("logging.tab.evilpot"), countOf(banData)],
-      ["visitors", t("logging.tab.visitors"), countOf(fpData)],
-      ["alerts", t("logging.tab.alerts"), countOf(alertData)],
-      ["audit", t("logging.tab.audit"), countOf(auditData)],
+      ["access", t("Access Logs"), countOf(logData)],
+      ["evilpot", t("Evilpot & Bans"), countOf(banData)],
+      ["visitors", t("Visitors & Fingerprints"), countOf(fpData)],
+      ["alerts", t("Alerts"), countOf(alertData)],
+      ["audit", t("Audit"), countOf(auditData)],
     ];
     return `
       <div class="subtabs-bar">
@@ -540,21 +540,21 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
     root.innerHTML = `
       ${renderLoggingSubtabsBar()}
       <div class="kpi-grid">
-        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.requests"))}</div><div class="kpi-val">${formatCompact(sum.total_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.total_events || items.length)} events · ${formatCompact(sum.unique_ips || 0)} unique IPs</div></div>
-        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.blocked"))}</div><div class="kpi-val">${formatCompact(sum.blocked_requests || 0)}</div><div class="kpi-sub">cache hits: ${formatCompact(sum.cache_hits || 0)} · folded: ${formatCompact(sum.folded_requests || 0)}</div></div>
-        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.errors"))}</div><div class="kpi-val">${formatCompact(sum.error_5xx_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.unique_paths || 0)} unique URLs</div></div>
-        <div class="kpi"><div class="kpi-label">${esc(t("logs.kpi.dos_shield"))}</div><div class="kpi-val">${formatCompact(prot.folded_records || 0)} / ${formatCompact(prot.dropped_records || 0)}</div><div class="kpi-sub">folded / dropped · ${formatCompact(prot.warn_suppressed || 0)} warns muted</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Total Requests"))}</div><div class="kpi-val">${formatCompact(sum.total_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.total_events || items.length)} events · ${formatCompact(sum.unique_ips || 0)} unique IPs</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Blocked / Mitigated"))}</div><div class="kpi-val">${formatCompact(sum.blocked_requests || 0)}</div><div class="kpi-sub">cache hits: ${formatCompact(sum.cache_hits || 0)} · folded: ${formatCompact(sum.folded_requests || 0)}</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("5xx Errors"))}</div><div class="kpi-val">${formatCompact(sum.error_5xx_requests || 0)}</div><div class="kpi-sub">${formatCompact(sum.unique_paths || 0)} unique URLs</div></div>
+        <div class="kpi"><div class="kpi-label">${esc(t("Log DoS Shield"))}</div><div class="kpi-val">${formatCompact(prot.folded_records || 0)} / ${formatCompact(prot.dropped_records || 0)}</div><div class="kpi-sub">folded / dropped · ${formatCompact(prot.warn_suppressed || 0)} warns muted</div></div>
       </div>
 
       <div class="panel">
         <div class="fp-search-bar">
-          <label><span>URL / Search</span><input id="log-search-q" type="search" value="${esc(logFilters.q)}" placeholder="${esc(t("logs.search_ph"))}" /></label>
-          <label><span>IP / HMAC</span><input id="log-search-ip" type="search" value="${esc(logFilters.ip)}" placeholder="${esc(t("logs.ip_ph"))}" /></label>
-          <label><span>Host</span><input id="log-search-host" type="search" value="${esc(logFilters.host)}" placeholder="${esc(t("logs.host_ph"))}" /></label>
+          <label><span>URL / Search</span><input id="log-search-q" type="search" value="${esc(logFilters.q)}" placeholder="${esc(t("Path, ?query, host, country, ray_id, UA, WAF…"))}" /></label>
+          <label><span>IP / HMAC</span><input id="log-search-ip" type="search" value="${esc(logFilters.ip)}" placeholder="${esc(t("203.0.113.5 or HMAC"))}" /></label>
+          <label><span>Host</span><input id="log-search-host" type="search" value="${esc(logFilters.host)}" placeholder="${esc(t("example.com"))}" /></label>
           <div class="btn-row">
-            <button type="button" id="btn-log-search" class="btn primary">${esc(t("common.search"))}</button>
-            <button type="button" id="btn-log-clear" class="btn ghost">${esc(t("common.reset"))}</button>
-            <button type="button" id="btn-log-export" class="btn sm">${esc(t("logging.export_json"))}</button>
+            <button type="button" id="btn-log-search" class="btn primary">${esc(t("Search…"))}</button>
+            <button type="button" id="btn-log-clear" class="btn ghost">${esc(t("Reset"))}</button>
+            <button type="button" id="btn-log-export" class="btn sm">${esc(t("Export JSON"))}</button>
           </div>
         </div>
         <div class="fp-filter-row">
@@ -575,15 +575,15 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
               <option value="egress" ${logFilters.role === "egress" ? "selected" : ""}>egress</option>
             </select>
             <select id="log-node-filter" class="select-sm">
-              <option value="all">${esc(t("ana.all_nodes"))}</option>
+              <option value="all">${esc(t("All Hosts"))}</option>
               ${nodes.map((n) => `<option value="${esc(n)}" ${logFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
             </select>
             <select id="log-svc-filter" class="select-sm">
-              <option value="all">${esc(t("ana.all_services"))}</option>
+              <option value="all">${esc(t("All Services"))}</option>
               ${svcs.map((s) => `<option value="${esc(s)}" ${logFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
             </select>
             <select id="log-country-filter" class="select-sm">
-              <option value="all">${esc(t("logs.all_countries"))}</option>
+              <option value="all">${esc(t("All Countries"))}</option>
               ${countries.map((c) => `<option value="${esc(c)}" ${logFilters.country === c ? "selected" : ""}>${esc(c)}</option>`).join("")}
             </select>
           </div>
@@ -593,7 +593,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
       ${
         topPaths.length
           ? `<div class="panel">
-              <div class="panel-header"><h3>${esc(t("logs.top_urls"))}</h3><span class="muted-sm">Click a path to filter</span></div>
+              <div class="panel-header"><h3>${esc(t("Top Requested URLs / Paths"))}</h3><span class="muted-sm">Click a path to filter</span></div>
               <div class="table-scroll">
                 <table class="table">
                   <thead><tr><th>Host</th><th>Path</th><th>Hits</th><th>Blocked</th><th>5xx</th></tr></thead>
@@ -619,21 +619,21 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
 
       <div class="panel">
         <div class="panel-header">
-          <h3>${esc(t("logs.explorer_title"))} (${totalMatched})</h3>
+          <h3>${esc(t("HTTP Access & URL Logs"))} (${totalMatched})</h3>
           <span class="muted-sm">Query strings redact secrets · Click row for full detail &amp; visitor correlation</span>
         </div>
         <div class="table-scroll">
           <table class="table">
             <thead>
               <tr>
-                <th>${esc(t("logs.col.time"))}</th>
-                <th>${esc(t("logs.col.method"))}</th>
-                <th>${esc(t("logs.col.status"))}</th>
-                <th>${esc(t("logs.col.url"))}</th>
-                <th>${esc(t("logs.col.action"))}</th>
-                <th>${esc(t("logs.col.client"))}</th>
-                <th>${esc(t("logs.col.route"))}</th>
-                <th>${esc(t("logs.col.perf"))}</th>
+                <th>${esc(t("Time"))}</th>
+                <th>${esc(t("Method"))}</th>
+                <th>${esc(t("Status"))}</th>
+                <th>${esc(t("Host & URL"))}</th>
+                <th>${esc(t("Action / Security"))}</th>
+                <th>${esc(t("Client IP / HMAC"))}</th>
+                <th>${esc(t("Node / Service"))}</th>
+                <th>${esc(t("Latency / Size"))}</th>
               </tr>
             </thead>
             <tbody>
@@ -649,6 +649,23 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                     // earliest hop when the ingress record is missing).
                     const enteredMs = Number(r.ray_entered_ms) || Number(r.timestamp_ms) || 0;
                     const tsSec = Math.floor(enteredMs / 1000);
+                    const isIngressHop = String(r.role || "").toLowerCase() === "ingress";
+                    // `i` = ingress end-to-end (client-observed round trip), `e` = egress leg.
+                    const ingressMs = isIngressHop ? Number(r.latency_ms) || 0 : null;
+                    const egressMs = isIngressHop
+                      ? r.egress && r.egress.latency_ms != null
+                        ? Number(r.egress.latency_ms) || 0
+                        : null
+                      : Number(r.latency_ms) || 0;
+                    const roundtripMs = ingressMs ?? egressMs ?? 0;
+                    const hopSplit = [
+                      ingressMs != null ? `i: ${ingressMs.toFixed(1)} ms` : "",
+                      egressMs != null ? `e: ${egressMs.toFixed(1)} ms` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ");
+                    const hops = Number(r.hops) || 1;
+                    const hopChain = [r.node_tag, r.egress?.node_tag].filter(Boolean).join(" → ");
                     return `
                   <tr class="fp-table-row" data-log-idx="${idx}">
                     <td><div>${esc(formatDateTime(tsSec))}</div><div class="muted-sm" title="${esc(r.ray_id || "")}"><code>${esc(r.ray_id ? (r.ray_id.length > 20 ? `${r.ray_id.slice(0, 16)}…` : r.ray_id) : "-")}</code></div></td>
@@ -668,17 +685,16 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                     <td><div>${esc(r.raw_ip || "-")} ${r.client_country ? `<span class="pill info">${esc(r.client_country)}</span>` : ""}</div><div class="muted-sm"><span class="fp-code">${esc((r.ip_hmac || "").slice(0, 14))}</span></div></td>
                     <td>
                       <div><code>${esc(r.service_tag)}</code></div>
-                      <div class="muted-sm">${esc(r.role)} · ${esc(r.node_tag)}${Number(r.hops) > 1 ? ` <span class="pill">${Number(r.hops)} hops</span>` : ""}</div>
-                      ${r.egress ? `<div class="muted-sm">→ egress · ${esc(r.egress.node_tag || "-")}</div>` : ""}
+                      <div class="muted-sm"><code>${esc(hopChain)}</code>${hops > 1 ? ` <span class="pill">${hops} hops</span>` : ""}</div>
                     </td>
                     <td>
-                      <div>${(Number(r.latency_ms) || 0).toFixed(1)} ms</div>
-                      ${r.egress && Number(r.egress.latency_ms) ? `<div class="muted-sm">egress ${(Number(r.egress.latency_ms) || 0).toFixed(1)} ms</div>` : ""}
+                      <div>${roundtripMs.toFixed(1)} ms</div>
+                      <div class="muted-sm">${esc(hopSplit)}</div>
                       <div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div>
                     </td>
                   </tr>`;
                   })
-                  .join("") || `<tr><td colspan="8" class="muted">${esc(t("logs.empty"))}</td></tr>`
+                  .join("") || `<tr><td colspan="8" class="muted">${esc(t("No access logs match current filters."))}</td></tr>`
               }
             </tbody>
           </table>
@@ -750,7 +766,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
         const modalActions = [];
         if (ipKey) {
           modalActions.push({
-            label: t("logging.cross.filter_ip"),
+            label: t("Filter this IP"),
             cls: "ghost",
             onClick: () => {
               logFilters.ip = ipKey;
@@ -759,7 +775,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             },
           });
           modalActions.push({
-            label: t("logging.cross.view_visitor"),
+            label: t("Inspect Visitor & Fingerprints →"),
             cls: "ghost",
             onClick: () => {
               loggingSubTab = "visitors";
@@ -770,7 +786,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
         }
         if (r.ray_id) {
           modalActions.push({
-            label: t("logging.cross.filter_ray"),
+            label: t("Filter Ray ID"),
             cls: "ghost",
             onClick: () => {
               logFilters.q = r.ray_id;
@@ -781,7 +797,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
         }
         if (r.path) {
           modalActions.push({
-            label: t("logging.cross.filter_path"),
+            label: t("Filter this Path"),
             cls: "ghost",
             onClick: () => {
               logFilters.q = r.path;
@@ -790,7 +806,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             },
           });
         }
-        modalActions.push({ label: t("common.close"), cls: "primary" });
+        modalActions.push({ label: t("Close"), cls: "primary" });
 
         openModal({
           title: `${r.method || "HTTP"} ${r.path || "/"} (${r.status || 0})`,
@@ -869,9 +885,9 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           <label><span>IP / Prefix / HMAC / WebRTC</span><input id="fp-search-ip" type="search" value="${esc(fpFilters.ip)}" placeholder="203.0.113.5" /></label>
           <label><span>Browser FP / Canvas</span><input id="fp-search-fp" type="search" value="${esc(fpFilters.fp)}" placeholder="fp_hash" /></label>
           <div class="btn-row">
-            <button type="button" id="btn-fp-search" class="btn primary">${esc(t("common.search"))}</button>
-            <button type="button" id="btn-fp-clear" class="btn ghost">${esc(t("common.reset"))}</button>
-            <button type="button" id="btn-fp-export" class="btn sm">${esc(t("logging.export_json"))}</button>
+            <button type="button" id="btn-fp-search" class="btn primary">${esc(t("Search…"))}</button>
+            <button type="button" id="btn-fp-clear" class="btn ghost">${esc(t("Reset"))}</button>
+            <button type="button" id="btn-fp-export" class="btn sm">${esc(t("Export JSON"))}</button>
           </div>
         </div>
         <div class="fp-filter-row">
@@ -883,15 +899,15 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           </div>
           <div class="btn-row">
             <select id="fp-node-filter" class="select-sm">
-              <option value="all">${esc(t("ana.all_nodes"))}</option>
+              <option value="all">${esc(t("All Hosts"))}</option>
               ${nodes.map((n) => `<option value="${esc(n)}" ${fpFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
             </select>
             <select id="fp-svc-filter" class="select-sm">
-              <option value="all">${esc(t("ana.all_services"))}</option>
+              <option value="all">${esc(t("All Services"))}</option>
               ${svcs.map((s) => `<option value="${esc(s)}" ${fpFilters.service === s ? "selected" : ""}>${esc(s)}</option>`).join("")}
             </select>
             <select id="fp-country-filter" class="select-sm">
-              <option value="all">${esc(t("logs.all_countries"))}</option>
+              <option value="all">${esc(t("All Countries"))}</option>
               ${countries.map((c) => `<option value="${esc(c)}" ${fpFilters.country === c ? "selected" : ""}>${esc(c)}</option>`).join("")}
             </select>
           </div>
@@ -924,16 +940,16 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                     }
                     const jsSum = jsParts.length ? jsParts.join(" · ") : "-";
                     const riskCls = obs.is_headless || obs.is_bot || obs.suspicion_score >= 60 ? "err" : obs.suspicion_score >= 30 ? "warn" : "ok";
-                    const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `${t("fp.server_score")} ${Number(obs.suspicion_score) || 0}`;
+                    const riskLbl = obs.is_headless ? "HEADLESS" : obs.is_bot ? "BOT" : `${t("Server Score")} ${Number(obs.suspicion_score) || 0}`;
                     const abuseBadge = obs.abuse_score != null
                       ? `<span class="pill ${obs.abuse_score >= 75 ? "err" : obs.abuse_score >= 25 ? "warn" : "ok"}">Abuse ${Number(obs.abuse_score)}${obs.abuse_country ? ` · ${esc(obs.abuse_country)}` : ""}${obs.abuse_is_tor ? " · TOR" : ""}</span>`
                       : "";
                     const webrtcBadge = js?.webrtc_ip_mismatch
-                      ? `<span class="pill err">${esc(t("fp.webrtc.leak_badge"))}</span>`
+                      ? `<span class="pill err">${esc(t("WebRTC IP Leak"))}</span>`
                       : js?.webrtc_local_ips?.length
-                        ? `<span class="pill warn">${esc(t("fp.webrtc.lan_badge"))}</span>`
+                        ? `<span class="pill warn">${esc(t("LAN IP Exposed"))}</span>`
                         : js?.webrtc_mdns
-                          ? `<span class="pill info">${esc(t("fp.webrtc.mdns_badge"))}</span>`
+                          ? `<span class="pill info">${esc(t("mDNS Protected"))}</span>`
                           : "";
                     const ja3Line = obs.tls_ja3
                       ? `<div class="muted-sm">JA3: <span class="fp-code">${esc(obs.tls_ja3.slice(0, 12))}</span>${obs.tls_grease ? " · GREASE" : ""}</div>`
@@ -953,7 +969,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                     <td>${esc(formatDateTime(obs.last_seen_ts))}</td>
                   </tr>`;
                   })
-                  .join("") || `<tr><td colspan="8" class="muted">No visitor fingerprints match.</td></tr>`
+                  .join("") || `<tr><td colspan="8" class="muted">${esc(t("No visitor fingerprints match."))}</td></tr>`
               }
             </tbody>
           </table>
@@ -1005,12 +1021,12 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           const pubList = (js.webrtc_public_ips || []).map((ip) => `<code>${esc(ip)}</code>`).join(", ") || "-";
           const locList = (js.webrtc_local_ips || []).map((ip) => `<code>${esc(ip)}</code>`).join(", ") || "-";
           const verdictPill = js.webrtc_ip_mismatch
-            ? `<span class="pill err">${esc(t("fp.webrtc.leak_badge"))}</span>`
+            ? `<span class="pill err">${esc(t("WebRTC IP Leak"))}</span>`
             : js.webrtc_local_ips?.length
-              ? `<span class="pill warn">${esc(t("fp.webrtc.lan_badge"))}</span>`
-              : `<span class="pill ok">${esc(t("fp.webrtc.clean"))}</span>`;
+              ? `<span class="pill warn">${esc(t("LAN IP Exposed"))}</span>`
+              : `<span class="pill ok">${esc(t("No WebRTC IP leak detected"))}</span>`;
           webrtcHtml = `
-            <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--accent);">${esc(t("fp.webrtc.title"))}</div>
+            <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--accent);">${esc(t("WebRTC Leak Detection"))}</div>
             <div class="fp-detail-grid">
               <div class="fp-kv"><div class="fp-kv-lbl">Verdict &amp; Status</div><div class="fp-kv-val">${verdictPill} <span class="muted-sm">(${esc(js.webrtc_status || "-")}${js.webrtc_mdns ? " · mDNS" : ""})</span></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Public / Local ICE IPs</div><div class="fp-kv-val">pub: ${pubList}<br/>lan: ${locList}</div></div>
@@ -1021,7 +1037,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
         const modalActions = [];
         if (ipKey) {
           modalActions.push({
-            label: t("logging.cross.view_logs"),
+            label: t("View Access Logs for this IP →"),
             cls: "ghost",
             onClick: () => {
               loggingSubTab = "access";
@@ -1030,18 +1046,18 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             },
           });
         }
-        modalActions.push({ label: t("common.close"), cls: "primary" });
+        modalActions.push({ label: t("Close"), cls: "primary" });
 
         openModal({
           title: `Fingerprint — ${obs.fp_hash}`,
           bodyHtml: `
-            <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--accent);">${esc(t("fp.sec.server"))}</div>
+            <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--accent);">${esc(t("Server-Side Unforgeable Signals (Primary Trust Score)"))}</div>
             <div class="fp-detail-grid">
               <div class="fp-kv"><div class="fp-kv-lbl">IP / GeoIP / HMAC</div><div class="fp-kv-val">${esc(obs.client_ip || obs.ip_prefix || "-")} ${obs.geo_country ? `<span class="pill info">${esc(obs.geo_country)}${obs.geo_continent ? ` · ${esc(obs.geo_continent)}` : ""}</span>` : ""}<br/><code>${esc(obs.ip_hmac)}</code></div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Route / Host</div><div class="fp-kv-val"><code>${esc(obs.service_tag)}</code> @ ${esc(obs.node_tag)}<br/><span class="muted-sm">${esc(obs.host || "-")}</span></div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.server_score"))}</div><div class="fp-kv-val"><strong>${Number(obs.suspicion_score) || 0}/100</strong> · bot:${obs.is_bot ? "yes" : "no"} · headless:${obs.is_headless ? "yes" : "no"}</div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.tls_ja3"))}</div><div class="fp-kv-val"><code>${esc(obs.tls_ja3 || "-")}</code><br/><span class="muted-sm">ciphers: ${Number(obs.tls_cipher_count) || 0} · GREASE: ${obs.tls_grease ? "yes" : "no"}</span></div></div>
-              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("fp.abuse_intel"))}</div><div class="fp-kv-val">${abuseHtml}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("Server Score"))}</div><div class="fp-kv-val"><strong>${Number(obs.suspicion_score) || 0}/100</strong> · bot:${obs.is_bot ? "yes" : "no"} · headless:${obs.is_headless ? "yes" : "no"}</div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("TLS JA3 / GREASE"))}</div><div class="fp-kv-val"><code>${esc(obs.tls_ja3 || "-")}</code><br/><span class="muted-sm">ciphers: ${Number(obs.tls_cipher_count) || 0} · GREASE: ${obs.tls_grease ? "yes" : "no"}</span></div></div>
+              <div class="fp-kv"><div class="fp-kv-lbl">${esc(t("AbuseIPDB Reputation"))}</div><div class="fp-kv-val">${abuseHtml}</div></div>
               <div class="fp-kv"><div class="fp-kv-lbl">Traffic</div><div class="fp-kv-val">${formatCompact(obs.request_count)} req · ${obs.challenge_count || 0} PoW · ${obs.rate_limited_count || 0} 429</div></div>
             </div>
             <div class="fp-ua-box" style="margin-top:8px;">${esc(obs.user_agent || "(empty)")}</div>
@@ -1049,14 +1065,14 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             ${
               js
                 ? `
-              <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--text-muted);">${esc(t("fp.sec.client"))}</div>
+              <div style="font-size:12px;font-weight:700;margin:12px 0 6px;color:var(--text-muted);">${esc(t("Client-Side Auxiliary BrowserLeaks Signals (Untrusted · Tamper Detection Only)"))}</div>
               <div class="fp-detail-grid">
                 <div class="fp-kv"><div class="fp-kv-lbl">Canvas / Audio / Fonts</div><div class="fp-kv-val">cv: <code>${esc(js.canvas_hash || "-")}</code> · au: <code>${esc(js.audio_hash || "-")}</code><br/>fonts: <code>${esc(js.fonts_hash || "-")}</code> (${Number(js.fonts_count) || 0} detected)</div></div>
                 <div class="fp-kv"><div class="fp-kv-lbl">WebGL GPU &amp; Extensions</div><div class="fp-kv-val">${esc(js.webgl || "-")}<br/><span class="muted-sm">vendor: ${esc(js.webgl_vendor || "-")} · ext: <code>${esc(js.webgl_ext_hash || "-")}</code> · maxTex: ${Number(js.webgl_max_tex) || 0}</span></div></div>
                 <div class="fp-kv"><div class="fp-kv-lbl">Screen &amp; Media Prefs</div><div class="fp-kv-val">${esc(js.screen || "-")} (avail ${esc(js.avail_screen || "-")}) · DPR ${esc(js.dpr || "1")}<br/><span class="muted-sm">${esc(js.media_prefs || "-")}</span></div></div>
                 <div class="fp-kv"><div class="fp-kv-lbl">Timezone &amp; Locale</div><div class="fp-kv-val">${esc(js.tz || "-")} (UTC offset ${Number(js.tz_offset) || 0}m)<br/><span class="muted-sm">intl: ${esc(js.intl_locale || "-")} · langs: ${esc(js.languages || js.lang || "-")}</span></div></div>
                 <div class="fp-kv"><div class="fp-kv-lbl">Hardware &amp; UA-CH</div><div class="fp-kv-val">${Number(js.cores) || 0} cores · ${Number(js.mem) || 0} GB · touch:${Number(js.touch) || 0} · plugins:${Number(js.plugins_count) || 0} · voices:${Number(js.speech_voices) || 0}<br/><span class="muted-sm">${esc(js.ua_brands || js.platform || "-")}</span></div></div>
-                <div class="fp-kv"><div class="fp-kv-lbl">Storage &amp; APIs / ${esc(t("fp.tamper_flags"))}</div><div class="fp-kv-val"><code>${esc(js.storage_flags || "-")}</code><br/><div style="margin-top:4px;">${tamperHtml}</div></div></div>
+                <div class="fp-kv"><div class="fp-kv-lbl">Storage &amp; APIs / ${esc(t("Automation & Tamper Flags"))}</div><div class="fp-kv-val"><code>${esc(js.storage_flags || "-")}</code><br/><div style="margin-top:4px;">${tamperHtml}</div></div></div>
               </div>`
                 : ""
             }`,
@@ -1181,13 +1197,13 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           </label>
           <label><span>Host</span>
             <select id="ban-node-filter">
-              <option value="all">${esc(t("ana.all_nodes"))}</option>
+              <option value="all">${esc(t("All Hosts"))}</option>
               ${nodes.map((n) => `<option value="${n}" ${banFilters.node === n ? "selected" : ""}>${esc(n)}</option>`).join("")}
             </select>
           </label>
           <div class="btn-row">
-            <button type="button" id="btn-ban-search" class="btn primary">${esc(t("common.search"))}</button>
-            <button type="button" id="btn-ban-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+            <button type="button" id="btn-ban-search" class="btn primary">${esc(t("Search…"))}</button>
+            <button type="button" id="btn-ban-clear" class="btn ghost">${esc(t("Reset"))}</button>
           </div>
         </div>
       </div>
@@ -1230,7 +1246,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                   </td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="10" class="muted">No ban records in this window</td></tr>`
+                  .join("") || `<tr><td colspan="10" class="muted">${esc(t("No ban records in this window"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -1260,7 +1276,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                   <td class="muted-sm">${esc(formatDateTime(s.last_seen_unix))}</td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="9" class="muted">No evilpot sessions in this window</td></tr>`
+                  .join("") || `<tr><td colspan="9" class="muted">${esc(t("No evilpot sessions in this window"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -1286,7 +1302,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                   <td>${esc(e.detail || "-")}</td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="6" class="muted">No evilpot events in this window</td></tr>`
+                  .join("") || `<tr><td colspan="6" class="muted">${esc(t("No evilpot events in this window"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -1338,7 +1354,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           title: "Confirm Unban",
           bodyHtml: `<p>Lift the active <code>${esc(rec.kind)}</code> ban on <code>${esc(rec.target)}</code>?</p><p class="muted-sm">Node: ${esc(rec.node_tag)} · reason: ${esc(rec.reason || "-")}</p>`,
           actions: [
-            { label: t("common.cancel"), cls: "ghost" },
+            { label: t("Cancel"), cls: "ghost" },
             { label: "Unban", cls: "danger", onClick: () => submitUnban(rec.kind, rec.target, rec.node_tag) },
           ],
         });
@@ -1398,8 +1414,8 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             </select>
           </label>
           <div class="btn-row">
-            <button type="button" id="btn-alr-search" class="btn primary">${esc(t("common.search"))}</button>
-            <button type="button" id="btn-alr-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+            <button type="button" id="btn-alr-search" class="btn primary">${esc(t("Search…"))}</button>
+            <button type="button" id="btn-alr-clear" class="btn ghost">${esc(t("Reset"))}</button>
           </div>
         </div>
       </div>
@@ -1421,7 +1437,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                   <td>${esc(a.message)}</td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="4" class="muted">No alerts in this window</td></tr>`
+                  .join("") || `<tr><td colspan="4" class="muted">${esc(t("No alerts in this window"))}</td></tr>`
               }
             </tbody>
           </table>
@@ -1480,8 +1496,8 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
           <label><span>Actor</span><input id="aud-actor" value="${esc(auditFilters.actor)}" placeholder="admin" /></label>
           <label><span>Action</span><input id="aud-action" value="${esc(auditFilters.action)}" placeholder="config_apply…" /></label>
           <div class="btn-row">
-            <button type="button" id="btn-aud-search" class="btn primary">${esc(t("common.search"))}</button>
-            <button type="button" id="btn-aud-clear" class="btn ghost">${esc(t("common.reset"))}</button>
+            <button type="button" id="btn-aud-search" class="btn primary">${esc(t("Search…"))}</button>
+            <button type="button" id="btn-aud-clear" class="btn ghost">${esc(t("Reset"))}</button>
           </div>
         </div>
       </div>
@@ -1505,7 +1521,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                   <td>${esc(l.detail)}</td>
                 </tr>`
                   )
-                  .join("") || `<tr><td colspan="6" class="muted">No audit entries in this window</td></tr>`
+                  .join("") || `<tr><td colspan="6" class="muted">${esc(t("No audit entries in this window"))}</td></tr>`
               }
             </tbody>
           </table>

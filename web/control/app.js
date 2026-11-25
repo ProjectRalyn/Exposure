@@ -1,6 +1,6 @@
 // Exposure Control Plane — Redesigned Modular App Coordinator
 import { formatDateTime } from "./charts.js";
-import { applyStaticI18n, getLang, onLangChange, setLang, t } from "./i18n.js";
+import { applyI18n, getAvailableLangs, getLang, onLangChange, setLang, t } from "./i18n.js";
 import { createControlStore } from "./store.js";
 import { closeDrawer, closeModal, el, esc, initOverlayControls, openModal, showToast } from "./ui.js";
 import { createAnalyticsViews } from "./views/analytics.js";
@@ -55,7 +55,7 @@ async function api(path, opts = {}) {
   });
   if (resp.status === 401) {
     if (!skipLogoutOn401) resetToLogin();
-    throw new Error(t("auth.session_expired"));
+    throw new Error(t("Session expired"));
   }
   const text = await resp.text();
   let data = null;
@@ -143,14 +143,14 @@ function resetToLogin(opts = {}) {
 
 async function logout() {
   const btn = el("btn-logout");
-  if (btn) { btn.disabled = true; btn.textContent = t("auth.signing_out"); }
+  if (btn) { btn.disabled = true; btn.textContent = t("Signing Out…"); }
   try {
     await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", cache: "no-store" });
   } catch {} finally {
-    if (btn) { btn.disabled = false; btn.textContent = t("auth.signout"); }
+    if (btn) { btn.disabled = false; btn.textContent = t("Sign Out"); }
   }
   resetToLogin({ clearUrl: true });
-  showToast(t("auth.signed_out"));
+  showToast(t("Signed out safely"));
   el("login-pass")?.focus();
 }
 
@@ -161,8 +161,8 @@ function updateBootstrapBadge(bootTag) {
   card.innerHTML = `
     <span class="live-dot ${connected ? "online" : "offline"}"></span>
     <div class="bootstrap-card-text">
-      <div class="bootstrap-card-lbl">${esc(t("sidebar.bootstrap"))}</div>
-      <div class="bootstrap-card-val">${connected ? esc(bootTag) : esc(t("sidebar.disconnected"))}</div>
+      <div class="bootstrap-card-lbl">${esc(t("Bootstrap Link"))}</div>
+      <div class="bootstrap-card-val">${connected ? esc(bootTag) : esc(t("Disconnected"))}</div>
     </div>`;
 }
 
@@ -170,8 +170,8 @@ function updateTopbarTimestamp(iso) {
   const elTime = el("topbar-updated");
   if (!elTime) return;
   elTime.textContent = iso
-    ? t("topbar.updated_telemetry", { time: formatDateTime(iso) })
-    : t("topbar.updated_at", { time: formatDateTime(new Date().toISOString()) });
+    ? t("Telemetry: {time}", { time: formatDateTime(iso) })
+    : t("Updated {time}", { time: formatDateTime(new Date().toISOString()) });
 }
 
 /* ==================== GLOBAL DEPLOY BAR & VALIDATION STRIP ==================== */
@@ -197,8 +197,8 @@ function updateDeployBar() {
   if (pill) {
     pill.className = `pill ${store.dirty ? "warn" : "ok"}`;
     pill.textContent = store.dirty
-      ? t("deploy.pending", { count: Math.max(1, changes.length) })
-      : t("deploy.clean");
+      ? t("{count} pending change(s)", { count: Math.max(1, changes.length) })
+      : t("All changes deployed");
   }
   if (el("btn-global-undo")) el("btn-global-undo").disabled = store.undoStack.length === 0;
   if (el("btn-global-redo")) el("btn-global-redo").disabled = store.redoStack.length === 0;
@@ -253,8 +253,24 @@ function getRouteFromLocation() {
   return { tab: "overview" };
 }
 
+// Literal (not interpolated) so `pnpm i18n:extract` can discover the source strings.
+function tabTitle(tab) {
+  switch (tab) {
+    case "overview": return t("Overview");
+    case "analytics": return t("Analytics");
+    case "logging": return t("Logging");
+    case "hosts": return t("Hosts");
+    case "services": return t("Services");
+    case "domains": return t("Domains & DNS");
+    case "security": return t("Security");
+    case "topology": return t("Topology");
+    case "system": return t("System");
+    default: return t("Overview");
+  }
+}
+
 function updatePageTitle() {
-  const titleText = t(`nav.${appState.activeTab}`);
+  const titleText = tabTitle(appState.activeTab);
   if (el("page-title")) el("page-title").textContent = titleText;
   document.title = `${titleText} · Exposure Control`;
 }
@@ -343,8 +359,8 @@ async function handleValidate() {
     const res = await store.validate();
     showToast(
       res.valid
-        ? t("deploy.validated_ok", { paths: (res.paths || []).length })
-        : t("deploy.validated_err", { count: (res.errors || []).length }),
+        ? t("Configuration valid ({paths} service route(s) verified)", { paths: (res.paths || []).length })
+        : t("Validation failed: {count} error(s)", { count: (res.errors || []).length }),
       !res.valid
     );
     renderActiveTabOnly();
@@ -355,7 +371,7 @@ async function handleValidate() {
 
 async function handlePreflight() {
   try {
-    showToast(t("deploy.preflight_running"));
+    showToast(t("Running preflight connectivity checks across hosts…"));
     const res = await store.preflight();
     const rowsHtml = (res.reports || [])
       .map((rep) => {
@@ -376,10 +392,10 @@ async function handlePreflight() {
     openModal({
       title: res.all_ok ? "Preflight — All Passed" : "Preflight — Issues Found",
       bodyHtml: `<div class="table-scroll"><table class="table"><thead><tr><th>Host</th><th>Target</th><th>Result</th><th>Detail</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>`,
-      actions: [{ label: t("common.close"), cls: "primary" }],
+      actions: [{ label: t("Close"), cls: "primary" }],
     });
     showToast(
-      res.all_ok ? t("deploy.preflight_ok", { count: (res.reports || []).length }) : t("deploy.preflight_fail"),
+      res.all_ok ? t("Preflight passed on {count} host(s)", { count: (res.reports || []).length }) : t("Preflight found connectivity or port issues"),
       !res.all_ok
     );
   } catch (e) {
@@ -394,8 +410,8 @@ async function handleDeploy(push, syncDns = false) {
       const errs = res.push_errors || [];
       showToast(
         errs.length
-          ? t("deploy.pushed_partial", { count: res.pushed_count ?? 0, errors: errs.length })
-          : t("deploy.pushed_ok", { count: res.pushed_count ?? 0 }),
+          ? t("Deployed to {count} host(s) with {errors} push error(s)", { count: res.pushed_count ?? 0, errors: errs.length })
+          : t("Deployed & pushed to {count} host(s)", { count: res.pushed_count ?? 0 }),
         errs.length > 0
       );
       if (syncDns && res.dns_sync_error) {
@@ -404,7 +420,7 @@ async function handleDeploy(push, syncDns = false) {
         showToast(`DNS synced (${res.dns_sync_results.length} domain(s))`);
       }
     } else {
-      showToast(t("deploy.saved_draft"));
+      showToast(t("Draft saved to Control SQLite"));
     }
     renderActiveTabOnly();
   } catch (e) {
@@ -424,14 +440,14 @@ function openDiffModal() {
         </div>`
         )
         .join("")}</div>`
-    : `<p class="muted">${esc(t("deploy.no_changes"))}</p>`;
+    : `<p class="muted">${esc(t("No unsaved changes in draft."))}</p>`;
 
   openModal({
-    title: t("deploy.diff_title"),
+    title: t("Pending Draft Changes"),
     bodyHtml,
     actions: [
-      { label: t("common.close"), cls: "ghost" },
-      { label: t("deploy.push_all"), cls: "primary", onClick: () => handleDeploy(true, false) },
+      { label: t("Close"), cls: "ghost" },
+      { label: t("Deploy & Push"), cls: "primary", onClick: () => handleDeploy(true, false) },
     ],
   });
 }
@@ -458,16 +474,30 @@ document.querySelectorAll(".theme-btn").forEach((btn) => {
   btn.addEventListener("click", () => applyTheme(btn.dataset.themeVal));
 });
 
+// Language pickers are rendered from the locale files on disk, so adding a new
+// translation file is enough to expose it in both the login and topbar selectors.
+function renderLangSelectors() {
+  const langs = getAvailableLangs();
+  const current = getLang();
+  for (const id of ["sel-lang", "sel-lang-login"]) {
+    const select = el(id);
+    if (!select) continue;
+    const signature = langs.map((l) => l.code).join("|");
+    if (select.dataset.signature !== signature) {
+      select.innerHTML = langs
+        .map((l) => `<option value="${esc(l.code)}">${esc(l.name)}</option>`)
+        .join("");
+      select.dataset.signature = signature;
+    }
+    select.value = current;
+  }
+}
+
 function syncLanguageUI() {
   const lang = getLang();
   document.documentElement.lang = lang;
-  applyStaticI18n(document);
-  document.querySelectorAll(".lang-btn").forEach((b) => {
-    b.classList.toggle("active", b.dataset.lang === lang);
-  });
-  if (el("btn-login-lang")) {
-    el("btn-login-lang").textContent = lang === "zh-CN" ? "English" : "简体中文";
-  }
+  applyI18n(document);
+  renderLangSelectors();
   updatePageTitle();
   updateDeployBar();
   if (appState.authenticated) renderActiveTabOnly();
@@ -475,12 +505,34 @@ function syncLanguageUI() {
 
 onLangChange(syncLanguageUI);
 
-document.querySelectorAll(".lang-btn").forEach((btn) => {
-  btn.addEventListener("click", () => setLang(btn.dataset.lang));
-});
-el("btn-login-lang")?.addEventListener("click", () => {
-  setLang(getLang() === "zh-CN" ? "en" : "zh-CN");
-});
+for (const id of ["sel-lang", "sel-lang-login"]) {
+  el(id)?.addEventListener("change", (ev) => setLang(ev.target.value));
+}
+
+// Views replace innerHTML wholesale, so translated text must be re-applied after every
+// repaint. A debounced MutationObserver keeps this automatic: developers write plain
+// English and never annotate nodes. API-driven regions are excluded inside applyI18n().
+function observeI18nDom() {
+  if (typeof MutationObserver === "undefined") return;
+  const root = el("app-view") || document.body;
+  if (!root) return;
+  let queued = false;
+  const flush = () => {
+    queued = false;
+    applyI18n(root);
+  };
+  new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(flush);
+  }).observe(root, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["placeholder", "title", "aria-label", "alt"],
+  });
+}
+observeI18nDom();
 
 function startAutoRefresh() {
   stopAutoRefresh();
@@ -542,16 +594,16 @@ el("btn-pull-all")?.addEventListener("click", async () => {
   } catch (e) { showToast(e.message, true); }
 });
 
-el("btn-global-undo")?.addEventListener("click", () => { if (store.undo()) showToast(t("deploy.undo")); });
-el("btn-global-redo")?.addEventListener("click", () => { if (store.redo()) showToast(t("deploy.redo")); });
+el("btn-global-undo")?.addEventListener("click", () => { if (store.undo()) showToast(t("Undo")); });
+el("btn-global-redo")?.addEventListener("click", () => { if (store.redo()) showToast(t("Redo")); });
 el("btn-global-diff")?.addEventListener("click", openDiffModal);
 el("btn-global-discard")?.addEventListener("click", () => {
   openModal({
-    title: t("deploy.discard"),
-    bodyHtml: `<p>${esc(t("deploy.discard"))}?</p>`,
+    title: t("Discard Draft"),
+    bodyHtml: `<p>${esc(t("Discard Draft"))}?</p>`,
     actions: [
-      { label: t("common.cancel"), cls: "ghost" },
-      { label: t("common.confirm"), cls: "danger", onClick: () => { store.discardDraft(); showToast("Draft discarded"); } },
+      { label: t("Cancel"), cls: "ghost" },
+      { label: t("Confirm"), cls: "danger", onClick: () => { store.discardDraft(); showToast("Draft discarded"); } },
     ],
   });
 });
@@ -611,9 +663,9 @@ window.addEventListener("keydown", (ev) => {
     ev.preventDefault();
     if (store.dirty) handleDeploy(false, false);
   } else if (!inInput && (ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z" && !ev.shiftKey) {
-    if (store.undo()) { ev.preventDefault(); showToast(t("deploy.undo")); }
+    if (store.undo()) { ev.preventDefault(); showToast(t("Undo")); }
   } else if (!inInput && (ev.ctrlKey || ev.metaKey) && (ev.key.toLowerCase() === "y" || (ev.shiftKey && ev.key.toLowerCase() === "z"))) {
-    if (store.redo()) { ev.preventDefault(); showToast(t("deploy.redo")); }
+    if (store.redo()) { ev.preventDefault(); showToast(t("Redo")); }
   }
 });
 

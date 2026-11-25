@@ -1,1100 +1,95 @@
-// Bilingual i18n engine for Exposure Control (zh-CN / en)
+// English-source i18n engine for Exposure Control.
+//
+// Authoring rule
+// --------------
+// Write plain English. Static markup needs no attributes: `applyI18n()` translates DOM
+// text nodes plus the placeholder/title/aria-label/alt attributes at runtime by exact
+// matching against the active locale dictionary (English text -> translation).
+// Inside JS strings use `t("English text")`; `{name}` placeholders are supported.
+//
+// Locale files live in ./i18n/locales/<code>.json shaped as { "English source": "译文" }
+// and are synced by `pnpm i18n:extract` / validated by `pnpm i18n:check`.
+//
+// API-driven values are exempt from translation: the walker skips code/pre/textarea/SVG,
+// table bodies and any subtree marked with `data-i18n-skip`.
 
 const LANG_STORAGE_KEY = "exposure_panel_lang";
+const SOURCE_LANG = "en";
 
-const MESSAGES = {
-  en: {
-    // Brand & Auth
-    "brand.tag": "EXPOSURE CONTROL",
-    "brand.name": "EXPOSURE",
-    "login.title": "Sign in to Control Plane",
-    "login.subtitle": "Authenticate to manage hosts, services, smart DNS, security guards, and mesh topology.",
-    "login.username": "Username",
-    "login.password": "Password",
-    "login.submit": "Sign In",
-    "auth.signout": "Sign Out",
-    "auth.signing_out": "Signing Out…",
-    "auth.signed_out": "Signed out safely",
-    "auth.session_expired": "Session expired",
+const LOCALE_MODULES = import.meta.glob("./i18n/locales/*.json", { eager: true });
 
-    // Sidebar Groups & Nav
-    "nav.group.monitor": "Monitor",
-    "nav.group.configure": "Configure",
-    "nav.group.system": "System",
-    "nav.overview": "Overview",
-    "nav.analytics": "Analytics",
-    "nav.logging": "Logging",
-    "nav.hosts": "Hosts",
-    "nav.services": "Services",
-    "nav.domains": "Domains & DNS",
-    "nav.security": "Security",
-    "nav.topology": "Topology",
-    "nav.system": "System",
-    "sidebar.bootstrap": "Bootstrap Link",
-    "sidebar.checking": "Checking…",
-    "sidebar.disconnected": "Disconnected",
+/** Collapse whitespace so markup indentation never affects lookups. */
+function normalize(text) {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
 
-    // Topbar & Global Deploy Bar
-    "topbar.window.1m": "Window: 1m",
-    "topbar.window.5m": "Window: 5m",
-    "topbar.window.15m": "Window: 15m",
-    "topbar.window.30m": "Window: 30m",
-    "topbar.window.1h": "Window: 1h",
-    "topbar.window.6h": "Window: 6h",
-    "topbar.window.12h": "Window: 12h",
-    "topbar.window.24h": "Window: 24h",
-    "topbar.window.7d": "Window: 7d",
-    "topbar.window.30d": "Window: 30d",
-    "topbar.window.all": "Window: All",
-    "topbar.window.custom": "Window: Custom…",
-    "topbar.window.apply": "Apply",
-    "topbar.auto.off": "Auto: Off",
-    "topbar.auto.10s": "Auto: 10s",
-    "topbar.auto.30s": "Auto: 30s",
-    "topbar.pull": "Pull Telemetry",
-    "topbar.discover": "Discover",
-    "topbar.refresh": "Refresh",
-    "topbar.updated_telemetry": "Telemetry: {time}",
-    "topbar.updated_at": "Updated {time}",
+function buildLocales() {
+  const out = new Map();
+  // The source language needs no dictionary: the UI already is English.
+  out.set(SOURCE_LANG, { code: SOURCE_LANG, name: "English", dir: "ltr", dict: new Map() });
+  for (const [file, mod] of Object.entries(LOCALE_MODULES || {})) {
+    const code = (file.match(/([^/]+)\.json$/) || [])[1];
+    if (!code) continue;
+    const data = (mod && mod.default) || {};
+    const dict = new Map();
+    for (const [source, translated] of Object.entries(data)) {
+      if (source === "__meta") continue;
+      if (typeof translated !== "string" || !translated.trim()) continue;
+      dict.set(normalize(source), translated);
+    }
+    out.set(code, {
+      code,
+      name: data.__meta?.name || code,
+      dir: data.__meta?.dir || "ltr",
+      dict,
+    });
+  }
+  return out;
+}
 
-    "deploy.pending": "{count} pending change(s)",
-    "deploy.clean": "All changes deployed",
-    "deploy.undo": "Undo",
-    "deploy.redo": "Redo",
-    "deploy.diff": "Diff",
-    "deploy.validate": "Validate",
-    "deploy.preflight": "Preflight",
-    "deploy.save_draft": "Save Draft",
-    "deploy.push_all": "Deploy & Push",
-    "deploy.push_and_dns": "Deploy + Sync DNS",
-    "deploy.discard": "Discard Draft",
-    "deploy.diff_title": "Pending Draft Changes",
-    "deploy.no_changes": "No unsaved changes in draft.",
-    "deploy.validated_ok": "Configuration valid ({paths} service route(s) verified)",
-    "deploy.validated_err": "Validation failed: {count} error(s)",
-    "deploy.saved_draft": "Draft saved to Control SQLite",
-    "deploy.pushed_ok": "Deployed & pushed to {count} host(s)",
-    "deploy.pushed_partial": "Deployed to {count} host(s) with {errors} push error(s)",
-    "deploy.preflight_running": "Running preflight connectivity checks across hosts…",
-    "deploy.preflight_ok": "Preflight passed on {count} host(s)",
-    "deploy.preflight_fail": "Preflight found connectivity or port issues",
-
-    // Common UI
-    "common.add": "Add",
-    "common.create": "Create",
-    "common.edit": "Edit",
-    "common.delete": "Delete",
-    "common.remove": "Remove",
-    "common.save": "Save",
-    "common.apply": "Apply",
-    "common.cancel": "Cancel",
-    "common.close": "Close",
-    "common.confirm": "Confirm",
-    "common.search": "Search…",
-    "common.reset": "Reset",
-    "common.enable": "Enable",
-    "common.disable": "Disable",
-    "common.enabled": "Enabled",
-    "common.disabled": "Disabled",
-    "common.default": "Default",
-    "common.on": "On",
-    "common.off": "Off",
-    "common.all": "All",
-    "common.none": "(none)",
-    "common.auto": "Auto",
-    "common.status": "Status",
-    "common.actions": "Actions",
-    "common.loading": "Loading…",
-    "common.copy": "Copy",
-    "common.copied": "Copied to clipboard",
-    "common.online": "ONLINE",
-    "common.offline": "OFFLINE",
-    "common.draft": "DRAFT",
-    "common.yes": "Yes",
-    "common.no": "No",
-    "common.back": "Back",
-    "common.generate": "Generate",
-    "common.invalidName": "Invalid name (use 1-64 letters, digits, ., _, -)",
-
-    // Overview
-    "ov.kpi.nodes": "Mesh Hosts",
-    "ov.kpi.links": "Link Health",
-    "ov.kpi.requests": "Total Requests",
-    "ov.kpi.uv": "Unique Visitors (HLL)",
-    "ov.kpi.latency": "Latency (p50 / p95)",
-    "ov.kpi.certs": "Release & Certs",
-    "ov.traffic_trend": "Traffic & Protection Trend",
-    "ov.traffic_sub": "Aggregated per minute",
-    "ov.latency_pct": "Latency Percentiles (ms)",
-    "ov.latency_sub": "Merged histogram quantiles",
-    "ov.mesh_map": "Live Mesh Health Map",
-    "ov.mesh_map_sub": "Click a host to inspect in Topology",
-    "ov.link_mix": "Link Status Mix",
-    "ov.top_services": "Top Services by Traffic",
-    "ov.recent_alerts": "Recent Alerts",
-    "ov.no_alerts": "No active alerts",
-
-    // Hosts
-    "hosts.tab.nodes": "Hosts",
-    "hosts.tab.links": "Observed Links",
-    "hosts.tab.onboarding": "Node Onboarding",
-    "hosts.add_host": "+ Add Host",
-    "hosts.sync_live": "Import Live Hosts",
-    "hosts.search": "Filter by host tag or IP…",
-    "hosts.all_roles": "All Roles",
-    "hosts.col.tag": "Host Tag",
-    "hosts.col.roles": "Roles",
-    "hosts.col.ips": "External IPs",
-    "hosts.col.uptime": "Uptime",
-    "hosts.col.seq": "Seq",
-    "hosts.col.status": "Status",
-    "hosts.configure": "Configure",
-    "hosts.push": "Push",
-    "hosts.locate": "Topology",
-    "hosts.empty": "No hosts configured or discovered yet.",
-    "hosts.drawer.title": "Configure Host: {tag}",
-    "hosts.drawer.roles": "Node Roles",
-    "hosts.drawer.ips": "External Public IPs (IPv4 / IPv6, one per line or CSV — used for DNS sync)",
-    "hosts.drawer.mesh_listener": "Mesh Link Listener",
-    "hosts.drawer.listen_addr": "Listen Address (host:port)",
-    "hosts.drawer.ingress_listeners": "Ingress HTTP/HTTPS Listeners",
-    "hosts.drawer.ingress_settings": "Ingress Node Settings",
-    "hosts.drawer.maint_hops": "Telemetry Hop Path to Maintainer",
-    "hosts.drawer.auto_hops": "Auto Hops",
-    "hosts.drawer.maint_tpl": "Maintainer Template & ACME",
-    "hosts.drawer.delete_host": "Delete Host from Draft",
-    "hosts.drawer.services_hosted": "Services on this Host",
-    "hosts.onboard.title": "Register One-Time Onboarding Passphrase",
-    "hosts.onboard.cli": "Quick CLI Helper",
-    "hosts.onboard.registry": "Passphrase Registry",
-    "hosts.onboard.node_tag": "Target Host Tag",
-    "hosts.onboard.passphrase": "5-Word Passphrase",
-    "hosts.onboard.mode": "Onboarding Mode",
-    "hosts.onboard.mode_active": "Active (host dials bootstrap tunnel)",
-    "hosts.onboard.mode_listening": "Listening (mesh dials host)",
-    "hosts.onboard.addr": "Target Address (Listening mode)",
-    "hosts.onboard.hops": "Via Hop Path (CSV, optional)",
-    "hosts.onboard.submit": "Register & Enroll",
-
-    // Services
-    "svc.tab.catalog": "Service Catalog",
-    "svc.tab.matrix": "Compiled Routes",
-    "svc.tab.legacy": "Legacy Node Rules",
-    "svc.add": "+ New Service",
-    "svc.search": "Search service name, host, or backend…",
-    "svc.col.service": "Service & Hosts",
-    "svc.col.ingress": "Ingress Scope",
-    "svc.col.route": "Mesh Route & Egress Backend",
-    "svc.col.security": "Guard & TLS",
-    "svc.scope.all": "All Ingress ({count})",
-    "svc.scope.selected": "Selected ({count})",
-    "svc.scope.exclude": "All Except ({count})",
-    "svc.empty": "No declarative services yet. Create a service once to automatically expose it across all Ingress hosts.",
-    "svc.migrate_banner": "{count} legacy node-level service rule(s) detected. You can migrate them into unified Services with one click.",
-    "svc.migrate_btn": "Migrate Legacy Rules",
-    "svc.trace": "Trace",
-    "svc.drawer.new": "Create Service",
-    "svc.drawer.edit": "Edit Service: {name}",
-    "svc.step.entry": "1. Entry & Domains",
-    "svc.step.scope": "2. Ingress Exposure Scope",
-    "svc.step.backend": "3. Egress Origin Backend",
-    "svc.step.routing": "4. Routing, Guard & Auto-TLS",
-    "svc.field.name": "Service ID / Tag",
-    "svc.field.hosts": "Match Hosts (comma or newline separated, e.g. app.example.com)",
-    "svc.field.url_prefix": "URL Prefix (optional)",
-    "svc.field.sni": "TLS SNI Override (optional)",
-    "svc.field.cidrs": "Allowed Source CIDRs (optional CSV)",
-    "svc.field.scope_mode": "Expose On",
-    "svc.field.scope_all": "All Ingress Hosts (auto-applies to future Ingress hosts)",
-    "svc.field.scope_selected": "Selected Ingress Hosts Only",
-    "svc.field.scope_exclude": "All Ingress Hosts Except Selected",
-    "svc.field.overrides": "Per-Ingress Overrides (optional)",
-    "svc.field.egress_node": "Egress Host",
-    "svc.field.backend": "Backend Address (IP:Port)",
-    "svc.field.protocol": "Backend Protocol",
-    "svc.field.timeout": "Timeout (ms, 0 = default)",
-    "svc.field.guard": "Guard Policy",
-    "svc.field.bucket_set": "Bucket Set",
-    "svc.field.antibot_set": "Antibot Set",
-    "svc.field.waf_set": "WAF Set",
-    "svc.field.routing_mode": "Mesh Routing Mode",
-    "svc.field.routing_auto": "Auto Shortest Path (recommended)",
-    "svc.field.routing_pinned": "Pinned Custom Hop Paths",
-    "svc.field.auto_tls": "Auto-TLS Certificate Coverage",
-    "svc.field.auto_tls_sub": "Ensure Primary Maintainer issues & distributes TLS certs for these hosts",
-    "svc.route_preview": "Compiled Route Preview",
-    "svc.route_unreachable": "Unreachable (no mesh link path)",
-    "svc.route_local": "Local (co-located Ingress & Egress)",
-
-    // Domains & DNS
-    "dns.tab.domains": "Domains & Smart DNS",
-    "dns.tab.certs": "TLS Certificates",
-    "dns.tab.providers": "DNS Providers",
-    "dns.add_domain": "+ Bind Domain",
-    "dns.sync_all": "Sync All DNS",
-    "dns.sync_domain": "Sync This Domain",
-    "dns.fetch_remote": "Fetch Remote Records",
-    "dns.add_remote_rec": "+ Add Remote Record",
-    "dns.add_line_route": "+ Add Line Route",
-    "dns.section.declarative": "Declarative Split-Horizon Routing (Bound to Exposure Hosts)",
-    "dns.section.declarative_sub": "Map provider resolution lines (e.g., Aliyun Default / Telecom / Unicom / Mobile / Overseas) to Exposure Ingress hosts or manual CNAME/IP values.",
-    "dns.section.remote": "Live Remote Exposure Records (A / AAAA / CNAME)",
-    "dns.section.remote_sub": "Fetched directly from DNS provider via Primary Maintainer. Strictly scoped to A, AAAA, and CNAME records for this domain.",
-    "dns.cap.lines": "Split Lines Supported",
-    "dns.cap.proxied": "Cloudflare Proxy",
-    "dns.cap.status": "Record Enable/Pause",
-    "dns.cap.readonly": "Declarative Sync Only",
-    "dns.col.line": "Resolution Line",
-    "dns.col.target": "Target Hosts / Manual Values",
-    "dns.col.preview": "Resolved Values",
-    "dns.col.ttl": "TTL",
-    "dns.col.type": "Type",
-    "dns.col.value": "Value",
-    "dns.col.sync_state": "Sync Status",
-    "dns.state.synced": "Synced",
-    "dns.state.drift": "Drift",
-    "dns.state.extra": "Remote Only",
-    "dns.state.paused": "Paused",
-    "dns.no_domains": "No domains bound yet. Add a DNS provider account first, then bind domains for smart DNS sync and ACME DNS-01 certificates.",
-    "dns.no_providers": "No DNS provider accounts configured yet.",
-    "dns.save_before_remote": "Note: Save/Deploy DNS provider & domain bindings to Maintainer before querying remote records.",
-    "dns.remote_empty": "No A / AAAA / CNAME records found on remote provider for this domain (or click Fetch Remote Records).",
-    "dns.certs.live": "Live Certificate Status (Maintainer Telemetry)",
-    "dns.certs.orders": "ACME Certificate Orders",
-    "dns.certs.add_order": "+ Add Cert Order",
-    "dns.certs.no_maint": "No Primary Maintainer configured yet. Enable the Maintainer role on a host in Hosts first.",
-
-    // Security
-    "sec.tab.guards": "Guard Policies",
-    "sec.tab.buckets": "Buckets",
-    "sec.tab.antibot": "Antibot & Geo",
-    "sec.tab.waf": "WAF (OWASP CRS)",
-    "sec.tab.geoip": "GeoIP DB",
-    "sec.tab.evilpot": "Evilpot & Bans",
-    "sec.tab.pages": "Custom Error & PoW Pages",
-    "sec.add_guard": "+ New Guard Policy",
-    "sec.add_bucket": "+ New Bucket Set",
-    "sec.add_antibot": "+ New Antibot Set",
-    "sec.add_waf": "+ New WAF Set",
-    "sec.migrate.title": "Legacy Guard Policies Detected",
-    "sec.migrate.desc": "{count} legacy monolithic guard profile(s) can be cleanly split into modular Bucket / Antibot / WAF sets.",
-    "sec.migrate.btn": "Migrate to Modular Sets",
-    "sec.migrate.done": "Migrated legacy guards into Bucket / Antibot / WAF sets in draft",
-    "sec.assign.buckets": "Per-Ingress Bucket Set Assignment",
-    "sec.assign.antibot": "Per-Ingress Antibot Set Assignment",
-    "sec.assign.waf": "Per-Ingress WAF Set Assignment",
-    "sec.assign.scope": "Edit Scope",
-    "sec.assign.cluster_tpl": "Cluster Templates",
-    "sec.assign.cluster_default": "Cluster Default Set",
-    "sec.assign.hint": "Configure sets globally or per-Ingress node; override individually on any Service.",
-    "sec.assign.inherit": "Inherit Cluster",
-    "sec.assign.no_ingress": "No Ingress nodes defined yet.",
-    "sec.empty.buckets": "No rate-limit bucket sets in this scope yet.",
-    "sec.empty.antibot": "No Antibot / Geo policy sets in this scope yet.",
-    "sec.empty.waf": "No OWASP CRS WAF sets in this scope yet.",
-    "sec.under_attack": "Under Attack Mode",
-    "sec.pages.preview": "Live Preview (Sandboxed)",
-    "sec.pages.reset": "Reset to Built-in Defaults",
-    "sec.pages.error_html": "Custom Intercept Error Page HTML (403 / 429 / 5xx)",
-    "sec.pages.chal_html": "Custom PoW Challenge HTML (/cdn-cgi/)",
-    "sec.pages.chal_css": "Custom PoW Challenge CSS (/cdn-cgi/styles.css)",
-    "waf.title": "OWASP CRS WAF",
-    "waf.mode": "WAF Mode",
-    "waf.mode.inherit": "Inherit Default ({mode})",
-    "waf.mode.off": "Off",
-    "waf.mode.monitor": "Monitor (Log Only)",
-    "waf.mode.block": "Block (403 Forbidden)",
-    "waf.mode.evilpot": "Evilpot (Honeypot & Behavior Analysis)",
-    "waf.max_body_kb": "Max Body Inspection (KiB)",
-    "waf.inspect_headers": "Inspect Headers (UA / Referer / Cookie)",
-    "waf.inspect_body": "Inspect Text / JSON / Form Bodies",
-    "waf.exempt_paths": "Exempt Path Prefixes (CSV)",
-    "waf.disabled_rule_ids": "Disabled CRS Rule IDs (CSV)",
-    "waf.categories": "Attack Categories (empty = all 12)",
-    "waf.categories.all": "All 12 OWASP CRS Categories",
-    "waf.cat.sql-injection": "SQLi",
-    "waf.cat.xss": "XSS",
-    "waf.cat.path-traversal": "Path Traversal",
-    "waf.cat.command-injection": "Cmd Injection",
-    "waf.cat.nosql-injection": "NoSQLi",
-    "waf.cat.ssrf": "SSRF",
-    "waf.cat.ssti": "SSTI / Code",
-    "waf.cat.xxe": "XXE / XML",
-    "waf.cat.ldap-injection": "LDAPi",
-    "waf.cat.crlf-injection": "CRLF",
-    "waf.cat.deserialization": "JNDI / Deser",
-    "waf.cat.buffer-overflow": "Overflow",
-    "ep.pull_refresh": "Pull Telemetry & Refresh",
-    "ep.kpi.trapped": "Trapped Requests",
-    "ep.kpi.verified": "Verified Exploits",
-    "ep.kpi.canaries": "Canary Triggers",
-    "ep.kpi.tarpit": "Active Tarpit / Dripped",
-    "ep.kpi.nodes": "Active Evilpot Hosts",
-    "ep.kpi.autoban": "Auto-Banned (IP / FP)",
-    "ep.bans.title": "Active Auto-Bans (Confirmed Attackers)",
-    "ep.unban.title": "Unban IP or Fingerprint",
-    "ep.unban.all_nodes": "All Online Ingress Nodes",
-    "ep.unban.btn": "Unban",
-    "ep.unban.clear_all": "Clear All Bans",
-    "ep.unban.clear_confirm": "Clear ALL active IP and fingerprint auto-bans on the selected Ingress node(s)?",
-    "ep.unban.done": "Unbanned {kind}: {target}",
-    "geo.policy.title": "GeoIP Region-Targeting",
-    "geo.policy.configure": "Regions & Rules",
-    "geo.policy.enable": "Enable GeoIP Region Policy",
-    "geo.policy.quick_target": "Chip adds to",
-    "geo.policy.deny_list": "Deny List",
-    "geo.policy.allow_list": "Allow List",
-    "geo.policy.quick_chips": "Quick-Pick Country / Continent Codes (click to toggle)",
-    "geo.policy.allow_regions": "Allow Regions CSV (non-matching trigger Deny Action if non-empty)",
-    "geo.policy.deny_regions": "Deny Regions CSV (e.g. CN, RU, CONTINENT:AF)",
-    "geo.policy.deny_action": "Deny Action",
-    "geo.policy.default_action": "Default Action",
-    "geo.policy.unknown_action": "Unknown / Unallocated IP Action",
-    "geo.policy.rules_title": "Ordered Region Override Rules",
-    "geo.policy.add_rule": "Add Rule",
-    "geo.policy.no_rules": "No per-region override rules yet.",
-    "geo.db.sync_now": "Sync GeoIP DB Now",
-    "geo.db.syncing": "Syncing GeoIP…",
-    "geo.db.synced_ok": "GeoIP synced on {ok}/{total} Ingress node(s)",
-    "geo.db.nodes_loaded": "Nodes Loaded",
-    "geo.db.last_pull": "Telemetry Updated",
-    "geo.db.local_cache": "Persisted geoip.bin disk cache",
-    "geo.db.settings_title": "Cluster GeoIP Auto-Pull Settings (CC0 Free DB)",
-    "geo.db.enabled": "Enable Local GeoIP Engine on Ingress Nodes",
-    "geo.db.auto_update": "Background Auto-Update",
-    "geo.db.interval_h": "Refresh Interval (hours, 6–720)",
-    "geo.db.cache_dir": "Optional Cache Dir Override",
-    "geo.db.lookup_title": "Live Node GeoIP Lookup Tester",
-    "geo.db.any_loaded": "Auto (First Loaded Ingress)",
-    "geo.db.lookup_btn": "Lookup IP",
-    "geo.db.node_table": "Per-Ingress GeoIP Database Status",
-    "ep.sessions.title": "Attacker Behavior Sessions",
-    "ep.events.title": "Recent Deception & Verification Timeline",
-    "ep.empty": "No Evilpot sessions captured yet. Set any Guard policy's WAF Mode to Evilpot, deploy to Ingress hosts, and click Pull Telemetry to inspect live attacker behavior.",
-    "ep.status.verified": "VERIFIED EXPLOIT",
-    "ep.status.multistep": "MULTI-STEP",
-    "ep.status.probing": "PROBING",
-    "ep.col.status": "Verification",
-    "ep.col.ip": "Attacker IP & Host",
-    "ep.col.persona": "Decoy Persona",
-    "ep.col.activity": "Probes / SQLi / Canary",
-    "ep.col.iocs": "RCE Commands & Captured IOCs",
-    "ep.col.tarpit": "Tarpit Consumed",
-    "ep.col.evidence": "Evidence",
-    "ep.defaults.title": "Evilpot Honeypot Engine Defaults",
-    "ep.defaults.rotation": "Persona Rotation (s)",
-    "ep.defaults.slots": "Persona Slots",
-    "ep.defaults.tarpit_conns": "Max Tarpit Conns",
-    "ep.defaults.drip_bps": "Tarpit Drip (B/s)",
-    "ep.defaults.sqli_delay": "SQLi Blind Delay (ms)",
-    "ep.defaults.max_sessions": "Max Tracked Sessions",
-    "ep.defaults.canary_url": "Canary Webhook Base URL",
-
-    // Topology
-    "topo.connect": "Connect",
-    "topo.auto_layout": "Auto Layout",
-    "topo.trace_off": "Trace Service: Off",
-    "topo.connect_hint": "Click source host, then click target host to create a mesh link (Esc to cancel)",
-    "topo.fit": "Fit",
-    "topo.grid": "Grid",
-    "topo.live": "Live",
-    "topo.empty_inspector": "Select a host or mesh link on the canvas to inspect its connections. Use Hosts & Services tabs for detailed configuration.",
-    "topo.node_summary": "Host Summary",
-    "topo.open_host": "Configure Host →",
-    "topo.open_services": "Manage Services →",
-    "topo.link_title": "Mesh Link",
-    "topo.reverse_dir": "Reverse Direction",
-    "topo.delete_link": "Delete Link",
-
-    // Analytics & Logging (Access URL Explorer + Visitors & Fingerprints)
-    "ana.all_nodes": "All Hosts",
-    "ana.all_services": "All Services",
-    "ana.fp_explorer": "Open in Logging Workspace →",
-    "ana.svc_latency_title": "Service Latency & Performance (p50 / p95 / p99)",
-    "ana.svc_latency_sub": "Click any service to filter analytics or inspect its URL logs",
-    "logging.tab.access": "Access Logs",
-    "logging.tab.evilpot": "Evilpot & Bans",
-    "logging.tab.visitors": "Visitors & Fingerprints",
-    "logging.tab.alerts": "Alerts",
-    "logging.tab.audit": "Audit",
-    "logging.export_json": "Export JSON",
-    "logging.cross.view_logs": "View Access Logs for this IP →",
-    "logging.cross.view_visitor": "Inspect Visitor & Fingerprints →",
-    "logging.cross.filter_ip": "Filter this IP",
-    "logging.cross.filter_path": "Filter this Path",
-    "logs.kpi.requests": "Total Requests",
-    "logs.kpi.blocked": "Blocked / Mitigated",
-    "logs.kpi.errors": "5xx Errors",
-    "logs.kpi.dos_shield": "Log DoS Shield",
-    "logs.top_urls": "Top Requested URLs / Paths",
-    "logs.explorer_title": "HTTP Access & URL Logs",
-    "logs.col.time": "Time",
-    "logs.col.method": "Method",
-    "logs.col.status": "Status",
-    "logs.col.url": "Host & URL",
-    "logs.col.action": "Action / Security",
-    "logs.col.client": "Client IP / HMAC",
-    "logs.col.route": "Node / Service",
-    "logs.col.perf": "Latency / Size",
-    "logs.search_ph": "Path, ?query, host, country, ray_id, UA, WAF…",
-    "logs.ip_ph": "203.0.113.5 or HMAC",
-    "logs.host_ph": "example.com",
-    "logs.all_countries": "All Countries",
-    "logs.page.showing": "Showing {start}–{end} of {total}",
-    "logs.page.per_page": "Per page",
-    "logs.page.of": "Page {page} / {pages}",
-    "logs.empty": "No access logs match current filters.",
-    "logging.cross.filter_ray": "Filter Ray ID",
-
-    // System
-    "sys.tab.defaults": "Cluster Defaults",
-    "sys.tab.storage": "Storage & Retention",
-    "sys.tab.releases": "Releases",
-    "sys.tab.yaml": "YAML Source",
-    "sys.yaml_hint": "Advanced raw TopologySpec YAML editor. Changes here sync with all visual tabs when applied.",
-    "sys.yaml_apply": "Parse & Apply YAML to Draft",
-
-    // WAF Rules & OWASP CRS
-    "sec.tab.waf_rules": "WAF Rules (OWASP CRS)",
-    "waf.crs.enabled": "OWASP CRS Ruleset Enabled",
-    "waf.crs.paranoia": "CRS Paranoia Level",
-    "waf.crs.sync_now": "Sync OWASP CRS Now",
-    "waf.crs.syncing": "Syncing from coreruleset.org…",
-    "waf.crs.synced_ok": "Synced OWASP CRS {version} ({count} active rules)",
-    "waf.crs.auto_update": "Auto-Update OWASP CRS",
-    "waf.crs.interval_h": "Update Interval (hours)",
-    "waf.crs.version": "Active CRS Version",
-    "waf.crs.updated": "Last Synced",
-    "waf.crs.active_count": "Active Rules",
-    "waf.crs.skipped_pcre": "PCRE-only Skipped",
-    "waf.crs.search_ph": "Search rule ID, message, category, regex…",
-    "waf.crs.src_all": "All Sources",
-    "waf.crs.src_crs": "OWASP CRS",
-    "waf.crs.pure_engine": "Pure OWASP CRS Linear-Time Engine",
-    "waf.crs.status_all": "All Status",
-    "waf.crs.status_on": "Enabled",
-    "waf.crs.status_off": "Disabled",
-    "waf.crs.col_id": "Rule ID",
-    "waf.crs.col_source": "Source",
-    "waf.crs.col_pl": "PL",
-    "waf.crs.col_cat": "Category",
-    "waf.crs.col_sev": "Severity",
-    "waf.crs.col_desc": "Description / Pattern",
-    "waf.crs.col_state": "Enabled",
-    "waf.crs.deploy_hint": "Toggling rules updates cluster CRS defaults in draft — deploy to push changes to Ingress nodes.",
-
-    // AbuseIPDB IP Reputation
-    "abuse.title": "AbuseIPDB IP Reputation",
-    "abuse.enable": "Enable AbuseIPDB Automatic IP Scoring",
-    "abuse.enable_sub": "Queries AbuseIPDB v2 with your own API key; high abuse scores raise server suspicion or trigger automatic mitigation",
-    "abuse.api_key": "AbuseIPDB API Key",
-    "abuse.test_ip": "Test IP Address",
-    "abuse.test_btn": "Test Key",
-    "abuse.testing": "Testing…",
-    "abuse.action": "High-Risk Action (≥ Block Score)",
-    "abuse.action.off": "off — Score Only",
-    "abuse.action.monitor": "monitor — Log Only",
-    "abuse.action.challenge": "challenge — Force PoW",
-    "abuse.action.block": "block — HTTP 403",
-    "abuse.action.evilpot": "evilpot — Divert to Honeypot",
-    "abuse.challenge_th": "Challenge Score (0-100)",
-    "abuse.block_th": "Block Score (0-100)",
-    "abuse.max_age": "Max Age (days)",
-    "abuse.cache_ttl": "Cache TTL (s)",
-    "abuse.daily_limit": "Daily Quota Cap / Node",
-
-    // Log Persistence & Retention
-    "log.flush_secs": "Node Push Interval (s)",
-    "log.max_batch_rec": "Early Flush Records",
-    "log.max_batch_kb": "Early Flush Size (KiB)",
-    "log.retention_h": "Maintainer Retention (h)",
-    "log.max_disk_mb": "Maintainer Max Disk (MiB)",
-    "log.max_summaries": "Max Summaries in Store",
-    "log.max_fps": "Max Fingerprints in Store",
-    "log.max_recent": "Recent URL Logs Cap",
-    "log.prot_enable": "Enable Log DoS Protection",
-    "log.prot_enable_sub": "Token-bucket rate limit, byte ceiling & duplicate flood folding (metrics stay 100% exact)",
-    "log.prot_query": "Log Redacted URL Query Strings",
-    "log.prot_query_sub": "Records sanitized URL ?query parameters while auto-redacting secret keys (token, password, key, auth)",
-    "log.prot_stdout": "Emit Stdout Access Logs",
-    "log.prot_rps": "Global Log Cap (rec/s)",
-    "log.prot_iprps": "Per-IP Log Cap (rec/s)",
-    "log.prot_mbmin": "Log Byte Cap (MiB/min)",
-    "log.prot_dedup": "Flood Fold Window (s)",
-    "log.prot_warn": "Warn Log Cap (/s)",
-
-    // Fingerprints Server-First & BrowserLeaks
-    "fp.sec.server": "Server-Side Unforgeable Signals (Primary Trust Score)",
-    "fp.sec.client": "Client-Side Auxiliary BrowserLeaks Signals (Untrusted · Tamper Detection Only)",
-    "fp.server_score": "Server Score",
-    "fp.tls_ja3": "TLS JA3 / GREASE",
-    "fp.abuse_intel": "AbuseIPDB Reputation",
-    "fp.tamper_flags": "Automation & Tamper Flags",
-    "fp.webrtc.title": "WebRTC Leak Detection",
-    "fp.webrtc.leak_badge": "WebRTC IP Leak",
-    "fp.webrtc.lan_badge": "LAN IP Exposed",
-    "fp.webrtc.mdns_badge": "mDNS Protected",
-    "fp.webrtc.clean": "No WebRTC IP leak detected",
-  },
-
-  "zh-CN": {
-    // Brand & Auth
-    "brand.tag": "EXPOSURE CONTROL",
-    "brand.name": "EXPOSURE",
-    "login.title": "登录控制平面",
-    "login.subtitle": "管理节点主机、服务发布、智能分线路 DNS、安全防护与网格拓扑。",
-    "login.username": "管理员账号",
-    "login.password": "密码",
-    "login.submit": "登录",
-    "auth.signout": "退出登录",
-    "auth.signing_out": "正在退出…",
-    "auth.signed_out": "已安全退出登录",
-    "auth.session_expired": "登录会话已过期",
-
-    // Sidebar Groups & Nav
-    "nav.group.monitor": "总览与监控",
-    "nav.group.configure": "资源与配置",
-    "nav.group.system": "系统与运维",
-    "nav.overview": "总览大盘",
-    "nav.analytics": "流量分析",
-    "nav.logging": "日志与审计 (Logging)",
-    "nav.hosts": "节点主机 (Hosts)",
-    "nav.services": "服务发布 (Services)",
-    "nav.domains": "域名与 DNS",
-    "nav.security": "安全防护",
-    "nav.topology": "网格拓扑",
-    "nav.system": "系统设置",
-    "sidebar.bootstrap": "引导链路",
-    "sidebar.checking": "检测中…",
-    "sidebar.disconnected": "未连接",
-
-    // Topbar & Global Deploy Bar
-    "topbar.window.1m": "窗口: 1分钟",
-    "topbar.window.5m": "窗口: 5分钟",
-    "topbar.window.15m": "窗口: 15分钟",
-    "topbar.window.30m": "窗口: 30分钟",
-    "topbar.window.1h": "窗口: 1小时",
-    "topbar.window.6h": "窗口: 6小时",
-    "topbar.window.12h": "窗口: 12小时",
-    "topbar.window.24h": "窗口: 24小时",
-    "topbar.window.7d": "窗口: 7天",
-    "topbar.window.30d": "窗口: 30天",
-    "topbar.window.all": "窗口: 全部",
-    "topbar.window.custom": "窗口: 自定义…",
-    "topbar.window.apply": "应用",
-    "topbar.auto.off": "自动刷新: 关",
-    "topbar.auto.10s": "自动刷新: 10秒",
-    "topbar.auto.30s": "自动刷新: 30秒",
-    "topbar.pull": "拉取遥测",
-    "topbar.discover": "发现节点",
-    "topbar.refresh": "刷新",
-    "topbar.updated_telemetry": "遥测更新: {time}",
-    "topbar.updated_at": "刷新于 {time}",
-
-    "deploy.pending": "{count} 处待发布变更",
-    "deploy.clean": "配置已全部同步",
-    "deploy.undo": "撤销",
-    "deploy.redo": "重做",
-    "deploy.diff": "查看变更",
-    "deploy.validate": "校验",
-    "deploy.preflight": "预检",
-    "deploy.save_draft": "保存草稿",
-    "deploy.push_all": "部署并推送",
-    "deploy.push_and_dns": "部署并同步 DNS",
-    "deploy.discard": "放弃草稿",
-    "deploy.diff_title": "待发布配置变更预览",
-    "deploy.no_changes": "当前草稿没有未保存的变更。",
-    "deploy.validated_ok": "配置校验通过（已验证 {paths} 条服务路径）",
-    "deploy.validated_err": "校验失败：发现 {count} 个错误",
-    "deploy.saved_draft": "配置草稿已保存至 Control SQLite",
-    "deploy.pushed_ok": "已保存并成功推送至 {count} 台主机",
-    "deploy.pushed_partial": "已推送 {count} 台主机，{errors} 台推送失败",
-    "deploy.preflight_running": "正在对各节点执行预检连通性测试…",
-    "deploy.preflight_ok": "预检通过（共 {count} 台主机）",
-    "deploy.preflight_fail": "预检发现端口或连通性问题",
-
-    // Common UI
-    "common.add": "添加",
-    "common.create": "创建",
-    "common.edit": "编辑",
-    "common.delete": "删除",
-    "common.remove": "移除",
-    "common.save": "保存",
-    "common.apply": "应用",
-    "common.cancel": "取消",
-    "common.close": "关闭",
-    "common.confirm": "确认",
-    "common.search": "搜索…",
-    "common.reset": "重置",
-    "common.enable": "启用",
-    "common.disable": "停用",
-    "common.enabled": "已启用",
-    "common.disabled": "已停用",
-    "common.default": "默认",
-    "common.on": "开",
-    "common.off": "关",
-    "common.all": "全部",
-    "common.none": "（无）",
-    "common.auto": "自动",
-    "common.status": "状态",
-    "common.actions": "操作",
-    "common.loading": "加载中…",
-    "common.copy": "复制",
-    "common.copied": "已复制到剪贴板",
-    "common.online": "在线",
-    "common.offline": "离线",
-    "common.draft": "草稿",
-    "common.yes": "是",
-    "common.no": "否",
-    "common.back": "返回",
-    "common.generate": "生成",
-    "common.invalidName": "名称无效（请使用 1-64 位字母、数字、.、_、-）",
-
-    // Overview
-    "ov.kpi.nodes": "网格主机",
-    "ov.kpi.links": "链路健康",
-    "ov.kpi.requests": "总请求数",
-    "ov.kpi.uv": "独立访客 (HLL)",
-    "ov.kpi.latency": "延迟 (p50 / p95)",
-    "ov.kpi.certs": "发布版本与证书",
-    "ov.traffic_trend": "流量与防护趋势",
-    "ov.traffic_sub": "按分钟聚合",
-    "ov.latency_pct": "延迟分位 (ms)",
-    "ov.latency_sub": "合并直方图分位",
-    "ov.mesh_map": "实时网格健康图",
-    "ov.mesh_map_sub": "点击节点前往拓扑画布查看",
-    "ov.link_mix": "链路状态分布",
-    "ov.top_services": "热门服务流量排行",
-    "ov.recent_alerts": "最近告警",
-    "ov.no_alerts": "暂无活跃告警",
-
-    // Hosts
-    "hosts.tab.nodes": "主机列表",
-    "hosts.tab.links": "观测链路状态",
-    "hosts.tab.onboarding": "新节点接入",
-    "hosts.add_host": "+ 添加主机",
-    "hosts.sync_live": "导入在线节点",
-    "hosts.search": "搜索主机名称或 IP…",
-    "hosts.all_roles": "全部角色",
-    "hosts.col.tag": "主机标识",
-    "hosts.col.roles": "角色",
-    "hosts.col.ips": "公网 IP",
-    "hosts.col.uptime": "运行时间",
-    "hosts.col.seq": "配置版本",
-    "hosts.col.status": "状态",
-    "hosts.configure": "配置",
-    "hosts.push": "推送",
-    "hosts.locate": "拓扑定位",
-    "hosts.empty": "暂无主机，请添加主机或前往“新节点接入”引导节点上线。",
-    "hosts.drawer.title": "主机配置：{tag}",
-    "hosts.drawer.roles": "节点角色",
-    "hosts.drawer.ips": "公网外部 IP（IPv4/IPv6，逗号或换行分隔，用于自动 DNS 解析同步）",
-    "hosts.drawer.mesh_listener": "Mesh 网格监听",
-    "hosts.drawer.listen_addr": "监听地址 (host:port)",
-    "hosts.drawer.ingress_listeners": "Ingress HTTP/HTTPS 监听端口",
-    "hosts.drawer.ingress_settings": "Ingress 节点级选项",
-    "hosts.drawer.maint_hops": "到 Maintainer 的遥测跳表",
-    "hosts.drawer.auto_hops": "自动算路",
-    "hosts.drawer.maint_tpl": "Maintainer 模板与 ACME",
-    "hosts.drawer.delete_host": "从草稿删除该主机",
-    "hosts.drawer.services_hosted": "该主机承载的服务",
-    "hosts.onboard.title": "注册一次性节点引导口令",
-    "hosts.onboard.cli": "快捷 CLI 启动命令",
-    "hosts.onboard.registry": "引导口令注册表",
-    "hosts.onboard.node_tag": "目标主机标识",
-    "hosts.onboard.passphrase": "5 词引导口令",
-    "hosts.onboard.mode": "接入模式",
-    "hosts.onboard.mode_active": "主动模式（节点拨号连接引导隧道）",
-    "hosts.onboard.mode_listening": "监听模式（由网格主动拨号节点）",
-    "hosts.onboard.addr": "节点地址（监听模式必填）",
-    "hosts.onboard.hops": "经由跳表（逗号分隔，可选）",
-    "hosts.onboard.submit": "注册并引导接入",
-
-    // Services
-    "svc.tab.catalog": "服务目录",
-    "svc.tab.matrix": "编译路由矩阵",
-    "svc.tab.legacy": "旧版底层规则",
-    "svc.add": "+ 新建服务",
-    "svc.search": "搜索服务名、域名或后端地址…",
-    "svc.col.service": "服务与入口域名",
-    "svc.col.ingress": "暴露范围 (Ingress)",
-    "svc.col.route": "网格路由与后端源站",
-    "svc.col.security": "防护与 TLS",
-    "svc.scope.all": "全部 Ingress ({count})",
-    "svc.scope.selected": "指定 Ingress ({count})",
-    "svc.scope.exclude": "排除部分 ({count})",
-    "svc.empty": "暂无声明式服务。在这里定义一次服务，即可自动下发到全部或指定 Ingress 节点并自动计算转发路由。",
-    "svc.migrate_banner": "检测到 {count} 条旧版节点级服务规则，可一键迁移为全新的统一 Service 模型。",
-    "svc.migrate_btn": "一键迁移旧规则",
-    "svc.trace": "追踪路径",
-    "svc.drawer.new": "新建服务",
-    "svc.drawer.edit": "编辑服务：{name}",
-    "svc.step.entry": "1. 入口域名与匹配",
-    "svc.step.scope": "2. Ingress 暴露范围",
-    "svc.step.backend": "3. Egress 后端源站",
-    "svc.step.routing": "4. 路由、安全防护与自动 TLS",
-    "svc.field.name": "服务标识 (Service Tag)",
-    "svc.field.hosts": "匹配域名（逗号或换行分隔，如 app.example.com）",
-    "svc.field.url_prefix": "路径前缀（可选）",
-    "svc.field.sni": "TLS SNI 覆写（可选）",
-    "svc.field.cidrs": "来源 IP 白名单 CIDR（逗号分隔，可选）",
-    "svc.field.scope_mode": "暴露到哪些入口节点",
-    "svc.field.scope_all": "全部 Ingress 节点（推荐，新增入口节点自动生效）",
-    "svc.field.scope_selected": "仅选定的 Ingress 节点",
-    "svc.field.scope_exclude": "除选定外的全部 Ingress 节点",
-    "svc.field.overrides": "单入口节点差异化覆写（可选）",
-    "svc.field.egress_node": "目标 Egress 主机",
-    "svc.field.backend": "本地后端地址 (IP:Port)",
-    "svc.field.protocol": "后端协议",
-    "svc.field.timeout": "超时时间 (ms, 0 = 继承默认)",
-    "svc.field.guard": "Guard 防护策略",
-    "svc.field.bucket_set": "限流桶集合 (Bucket)",
-    "svc.field.antibot_set": "Antibot 反爬集合",
-    "svc.field.waf_set": "WAF 防护集合",
-    "svc.field.routing_mode": "网格路由模式",
-    "svc.field.routing_auto": "自动最短路径（推荐，自动生成 Relay 规则）",
-    "svc.field.routing_pinned": "手动固定跳表路径",
-    "svc.field.auto_tls": "自动 HTTPS 证书覆盖 (Auto-TLS)",
-    "svc.field.auto_tls_sub": "自动确保主 Maintainer 为上述域名签发并分发证书至对应 Ingress",
-    "svc.route_preview": "实时路由推演预览",
-    "svc.route_unreachable": "不可达（网格中无连通链路）",
-    "svc.route_local": "本机直通（Ingress 与 Egress 同机）",
-
-    // Domains & DNS
-    "dns.tab.domains": "域名与智能解析",
-    "dns.tab.certs": "TLS 证书管理",
-    "dns.tab.providers": "DNS 服务商账号",
-    "dns.add_domain": "+ 绑定域名",
-    "dns.sync_all": "同步全部 DNS",
-    "dns.sync_domain": "同步当前域名",
-    "dns.fetch_remote": "拉取远端记录",
-    "dns.add_remote_rec": "+ 新增远端记录",
-    "dns.add_line_route": "+ 添加解析线路",
-    "dns.section.declarative": "声明式分线路解析策略（自动联动 Host 公网 IP）",
-    "dns.section.declarative_sub": "为阿里云等支持智能线路的 DNS 按运营商/地域（默认/电信/联通/移动/境外等）分别绑定不同 Ingress 节点或手动 IP/CNAME。",
-    "dns.section.remote": "远端实时 Exposure 解析记录（仅管理 A / AAAA / CNAME）",
-    "dns.section.remote_sub": "经由主 Maintainer 安全查询远端 DNS 服务商；严格限定为当前域名的 A / AAAA / CNAME 记录，不干扰其他无关记录。",
-    "dns.cap.lines": "支持分线路解析",
-    "dns.cap.proxied": "支持 Cloudflare 代理",
-    "dns.cap.status": "支持启停单条记录",
-    "dns.cap.readonly": "仅支持声明式同步",
-    "dns.col.line": "解析线路 (Line)",
-    "dns.col.target": "绑定主机 / 手动记录值",
-    "dns.col.preview": "解析结果预览",
-    "dns.col.ttl": "TTL",
-    "dns.col.type": "类型",
-    "dns.col.value": "记录值",
-    "dns.col.sync_state": "同步状态",
-    "dns.state.synced": "已同步",
-    "dns.state.drift": "存在漂移",
-    "dns.state.extra": "仅远端存在",
-    "dns.state.paused": "已暂停",
-    "dns.no_domains": "尚未绑定任何域名。请先在“DNS 服务商账号”中添加凭据，再绑定域名以启用分线路 DNS 同步与自动证书签发。",
-    "dns.no_providers": "尚未配置 DNS 服务商账号。",
-    "dns.save_before_remote": "提示：新增或修改服务商/域名绑定后，需先“部署并推送”至 Maintainer 才能查询远端记录。",
-    "dns.remote_empty": "远端暂无该域名的 A / AAAA / CNAME 记录（或点击右上角“拉取远端记录”）。",
-    "dns.certs.live": "实时证书状态（来自 Maintainer 遥测）",
-    "dns.certs.orders": "ACME 证书订单配置",
-    "dns.certs.add_order": "+ 添加证书订单",
-    "dns.certs.no_maint": "尚未配置主 Maintainer，请先在“节点主机”中为某台主机开启 Maintainer 角色。",
-
-    // Security
-    "sec.tab.guards": "防护策略模板 (Guards)",
-    "sec.tab.buckets": "限流桶 (Bucket)",
-    "sec.tab.antibot": "Antibot 与地区策略",
-    "sec.tab.waf": "WAF (OWASP CRS)",
-    "sec.tab.geoip": "GeoIP 库与探测",
-    "sec.tab.evilpot": "Evilpot 与解封",
-    "sec.tab.pages": "自定义错误与挑战页",
-    "sec.add_guard": "+ 新建防护策略",
-    "sec.add_bucket": "+ 新建限流桶集合",
-    "sec.add_antibot": "+ 新建 Antibot 集合",
-    "sec.add_waf": "+ 新建 WAF 集合",
-    "sec.migrate.title": "检测到旧版单体 Guard 策略",
-    "sec.migrate.desc": "检测到 {count} 个旧版 Guard 模板，可一键拆分为独立的 Bucket / Antibot / WAF 模块化集合。",
-    "sec.migrate.btn": "一键迁移到模块化集合",
-    "sec.migrate.done": "已将旧版 Guard 迁移至草稿中的 Bucket / Antibot / WAF 集合",
-    "sec.assign.buckets": "全局与单 Ingress 节点默认限流桶分配",
-    "sec.assign.antibot": "全局与单 Ingress 节点默认 Antibot 分配",
-    "sec.assign.waf": "全局与单 Ingress 节点默认 WAF 分配",
-    "sec.assign.scope": "编辑作用域",
-    "sec.assign.cluster_tpl": "集群全局模板",
-    "sec.assign.cluster_default": "集群默认集合",
-    "sec.assign.hint": "支持定义集群公共集合或单 Ingress 节点专属集合，也可在具体 Service 中单独覆写。",
-    "sec.assign.inherit": "继承集群",
-    "sec.assign.no_ingress": "尚未配置 Ingress 节点。",
-    "sec.empty.buckets": "当前作用域下暂无 Bucket 限流集合。",
-    "sec.empty.antibot": "当前作用域下暂无 Antibot / 地区策略集合。",
-    "sec.empty.waf": "当前作用域下暂无 OWASP CRS WAF 防护集合。",
-    "sec.under_attack": "Under Attack 应急模式",
-    "sec.pages.preview": "沙盒实时预览",
-    "sec.pages.reset": "恢复内置默认页面",
-    "sec.pages.error_html": "自定义拦截错误页 HTML (403 / 429 / 5xx)",
-    "sec.pages.chal_html": "自定义 PoW 校验页 HTML (/cdn-cgi/)",
-    "sec.pages.chal_css": "自定义 PoW 校验页 CSS (/cdn-cgi/styles.css)",
-    "waf.title": "OWASP CRS WAF 防护",
-    "waf.mode": "WAF 防护模式",
-    "waf.mode.inherit": "继承全局默认 ({mode})",
-    "waf.mode.off": "关闭 (Off)",
-    "waf.mode.monitor": "仅审计告警 (Monitor)",
-    "waf.mode.block": "拦截阻断 403 (Block)",
-    "waf.mode.evilpot": "导入 Evilpot 蜜罐并分析行为 (Evilpot)",
-    "waf.max_body_kb": "请求体检测上限 (KiB)",
-    "waf.inspect_headers": "检测请求头 (UA / Referer / Cookie)",
-    "waf.inspect_body": "检测文本 / JSON / 表单请求体",
-    "waf.exempt_paths": "豁免路径前缀 (逗号分隔)",
-    "waf.disabled_rule_ids": "本集合禁用的 CRS 规则 ID (逗号分隔)",
-    "waf.categories": "启用攻击类别（留空则全选 12 类）",
-    "waf.categories.all": "已启用全部 12 类 OWASP CRS 规则",
-    "waf.cat.sql-injection": "SQL 注入",
-    "waf.cat.xss": "XSS 跨站",
-    "waf.cat.path-traversal": "路径穿越",
-    "waf.cat.command-injection": "命令注入",
-    "waf.cat.nosql-injection": "NoSQL 注入",
-    "waf.cat.ssrf": "SSRF 伪造",
-    "waf.cat.ssti": "模板注入",
-    "waf.cat.xxe": "XXE / XML",
-    "waf.cat.ldap-injection": "LDAP 注入",
-    "waf.cat.crlf-injection": "CRLF 头注入",
-    "waf.cat.deserialization": "JNDI / 反序列化",
-    "waf.cat.buffer-overflow": "溢出 / 格式化",
-    "ep.pull_refresh": "拉取遥测并刷新",
-    "ep.kpi.trapped": "诱捕攻击请求",
-    "ep.kpi.verified": "实锤利用会话",
-    "ep.kpi.canaries": "金丝雀凭据触发",
-    "ep.kpi.tarpit": "活跃焦油坑 / 牵制流量",
-    "ep.kpi.nodes": "启用 Evilpot 主机",
-    "ep.kpi.autoban": "自动封禁 (IP / 指纹)",
-    "ep.bans.title": "活跃自动封禁（已确认攻击者）",
-    "ep.unban.title": "手动解封 IP 或指纹",
-    "ep.unban.all_nodes": "全部在线 Ingress 节点",
-    "ep.unban.btn": "解封",
-    "ep.unban.clear_all": "清空全部封禁",
-    "ep.unban.clear_confirm": "确认清空所选 Ingress 节点上的全部活跃 IP 与指纹自动封禁？",
-    "ep.unban.done": "已下发解封指令 {kind}: {target}",
-    "geo.policy.title": "GeoIP 地区指向性访问策略",
-    "geo.policy.configure": "地区规则配置",
-    "geo.policy.enable": "启用基于 GeoIP 的地区访问控制",
-    "geo.policy.quick_target": "点击快捷标签加入",
-    "geo.policy.deny_list": "拒绝列表",
-    "geo.policy.allow_list": "允许列表",
-    "geo.policy.quick_chips": "常用国家 / 大洲快捷代码（点击切换）",
-    "geo.policy.allow_regions": "仅允许地区列表 (CSV，非空时未命中触发拒绝动作)",
-    "geo.policy.deny_regions": "拒绝地区列表 (CSV，如 CN, RU, CONTINENT:AF)",
-    "geo.policy.deny_action": "拒绝列表触发动作",
-    "geo.policy.default_action": "其余未命中地区默认动作",
-    "geo.policy.unknown_action": "未知 / 未分配 IP 处理动作",
-    "geo.policy.rules_title": "按顺序优先匹配的地区规则",
-    "geo.policy.add_rule": "添加规则",
-    "geo.policy.no_rules": "暂未配置自定义地区覆盖规则。",
-    "geo.db.sync_now": "立即同步 GeoIP 库",
-    "geo.db.syncing": "正在同步 GeoIP 库…",
-    "geo.db.synced_ok": "已在 {ok}/{total} 台 Ingress 节点同步最新 GeoIP 库",
-    "geo.db.nodes_loaded": "已加载节点数",
-    "geo.db.last_pull": "状态更新时间",
-    "geo.db.local_cache": "本地 geoip.bin 二进制持久化缓存",
-    "geo.db.settings_title": "集群免费 GeoIP 库自动拉取设置 (CC0)",
-    "geo.db.enabled": "Ingress 节点启用本地 GeoIP 解析引擎",
-    "geo.db.auto_update": "后台定期自动拉取更新",
-    "geo.db.interval_h": "更新间隔（小时，6–720）",
-    "geo.db.cache_dir": "本地缓存目录覆写（可选）",
-    "geo.db.lookup_title": "Ingress 节点本地 GeoIP 实时归属地查询",
-    "geo.db.any_loaded": "自动选择（首个已加载 Ingress）",
-    "geo.db.lookup_btn": "查询归属地",
-    "geo.db.node_table": "各 Ingress 节点本地 GeoIP 数据库状态",
-    "ep.sessions.title": "攻击者行为分析会话",
-    "ep.events.title": "近期诱捕与实锤验证时间线",
-    "ep.empty": "暂未捕获 Evilpot 蜜罐会话。请在防护策略中将 WAF 模式设为“导入 Evilpot 蜜罐并分析行为”并部署至 Ingress 节点，随后点击右上角拉取遥测查看实时分析。",
-    "ep.status.verified": "实锤利用",
-    "ep.status.multistep": "多步渗透",
-    "ep.status.probing": "探测阶段",
-    "ep.col.status": "行为定性",
-    "ep.col.ip": "攻击源 IP / 节点",
-    "ep.col.persona": "伪装画像",
-    "ep.col.activity": "请求 / SQLi / 金丝雀",
-    "ep.col.iocs": "RCE 命令与捕获 IOC",
-    "ep.col.tarpit": "焦油坑消耗",
-    "ep.col.evidence": "行为证据",
-    "ep.defaults.title": "Evilpot 蜜罐引擎默认参数",
-    "ep.defaults.rotation": "画像轮换周期 (秒)",
-    "ep.defaults.slots": "画像槽位数",
-    "ep.defaults.tarpit_conns": "最大焦油坑连接",
-    "ep.defaults.drip_bps": "焦油坑滴流速率 (B/s)",
-    "ep.defaults.sqli_delay": "SQLi 盲注延时 (ms)",
-    "ep.defaults.max_sessions": "最大跟踪会话数",
-    "ep.defaults.canary_url": "金丝雀 Webhook 基础 URL",
-
-    // Topology
-    "topo.connect": "连线模式",
-    "topo.auto_layout": "自动排版",
-    "topo.trace_off": "路径追踪: 关闭",
-    "topo.connect_hint": "先点击源主机，再点击目标主机创建网格链路（按 Esc 取消）",
-    "topo.fit": "适配视图",
-    "topo.grid": "网格吸附",
-    "topo.live": "实时健康",
-    "topo.empty_inspector": "点击画布中的主机或连线查看网格连接详情。主机详细配置请前往“节点主机”，业务发布请前往“服务发布”。",
-    "topo.node_summary": "主机连接概览",
-    "topo.open_host": "配置主机 →",
-    "topo.open_services": "管理服务 →",
-    "topo.link_title": "网格链路配置",
-    "topo.reverse_dir": "反转方向",
-    "topo.delete_link": "删除链路",
-
-    // Analytics & Logging
-    "ana.all_nodes": "全部主机",
-    "ana.all_services": "全部服务",
-    "ana.fp_explorer": "前往 Logging 工具检索 →",
-    "ana.svc_latency_title": "各服务延迟分布与性能明细 (p50 / p95 / p99)",
-    "ana.svc_latency_sub": "点击服务行可按服务过滤分析，或跳转查看其 URL 访问日志",
-    "logging.tab.access": "访问日志 (URL)",
-    "logging.tab.evilpot": "蜜罐与封禁",
-    "logging.tab.visitors": "访客画像与指纹",
-    "logging.tab.alerts": "告警",
-    "logging.tab.audit": "审计",
-    "logging.export_json": "导出 JSON",
-    "logging.cross.view_logs": "查看该 IP 的访问日志 →",
-    "logging.cross.view_visitor": "查看访客指纹与信誉 →",
-    "logging.cross.filter_ip": "按此 IP 过滤",
-    "logging.cross.filter_path": "按此路径过滤",
-    "logs.kpi.requests": "匹配总请求数",
-    "logs.kpi.blocked": "拦截 / 防护处置",
-    "logs.kpi.errors": "5xx 异常响应",
-    "logs.kpi.dos_shield": "日志防爆护盾",
-    "logs.top_urls": "热门访问 URL / 路径统计",
-    "logs.explorer_title": "HTTP 访问与 URL 明细日志",
-    "logs.col.time": "时间",
-    "logs.col.method": "方法",
-    "logs.col.status": "状态码",
-    "logs.col.url": "域名与完整 URL",
-    "logs.col.action": "防护动作 / WAF",
-    "logs.col.client": "来源 IP / HMAC",
-    "logs.col.route": "节点 / 服务",
-    "logs.col.perf": "耗时 / 流量",
-    "logs.search_ph": "路径、参数、Host、国家、Ray ID、UA、WAF…",
-    "logs.ip_ph": "203.0.113.5 或 HMAC",
-    "logs.host_ph": "example.com",
-    "logs.all_countries": "全部国家/地区",
-    "logs.page.showing": "第 {start}–{end} 条，共 {total} 条",
-    "logs.page.per_page": "每页",
-    "logs.page.of": "第 {page} / {pages} 页",
-    "logs.empty": "没有匹配的 URL 访问日志。",
-    "logging.cross.filter_ray": "按 Ray ID 过滤",
-
-    // System
-    "sys.tab.defaults": "集群默认策略",
-    "sys.tab.storage": "存储与清理",
-    "sys.tab.releases": "版本发布",
-    "sys.tab.yaml": "YAML 源码",
-    "sys.yaml_hint": "高级完整 TopologySpec YAML 编辑器。点击“解析并应用到草稿”即可与全部可视化页面同步。",
-    "sys.yaml_apply": "解析并应用到草稿",
-
-    // WAF Rules & OWASP CRS
-    "sec.tab.waf_rules": "WAF 规则集 (OWASP CRS)",
-    "waf.crs.enabled": "启用 OWASP CRS 规则集",
-    "waf.crs.paranoia": "CRS 严格等级 (PL)",
-    "waf.crs.sync_now": "立即同步 OWASP CRS",
-    "waf.crs.syncing": "正在从 coreruleset.org 同步…",
-    "waf.crs.synced_ok": "已同步 OWASP CRS {version}（{count} 条有效规则）",
-    "waf.crs.auto_update": "自动定时更新 OWASP CRS",
-    "waf.crs.interval_h": "自动检查间隔 (小时)",
-    "waf.crs.version": "当前 CRS 版本",
-    "waf.crs.updated": "上次同步时间",
-    "waf.crs.active_count": "已启用规则数",
-    "waf.crs.skipped_pcre": "已跳过 PCRE 专有规则",
-    "waf.crs.search_ph": "搜索规则 ID、名称、分类、正则表达式…",
-    "waf.crs.src_all": "全部来源",
-    "waf.crs.src_crs": "OWASP CRS 规则",
-    "waf.crs.pure_engine": "纯 OWASP CRS 线性正则引擎",
-    "waf.crs.status_all": "全部状态",
-    "waf.crs.status_on": "已启用",
-    "waf.crs.status_off": "已禁用",
-    "waf.crs.col_id": "规则 ID",
-    "waf.crs.col_source": "来源",
-    "waf.crs.col_pl": "等级",
-    "waf.crs.col_cat": "攻击分类",
-    "waf.crs.col_sev": "严重级别",
-    "waf.crs.col_desc": "规则描述 / 匹配模式",
-    "waf.crs.col_state": "开关",
-    "waf.crs.deploy_hint": "切换规则开关会更新集群 CRS 禁用列表草稿，点击顶部部署即可下发至全部 Ingress 节点。",
-
-    // AbuseIPDB IP Reputation
-    "abuse.title": "AbuseIPDB 威胁 IP 信誉库",
-    "abuse.enable": "启用 AbuseIPDB 自动信誉评分与拦截",
-    "abuse.enable_sub": "使用您自己的 AbuseIPDB v2 密钥查询公网 IP 滥用分（0-100，越高越危险），自动加权风险分或直接处置",
-    "abuse.api_key": "AbuseIPDB API 密钥",
-    "abuse.test_ip": "测试查询 IP",
-    "abuse.test_btn": "验证密钥",
-    "abuse.testing": "验证中…",
-    "abuse.action": "高危 IP 自动动作（≥ 拦截阈值）",
-    "abuse.action.off": "off — 仅记录评分",
-    "abuse.action.monitor": "monitor — 仅告警记录",
-    "abuse.action.challenge": "challenge — 强制 PoW 质询",
-    "abuse.action.block": "block — 直接 403 拦截",
-    "abuse.action.evilpot": "evilpot — 导入 Evilpot 蜜罐",
-    "abuse.challenge_th": "质询阈值 (0-100)",
-    "abuse.block_th": "拦截阈值 (0-100)",
-    "abuse.max_age": "回溯天数",
-    "abuse.cache_ttl": "本地缓存 TTL (秒)",
-    "abuse.daily_limit": "单节点每日配额上限",
-
-    // Log Persistence & Retention
-    "log.flush_secs": "节点定时提交间隔 (秒)",
-    "log.max_batch_rec": "满条数提前提交阈值",
-    "log.max_batch_kb": "满体积提前提交 (KiB)",
-    "log.retention_h": "Maintainer 日志保留 (小时)",
-    "log.max_disk_mb": "Maintainer 最大磁盘 (MiB)",
-    "log.max_summaries": "最大保留分钟汇总数",
-    "log.max_fps": "最大保留访客指纹数",
-    "log.max_recent": "最近 URL 日志内存上限",
-    "log.prot_enable": "启用防日志 DoS 爆炸保护",
-    "log.prot_enable_sub": "开启全局限流、单 IP 限流、字节预算与重复洪泛折叠（MinuteSummary 指标始终保持 100% 精确）",
-    "log.prot_query": "记录脱敏 URL 查询参数",
-    "log.prot_query_sub": "记录净化后的 ?query 参数，自动遮蔽 token / password / secret / key 等敏感字段",
-    "log.prot_stdout": "向标准输出打印访问日志",
-    "log.prot_rps": "全局详细日志上限 (条/秒)",
-    "log.prot_iprps": "单 IP 详细日志上限 (条/秒)",
-    "log.prot_mbmin": "分钟日志字节上限 (MiB)",
-    "log.prot_dedup": "重复洪水折叠窗口 (秒)",
-    "log.prot_warn": "告警 stderr 限流 (/秒)",
-
-    // Fingerprints Server-First & BrowserLeaks
-    "fp.sec.server": "服务端不可伪造信号（核心可信评分依据）",
-    "fp.sec.client": "客户端辅助 BrowserLeaks 指纹（不可信 · 仅用于无头/篡改检测与观测）",
-    "fp.server_score": "服务端风险分",
-    "fp.tls_ja3": "TLS JA3 / GREASE",
-    "fp.abuse_intel": "AbuseIPDB 信誉情报",
-    "fp.tamper_flags": "自动化与篡改标记",
-    "fp.webrtc.title": "WebRTC 真实 IP 泄漏检测",
-    "fp.webrtc.leak_badge": "WebRTC 公网 IP 泄漏",
-    "fp.webrtc.lan_badge": "暴露内网 IP",
-    "fp.webrtc.mdns_badge": "mDNS 隐藏保护",
-    "fp.webrtc.clean": "未检测到 WebRTC IP 泄漏",
-  },
-};
-
-let currentLang = detectInitialLang();
+const LOCALES = buildLocales();
 const listeners = new Set();
 
 function detectInitialLang() {
   try {
     const saved = localStorage.getItem(LANG_STORAGE_KEY);
-    if (saved && MESSAGES[saved]) return saved;
+    if (saved && LOCALES.has(saved)) return saved;
   } catch {}
-  const navLang = (navigator.language || "").toLowerCase();
-  return navLang.startsWith("zh") ? "zh-CN" : "en";
+  let navLang = "";
+  try {
+    navLang = (navigator.language || "").toLowerCase();
+  } catch {}
+  if (navLang) {
+    for (const code of LOCALES.keys()) {
+      if (code === SOURCE_LANG) continue;
+      const base = code.toLowerCase().split("-")[0];
+      if (navLang.startsWith(base)) return code;
+    }
+  }
+  return SOURCE_LANG;
 }
+
+let currentLang = detectInitialLang();
 
 export function getLang() {
   return currentLang;
 }
 
+/** All registered languages, source language first. */
+export function getAvailableLangs() {
+  return [...LOCALES.values()].map(({ code, name, dir }) => ({ code, name, dir }));
+}
+
 export function setLang(lang) {
-  if (!MESSAGES[lang] || lang === currentLang) return;
+  if (!LOCALES.has(lang) || lang === currentLang) return;
   currentLang = lang;
   try {
     localStorage.setItem(LANG_STORAGE_KEY, lang);
   } catch {}
+  const meta = LOCALES.get(lang);
   document.documentElement.lang = lang;
+  document.documentElement.dir = meta?.dir || "ltr";
+  applyI18n(document);
   for (const fn of listeners) fn(lang);
 }
 
@@ -1103,9 +98,14 @@ export function onLangChange(fn) {
   return () => listeners.delete(fn);
 }
 
-export function t(key, vars = null) {
-  const dict = MESSAGES[currentLang] || MESSAGES.en;
-  let msg = dict[key] ?? MESSAGES.en[key] ?? key;
+/**
+ * Translate an English source string. Missing translations fall back to the English
+ * source, so a partially translated locale still renders a usable UI.
+ */
+export function t(source, vars = null) {
+  const locale = LOCALES.get(currentLang) || LOCALES.get(SOURCE_LANG);
+  const key = normalize(source);
+  let msg = locale.dict.get(key) ?? key;
   if (vars && typeof vars === "object") {
     for (const [k, v] of Object.entries(vars)) {
       msg = msg.replaceAll(`{${k}}`, String(v ?? ""));
@@ -1114,20 +114,121 @@ export function t(key, vars = null) {
   return msg;
 }
 
-export function applyStaticI18n(root = document) {
-  root.querySelectorAll("[data-i18n]").forEach((node) => {
-    const key = node.dataset.i18n;
-    if (key) node.textContent = t(key);
-  });
-  root.querySelectorAll("[data-i18n-placeholder]").forEach((node) => {
-    const key = node.dataset.i18nPlaceholder;
-    if (key) node.placeholder = t(key);
-  });
-  root.querySelectorAll("[data-i18n-title]").forEach((node) => {
-    const key = node.dataset.i18nTitle;
-    if (key) node.title = t(key);
+/* ==================== DOM translation (no data-i18n required) ==================== */
+
+// Never touch: executable/embedded content, values that come from API payloads, and
+// elements explicitly opted out with `data-i18n-skip`.
+const SKIP_TAGS = new Set([
+  "SCRIPT",
+  "STYLE",
+  "PRE",
+  "CODE",
+  "TEXTAREA",
+  "SVG",
+  "CANVAS",
+  "IFRAME",
+  "NOSCRIPT",
+]);
+const SKIP_SELECTOR = [
+  "tbody", // table bodies are rendered from API data
+  ".fp-kv-val", // detail drawers show API values
+  ".fp-ua-box",
+  ".output-box",
+  ".code-editor",
+  ".chart-box",
+  ".chart-svg-wrap",
+  "[data-i18n-skip]",
+].join(",");
+const ATTRS = ["placeholder", "title", "aria-label", "alt"];
+
+const originalText = new WeakMap();
+const originalAttrs = new WeakMap();
+
+function isSkipped(el) {
+  if (SKIP_TAGS.has(el.tagName)) return true;
+  if (el.isContentEditable) return true;
+  return el.matches(SKIP_SELECTOR);
+}
+
+function walkTree(root, handler) {
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      handler.text(node);
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (isSkipped(node)) return;
+    handler.element(node);
+    for (let child = node.firstChild; child; child = child.nextSibling) visit(child);
+  };
+  if (!root) return;
+  for (let child = root.firstChild; child; child = child.nextSibling) visit(child);
+}
+
+function translateTextNode(node, dict) {
+  const raw = node.nodeValue;
+  if (!raw) return;
+  const key = normalize(raw);
+  if (key.length < 2) return;
+  const translated = dict.get(key);
+  if (!translated || translated === key) return;
+  if (!originalText.has(node)) originalText.set(node, raw);
+  const m = raw.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  node.nodeValue = `${m[1]}${translated}${m[3]}`;
+}
+
+function restoreTree(root) {
+  walkTree(root, {
+    text(node) {
+      const original = originalText.get(node);
+      if (original != null) node.nodeValue = original;
+    },
+    element(el) {
+      const attrs = originalAttrs.get(el);
+      if (!attrs) return;
+      for (const [name, value] of attrs) {
+        if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+      }
+    },
   });
 }
+
+/**
+ * Translate (or restore, when the active language is English) static UI text under `root`.
+ * Call after every view render; safe to call repeatedly.
+ */
+export function applyI18n(root = document) {
+  if (currentLang === SOURCE_LANG) {
+    restoreTree(root);
+    return;
+  }
+  const dict = LOCALES.get(currentLang)?.dict;
+  if (!dict || dict.size === 0) return;
+  walkTree(root, {
+    text(node) {
+      translateTextNode(node, dict);
+    },
+    element(el) {
+      for (const name of ATTRS) {
+        const value = el.getAttribute(name);
+        if (!value) continue;
+        const key = normalize(value);
+        const translated = dict.get(key);
+        if (!translated || translated === key) continue;
+        let attrs = originalAttrs.get(el);
+        if (!attrs) {
+          attrs = new Map();
+          originalAttrs.set(el, attrs);
+        }
+        if (!attrs.has(name)) attrs.set(name, value);
+        el.setAttribute(name, translated);
+      }
+    },
+  });
+}
+
+/** Backwards-compatible alias for the previous attribute-based API. */
+export const applyStaticI18n = applyI18n;
 
 // Common Aliyun DNS line display names fallback when DescribeSupportLines hasn't been fetched yet
 export const COMMON_ALIYUN_LINES = [
