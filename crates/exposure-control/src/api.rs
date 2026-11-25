@@ -11,7 +11,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use exposure_core::assets::{WebApp, load_web_asset};
+use exposure_core::assets::{WebApp, load_web_asset_negotiated};
 use exposure_core::config::{
     ControlConfig, ControlRetentionConfig, ControlRole, DnsProviderAccountConfig,
     MaintainerRetentionConfig, NodeConfig, TopologySpec,
@@ -5395,24 +5395,29 @@ async fn lookup_geoip(
 }
 
 /// Serve Control Web Panel static files (returning JSON 404 for unknown `/api/*` paths).
-async fn serve_web_panel(uri: Uri) -> Response {
+async fn serve_web_panel(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path();
     if path.starts_with("/api/") || path == "/api" {
         return json_err(StatusCode::NOT_FOUND, "api endpoint not found");
     }
-    let asset = load_web_asset(WebApp::Control, path)
-        .or_else(|| load_web_asset(WebApp::Control, "index.html"));
+    let accept_enc = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let asset = load_web_asset_negotiated(WebApp::Control, path, accept_enc)
+        .or_else(|| load_web_asset_negotiated(WebApp::Control, "index.html", accept_enc));
 
     match asset {
-        Some((bytes, mime)) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, mime),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Some(asset) => {
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(asset.mime));
+            resp_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            resp_headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+            if let Some(encoding) = asset.encoding {
+                resp_headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
+            }
+            (StatusCode::OK, resp_headers, asset.bytes.into_owned()).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "Control web asset not found").into_response(),
     }
 }

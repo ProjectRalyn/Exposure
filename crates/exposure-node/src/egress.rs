@@ -403,6 +403,9 @@ impl EgressHandler {
             .into_iter()
             .map(|o| (o.node_tag, o.public_key))
             .collect();
+        // Read the configured single-file error page into memory once, up front.
+        let mut cfg = cfg;
+        cfg.resolved_pages = cfg.pages.resolve();
         Arc::new(Self {
             node_tag: node_tag.into(),
             cfg: Arc::new(RwLock::new(cfg)),
@@ -416,6 +419,8 @@ impl EgressHandler {
     }
 
     pub async fn update_config(&self, cfg: EgressConfig, trusted_origins: Vec<TrustedOrigin>) {
+        let mut cfg = cfg;
+        cfg.resolved_pages = cfg.pages.resolve();
         *self.cfg.write().await = cfg;
         *self.trusted_origins.write().await = trusted_origins
             .into_iter()
@@ -661,7 +666,7 @@ impl EgressHandler {
             let cfg = self.cfg.read().await;
             (
                 cfg.services.get(&header.service_tag).cloned(),
-                cfg.pages.error_html.clone(),
+                cfg.resolved_pages.error.clone(),
             )
         };
 

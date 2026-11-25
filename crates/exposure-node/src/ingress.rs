@@ -283,6 +283,9 @@ impl IngressServer {
             &cfg.crs_rules,
             &cfg.crs.disabled_rule_ids,
         ));
+        // Read the configured single-file pages into memory once, up front.
+        let mut cfg = cfg;
+        cfg.resolved_pages = cfg.pages.resolve();
         Arc::new(Self {
             node_tag: tag,
             keypair,
@@ -355,7 +358,8 @@ impl IngressServer {
     ) -> Result<()> {
         self.cert_resolver.load_from_files(&cfg.tls_certs)?;
         let prev_secret = self.cfg.read().await.clearance_secret.clone();
-        let cfg = ensure_strong_clearance_secret(cfg, &self.node_tag, Some(&prev_secret));
+        let mut cfg = ensure_strong_clearance_secret(cfg, &self.node_tag, Some(&prev_secret));
+        cfg.resolved_pages = cfg.pages.resolve();
         let any_cache_enabled = ingress_enabled
             && (cfg.cache.enabled
                 || cfg
@@ -1531,7 +1535,7 @@ impl IngressServer {
                             show_error_page,
                             false,
                             &ray_id,
-                            cfg.pages.error_html.as_deref(),
+                            cfg.resolved_pages.error.as_deref(),
                             accept_encoding(&headers),
                         );
                     }
@@ -1569,7 +1573,7 @@ impl IngressServer {
                         false,
                         false,
                         &ray_id,
-                        cfg.pages.error_html.as_deref(),
+                        cfg.resolved_pages.error.as_deref(),
                         accept_encoding(&headers),
                     );
                 }
@@ -1587,7 +1591,7 @@ impl IngressServer {
                 guard_profile,
                 &cfg.clearance_secret,
                 cfg.effective_js_fp_ttl_secs(),
-                Some(&cfg.pages),
+                Some(&cfg.resolved_pages),
             );
 
             let passed = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::OK;
@@ -1865,7 +1869,7 @@ impl IngressServer {
                             StatusCode::SERVICE_UNAVAILABLE,
                             &ray_id,
                             rule.effective_intercept_errors(),
-                            cfg.pages.error_html.as_deref(),
+                            cfg.resolved_pages.error.as_deref(),
                             &accept_enc,
                         );
                     }
@@ -1986,7 +1990,7 @@ impl IngressServer {
                         show_error_page,
                         rule.effective_intercept_errors(),
                         &ray_id,
-                        cfg.pages.error_html.as_deref(),
+                        cfg.resolved_pages.error.as_deref(),
                         &accept_enc,
                     );
                 }
@@ -2353,7 +2357,7 @@ impl IngressServer {
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     &ray_id,
                                     rule.effective_intercept_errors(),
-                                    cfg.pages.error_html.as_deref(),
+                                    cfg.resolved_pages.error.as_deref(),
                                     &accept_enc,
                                 );
                             };
@@ -2556,7 +2560,7 @@ impl IngressServer {
                                 rule.effective_intercept_errors(),
                                 is_browser_navigation(req.method(), req.headers()),
                                 &ray_id,
-                                cfg.pages.error_html.as_deref(),
+                                cfg.resolved_pages.error.as_deref(),
                                 accept_encoding(req.headers()),
                             );
                         }
@@ -3356,7 +3360,7 @@ impl IngressServer {
                     StatusCode::BAD_GATEWAY,
                     &ray_id,
                     rule.effective_intercept_errors(),
-                    cfg.pages.error_html.as_deref(),
+                    cfg.resolved_pages.error.as_deref(),
                     &accept_enc,
                 );
             }
@@ -3421,7 +3425,7 @@ impl IngressServer {
                     StatusCode::GATEWAY_TIMEOUT,
                     &ray_id,
                     rule.effective_intercept_errors(),
-                    cfg.pages.error_html.as_deref(),
+                    cfg.resolved_pages.error.as_deref(),
                     &accept_enc,
                 );
             }
@@ -3657,7 +3661,7 @@ impl IngressServer {
                             resp.status(),
                             &ray_id,
                             true,
-                            cfg.pages.error_html.as_deref(),
+                            cfg.resolved_pages.error.as_deref(),
                             &accept_enc,
                         );
                     }
@@ -3794,7 +3798,7 @@ impl IngressServer {
                     err_status,
                     &ray_id,
                     rule.effective_intercept_errors(),
-                    cfg.pages.error_html.as_deref(),
+                    cfg.resolved_pages.error.as_deref(),
                     &accept_enc,
                 )
             }

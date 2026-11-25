@@ -404,9 +404,8 @@ export function defaultTopologyDefaults() {
       allow_bootstrap: false,
     },
     pages: {
-      error_html: null,
-      challenge_html: null,
-      challenge_css: null,
+      error: null,
+      pow: null,
     },
   };
 }
@@ -617,9 +616,9 @@ export function defaultNodeSpec() {
       js_fp_beacon: null,
       js_fp_ttl_secs: null,
       geoip: null,
-      pages: { error_html: null, challenge_html: null, challenge_css: null },
+      pages: { error: null, pow: null },
     },
-    egress: { services: {}, pages: { error_html: null, challenge_html: null, challenge_css: null } },
+    egress: { services: {}, pages: { error: null, pow: null } },
     relay: { rules: [] },
   };
 }
@@ -709,15 +708,13 @@ export function normalizeNode(n) {
   for (const [k, v] of Object.entries(rawBuckets)) out.ingress.rate_limit_buckets[k] = normalizeBucket(v);
   out.ingress.tls_certs = Array.isArray(out.ingress.tls_certs) ? out.ingress.tls_certs : [];
   out.ingress.pages = {
-    error_html: n?.ingress?.pages?.error_html || null,
-    challenge_html: n?.ingress?.pages?.challenge_html || null,
-    challenge_css: n?.ingress?.pages?.challenge_css || null,
+    error: n?.ingress?.pages?.error || null,
+    pow: n?.ingress?.pages?.pow || null,
   };
   out.egress = { ...base.egress, ...(n?.egress || {}) };
   out.egress.pages = {
-    error_html: n?.egress?.pages?.error_html || null,
-    challenge_html: null,
-    challenge_css: null,
+    error: n?.egress?.pages?.error || null,
+    pow: null,
   };
   const rawSvcs = sanitizeRecord(out.egress.services);
   out.egress.services = {};
@@ -794,9 +791,8 @@ export function normalizeDefaults(raw) {
       allow_bootstrap: Boolean(src.link_listener?.allow_bootstrap ?? base.link_listener.allow_bootstrap),
     },
     pages: {
-      error_html: src.pages?.error_html || null,
-      challenge_html: src.pages?.challenge_html || null,
-      challenge_css: src.pages?.challenge_css || null,
+      error: src.pages?.error || null,
+      pow: src.pages?.pow || null,
     },
   };
 }

@@ -479,6 +479,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         egress: EgressConfig {
             services: local_services,
             pages: Default::default(),
+            resolved_pages: Default::default(),
         },
         relay: Default::default(),
         maintainer: None,
@@ -1185,10 +1186,19 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     // Verify Preflight bundle CANNOT be replayed as ConfigPush (domain separation!)
     let mut updated_cfg = ingress_rt.config_snapshot().await;
     updated_cfg.default_ttl = 12;
+    let pages_dir = std::env::temp_dir().join(format!("exposure-e2e-pages-{}", std::process::id()));
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    let error_page_path = pages_dir.join("error.html");
+    let pow_page_path = pages_dir.join("pow.html");
+    std::fs::write(&error_page_path, "<html>custom-err-{{status}}</html>").unwrap();
+    std::fs::write(
+        &pow_page_path,
+        "<html><body>Custom PoW Page</body></html>",
+    )
+    .unwrap();
     updated_cfg.ingress.pages = exposure_core::config::CustomPagesConfig {
-        error_html: Some("<html>custom-err-{{status}}</html>".into()),
-        challenge_html: Some("<html><body>Custom PoW Page</body></html>".into()),
-        challenge_css: Some("body{background:#010203}".into()),
+        error: Some(error_page_path.to_string_lossy().into_owned()),
+        pow: Some(pow_page_path.to_string_lossy().into_owned()),
     };
     let preflight_bundle = ctrl_rt
         .client()
@@ -1217,7 +1227,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     assert_eq!(ingress_rt.config_snapshot().await.config_sequence, 2);
     assert_eq!(ingress_rt.config_snapshot().await.default_ttl, 12);
 
-    // Verify custom Control-distributed PoW HTML & CSS are served immediately from memory
+    // Verify the custom single-file PoW page was preloaded from disk and is served as-is
     let custom_pow_html = http_client
         .get(format!("http://{ingress_http}/cdn-cgi/"))
         .header("Host", "pow.test")
@@ -1228,17 +1238,6 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     assert_eq!(
         custom_pow_html.text().await.unwrap(),
         "<html><body>Custom PoW Page</body></html>"
-    );
-    let custom_pow_css = http_client
-        .get(format!("http://{ingress_http}/cdn-cgi/styles.css"))
-        .header("Host", "pow.test")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(custom_pow_css.status(), 200);
-    assert_eq!(
-        custom_pow_css.text().await.unwrap(),
-        "body{background:#010203}"
     );
 
     // Attempt rollback with seq=1 -> must be rejected and seq remains 2

@@ -7,8 +7,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use dashmap::DashMap;
-use exposure_core::assets::{WebApp, load_web_asset};
-use exposure_core::config::{AntibotMode, CustomPagesConfig, GuardProfile, RateLimitBucket};
+use exposure_core::assets::{WebApp, load_web_asset_negotiated, maybe_gzip_body};
+use exposure_core::config::{AntibotMode, GuardProfile, RateLimitBucket, ResolvedPages};
 use exposure_core::crypto::{
     ClearanceClaims, FpCookieClaims, ct_eq_hashed, keyed_short_hmac_hex, short_sha256_hex,
     sign_challenge_token, sign_clearance_cookie, sign_fp_cookie, sign_fp_token,
@@ -1048,7 +1048,7 @@ impl GuardEngine {
         profile: Option<&GuardProfile>,
         clearance_secret: &str,
         fp_ttl_secs: u64,
-        custom_pages: Option<&CustomPagesConfig>,
+        custom_pages: Option<&ResolvedPages>,
     ) -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
         let client_ip = canonical_ip(client_ip);
         let host_clean = normalize_host(host);
@@ -1528,51 +1528,33 @@ impl GuardEngine {
         }
 
         let asset_path = sub.trim_start_matches('/');
-        if let Some(pages) = custom_pages {
-            if asset_path.is_empty() || asset_path == "index.html" {
-                if let Some(custom_html) = pages
-                    .challenge_html
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let mut extra = sec_headers();
-                    extra.push(("Cache-Control".into(), "no-cache".into()));
-                    return (
-                        GuardHttpResponse {
-                            status: StatusCode::OK,
-                            content_type: "text/html; charset=utf-8",
-                            body: custom_html.as_bytes().to_vec(),
-                            extra_headers: extra,
-                            record_verify_offense: false,
-                        },
-                        None,
-                    );
+        let accept_enc = headers
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // A configured single-file PoW page replaces the built-in one wholesale.
+        if asset_path.is_empty() || asset_path == "index.html" {
+            if let Some(pow) = custom_pages.and_then(|p| p.pow.as_deref()) {
+                let (body, encoding) = maybe_gzip_body(pow.as_bytes().to_vec(), accept_enc);
+                let mut extra = sec_headers();
+                extra.push(("Cache-Control".into(), "no-cache".into()));
+                extra.push(("Vary".into(), "Accept-Encoding".into()));
+                if let Some(encoding) = encoding {
+                    extra.push(("Content-Encoding".into(), encoding.into()));
                 }
-            }
-            if asset_path == "styles.css" || asset_path == "assets/styles.min.css" {
-                if let Some(custom_css) = pages
-                    .challenge_css
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let mut extra = sec_headers();
-                    extra.push(("Cache-Control".into(), "no-cache".into()));
-                    return (
-                        GuardHttpResponse {
-                            status: StatusCode::OK,
-                            content_type: "text/css; charset=utf-8",
-                            body: custom_css.as_bytes().to_vec(),
-                            extra_headers: extra,
-                            record_verify_offense: false,
-                        },
-                        None,
-                    );
-                }
+                return (
+                    GuardHttpResponse {
+                        status: StatusCode::OK,
+                        content_type: "text/html; charset=utf-8",
+                        body,
+                        extra_headers: extra,
+                        record_verify_offense: false,
+                    },
+                    None,
+                );
             }
         }
-        if let Some((bytes, mime)) = load_web_asset(WebApp::Challenge, asset_path) {
+        if let Some(asset) = load_web_asset_negotiated(WebApp::Challenge, asset_path, accept_enc) {
             let mut extra = sec_headers();
             let cc = if asset_path == "fp.js" {
                 "public, max-age=300"
@@ -1580,11 +1562,25 @@ impl GuardEngine {
                 "no-cache"
             };
             extra.push(("Cache-Control".into(), cc.into()));
+            extra.push(("Vary".into(), "Accept-Encoding".into()));
+            // Every `/cdn-cgi/*` resource is gzip'd for clients that accept it: build-time
+            // pre-compressed variants are used as-is, text assets are compressed on the spot.
+            // Already-compressed binaries (png/ico) are never re-compressed.
+            let (body, encoding) = match asset.encoding {
+                Some(encoding) => (asset.bytes.into_owned(), Some(encoding)),
+                None if is_compressible_mime(asset.mime) => {
+                    maybe_gzip_body(asset.bytes.into_owned(), accept_enc)
+                }
+                None => (asset.bytes.into_owned(), None),
+            };
+            if let Some(encoding) = encoding {
+                extra.push(("Content-Encoding".into(), encoding.into()));
+            }
             return (
                 GuardHttpResponse {
                     status: StatusCode::OK,
-                    content_type: mime,
-                    body: bytes,
+                    content_type: asset.mime,
+                    body,
                     extra_headers: extra,
                     record_verify_offense: false,
                 },
@@ -1603,6 +1599,16 @@ impl GuardEngine {
             None,
         )
     }
+}
+
+/// Asset types worth gzip'ing on the fly (build-time variants cover release builds; this matters
+/// for dev builds and for anything staged without a pre-compressed twin).
+fn is_compressible_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime.contains("javascript")
+        || mime.contains("json")
+        || mime.contains("svg")
+        || mime.contains("wasm")
 }
 
 /// Returns `true` for unambiguous offensive vulnerability scanners and exploit frameworks.
@@ -2063,12 +2069,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_challenge_html_and_css_served_from_memory() {
+    fn custom_single_file_pow_page_replaces_builtin() {
         let engine = GuardEngine::new();
-        let pages = CustomPagesConfig {
-            error_html: None,
-            challenge_html: Some("<html><body>Custom PoW</body></html>".into()),
-            challenge_css: Some("body{background:#123456}".into()),
+        let pow_html = format!("<html><body>Custom PoW {}</body></html>", "x".repeat(4096));
+        let pages = ResolvedPages {
+            error: None,
+            pow: Some(pow_html.clone().into()),
         };
         let ip: IpAddr = "203.0.113.55".parse().unwrap();
         let headers = HeaderMap::new();
@@ -2089,13 +2095,16 @@ mod tests {
         );
         assert_eq!(html_resp.status, StatusCode::OK);
         assert_eq!(html_resp.content_type, "text/html; charset=utf-8");
-        assert_eq!(html_resp.body, b"<html><body>Custom PoW</body></html>");
+        assert_eq!(html_resp.body, pow_html.as_bytes());
 
-        let (css_resp, _) = engine.handle_cdn_cgi_with_pages(
+        // `/cdn-cgi/index.html` is the same page, and it is gzip'd for clients that accept it.
+        let mut gz_headers = HeaderMap::new();
+        gz_headers.insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let (gz_resp, _) = engine.handle_cdn_cgi_with_pages(
             &Method::GET,
-            "/cdn-cgi/styles.css",
+            "/cdn-cgi/index.html",
             &[],
-            &headers,
+            &gz_headers,
             "example.com",
             ip,
             true,
@@ -2105,9 +2114,15 @@ mod tests {
             3600,
             Some(&pages),
         );
-        assert_eq!(css_resp.status, StatusCode::OK);
-        assert_eq!(css_resp.content_type, "text/css; charset=utf-8");
-        assert_eq!(css_resp.body, b"body{background:#123456}");
+        assert_eq!(gz_resp.status, StatusCode::OK);
+        assert_eq!(
+            gz_resp
+                .extra_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                .map(|(_, v)| v.as_str()),
+            Some("gzip")
+        );
     }
 
     #[test]

@@ -3,6 +3,10 @@ name = "exposure-core"
 version.workspace = true
 edition.workspace = true
 
+[build-dependencies]
+flate2.workspace = true
+brotli.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true

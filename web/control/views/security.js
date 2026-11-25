@@ -1567,12 +1567,10 @@ export function createSecurityView({ api, store }) {
     ".hidden{display:none}" +
     "@media (max-width:980px){.page{align-items:flex-start;padding:52px 24px 0}.foot{margin-top:36px}}";
 
+  // Custom pages are node-local files, so the panel can only preview the built-in templates.
   function buildPreviewHtml() {
-    const pages = store.spec.defaults?.pages || {};
     if (previewMode === "error") {
-      const tpl =
-        pages.error_html ||
-        `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>{{status}} {{title}}</title><style>${BUILTIN_PAGE_CSS}</style></head><body><main class="page is-429"><section class="col"><div class="tag">HTTP {{status}}</div><h1>{{title}}</h1><div class="rule"></div><p class="detail">{{detail}}</p>{{retry_note}}<div class="foot"><span>Exposure Edge</span><span>Ray {{ray_id}}</span></div></section></main></body></html>`;
+      const tpl = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>{{status}} {{title}}</title><style>${BUILTIN_PAGE_CSS}</style></head><body><main class="page is-429"><section class="col"><div class="tag">HTTP {{status}}</div><h1>{{title}}</h1><div class="rule"></div><p class="detail">{{detail}}</p>{{retry_note}}<div class="foot"><span>Exposure Edge</span><span>Ray {{ray_id}}</span></div></section></main></body></html>`;
       return tpl
         .replaceAll("{{status}}", "429")
         .replaceAll("{{title}}", "Too Many Requests")
@@ -1586,32 +1584,24 @@ export function createSecurityView({ api, store }) {
         );
     }
     const css =
-      pages.challenge_css ||
       BUILTIN_PAGE_CSS.replace(
         "--accent:#C40233;--accent-ink:#ffffff;--danger:#c40233}",
         "--accent:#3c7499;--accent-ink:#ffffff;--danger:#c40233}"
       ) + "@media (prefers-color-scheme:dark){:root{--accent:#8fb9d6;--accent-ink:#121212}}";
-    const html =
-      pages.challenge_html ||
-      `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>Security Check</title><style>${css}</style></head><body><main class="page"><section class="col"><div class="tag">Security Check</div><h1>Verifying your browser</h1><div class="rule"></div><p id="status-text" class="detail">Running a lightweight proof-of-work check before forwarding your request.</p><div class="track"><div id="progress-bar" class="bar" style="width:62%"></div></div><dl class="meta"><div><dt>Difficulty</dt><dd id="meta-difficulty">18 bits</dd></div><div><dt>Hashes</dt><dd id="meta-hashes">131072</dd></div></dl><p id="error-text" class="error hidden"></p><div class="foot"><span>Exposure Edge</span><span>PoW / SHA-256</span></div></section></main></body></html>`;
-    return html.includes("</head>")
-      ? html.replace("</head>", `<style>${css}</style></head>`)
-      : `<style>${css}</style>${html}`;
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>Security Check</title><style>${css}</style></head><body><main class="page"><section class="col"><div class="tag">Security Check</div><h1>Verifying your browser</h1><div class="rule"></div><p id="status-text" class="detail">Running a lightweight proof-of-work check before forwarding your request.</p><div class="track"><div id="progress-bar" class="bar" style="width:62%"></div></div><dl class="meta"><div><dt>Difficulty</dt><dd id="meta-difficulty">18 bits</dd></div><div><dt>Hashes</dt><dd id="meta-hashes">131072</dd></div></dl><p id="error-text" class="error hidden"></p><div class="foot"><span>Exposure Edge</span><span>PoW / SHA-256</span></div></section></main></body></html>`;
   }
 
   function renderPagesSubTab(container) {
-    const pages = store.spec.defaults?.pages || { error_html: null, challenge_html: null, challenge_css: null };
+    const pages = store.spec.defaults?.pages || { error: null, pow: null };
     container.innerHTML = `
       <div class="page-editor-grid">
         <div class="panel" style="display:flex;flex-direction:column;gap:12px;margin-bottom:0;">
-          <label><span>${esc(t("Custom Intercept Error Page HTML (403 / 429 / 5xx)"))}</span>
-            <textarea id="pg-err-html" class="code-editor" style="min-height:120px;" spellcheck="false" placeholder="Leave empty for built-in 403 / 429 / 5xx error page">${esc(pages.error_html || "")}</textarea>
+          <p style="margin:0;font-size:12px;color:var(--muted);">${esc(t("Each node reads these single-file HTML pages from its own filesystem when the config is applied. Leave empty for the built-in page; a missing or unreadable file falls back to it with a warning."))}</p>
+          <label><span>${esc(t("Custom Intercept Error Page (single-file HTML path)"))}</span>
+            <input id="pg-err-path" type="text" spellcheck="false" placeholder="/etc/exposure/pages/error.html" value="${esc(pages.error || "")}" />
           </label>
-          <label><span>${esc(t("Custom PoW Challenge HTML (/cdn-cgi/)"))}</span>
-            <textarea id="pg-chal-html" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for built-in PoW HTML">${esc(pages.challenge_html || "")}</textarea>
-          </label>
-          <label><span>${esc(t("Custom PoW Challenge CSS (/cdn-cgi/styles.css)"))}</span>
-            <textarea id="pg-chal-css" class="code-editor" style="min-height:100px;" spellcheck="false" placeholder="Leave empty for built-in PoW CSS">${esc(pages.challenge_css || "")}</textarea>
+          <label><span>${esc(t("Custom PoW Challenge Page (single-file HTML path)"))}</span>
+            <input id="pg-pow-path" type="text" spellcheck="false" placeholder="/etc/exposure/pages/pow.html" value="${esc(pages.pow || "")}" />
           </label>
         </div>
         <div class="panel" style="display:flex;flex-direction:column;gap:10px;margin-bottom:0;">
@@ -1640,22 +1630,18 @@ export function createSecurityView({ api, store }) {
       });
     });
 
-    el("pg-err-html")?.addEventListener("input", (ev) => {
-      store.mutate((s) => { s.defaults.pages.error_html = ev.target.value.trim() ? ev.target.value : null; }, false);
-      refreshFrame();
+    el("pg-err-path")?.addEventListener("input", (ev) => {
+      const v = ev.target.value.trim();
+      store.mutate((s) => { s.defaults.pages.error = v ? v : null; }, false);
     });
-    el("pg-chal-html")?.addEventListener("input", (ev) => {
-      store.mutate((s) => { s.defaults.pages.challenge_html = ev.target.value.trim() ? ev.target.value : null; }, false);
-      refreshFrame();
-    });
-    el("pg-chal-css")?.addEventListener("input", (ev) => {
-      store.mutate((s) => { s.defaults.pages.challenge_css = ev.target.value.trim() ? ev.target.value : null; }, false);
-      refreshFrame();
+    el("pg-pow-path")?.addEventListener("input", (ev) => {
+      const v = ev.target.value.trim();
+      store.mutate((s) => { s.defaults.pages.pow = v ? v : null; }, false);
     });
 
     el("btn-sec-reset-pages")?.addEventListener("click", () => {
       store.mutate((s) => {
-        s.defaults.pages = { error_html: null, challenge_html: null, challenge_css: null };
+        s.defaults.pages = { error: null, pow: null };
       });
       render();
       showToast("Reset custom pages to built-in defaults");

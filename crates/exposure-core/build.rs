@@ -242,7 +242,8 @@ fn main() {
     if profile != "release" {
         fs::write(
             &dest,
-            "pub fn get_embedded(_app: &str, _path: &str) -> Option<&'static [u8]> { None }\n",
+            "pub fn get_embedded(_app: &str, _path: &str) -> Option<&'static [u8]> { None }\n\
+             pub fn get_embedded_encoded(_app: &str, _path: &str, _encoding: &str) -> Option<&'static [u8]> { None }\n",
         )
         .unwrap();
         return;
@@ -279,25 +280,158 @@ fn main() {
     collect_files(&dist_control, &dist_control, &mut control_files);
     collect_files(&dist_challenge, &dist_challenge, &mut challenge_files);
 
+    // The built-in PoW page ships as ONE self-contained document: the dist `index.html` with its
+    // CSS and JS inlined. The separate `assets/app.min.js` / `assets/styles.min.css` stay embedded
+    // too, so operator-provisioned pages may still reference those stable paths.
+    let single_pow_page = build_single_file_page(&dist_challenge, &out_dir.join("web_single"));
+
+    let compressed_root = out_dir.join("web_compressed");
     let mut code = String::from(
         "pub fn get_embedded(app: &str, path: &str) -> Option<&'static [u8]> {\n    match (app, path) {\n",
     );
-    for (rel, full) in control_files {
-        let abs = fs::canonicalize(&full).unwrap();
-        code.push_str(&format!(
-            "        (\"control\", {:?}) => Some(include_bytes!({:?})),\n",
-            rel,
-            abs.to_string_lossy()
-        ));
-    }
-    for (rel, full) in challenge_files {
-        let abs = fs::canonicalize(&full).unwrap();
-        code.push_str(&format!(
-            "        (\"challenge\", {:?}) => Some(include_bytes!({:?})),\n",
-            rel,
-            abs.to_string_lossy()
-        ));
+    let mut encoded = String::from(
+        "pub fn get_embedded_encoded(app: &str, path: &str, encoding: &str) -> Option<&'static [u8]> {\n    match (app, path, encoding) {\n",
+    );
+    for (app_name, files) in [("control", control_files), ("challenge", challenge_files)] {
+        for (rel, full) in files {
+            let abs = fs::canonicalize(&full).unwrap();
+            let served = match (&single_pow_page, app_name, rel.as_str()) {
+                (Some(page), "challenge", "index.html") => page.clone(),
+                _ => abs,
+            };
+            code.push_str(&format!(
+                "        ({:?}, {:?}) => Some(include_bytes!({:?})),\n",
+                app_name,
+                rel,
+                served.to_string_lossy()
+            ));
+            for (coding, staged) in
+                stage_compressed_variants(&compressed_root, app_name, &rel, &served)
+            {
+                encoded.push_str(&format!(
+                    "        ({:?}, {:?}, {:?}) => Some(include_bytes!({:?})),\n",
+                    app_name,
+                    rel,
+                    coding,
+                    staged.to_string_lossy()
+                ));
+            }
+        }
     }
     code.push_str("        _ => None,\n    }\n}\n");
+    code.push_str(&encoded);
+    code.push_str("        _ => None,\n    }\n}\n");
     fs::write(&dest, code).unwrap();
+}
+
+/// Replace the HTML tag that references `needle` with `replacement`, leaving the document
+/// untouched when the tag cannot be located.
+fn splice_tag(html: &str, needle: &str, replacement: &str) -> String {
+    let Some(at) = html.find(needle) else {
+        return html.to_string();
+    };
+    let Some(start) = html[..at].rfind('<') else {
+        return html.to_string();
+    };
+    let Some(close) = html[at..].find('>') else {
+        return html.to_string();
+    };
+    let mut out = String::with_capacity(html.len() + replacement.len());
+    out.push_str(&html[..start]);
+    out.push_str(replacement);
+    out.push_str(&html[at + close + 1..]);
+    out
+}
+
+/// Assemble the built-in PoW page as a single self-contained document (CSS + JS inlined).
+///
+/// The inline `<script>`/`<style>` bodies must not contain their own closing sequence; if the
+/// minified bundle ever does, that asset is left as an external reference instead of producing a
+/// broken inline page.
+fn build_single_file_page(dist: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let mut html = fs::read_to_string(dist.join("index.html")).ok()?;
+    let css = fs::read_to_string(dist.join("assets").join("styles.min.css")).unwrap_or_default();
+    let js = fs::read_to_string(dist.join("assets").join("app.min.js")).unwrap_or_default();
+
+    if !css.is_empty() && !css.contains("</style") {
+        html = splice_tag(&html, "styles.min.css", &format!("<style>{css}</style>"));
+    }
+    if !js.is_empty() && !js.contains("</script") {
+        html = splice_tag(
+            &html,
+            "app.min.js",
+            &format!("<script type=\"module\">{js}</script>"),
+        );
+    }
+
+    fs::create_dir_all(out_dir).ok()?;
+    let dst = out_dir.join("challenge-index.html");
+    fs::write(&dst, html).ok()?;
+    fs::canonicalize(&dst).ok()
+}
+
+/// Payloads below this size are dominated by the coding's own framing overhead.
+const MIN_COMPRESS_LEN: usize = 512;
+
+/// Asset types that genuinely shrink under gzip/brotli. Already-compressed binaries
+/// (png/jpg/ico/woff2) are skipped so we never ship a "compressed" variant that is larger.
+fn is_compressible(rel: &str) -> bool {
+    matches!(
+        rel.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(),
+        "html" | "htm" | "js" | "mjs" | "css" | "json" | "svg" | "txt" | "map" | "wasm"
+    )
+}
+
+fn gzip_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    std::io::Write::write_all(&mut enc, data).ok()?;
+    enc.finish().ok()
+}
+
+fn brotli_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: 9,
+        lgwin: 22,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut out, &params).ok()?;
+    Some(out)
+}
+
+/// Pre-compress one embedded asset and return the staged `(coding, path)` pairs that are
+/// strictly smaller than the identity payload. Compression happens once, at build time, so
+/// serving a compressed asset costs the node nothing beyond a memcpy.
+fn stage_compressed_variants(
+    root: &Path,
+    app: &str,
+    rel: &str,
+    file: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    if !is_compressible(rel) {
+        return Vec::new();
+    }
+    let Ok(data) = fs::read(file) else {
+        return Vec::new();
+    };
+    if data.len() < MIN_COMPRESS_LEN {
+        return Vec::new();
+    }
+    let mut staged = Vec::new();
+    for (coding, compressed) in [("br", brotli_bytes(&data)), ("gzip", gzip_bytes(&data))] {
+        let Some(compressed) = compressed else { continue };
+        if compressed.len() + 32 >= data.len() {
+            continue;
+        }
+        let dst = root.join(app).join(coding).join(rel);
+        let Some(parent) = dst.parent() else { continue };
+        if fs::create_dir_all(parent).is_err() || fs::write(&dst, &compressed).is_err() {
+            continue;
+        }
+        let Ok(abs) = fs::canonicalize(&dst) else {
+            continue;
+        };
+        staged.push((coding, abs));
+    }
+    staged
 }

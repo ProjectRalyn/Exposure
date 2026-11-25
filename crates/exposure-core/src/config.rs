@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1013,38 +1014,100 @@ pub struct IngressListener {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CustomPagesConfig {
-    /// Custom HTML template for `intercept_errors` pages (429 / 5xx).
+    /// Path (on the node's own filesystem) to a complete single-file HTML document that replaces
+    /// the built-in intercept page (403 / 429 / 5xx). Supports the `{{status}}`, `{{title}}`,
+    /// `{{detail}}`, `{{ray_id}}`, `{{retry_after}}`, `{{retry_note}}` and `{{accent}}`
+    /// placeholders. Missing or unreadable files fall back to the built-in template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_html: Option<String>,
-    /// Custom HTML for `/cdn-cgi/` PoW verification page.
+    pub error: Option<String>,
+    /// Path to a complete single-file HTML document that replaces the built-in PoW challenge page
+    /// served at `/cdn-cgi/`. Styles and scripts must be inlined — it is served as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub challenge_html: Option<String>,
-    /// Custom CSS served at `/cdn-cgi/styles.css` (and `/cdn-cgi/assets/styles.min.css`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub challenge_css: Option<String>,
+    pub pow: Option<String>,
 }
 
 impl CustomPagesConfig {
     pub fn is_empty(&self) -> bool {
-        self.error_html
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-            && self
-                .challenge_html
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-            && self
-                .challenge_css
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
+        is_blank(self.error.as_deref()) && is_blank(self.pow.as_deref())
     }
+
+    /// Read the configured page files into memory. Called once per node when a config is applied.
+    ///
+    /// A blank path, a missing file or an unreadable/oversized document leaves the built-in
+    /// template in place and logs a warning, so a bad path can never take the challenge or error
+    /// path down.
+    pub fn resolve(&self) -> ResolvedPages {
+        ResolvedPages {
+            error: load_page_file("error", self.error.as_deref()),
+            pow: load_page_file("pow", self.pow.as_deref()),
+        }
+    }
+}
+
+/// Upper bound for a provisioned single-file page: it is held in memory for the node's lifetime
+/// and cloned into responses, so an accidental multi-megabyte file must not be accepted.
+const MAX_PAGE_FILE_BYTES: usize = 512 * 1024;
+
+fn is_blank(s: Option<&str>) -> bool {
+    s.map(str::trim).unwrap_or("").is_empty()
+}
+
+fn load_page_file(kind: &'static str, path: Option<&str>) -> Option<Arc<str>> {
+    let path = path.map(str::trim).filter(|p| !p.is_empty())?;
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(page = kind, path, error = %e, "custom page file unavailable; using built-in page");
+            return None;
+        }
+    };
+    if !meta.is_file() {
+        tracing::warn!(page = kind, path, "custom page path is not a regular file; using built-in page");
+        return None;
+    }
+    if meta.len() as usize > MAX_PAGE_FILE_BYTES {
+        tracing::warn!(
+            page = kind,
+            path,
+            size = meta.len(),
+            limit = MAX_PAGE_FILE_BYTES,
+            "custom page file too large; using built-in page"
+        );
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(page = kind, path, error = %e, "custom page file unreadable; using built-in page");
+            return None;
+        }
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            tracing::warn!(page = kind, path, "custom page file is not valid UTF-8; using built-in page");
+            return None;
+        }
+    };
+    let text = text.trim_start_matches('\u{feff}');
+    if text.trim().is_empty() {
+        tracing::warn!(page = kind, path, "custom page file is empty; using built-in page");
+        return None;
+    }
+    tracing::info!(page = kind, path, bytes = text.len(), "loaded custom page");
+    Some(Arc::from(text))
+}
+
+/// Operator-provisioned pages after being read into memory when the node applies its config.
+///
+/// These fully replace the compile-time built-in templates (they are complete documents, not
+/// fragments), so serving one is a lookup — no HTML/CSS assembly per request.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedPages {
+    pub error: Option<Arc<str>>,
+    pub pow: Option<Arc<str>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1084,9 +1147,13 @@ pub struct IngressConfig {
     /// Cooldown TTL in seconds before re-injecting passive JS fingerprint beacon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub js_fp_ttl_secs: Option<u64>,
-    /// Optional custom HTML/CSS pages provisioned from Control (`error_html`, `challenge_html`, `challenge_css`).
+    /// Optional custom single-file pages provisioned from Control (`error`, `pow`).
     #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
     pub pages: CustomPagesConfig,
+    /// `pages` resolved into memory when the config is applied (never serialized; replaces the
+    /// compile-time built-in templates when set).
+    #[serde(skip)]
+    pub resolved_pages: ResolvedPages,
     /// Node-level HTTP edge cache defaults & memory limits.
     #[serde(default)]
     pub cache: NodeCacheConfig,
@@ -1140,6 +1207,7 @@ impl Default for IngressConfig {
             js_fp_beacon: None,
             js_fp_ttl_secs: None,
             pages: CustomPagesConfig::default(),
+            resolved_pages: ResolvedPages::default(),
             cache: NodeCacheConfig::default(),
             evilpot: EvilpotNodeConfig::default(),
             auto_ban: AutoBanConfig::default(),
@@ -1232,9 +1300,12 @@ fn default_backend_timeout_ms() -> u64 {
 pub struct EgressConfig {
     #[serde(default)]
     pub services: BTreeMap<String, EgressServiceConfig>,
-    /// Optional custom error page template provisioned from Control.
+    /// Optional custom single-file error page provisioned from Control.
     #[serde(default, skip_serializing_if = "CustomPagesConfig::is_empty")]
     pub pages: CustomPagesConfig,
+    /// `pages` resolved into memory when the config is applied (never serialized).
+    #[serde(skip)]
+    pub resolved_pages: ResolvedPages,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2438,8 +2509,38 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig, resolve_domain_binding,
+        CertOrderConfig, CustomPagesConfig, DnsProviderAccountConfig, DomainBindingConfig,
+        resolve_domain_binding,
     };
+
+    #[test]
+    fn custom_pages_are_loaded_from_files_with_builtin_fallback() {
+        let dir = std::env::temp_dir().join(format!("exposure-pages-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pow = dir.join("pow.html");
+        std::fs::write(&pow, "<html>custom pow</html>").unwrap();
+
+        let pages = CustomPagesConfig {
+            error: Some(dir.join("missing.html").to_string_lossy().into_owned()),
+            pow: Some(pow.to_string_lossy().into_owned()),
+        };
+        let resolved = pages.resolve();
+        // A missing file silently falls back to the built-in page.
+        assert!(resolved.error.is_none());
+        assert_eq!(resolved.pow.as_deref(), Some("<html>custom pow</html>"));
+
+        // Blank entries resolve to the built-ins too.
+        let empty = CustomPagesConfig {
+            error: Some("   ".into()),
+            pow: None,
+        };
+        let resolved = empty.resolve();
+        assert!(resolved.error.is_none() && resolved.pow.is_none());
+        assert!(empty.is_empty());
+        assert!(!pages.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn aliyun_dns_provider_account_serde_yaml_and_alias() {

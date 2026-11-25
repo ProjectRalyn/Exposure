@@ -19,7 +19,8 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 const MAX_HOP_PATH_LEN: usize = 16;
-const MAX_CUSTOM_PAGE_BYTES: usize = 128 * 1024;
+/// Custom pages are node-local file paths, not documents.
+const MAX_PAGE_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceRouteTrace {
@@ -345,18 +346,19 @@ fn inherit_opt_page(node_val: &mut Option<String>, default_val: &Option<String>)
 }
 
 fn validate_custom_pages(pages: &CustomPagesConfig, label: &str, errors: &mut Vec<String>) {
-    for (field, val) in [
-        ("error_html", &pages.error_html),
-        ("challenge_html", &pages.challenge_html),
-        ("challenge_css", &pages.challenge_css),
-    ] {
-        if let Some(s) = val {
-            if s.len() > MAX_CUSTOM_PAGE_BYTES {
-                errors.push(format!(
-                    "{label}.pages.{field} exceeds {} byte limit",
-                    MAX_CUSTOM_PAGE_BYTES
-                ));
-            }
+    for (field, val) in [("error", &pages.error), ("pow", &pages.pow)] {
+        let Some(path) = val.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if path.len() > MAX_PAGE_PATH_BYTES {
+            errors.push(format!(
+                "{label}.pages.{field} exceeds {MAX_PAGE_PATH_BYTES} byte path limit"
+            ));
+        }
+        if path.chars().any(|c| c.is_control()) {
+            errors.push(format!(
+                "{label}.pages.{field} contains control characters"
+            ));
         }
     }
 }
@@ -597,9 +599,8 @@ fn resolve_ingress_config(
             rule.js_fp_beacon = out.js_fp_beacon;
         }
     }
-    inherit_opt_page(&mut out.pages.error_html, &page_defs.error_html);
-    inherit_opt_page(&mut out.pages.challenge_html, &page_defs.challenge_html);
-    inherit_opt_page(&mut out.pages.challenge_css, &page_defs.challenge_css);
+    inherit_opt_page(&mut out.pages.error, &page_defs.error);
+    inherit_opt_page(&mut out.pages.pow, &page_defs.pow);
     if out.cache == NodeCacheConfig::default() {
         out.cache = ingress_defs.cache.clone();
     }
@@ -660,10 +661,9 @@ fn resolve_egress_config(
             svc.timeout_ms = defs.timeout_ms;
         }
     }
-    inherit_opt_page(&mut out.pages.error_html, &page_defs.error_html);
-    // Egress does not serve PoW challenge pages
-    out.pages.challenge_html = None;
-    out.pages.challenge_css = None;
+    inherit_opt_page(&mut out.pages.error, &page_defs.error);
+    // Egress never serves the PoW challenge page.
+    out.pages.pow = None;
     out
 }
 

@@ -1,6 +1,7 @@
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 use std::path::{Component, Path};
+use std::borrow::Cow;
 
 include!(concat!(env!("OUT_DIR"), "/embedded_web.rs"));
 
@@ -64,34 +65,113 @@ fn resolve_dev_web_dir(app: WebApp) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("web").join(app.name()))
 }
 
-/// Serve a web asset:
-/// - In debug mode: reads live source files directly from `web/{control,challenge}/` on disk.
-/// - In release mode: returns the compile-time embedded Vite-minified asset bytes.
-pub fn load_web_asset(app: WebApp, req_path: &str) -> Option<(Vec<u8>, &'static str)> {
+/// A static web asset together with the content-coding it is stored in.
+///
+/// Release builds stage a pre-compressed (`br`/`gzip`) copy of every text asset at build time, so
+/// negotiating one is a lookup plus a `memcpy` — no per-request compression work.
+pub struct WebAsset {
+    pub bytes: Cow<'static, [u8]>,
+    pub mime: &'static str,
+    /// `Some("br" | "gzip")` when `bytes` is already compressed; the caller must emit
+    /// `Content-Encoding` (and `Vary: Accept-Encoding`).
+    pub encoding: Option<&'static str>,
+}
+
+/// Quality (0..=1) the client assigned to `br` and `gzip`, honouring `q=0` and `*`.
+fn coding_quality(accept_encoding: &str) -> (f32, f32) {
+    let (mut br, mut gzip, mut star): (Option<f32>, Option<f32>, Option<f32>) = (None, None, None);
+    for part in accept_encoding.split(',') {
+        let mut params = part.split(';');
+        let coding = params.next().unwrap_or("").trim();
+        if coding.is_empty() {
+            continue;
+        }
+        let mut q = 1.0f32;
+        for p in params {
+            if let Some(v) = p.trim().strip_prefix("q=") {
+                q = v.trim().parse::<f32>().unwrap_or(0.0);
+            }
+        }
+        if coding.eq_ignore_ascii_case("br") {
+            br = Some(q);
+        } else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
+            gzip = Some(q);
+        } else if coding == "*" {
+            star = Some(q);
+        }
+    }
+    let pick = |explicit: Option<f32>| explicit.or(star).unwrap_or(0.0).max(0.0);
+    (pick(br), pick(gzip))
+}
+
+/// Best content-coding we can serve for this client: brotli if it beats gzip, else gzip, else none.
+pub fn negotiate_encoding(accept_encoding: &str) -> Option<&'static str> {
+    let (br, gzip) = coding_quality(accept_encoding);
+    if br > 0.0 && br >= gzip {
+        Some("br")
+    } else if gzip > 0.0 {
+        Some("gzip")
+    } else {
+        None
+    }
+}
+
+/// Serve a web asset with the best content-coding the client accepts:
+/// - In debug mode: reads live source files directly from `web/{control,challenge}/` on disk
+///   (always identity — dev traffic is local and nothing is staged at build time).
+/// - In release mode: returns the compile-time embedded Vite-minified asset bytes, preferring the
+///   pre-compressed `br`/`gzip` variant staged by `build.rs`.
+///
+/// Returns `None` for unknown paths; path traversal attempts are rejected by `sanitize_rel_path`.
+pub fn load_web_asset_negotiated(
+    app: WebApp,
+    req_path: &str,
+    accept_encoding: &str,
+) -> Option<WebAsset> {
     let rel = sanitize_rel_path(req_path)?;
     let mime = content_type_for_path(&rel);
 
     #[cfg(debug_assertions)]
     {
+        let _ = accept_encoding;
         let full = resolve_dev_web_dir(app).join(&rel);
         let bytes = std::fs::read(&full).ok()?;
-        Some((bytes, mime))
+        Some(WebAsset {
+            bytes: Cow::Owned(bytes),
+            mime,
+            encoding: None,
+        })
     }
 
     #[cfg(not(debug_assertions))]
     {
-        let bytes = get_embedded(app.name(), &rel).or_else(|| {
-            if app == WebApp::Challenge {
-                match rel.as_str() {
-                    "pow.js" => get_embedded(app.name(), "assets/app.min.js"),
-                    "styles.css" => get_embedded(app.name(), "assets/styles.min.css"),
-                    _ => None,
-                }
-            } else {
-                None
+        // Same alias fallbacks as `load_web_asset` (legacy `/cdn-cgi/pow.js` + `styles.css`).
+        let served_rel: &str = if get_embedded(app.name(), &rel).is_some() {
+            rel.as_str()
+        } else if app == WebApp::Challenge {
+            match rel.as_str() {
+                "pow.js" => "assets/app.min.js",
+                "styles.css" => "assets/styles.min.css",
+                _ => return None,
             }
-        })?;
-        Some((bytes.to_vec(), mime))
+        } else {
+            return None;
+        };
+        if let Some(encoding) = negotiate_encoding(accept_encoding) {
+            if let Some(bytes) = get_embedded_encoded(app.name(), served_rel, encoding) {
+                return Some(WebAsset {
+                    bytes: Cow::Borrowed(bytes),
+                    mime,
+                    encoding: Some(encoding),
+                });
+            }
+        }
+        let bytes = get_embedded(app.name(), served_rel)?;
+        Some(WebAsset {
+            bytes: Cow::Borrowed(bytes),
+            mime,
+            encoding: None,
+        })
     }
 }
 
@@ -346,6 +426,28 @@ pub fn maybe_gzip_body(body: Vec<u8>, accept_encoding: &str) -> (Vec<u8>, Option
 #[cfg(test)]
 mod tests {
     use super::render_exposure_error_html_with_template;
+
+    #[test]
+    fn negotiate_encoding_prefers_brotli_and_honours_q_values() {
+        assert_eq!(super::negotiate_encoding("gzip, deflate, br"), Some("br"));
+        assert_eq!(super::negotiate_encoding("gzip"), Some("gzip"));
+        assert_eq!(super::negotiate_encoding("identity"), None);
+        assert_eq!(super::negotiate_encoding(""), None);
+        assert_eq!(super::negotiate_encoding("br;q=0, gzip"), Some("gzip"));
+        assert_eq!(super::negotiate_encoding("br;q=0.5, gzip;q=0.9"), Some("gzip"));
+        assert_eq!(super::negotiate_encoding("*"), Some("br"));
+        assert_eq!(super::negotiate_encoding("*;q=0"), None);
+    }
+
+    #[test]
+    fn asset_lookup_rejects_path_traversal() {
+        for p in ["/../Cargo.toml", "/assets/../../secret", "/.."] {
+            assert!(
+                super::load_web_asset_negotiated(super::WebApp::Challenge, p, "gzip").is_none(),
+                "{p} must not resolve"
+            );
+        }
+    }
 
     #[test]
     fn gzip_body_honours_accept_encoding() {
