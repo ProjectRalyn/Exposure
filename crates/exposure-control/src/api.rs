@@ -24,9 +24,9 @@ use exposure_core::routing::{
     canonical_ip, is_public_routable_ip, parse_valid_host, LinkHealthState,
 };
 use exposure_core::telemetry::{
-    is_cache_served_status, is_mitigated_record, normalize_alert_severity, AlertRecord, BanRecord,
-    EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation, HyperLogLog, LatencyHistogram,
-    MaintainerStorageStats, MinuteSummary, SessionSummary,
+    is_cache_served_status, is_evilpot_action, is_mitigated_record, normalize_alert_severity,
+    AlertRecord, BanRecord, EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation,
+    HyperLogLog, LatencyHistogram, MaintainerStorageStats, MinuteSummary, SessionSummary,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -4389,7 +4389,8 @@ fn build_logs_response_json(
         if is_blocked_rec {
             blocked_requests = blocked_requests.saturating_add(weight);
         }
-        if rec.status >= 500 {
+        // Evilpot decoy responses mimic origin failures; count them as blocked, not 5xx.
+        if rec.status >= 500 && !is_evilpot_action(rec.action.as_deref()) {
             error_5xx_requests = error_5xx_requests.saturating_add(weight);
         }
         if is_cache_served_status(rec.cache_status.as_deref()) {
@@ -4409,7 +4410,7 @@ fn build_logs_response_json(
                 if is_blocked_rec {
                     entry.1 = entry.1.saturating_add(weight);
                 }
-                if rec.status >= 500 {
+                if rec.status >= 500 && !is_evilpot_action(rec.action.as_deref()) {
                     entry.2 = entry.2.saturating_add(weight);
                 }
             }

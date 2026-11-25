@@ -652,7 +652,10 @@ impl MinuteSummary {
 
     pub fn record(&mut self, rec: &SessionSummary) {
         self.requests = self.requests.saturating_add(1);
-        if rec.status >= 500 {
+        let evilpot = is_evilpot_action(rec.action.as_deref());
+        // Evilpot decoy responses deliberately mimic broken origins (fake 5xx); they are a
+        // mitigation, not a backend error, so they must never inflate the 5xx KPI.
+        if rec.status >= 500 && !evilpot {
             self.errors = self.errors.saturating_add(1);
         }
         if rec.rate_limited {
@@ -661,12 +664,12 @@ impl MinuteSummary {
         if rec.challenged {
             self.challenges_issued = self.challenges_issued.saturating_add(1);
         } else if !rec.rate_limited
-            && rec.status < 500
+            && (evilpot || rec.status < 500)
             && is_security_block_action(rec.action.as_deref())
         {
             self.blocked = self.blocked.saturating_add(1);
         }
-        if is_evilpot_action(rec.action.as_deref()) {
+        if evilpot {
             self.evilpot_hits = self.evilpot_hits.saturating_add(1);
         }
         if is_autoban_action(rec.action.as_deref()) {
@@ -1710,5 +1713,31 @@ mod tests {
         assert!(!is_mitigated_record(&origin_403));
         assert!(is_mitigated_record(&canary));
         assert!(!is_mitigated_record(&cached));
+    }
+
+    #[test]
+    fn evilpot_decoy_5xx_counts_as_blocked_not_backend_error() {
+        let mut sum = MinuteSummary::new(1_700_000_100, "n1", "ingress", "svc", 10, 1, vec![10.0]);
+        // Evilpot personas deliberately answer with fake 500s to look like a broken origin.
+        let decoy_500 = SessionSummary {
+            status: 500,
+            action: Some("evilpot".into()),
+            ip_hmac: "ip-decoy".into(),
+            ..Default::default()
+        };
+        let real_500 = SessionSummary {
+            status: 502,
+            action: Some("upstream_error".into()),
+            ip_hmac: "ip-real".into(),
+            ..Default::default()
+        };
+
+        sum.record(&decoy_500);
+        sum.record(&real_500);
+
+        assert_eq!(sum.requests, 2);
+        assert_eq!(sum.errors, 1, "only the real upstream failure is a 5xx");
+        assert_eq!(sum.blocked, 1, "evilpot diversion is a mitigation");
+        assert_eq!(sum.evilpot_hits, 1);
     }
 }

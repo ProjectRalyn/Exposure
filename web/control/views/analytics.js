@@ -531,8 +531,10 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
     const totalMatched = Number(data.total_matched ?? items.length) || 0;
 
     const actionPillCls = (act, status) => {
+      // Evilpot decoys intentionally return fake 5xx; they are a mitigation, not a backend error.
+      if (act === "evilpot" || act === "evilpot_canary" || act === "geo_evilpot") return "warn";
       if (status >= 500 || act === "upstream_error" || act === "config_error" || act === "waf_overload") return "err";
-      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "evilpot_canary" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "geo_evilpot" || act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
+      if (act === "autoban" || act === "waf_block" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
       if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass") return "info";
       return "ok";
     };
@@ -641,8 +643,18 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                 items
                   .map((r, idx) => {
                     const st = Number(r.status) || 0;
-                    const stCls = st >= 500 ? "err" : st >= 400 ? "warn" : st >= 300 ? "info" : "ok";
                     const act = r.action || "allow";
+                    // Evilpot decoy responses mimic origin failures; they are a mitigation, not a 5xx.
+                    const evilpot = act === "evilpot" || act === "evilpot_canary" || act === "geo_evilpot";
+                    const stCls = evilpot
+                      ? "warn"
+                      : st >= 500
+                      ? "err"
+                      : st >= 400
+                      ? "warn"
+                      : st >= 300
+                      ? "info"
+                      : "ok";
                     const actCls = actionPillCls(act, st);
                     const repeat = Number(r.repeat_count) || 1;
                     // Sort/display time = when the request entered ingress (falls back to the
@@ -1105,17 +1117,24 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
   async function submitUnban(kind, target, nodeTag = null) {
     if (unbanBusy) return;
     unbanBusy = true;
+    if (loggingSubTab === "evilpot") renderBans(); // disable the buttons while in flight
     try {
       const res = await api("/api/security/unban", {
         method: "POST",
         body: JSON.stringify({ kind, target, node_tag: nodeTag || null }),
       });
       showToast(`Unbanned ${res.kind || kind}: ${res.target || target}`);
-      await refreshBans();
     } catch (e) {
       showToast(e.message, true);
     } finally {
+      // Reset before refetching so the freshly rendered rows are interactive again.
       unbanBusy = false;
+      try {
+        await refreshBans();
+      } catch (e) {
+        showToast(e.message, true);
+      }
+      if (loggingSubTab === "evilpot") renderBans();
     }
   }
 

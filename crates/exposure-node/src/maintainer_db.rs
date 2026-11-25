@@ -2236,7 +2236,9 @@ impl MaintainerDb {
                 "{cte} SELECT COUNT(*),
                         COALESCE(SUM(MAX(repeat_count, 1)), 0),
                         COALESCE(SUM(MAX(repeat_count - 1, 0)), 0),
-                        COALESCE(SUM(CASE WHEN status >= 500 THEN MAX(repeat_count, 1) ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN status >= 500
+                            AND LOWER(COALESCE(action, '')) NOT IN ('evilpot','evilpot_canary','geo_evilpot')
+                            THEN MAX(repeat_count, 1) ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN cache_status IN ('HIT','STALE','REVALIDATED') THEN MAX(repeat_count, 1) ELSE 0 END), 0),
                         COUNT(DISTINCT ip_hmac),
                         COUNT(DISTINCT CASE WHEN path IS NOT NULL AND path != '' THEN COALESCE(host,'') || '|' || path END)
@@ -2313,7 +2315,9 @@ impl MaintainerDb {
                         COALESCE(SUM(CASE WHEN (rate_limited = 1 OR challenged = 1
                             OR LOWER(COALESCE(action,'')) IN ('autoban','waf_block','evilpot','evilpot_canary','guard_reject','abuseipdb','geo_block','geo_evilpot','rate_limit','challenge','geo_challenge')
                             OR (action IS NULL AND status IN (403, 429))) THEN MAX(repeat_count, 1) ELSE 0 END), 0) AS blk,
-                        COALESCE(SUM(CASE WHEN status >= 500 THEN MAX(repeat_count, 1) ELSE 0 END), 0) AS e5
+                        COALESCE(SUM(CASE WHEN status >= 500
+                            AND LOWER(COALESCE(action, '')) NOT IN ('evilpot','evilpot_canary','geo_evilpot')
+                            THEN MAX(repeat_count, 1) ELSE 0 END), 0) AS e5
                  FROM primary_rows
                  WHERE path IS NOT NULL AND path != ''
                  GROUP BY 1, 2
