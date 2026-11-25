@@ -722,6 +722,7 @@
   "Testing…": "验证中…",
   "Theme": "主题",
   "This pushes a brand-new globally-signed release to every node.": "这会向每个节点推送一个全新的全局签名版本。",
+  "Threat Intel & Honeypot": "威胁情报与蜜罐",
   "Time": "时间",
   "Time range: global window (top bar)": "时间范围：全局窗口（顶栏）",
   "Timeout (ms, 0 = default)": "超时时间 (ms, 0 = 继承默认)",

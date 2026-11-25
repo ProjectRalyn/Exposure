@@ -2,12 +2,9 @@
 import { formatBytes, formatCompact, formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
-  defaultAbuseIpDbConfig,
-  defaultEvilpotConfig,
   defaultLogProtectionConfig,
   defaultNodeCacheConfig,
   defaultTopologyDefaults,
-  defaultWafConfig,
 } from "../store.js";
 import {
   el,
@@ -22,9 +19,6 @@ import {
 
 export function createSystemView({ api, store }) {
   let subTab = "defaults"; // defaults | storage | releases | yaml
-  let abuseTestIp = "118.25.6.39";
-  let abuseTestResult = null;
-  let abuseTesting = false;
 
   let storageData = null;
   let storageDraft = null;
@@ -70,14 +64,7 @@ export function createSystemView({ api, store }) {
     const defs = store.spec.defaults || defaultTopologyDefaults();
     const ig = defs.ingress;
     if (!ig.cache) ig.cache = defaultNodeCacheConfig();
-    if (!ig.evilpot) ig.evilpot = defaultEvilpotConfig();
-    if (!ig.abuseipdb) ig.abuseipdb = defaultAbuseIpDbConfig();
     const ca = ig.cache;
-    const ep = ig.evilpot;
-    const ab = ig.abuseipdb;
-    const gd = defs.guard;
-    if (!gd.waf) gd.waf = defaultWafConfig();
-    const dwaf = gd.waf;
     const eg = defs.egress;
     const ll = defs.link_listener;
     const gl = store.spec.global_logger || {
@@ -161,60 +148,6 @@ export function createSystemView({ api, store }) {
         </div>
 
         <div class="panel" style="margin-bottom:0;">
-          <div class="panel-header"><h3>Guard Defaults</h3></div>
-          <div class="inspector-row">
-            <label><span>Antibot Mode</span>
-              <select id="sd-gd-mode">
-                <option value="off" ${gd.antibot === "off" ? "selected" : ""}>off</option>
-                <option value="silent" ${gd.antibot === "silent" ? "selected" : ""}>silent</option>
-                <option value="challenge" ${gd.antibot === "challenge" ? "selected" : ""}>challenge</option>
-                <option value="always" ${gd.antibot === "always" ? "selected" : ""}>always</option>
-              </select>
-            </label>
-            <label><span>Default Bucket</span>
-              <select id="sd-gd-bk">
-                <option value="">(none)</option>
-                ${bucketNames.map((b) => `<option value="${esc(b)}" ${gd.rate_limit_bucket === b ? "selected" : ""}>${esc(b)}</option>`).join("")}
-              </select>
-            </label>
-          </div>
-          <div class="inspector-row">
-            <label><span>Challenge Score</span><input id="sd-gd-ct" type="number" min="0" max="100" value="${gd.challenge_threshold ?? 50}" /></label>
-            <label><span>Reject Score</span><input id="sd-gd-rt" type="number" min="0" max="100" value="${gd.reject_threshold ?? 85}" /></label>
-            <label><span>PoW Bits</span><input id="sd-gd-pow" type="number" min="4" max="28" value="${gd.pow_difficulty ?? 16}" /></label>
-            <label><span>Clearance TTL</span><input id="sd-gd-ttl" type="number" min="10" value="${gd.clearance_ttl_secs ?? 600}" /></label>
-          </div>
-          <div class="tri-stack" style="margin-top:8px;">
-            ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "bind_ua", label: "Bind User-Agent", val: gd.bind_ua })}
-            ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "bind_ip_prefix", label: "Bind Client IP", val: gd.bind_ip_prefix })}
-            ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "block_bots", label: "Block Known Bots", val: gd.block_bots })}
-            ${renderBinSlider({ attrName: "data-sd-gd-bin", attrVal: "block_headless", label: "Block Headless Browsers", val: gd.block_headless })}
-          </div>
-          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">
-            <div class="inspector-row">
-              <label><span>${esc(t("WAF Mode"))}</span>
-                <select id="sd-waf-mode">
-                  <option value="off" ${dwaf.mode === "off" ? "selected" : ""}>${esc(t("Off"))}</option>
-                  <option value="monitor" ${dwaf.mode === "monitor" ? "selected" : ""}>${esc(t("Monitor (Log Only)"))}</option>
-                  <option value="block" ${dwaf.mode === "block" ? "selected" : ""}>${esc(t("Block (403 Forbidden)"))}</option>
-                  <option value="evilpot" ${dwaf.mode === "evilpot" ? "selected" : ""}>${esc(t("Evilpot (Honeypot & Behavior Analysis)"))}</option>
-                </select>
-              </label>
-              <label><span>${esc(t("Max Body Inspection (KiB)"))}</span><input id="sd-waf-bodykb" type="number" min="0" max="256" value="${Math.round((dwaf.max_body_bytes ?? 32768) / 1024)}" /></label>
-              <label><span>${esc(t("CRS Paranoia Level"))}</span>
-                <select id="sd-waf-pl">
-                  ${[1, 2, 3, 4].map((pl) => `<option value="${pl}" ${(dwaf.crs_paranoia_level || 1) === pl ? "selected" : ""}>PL${pl}</option>`).join("")}
-                </select>
-              </label>
-            </div>
-            <div class="tri-stack" style="margin-top:6px;">
-              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_headers", label: t("Inspect Headers (UA / Referer / Cookie)"), val: dwaf.inspect_headers !== false })}
-              ${renderBinSlider({ attrName: "data-sd-waf-bin", attrVal: "inspect_body", label: t("Inspect Text / JSON / Form Bodies"), val: dwaf.inspect_body !== false })}
-            </div>
-          </div>
-        </div>
-
-        <div class="panel" style="margin-bottom:0;">
           <div class="panel-header"><h3>Egress Defaults</h3></div>
           <div class="inspector-row">
             <label><span>Protocol</span>
@@ -268,54 +201,6 @@ export function createSystemView({ api, store }) {
         </div>
 
         <div class="panel" style="margin-bottom:0;">
-          <div class="panel-header"><h3>${esc(t("AbuseIPDB IP Reputation"))}</h3></div>
-          <div class="tri-stack" style="margin-bottom:8px;">
-            ${renderBinSlider({ attrName: "data-sd-ab-bin", attrVal: "enabled", label: t("Enable AbuseIPDB Automatic IP Scoring"), sub: t("Queries AbuseIPDB v2 with your own API key; high abuse scores raise server suspicion or trigger automatic mitigation"), val: ab.enabled })}
-          </div>
-          <div class="inspector-row">
-            <label style="flex:1.5;"><span>${esc(t("AbuseIPDB API Key"))}</span>
-              <input id="sd-ab-key" type="password" autocomplete="off" value="${esc(ab.api_key || "")}" placeholder="AbuseIPDB v2 API Key" />
-            </label>
-            <label><span>${esc(t("Test IP Address"))}</span>
-              <div style="display:flex;gap:6px;">
-                <input id="sd-ab-test-ip" value="${esc(abuseTestIp)}" placeholder="118.25.6.39" />
-                <button type="button" id="sd-ab-test-btn" class="btn sm primary" ${abuseTesting ? "disabled" : ""}>${esc(abuseTesting ? t("Testing…") : t("Test Key"))}</button>
-              </div>
-            </label>
-          </div>
-          ${
-            abuseTestResult
-              ? `<div class="muted-sm" style="margin:6px 0;padding:6px 8px;border-radius:6px;background:var(--bg-elev);">
-                  ${
-                    abuseTestResult.error
-                      ? `<span class="pill err">ERR</span> ${esc(abuseTestResult.error)}`
-                      : `<span class="pill ${abuseTestResult.abuse_confidence_score >= 50 ? "err" : abuseTestResult.abuse_confidence_score >= 25 ? "warn" : "ok"}">Score ${esc(abuseTestResult.abuse_confidence_score)}/100</span>
-                         <code>${esc(abuseTestResult.ip_address)}</code> · ${esc(abuseTestResult.country_code || "-")} · ${esc(abuseTestResult.isp || "-")} · reports: ${esc(abuseTestResult.total_reports)}${abuseTestResult.is_tor ? ` <span class="pill warn">TOR</span>` : ""}`
-                  }
-                </div>`
-              : ""
-          }
-          <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("High-Risk Action (≥ Block Score)"))}</span>
-              <select id="sd-ab-act">
-                <option value="off" ${ab.high_risk_action === "off" ? "selected" : ""}>${esc(t("off — Score Only"))}</option>
-                <option value="monitor" ${ab.high_risk_action === "monitor" ? "selected" : ""}>${esc(t("monitor — Log Only"))}</option>
-                <option value="challenge" ${ab.high_risk_action === "challenge" ? "selected" : ""}>${esc(t("challenge — Force PoW"))}</option>
-                <option value="block" ${(ab.high_risk_action || "block") === "block" ? "selected" : ""}>${esc(t("block — HTTP 403"))}</option>
-                <option value="evilpot" ${ab.high_risk_action === "evilpot" ? "selected" : ""}>${esc(t("evilpot — Divert to Honeypot"))}</option>
-              </select>
-            </label>
-            <label><span>${esc(t("Challenge Score (0-100)"))}</span><input id="sd-ab-ch" type="number" min="0" max="100" value="${ab.challenge_threshold ?? 25}" /></label>
-            <label><span>${esc(t("Block Score (0-100)"))}</span><input id="sd-ab-blk" type="number" min="0" max="100" value="${ab.block_threshold ?? 75}" /></label>
-          </div>
-          <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("Max Age (days)"))}</span><input id="sd-ab-age" type="number" min="1" max="365" value="${ab.max_age_days ?? 90}" /></label>
-            <label><span>${esc(t("Cache TTL (s)"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
-            <label><span>${esc(t("Daily Quota Cap / Node"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
-          </div>
-        </div>
-
-        <div class="panel" style="margin-bottom:0;">
           <div class="panel-header"><h3>Edge HTTP Response Cache Defaults</h3></div>
           <div class="tri-stack" style="margin-bottom:8px;">
             ${renderBinSlider({ attrName: "data-sd-ca-bin", attrVal: "enabled", label: "Enable Edge Cache by Default", sub: "In-memory LRU cache on Ingress hosts (RFC 9111 Vary + ETag 304 + Stale-if-Error)", val: ca.enabled })}
@@ -330,23 +215,6 @@ export function createSystemView({ api, store }) {
           </div>
           <label style="margin-top:8px;"><span>Bypass Cookie Prefixes (CSV)</span>
             <input id="sd-ca-ck" value="${esc((ca.bypass_cookie_prefixes || []).join(", "))}" placeholder="session=, auth_" />
-          </label>
-        </div>
-
-        <div class="panel" style="margin-bottom:0;">
-          <div class="panel-header"><h3>${esc(t("Evilpot Honeypot Engine Defaults"))}</h3></div>
-          <div class="inspector-row">
-            <label><span>${esc(t("Persona Rotation (s)"))}</span><input id="sd-ep-rot" type="number" min="60" value="${ep.rotation_interval_secs ?? 300}" /></label>
-            <label><span>${esc(t("Persona Slots"))}</span><input id="sd-ep-slots" type="number" min="1" max="32" value="${ep.persona_slots ?? 16}" /></label>
-            <label><span>${esc(t("Max Tarpit Conns"))}</span><input id="sd-ep-tconns" type="number" min="1" max="256" value="${ep.max_tarpit_connections ?? 256}" /></label>
-          </div>
-          <div class="inspector-row" style="margin-top:6px;">
-            <label><span>${esc(t("Tarpit Drip (B/s)"))}</span><input id="sd-ep-drip" type="number" min="16" max="16384" value="${ep.tarpit_drip_bytes_per_sec ?? 256}" /></label>
-            <label><span>${esc(t("SQLi Blind Delay (ms)"))}</span><input id="sd-ep-sqli" type="number" min="100" max="5000" value="${ep.sqli_time_delay_ms ?? 2500}" /></label>
-            <label><span>${esc(t("Max Tracked Sessions"))}</span><input id="sd-ep-maxs" type="number" min="16" max="4096" value="${ep.max_tracked_sessions ?? 2048}" /></label>
-          </div>
-          <label style="margin-top:8px;"><span>${esc(t("Canary Webhook Base URL"))}</span>
-            <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
           </label>
         </div>
       </div>
@@ -366,22 +234,6 @@ export function createSystemView({ api, store }) {
       showToast("Generated cluster clearance secret");
     });
     wireBinSliders(container, "data-sd-ig-bin", (f, v) => store.mutate((s) => { s.defaults.ingress[f] = v; }, false));
-
-    el("sd-gd-mode")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.guard.antibot = ev.target.value; }, false));
-    el("sd-gd-bk")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.guard.rate_limit_bucket = ev.target.value || null; }, false));
-    el("sd-gd-ct")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.challenge_threshold = parseNum(ev.target.value, 50, 0, 100); }, false));
-    el("sd-gd-rt")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.reject_threshold = parseNum(ev.target.value, 85, 0, 100); }, false));
-    el("sd-gd-pow")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.pow_difficulty = parseNum(ev.target.value, 16, 4, 28); }, false));
-    el("sd-gd-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.guard.clearance_ttl_secs = parseNum(ev.target.value, 600, 10); }, false));
-    wireBinSliders(container, "data-sd-gd-bin", (f, v) => store.mutate((s) => { s.defaults.guard[f] = v; }, false));
-    const ensureWaf = (s) => {
-      if (!s.defaults.guard.waf) s.defaults.guard.waf = defaultWafConfig();
-      return s.defaults.guard.waf;
-    };
-    el("sd-waf-mode")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).mode = ev.target.value; }, false));
-    el("sd-waf-bodykb")?.addEventListener("input", (ev) => store.mutate((s) => { ensureWaf(s).max_body_bytes = parseNum(ev.target.value, 32, 0, 256) * 1024; }, false));
-    el("sd-waf-pl")?.addEventListener("change", (ev) => store.mutate((s) => { ensureWaf(s).crs_paranoia_level = parseNum(ev.target.value, 1, 1, 4); }, false));
-    wireBinSliders(container, "data-sd-waf-bin", (f, v) => store.mutate((s) => { ensureWaf(s)[f] = v; }, false));
 
     el("sd-eg-proto")?.addEventListener("change", (ev) => store.mutate((s) => { s.defaults.egress.protocol = ev.target.value; }, false));
     el("sd-eg-to")?.addEventListener("input", (ev) => store.mutate((s) => { s.defaults.egress.timeout_ms = parseNum(ev.target.value, 30000, 100); }, false));
@@ -429,42 +281,6 @@ export function createSystemView({ api, store }) {
     el("sd-logp-dedup")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.dedup_window_secs = parseNum(ev.target.value, 10, 0, 300); }, false));
     el("sd-logp-warn")?.addEventListener("input", (ev) => store.mutate((s) => { ensureGl(s).protection.warn_rate_per_sec = parseNum(ev.target.value, 20, 1, 1000); }, false));
 
-    const ensureAb = (s) => {
-      if (!s.defaults.ingress.abuseipdb) s.defaults.ingress.abuseipdb = defaultAbuseIpDbConfig();
-      return s.defaults.ingress.abuseipdb;
-    };
-    wireBinSliders(container, "data-sd-ab-bin", (f, v) => store.mutate((s) => { ensureAb(s)[f] = v; }, false));
-    el("sd-ab-key")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).api_key = ev.target.value.trim(); }, false));
-    el("sd-ab-test-ip")?.addEventListener("input", (ev) => { abuseTestIp = ev.target.value.trim(); });
-    el("sd-ab-act")?.addEventListener("change", (ev) => store.mutate((s) => { ensureAb(s).high_risk_action = ev.target.value; }, false));
-    el("sd-ab-ch")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).challenge_threshold = parseNum(ev.target.value, 25, 0, 100); }, false));
-    el("sd-ab-blk")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).block_threshold = parseNum(ev.target.value, 75, 0, 100); }, false));
-    el("sd-ab-age")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_age_days = parseNum(ev.target.value, 90, 1, 365); }, false));
-    el("sd-ab-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).cache_ttl_secs = parseNum(ev.target.value, 21600, 60); }, false));
-    el("sd-ab-cap")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_daily_lookups = parseNum(ev.target.value, 900, 10); }, false));
-    el("sd-ab-test-btn")?.addEventListener("click", async () => {
-      if (abuseTesting) return;
-      abuseTesting = true;
-      abuseTestResult = null;
-      render();
-      try {
-        const curAb = store.spec.defaults?.ingress?.abuseipdb || defaultAbuseIpDbConfig();
-        abuseTestResult = await api("/api/security/abuseipdb/test", {
-          method: "POST",
-          body: JSON.stringify({
-            api_key: curAb.api_key || "",
-            ip: abuseTestIp || "118.25.6.39",
-            max_age_days: curAb.max_age_days || 90,
-          }),
-        });
-      } catch (e) {
-        abuseTestResult = { error: e.message };
-      } finally {
-        abuseTesting = false;
-        if (subTab === "defaults") render();
-      }
-    });
-
     const ensureCa = (s) => {
       if (!s.defaults.ingress.cache) s.defaults.ingress.cache = defaultNodeCacheConfig();
       return s.defaults.ingress.cache;
@@ -475,18 +291,6 @@ export function createSystemView({ api, store }) {
     el("sd-ca-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).default_ttl_secs = parseNum(ev.target.value, 60, 0); }, false));
     el("sd-ca-stale")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).stale_if_error_secs = parseNum(ev.target.value, 300, 0); }, false));
     el("sd-ca-ck")?.addEventListener("input", (ev) => store.mutate((s) => { ensureCa(s).bypass_cookie_prefixes = ev.target.value.split(",").map((x) => x.trim()).filter(Boolean); }, false));
-
-    const ensureEp = (s) => {
-      if (!s.defaults.ingress.evilpot) s.defaults.ingress.evilpot = defaultEvilpotConfig();
-      return s.defaults.ingress.evilpot;
-    };
-    el("sd-ep-rot")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).rotation_interval_secs = parseNum(ev.target.value, 300, 60); }, false));
-    el("sd-ep-slots")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).persona_slots = parseNum(ev.target.value, 16, 1, 32); }, false));
-    el("sd-ep-tconns")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tarpit_connections = parseNum(ev.target.value, 256, 1, 256); }, false));
-    el("sd-ep-drip")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).tarpit_drip_bytes_per_sec = parseNum(ev.target.value, 256, 16, 16384); }, false));
-    el("sd-ep-sqli")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).sqli_time_delay_ms = parseNum(ev.target.value, 2500, 100, 5000); }, false));
-    el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
-    el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
   }
 
   /* ==================== STORAGE & RETENTION ==================== */

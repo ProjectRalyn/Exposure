@@ -669,7 +669,8 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                         ? Number(r.egress.latency_ms) || 0
                         : null
                       : Number(r.latency_ms) || 0;
-                    const roundtripMs = ingressMs ?? egressMs ?? 0;
+                    // Headline number = ingress leg + egress leg (additive).
+                    const totalMs = (ingressMs ?? 0) + (egressMs ?? 0);
                     const hopSplit = [
                       ingressMs != null ? `i: ${ingressMs.toFixed(1)} ms` : "",
                       egressMs != null ? `e: ${egressMs.toFixed(1)} ms` : "",
@@ -700,7 +701,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
                       <div class="muted-sm"><code>${esc(hopChain)}</code>${hops > 1 ? ` <span class="pill">${hops} hops</span>` : ""}</div>
                     </td>
                     <td>
-                      <div>${roundtripMs.toFixed(1)} ms</div>
+                      <div>${totalMs.toFixed(1)} ms</div>
                       <div class="muted-sm">${esc(hopSplit)}</div>
                       <div class="muted-sm">${formatBytes(r.bytes_in || 0)} / ${formatBytes(r.bytes_out || 0)}</div>
                     </td>

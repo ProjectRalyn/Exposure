@@ -2,7 +2,9 @@
 import { formatDateTime } from "../charts.js";
 import { t } from "../i18n.js";
 import {
+  defaultAbuseIpDbConfig,
   defaultAntibotProfile,
+  defaultEvilpotConfig,
   defaultGeoIpConfig,
   defaultGeoPolicyConfig,
   defaultTopologyDefaults,
@@ -65,7 +67,7 @@ const QUICK_GEO_TOKENS = [
 ];
 
 export function createSecurityView({ api, store }) {
-  let subTab = "buckets"; // buckets | antibot | waf | geoip | pages
+  let subTab = "buckets"; // buckets | antibot | waf | intel | geoip | pages
   let setScope = "cluster"; // "cluster" | <ingress-node-tag>
   let previewMode = "error"; // error | challenge
 
@@ -82,6 +84,10 @@ export function createSecurityView({ api, store }) {
   let geoLookupResult = null;
   let geoQuickTargetBySet = {}; // scope:setName -> "deny" | "allow"
   let geoPanelOpenBySet = {}; // scope:setName -> boolean
+
+  let abuseTestIp = "118.25.6.39";
+  let abuseTestResult = null;
+  let abuseTesting = false;
 
   function ingressNodes() {
     return Object.entries(store.spec.nodes || {})
@@ -1616,6 +1622,134 @@ export function createSecurityView({ api, store }) {
     });
   }
 
+  /* ---------- Threat Intel & Honeypot (cluster ingress defaults) ---------- */
+
+  function renderThreatIntelSubTab(container) {
+    const defs = store.spec.defaults || defaultTopologyDefaults();
+    const ig = defs.ingress;
+    if (!ig.abuseipdb) ig.abuseipdb = defaultAbuseIpDbConfig();
+    if (!ig.evilpot) ig.evilpot = defaultEvilpotConfig();
+    const ab = ig.abuseipdb;
+    const ep = ig.evilpot;
+
+    container.innerHTML = `
+      <div class="defaults-grid">
+        <div class="panel" style="margin-bottom:0;">
+          <div class="panel-header"><h3>${esc(t("AbuseIPDB IP Reputation"))}</h3></div>
+          <div class="tri-stack" style="margin-bottom:8px;">
+            ${renderBinSlider({ attrName: "data-sd-ab-bin", attrVal: "enabled", label: t("Enable AbuseIPDB Automatic IP Scoring"), sub: t("Queries AbuseIPDB v2 with your own API key; high abuse scores raise server suspicion or trigger automatic mitigation"), val: ab.enabled })}
+          </div>
+          <div class="inspector-row">
+            <label style="flex:1.5;"><span>${esc(t("AbuseIPDB API Key"))}</span>
+              <input id="sd-ab-key" type="password" autocomplete="off" value="${esc(ab.api_key || "")}" placeholder="AbuseIPDB v2 API Key" />
+            </label>
+            <label><span>${esc(t("Test IP Address"))}</span>
+              <div style="display:flex;gap:6px;">
+                <input id="sd-ab-test-ip" value="${esc(abuseTestIp)}" placeholder="118.25.6.39" />
+                <button type="button" id="sd-ab-test-btn" class="btn sm primary" ${abuseTesting ? "disabled" : ""}>${esc(abuseTesting ? t("Testing…") : t("Test Key"))}</button>
+              </div>
+            </label>
+          </div>
+          ${
+            abuseTestResult
+              ? `<div class="muted-sm" style="margin:6px 0;padding:6px 8px;border-radius:6px;background:var(--bg-elev);">
+                  ${
+                    abuseTestResult.error
+                      ? `<span class="pill err">ERR</span> ${esc(abuseTestResult.error)}`
+                      : `<span class="pill ${abuseTestResult.abuse_confidence_score >= 50 ? "err" : abuseTestResult.abuse_confidence_score >= 25 ? "warn" : "ok"}">Score ${esc(abuseTestResult.abuse_confidence_score)}/100</span>
+                         <code>${esc(abuseTestResult.ip_address)}</code> · ${esc(abuseTestResult.country_code || "-")} · ${esc(abuseTestResult.isp || "-")} · reports: ${esc(abuseTestResult.total_reports)}${abuseTestResult.is_tor ? ` <span class="pill warn">TOR</span>` : ""}`
+                  }
+                </div>`
+              : ""
+          }
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("High-Risk Action (≥ Block Score)"))}</span>
+              <select id="sd-ab-act">
+                <option value="off" ${ab.high_risk_action === "off" ? "selected" : ""}>${esc(t("off — Score Only"))}</option>
+                <option value="monitor" ${ab.high_risk_action === "monitor" ? "selected" : ""}>${esc(t("monitor — Log Only"))}</option>
+                <option value="challenge" ${ab.high_risk_action === "challenge" ? "selected" : ""}>${esc(t("challenge — Force PoW"))}</option>
+                <option value="block" ${(ab.high_risk_action || "block") === "block" ? "selected" : ""}>${esc(t("block — HTTP 403"))}</option>
+                <option value="evilpot" ${ab.high_risk_action === "evilpot" ? "selected" : ""}>${esc(t("evilpot — Divert to Honeypot"))}</option>
+              </select>
+            </label>
+            <label><span>${esc(t("Challenge Score (0-100)"))}</span><input id="sd-ab-ch" type="number" min="0" max="100" value="${ab.challenge_threshold ?? 25}" /></label>
+            <label><span>${esc(t("Block Score (0-100)"))}</span><input id="sd-ab-blk" type="number" min="0" max="100" value="${ab.block_threshold ?? 75}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("Max Age (days)"))}</span><input id="sd-ab-age" type="number" min="1" max="365" value="${ab.max_age_days ?? 90}" /></label>
+            <label><span>${esc(t("Cache TTL (s)"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
+            <label><span>${esc(t("Daily Quota Cap / Node"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:0;">
+          <div class="panel-header"><h3>${esc(t("Evilpot Honeypot Engine Defaults"))}</h3></div>
+          <div class="inspector-row">
+            <label><span>${esc(t("Persona Rotation (s)"))}</span><input id="sd-ep-rot" type="number" min="60" value="${ep.rotation_interval_secs ?? 300}" /></label>
+            <label><span>${esc(t("Persona Slots"))}</span><input id="sd-ep-slots" type="number" min="1" max="32" value="${ep.persona_slots ?? 16}" /></label>
+            <label><span>${esc(t("Max Tarpit Conns"))}</span><input id="sd-ep-tconns" type="number" min="1" max="256" value="${ep.max_tarpit_connections ?? 256}" /></label>
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("Tarpit Drip (B/s)"))}</span><input id="sd-ep-drip" type="number" min="16" max="16384" value="${ep.tarpit_drip_bytes_per_sec ?? 256}" /></label>
+            <label><span>${esc(t("SQLi Blind Delay (ms)"))}</span><input id="sd-ep-sqli" type="number" min="100" max="5000" value="${ep.sqli_time_delay_ms ?? 2500}" /></label>
+            <label><span>${esc(t("Max Tracked Sessions"))}</span><input id="sd-ep-maxs" type="number" min="16" max="4096" value="${ep.max_tracked_sessions ?? 2048}" /></label>
+          </div>
+          <label style="margin-top:8px;"><span>${esc(t("Canary Webhook Base URL"))}</span>
+            <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
+          </label>
+        </div>
+      </div>
+    `;
+
+    const ensureAb = (s) => {
+      if (!s.defaults.ingress.abuseipdb) s.defaults.ingress.abuseipdb = defaultAbuseIpDbConfig();
+      return s.defaults.ingress.abuseipdb;
+    };
+    wireBinSliders(container, "data-sd-ab-bin", (f, v) => store.mutate((s) => { ensureAb(s)[f] = v; }, false));
+    el("sd-ab-key")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).api_key = ev.target.value.trim(); }, false));
+    el("sd-ab-test-ip")?.addEventListener("input", (ev) => { abuseTestIp = ev.target.value.trim(); });
+    el("sd-ab-act")?.addEventListener("change", (ev) => store.mutate((s) => { ensureAb(s).high_risk_action = ev.target.value; }, false));
+    el("sd-ab-ch")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).challenge_threshold = parseNum(ev.target.value, 25, 0, 100); }, false));
+    el("sd-ab-blk")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).block_threshold = parseNum(ev.target.value, 75, 0, 100); }, false));
+    el("sd-ab-age")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_age_days = parseNum(ev.target.value, 90, 1, 365); }, false));
+    el("sd-ab-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).cache_ttl_secs = parseNum(ev.target.value, 21600, 60); }, false));
+    el("sd-ab-cap")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_daily_lookups = parseNum(ev.target.value, 900, 10); }, false));
+    el("sd-ab-test-btn")?.addEventListener("click", async () => {
+      if (abuseTesting) return;
+      abuseTesting = true;
+      abuseTestResult = null;
+      render();
+      try {
+        const curAb = store.spec.defaults?.ingress?.abuseipdb || defaultAbuseIpDbConfig();
+        abuseTestResult = await api("/api/security/abuseipdb/test", {
+          method: "POST",
+          body: JSON.stringify({
+            api_key: curAb.api_key || "",
+            ip: abuseTestIp || "118.25.6.39",
+            max_age_days: curAb.max_age_days || 90,
+          }),
+        });
+      } catch (e) {
+        abuseTestResult = { error: e.message };
+      } finally {
+        abuseTesting = false;
+        if (subTab === "intel") render();
+      }
+    });
+
+    const ensureEp = (s) => {
+      if (!s.defaults.ingress.evilpot) s.defaults.ingress.evilpot = defaultEvilpotConfig();
+      return s.defaults.ingress.evilpot;
+    };
+    el("sd-ep-rot")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).rotation_interval_secs = parseNum(ev.target.value, 300, 60); }, false));
+    el("sd-ep-slots")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).persona_slots = parseNum(ev.target.value, 16, 1, 32); }, false));
+    el("sd-ep-tconns")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tarpit_connections = parseNum(ev.target.value, 256, 1, 256); }, false));
+    el("sd-ep-drip")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).tarpit_drip_bytes_per_sec = parseNum(ev.target.value, 256, 16, 16384); }, false));
+    el("sd-ep-sqli")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).sqli_time_delay_ms = parseNum(ev.target.value, 2500, 100, 5000); }, false));
+    el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
+    el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
+  }
+
   function render() {
     const root = el("tab-security");
     if (!root) return;
@@ -1635,6 +1769,9 @@ export function createSecurityView({ api, store }) {
           </button>
           <button type="button" class="subtab-btn ${subTab === "waf" ? "active" : ""}" data-sec-sub="waf">
             ${esc(t("WAF (OWASP CRS)"))} <span class="subtab-count">${wafCnt}</span>
+          </button>
+          <button type="button" class="subtab-btn ${subTab === "intel" ? "active" : ""}" data-sec-sub="intel">
+            ${esc(t("Threat Intel & Honeypot"))}
           </button>
           <button type="button" class="subtab-btn ${subTab === "geoip" ? "active" : ""}" data-sec-sub="geoip">
             ${esc(t("GeoIP DB"))}
@@ -1672,6 +1809,7 @@ export function createSecurityView({ api, store }) {
     if (subTab === "buckets") renderBucketsSubTab(body);
     else if (subTab === "antibot") renderAntibotSubTab(body);
     else if (subTab === "waf") renderWafSubTab(body);
+    else if (subTab === "intel") renderThreatIntelSubTab(body);
     else if (subTab === "geoip") renderGeoIpSubTab(body);
     else renderPagesSubTab(body);
   }
@@ -1680,7 +1818,7 @@ export function createSecurityView({ api, store }) {
     if (opts.subTab) {
       if (opts.subTab === "waf-rules") subTab = "waf";
       else if (opts.subTab === "guards") subTab = "antibot";
-      else if (["buckets", "antibot", "waf", "geoip", "pages"].includes(opts.subTab)) subTab = opts.subTab;
+      else if (["buckets", "antibot", "waf", "intel", "geoip", "pages"].includes(opts.subTab)) subTab = opts.subTab;
     }
     if (!store.loaded) await store.loadTopology(false);
     if (subTab === "waf") {
