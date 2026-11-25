@@ -535,18 +535,24 @@ impl LinkManager {
                                 Some(session) => session.probe_rtt_ms(cfg2.timeout_ms).await,
                                 None => Err(ExposureError::Link("inbound tunnel disconnected".into())),
                             };
-                            let is_down = {
+                            let should_evict = {
                                 let mut tr = mgr2
                                     .probe_trackers
                                     .entry((peer.peer_tag.clone(), INBOUND_TUNNEL_TRACKER_KEY.to_string()))
                                     .or_default();
                                 match res {
-                                    Ok(rtt) => tr.record_success(rtt, &cfg2),
-                                    Err(_) => tr.record_failure(&cfg2),
+                                    Ok(rtt) => {
+                                        tr.record_success(rtt, &cfg2);
+                                        false
+                                    }
+                                    Err(_) => {
+                                        tr.record_failure(&cfg2);
+                                        tr.state == exposure_core::routing::LinkHealthState::Down
+                                            && tr.consecutive_failures >= cfg2.down_failures
+                                    }
                                 }
-                                tr.state == exposure_core::routing::LinkHealthState::Down
                             };
-                            if is_down {
+                            if should_evict {
                                 if let Some(session) = sess_opt {
                                     warn!(peer = %peer.node_tag, "evicting dead inbound tunnel session after probe failures");
                                     session.close().await;
@@ -591,18 +597,24 @@ impl LinkManager {
                                 Err(ExposureError::Link("tunnel disconnected".into()))
                             };
 
-                            let is_down = {
+                            let should_evict = {
                                 let mut tr = mgr2
                                     .probe_trackers
                                     .entry((peer_tag.clone(), ep.address.clone()))
                                     .or_default();
                                 match res {
-                                    Ok(rtt) => tr.record_success(rtt, &cfg2),
-                                    Err(_) => tr.record_failure(&cfg2),
+                                    Ok(rtt) => {
+                                        tr.record_success(rtt, &cfg2);
+                                        false
+                                    }
+                                    Err(_) => {
+                                        tr.record_failure(&cfg2);
+                                        tr.state == exposure_core::routing::LinkHealthState::Down
+                                            && tr.consecutive_failures >= cfg2.down_failures
+                                    }
                                 }
-                                tr.state == exposure_core::routing::LinkHealthState::Down
                             };
-                            if is_down {
+                            if should_evict {
                                 if let Some(sess) = probed_sess {
                                     warn!(peer = %peer_tag, addr = %ep.address, "evicting dead outbound session after probe failures");
                                     sess.close().await;
