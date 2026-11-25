@@ -387,7 +387,27 @@ function openDiffModal() {
   });
 }
 
-/* ==================== LANGUAGE & AUTO REFRESH ==================== */
+/* ==================== THEME, LANGUAGE & AUTO REFRESH ==================== */
+
+const THEME_STORAGE_KEY = "exposure_theme";
+
+function applyTheme(theme) {
+  const next = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_STORAGE_KEY, next); } catch {}
+  document.querySelectorAll(".theme-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.themeVal === next);
+  });
+  if (appState.authenticated) renderActiveTabOnly();
+}
+
+applyTheme((() => {
+  try { return localStorage.getItem(THEME_STORAGE_KEY) || "dark"; } catch { return "dark"; }
+})());
+
+document.querySelectorAll(".theme-btn").forEach((btn) => {
+  btn.addEventListener("click", () => applyTheme(btn.dataset.themeVal));
+});
 
 function syncLanguageUI() {
   const lang = getLang();

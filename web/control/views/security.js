@@ -1544,7 +1544,7 @@ export function createSecurityView({ api, store }) {
       <div class="page-editor-grid">
         <div class="panel" style="display:flex;flex-direction:column;gap:12px;margin-bottom:0;">
           <label><span>${esc(t("sec.pages.error_html"))}</span>
-            <textarea id="pg-err-html" class="code-editor" style="min-height:120px;" spellcheck="false" placeholder="Leave empty for built-in 429 / 5xx error page">${esc(pages.error_html || "")}</textarea>
+            <textarea id="pg-err-html" class="code-editor" style="min-height:120px;" spellcheck="false" placeholder="Leave empty for built-in 403 / 429 / 5xx error page">${esc(pages.error_html || "")}</textarea>
           </label>
           <label><span>${esc(t("sec.pages.chal_html"))}</span>
             <textarea id="pg-chal-html" class="code-editor" style="min-height:110px;" spellcheck="false" placeholder="Leave empty for built-in PoW HTML">${esc(pages.challenge_html || "")}</textarea>

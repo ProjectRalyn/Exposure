@@ -755,9 +755,9 @@ export function createHostsView({ api, store, navigate }) {
                     const cls = l.state === "UP" ? "ok" : l.state === "DEGRADED" ? "warn" : "err";
                     const rtt = l.rtt_ms != null ? Number(l.rtt_ms) : null;
                     const rttPct = rtt != null ? Math.min(100, Math.round((rtt / 300) * 100)) : 0;
-                    const rttColor = rtt == null ? "#64748b" : rtt < 80 ? "#009F6B" : rtt < 200 ? "#FAC800" : "#C40233";
+                    const rttColor = rtt == null ? "var(--muted)" : rtt < 80 ? "var(--ok)" : rtt < 200 ? "var(--warn)" : "var(--danger)";
                     const lossPct = Math.min(100, (l.loss_rate || 0) * 100);
-                    const lossColor = lossPct < 1 ? "#009F6B" : lossPct < 5 ? "#FAC800" : "#C40233";
+                    const lossColor = lossPct < 1 ? "var(--ok)" : lossPct < 5 ? "var(--warn)" : "var(--danger)";
                     return `
                   <tr>
                     <td><strong>${esc(l.node_tag)}</strong></td>

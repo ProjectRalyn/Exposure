@@ -93,9 +93,15 @@
       </nav>
 
       <div class="sidebar-foot">
-        <div class="lang-switch">
-          <button type="button" class="lang-btn" data-lang="zh-CN">中文</button>
-          <button type="button" class="lang-btn" data-lang="en">EN</button>
+        <div class="foot-switches">
+          <div class="lang-switch" title="Theme">
+            <button type="button" class="theme-btn" data-theme-val="dark">Dark</button>
+            <button type="button" class="theme-btn" data-theme-val="light">Light</button>
+          </div>
+          <div class="lang-switch" title="Language">
+            <button type="button" class="lang-btn" data-lang="zh-CN">中文</button>
+            <button type="button" class="lang-btn" data-lang="en">EN</button>
+          </div>
         </div>
         <button id="btn-logout" class="btn ghost full" data-i18n="auth.signout">Sign Out</button>
       </div>
@@ -110,10 +116,15 @@
         </div>
         <div class="topbar-actions">
           <select id="sel-time-window" class="select-sm" title="Stats time window">
+            <option value="60" data-i18n="topbar.window.1m">Window: 1m</option>
             <option value="300" data-i18n="topbar.window.5m">Window: 5m</option>
             <option value="900" data-i18n="topbar.window.15m">Window: 15m</option>
+            <option value="1800" data-i18n="topbar.window.30m">Window: 30m</option>
             <option value="3600" selected data-i18n="topbar.window.1h">Window: 1h</option>
+            <option value="21600" data-i18n="topbar.window.6h">Window: 6h</option>
+            <option value="43200" data-i18n="topbar.window.12h">Window: 12h</option>
             <option value="86400" data-i18n="topbar.window.24h">Window: 24h</option>
+            <option value="604800" data-i18n="topbar.window.7d">Window: 7d</option>
             <option value="0" data-i18n="topbar.window.all">Window: All</option>
           </select>
           <select id="sel-auto-refresh" class="select-sm" title="Auto refresh interval">

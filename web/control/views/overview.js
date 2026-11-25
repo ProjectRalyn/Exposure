@@ -8,6 +8,7 @@ import {
   renderBarList,
   renderDonutChart,
   renderMiniTopo,
+  themeColors,
 } from "../charts.js";
 import { t } from "../i18n.js";
 import { el, esc } from "../ui.js";
@@ -154,7 +155,7 @@ export function createOverviewView({ api, store, navigate }) {
 
     el("kpi-links").textContent = `${ov.links_up ?? 0} / ${ov.links_degraded ?? 0} / ${ov.links_down ?? 0}`;
     el("kpi-requests").textContent = formatCompact(totalReq);
-    el("kpi-requests-sub").textContent = `${errPct}% error · ${formatCompact(tr.total_rate_limited || 0)} 429`;
+    el("kpi-requests-sub").textContent = `${errPct}% 5xx · ${formatCompact(tr.total_blocked || 0)} blocked · ${formatCompact(tr.total_rate_limited || 0)} 429`;
 
     el("kpi-uv").textContent = formatCompact(tr.uv_estimate || 0);
     el("kpi-uv-sub").textContent = `${formatBytes(tr.total_bytes_in || 0)} in · ${formatBytes(tr.total_bytes_out || 0)} out`;
@@ -166,15 +167,17 @@ export function createOverviewView({ api, store, navigate }) {
     el("kpi-certs").textContent = `#${ov.latest_sequence ?? 0}`;
     el("kpi-certs-sub").textContent = `${cs.valid ?? 0}/${cs.total ?? 0} valid certs · ${(ov.alerts || []).length} alerts`;
 
+    const tc = themeColors();
     const ts = ov.timeseries || [];
     const labels = ts.map((b) => formatMinute(b.minute_epoch));
     renderAreaLineChart(el("ov-traffic-chart"), {
       labels,
       series: [
-        { name: "Requests", color: "#4DA9D6", values: ts.map((b) => b.requests), area: true },
-        { name: "Challenged", color: "#6A5ACD", values: ts.map((b) => b.challenges_issued) },
-        { name: "Rate-Limited", color: "#FAC800", values: ts.map((b) => b.rate_limited) },
-        { name: "Errors", color: "#C40233", values: ts.map((b) => b.errors) },
+        { name: "Requests", color: tc.accent, values: ts.map((b) => b.requests), area: true },
+        { name: "Blocked", color: "#e07a3c", values: ts.map((b) => b.blocked || 0) },
+        { name: "Challenged", color: tc.purple, values: ts.map((b) => b.challenges_issued) },
+        { name: "Rate-Limited", color: tc.warn, values: ts.map((b) => b.rate_limited) },
+        { name: "Errors", color: tc.danger, values: ts.map((b) => b.errors) },
       ],
     });
 
@@ -182,9 +185,9 @@ export function createOverviewView({ api, store, navigate }) {
       labels,
       unit: "ms",
       series: [
-        { name: "p99", color: "#C40233", values: ts.map((b) => b.p99_ms), dashed: true },
-        { name: "p95", color: "#FAC800", values: ts.map((b) => b.p95_ms) },
-        { name: "p50", color: "#009F6B", values: ts.map((b) => b.p50_ms), area: true },
+        { name: "p99", color: tc.danger, values: ts.map((b) => b.p99_ms), dashed: true },
+        { name: "p95", color: tc.warn, values: ts.map((b) => b.p95_ms) },
+        { name: "p50", color: tc.ok, values: ts.map((b) => b.p50_ms), area: true },
       ],
     });
 
@@ -200,9 +203,9 @@ export function createOverviewView({ api, store, navigate }) {
       centerValue: String(totalLinks),
       centerLabel: "Links",
       slices: [
-        { label: "UP", value: ov.links_up || 0, color: "#009F6B" },
-        { label: "DEGRADED", value: ov.links_degraded || 0, color: "#FAC800" },
-        { label: "DOWN", value: ov.links_down || 0, color: "#C40233" },
+        { label: "UP", value: ov.links_up || 0, color: tc.ok },
+        { label: "DEGRADED", value: ov.links_degraded || 0, color: tc.warn },
+        { label: "DOWN", value: ov.links_down || 0, color: tc.danger },
       ],
     });
 

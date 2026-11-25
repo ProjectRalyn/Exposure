@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::BufReader;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -10,10 +12,10 @@ use exposure_core::config::{BackendProtocol, EgressConfig, EgressServiceConfig, 
 use exposure_core::crypto::verify_signature_b64;
 use exposure_core::protocol::ServiceStreamHeader;
 use exposure_core::{ExposureError, Result};
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use http::{header, HeaderMap, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
-use hyper::body::{Body, Incoming};
+use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
@@ -32,6 +34,12 @@ use crate::logger::{AccessLogMeta, NodeLogger};
 const ORIGIN_SIG_MAX_SKEW_SECS: u64 = 120;
 const MAX_ORIGIN_REPLAY_ENTRIES: usize = 65_536;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+const ERROR_SNIPPET_MAX_BYTES: usize = 4096;
+const ERROR_SNIPPET_READ_TIMEOUT: Duration = Duration::from_millis(500);
+const ERROR_SUMMARY_MAX_CHARS: usize = 240;
+
+pub(crate) const RAY_ID_HEADER: &str = "x-exposure-ray";
+pub(crate) const INTERNAL_UPSTREAM_ERR_HEADER: &str = "x-exposure-upstream-error";
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -39,6 +47,265 @@ pub fn full_body(data: impl Into<Bytes>) -> ProxyBody {
     Full::new(data.into())
         .map_err(|never| match never {})
         .boxed()
+}
+
+/// Pass-through body wrapper prepending already-buffered bytes ahead of an unconsumed stream.
+pub(crate) struct PrefixBody {
+    pub(crate) prefix: Option<Bytes>,
+    pub(crate) rest: ProxyBody,
+}
+
+impl Body for PrefixBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(buf) = self.prefix.take() {
+            if !buf.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(buf))));
+            }
+        }
+        Pin::new(&mut self.rest).poll_frame(cx)
+    }
+}
+
+pub(crate) fn status_title_and_detail(status: StatusCode) -> (&'static str, &'static str) {
+    match status {
+        StatusCode::BAD_GATEWAY => ("Bad Gateway", "The upstream server is temporarily unavailable."),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "Service Unavailable",
+            "The upstream server is temporarily unavailable.",
+        ),
+        StatusCode::GATEWAY_TIMEOUT => (
+            "Gateway Timeout",
+            "The upstream server did not respond in time.",
+        ),
+        _ => (
+            "Internal Server Error",
+            "The upstream server encountered an unexpected error.",
+        ),
+    }
+}
+
+pub(crate) fn sanitize_single_line_text(raw: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_chars));
+    let mut prev_ws = false;
+    let mut count = 0usize;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !out.is_empty() && !prev_ws {
+                if count >= max_chars {
+                    break;
+                }
+                out.push(' ');
+                count += 1;
+                prev_ws = true;
+            }
+            continue;
+        }
+        if count >= max_chars {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+        prev_ws = false;
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+pub(crate) fn attach_ray_id_header(resp: &mut Response<ProxyBody>, ray_id: &str) {
+    if let Ok(hv) = HeaderValue::from_str(ray_id) {
+        resp.headers_mut().insert(RAY_ID_HEADER, hv);
+    }
+}
+
+pub(crate) fn attach_internal_upstream_error(resp: &mut Response<ProxyBody>, msg: &str) {
+    let clean = sanitize_single_line_text(msg, ERROR_SUMMARY_MAX_CHARS);
+    if !clean.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(&clean) {
+            resp.headers_mut().insert(INTERNAL_UPSTREAM_ERR_HEADER, hv);
+        }
+    }
+}
+
+fn extract_json_error_text(v: &serde_json::Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        let t = s.trim();
+        return (!t.is_empty()).then(|| t.to_string());
+    }
+    if let Some(obj) = v.as_object() {
+        for key in [
+            "error",
+            "message",
+            "detail",
+            "msg",
+            "err",
+            "title",
+            "reason",
+            "error_description",
+        ] {
+            if let Some(val) = obj.get(key) {
+                if let Some(s) = extract_json_error_text(val) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn strip_html_tags(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let mut out = String::with_capacity(raw.len().min(512));
+    let mut i = 0usize;
+    let bytes = raw.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if lower[i..].starts_with("<script") {
+                if let Some(end) = lower[i..].find("</script>") {
+                    i += end + 9;
+                    continue;
+                }
+            } else if lower[i..].starts_with("<style") {
+                if let Some(end) = lower[i..].find("</style>") {
+                    i += end + 8;
+                    continue;
+                }
+            }
+            if let Some(rel_end) = raw[i..].find('>') {
+                i += rel_end + 1;
+                out.push(' ');
+                continue;
+            }
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+pub(crate) fn summarize_backend_error_body(
+    status: u16,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> String {
+    let is_compressed = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|ce| {
+            let t = ce.trim();
+            !t.is_empty() && !t.eq_ignore_ascii_case("identity")
+        })
+        .unwrap_or(false);
+    if body.is_empty() || is_compressed {
+        return format!("backend status {status}");
+    }
+    // Reject binary payloads containing NUL or excessive non-printable bytes.
+    let non_text = body
+        .iter()
+        .take(256)
+        .filter(|&&b| b == 0 || (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')))
+        .count();
+    if non_text > 4 {
+        return format!("backend status {status}");
+    }
+
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return format!("backend status {status}");
+    }
+
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let extracted = if ct.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| extract_json_error_text(&v))
+            .unwrap_or_else(|| trimmed.to_string())
+    } else if ct.contains("html") || trimmed.starts_with('<') {
+        strip_html_tags(trimmed)
+    } else {
+        trimmed.to_string()
+    };
+
+    let prefix = format!("backend {status}: ");
+    let avail = ERROR_SUMMARY_MAX_CHARS.saturating_sub(prefix.len());
+    let clean = sanitize_single_line_text(&extracted, avail);
+    if clean.is_empty() {
+        format!("backend status {status}")
+    } else {
+        format!("{prefix}{clean}")
+    }
+}
+
+pub(crate) async fn capture_5xx_response_error(
+    resp: Response<ProxyBody>,
+) -> (Response<ProxyBody>, String) {
+    let status = resp.status().as_u16();
+    let (parts, mut body) = resp.into_parts();
+    let mut collected = Vec::new();
+    let mut hit_limit = false;
+    let mut io_err: Option<String> = None;
+
+    let read_res = tokio::time::timeout(ERROR_SNIPPET_READ_TIMEOUT, async {
+        while let Some(frame_res) = body.frame().await {
+            match frame_res {
+                Ok(frame) => {
+                    if let Some(data) = frame.data_ref() {
+                        collected.extend_from_slice(data);
+                        if collected.len() >= ERROR_SNIPPET_MAX_BYTES {
+                            hit_limit = true;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    io_err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+
+    let snippet_slice = &collected[..collected.len().min(ERROR_SNIPPET_MAX_BYTES)];
+    let summary = if snippet_slice.is_empty() {
+        if let Some(ref e) = io_err {
+            let prefix = format!("backend {status} (body error): ");
+            let clean = sanitize_single_line_text(
+                e,
+                ERROR_SUMMARY_MAX_CHARS.saturating_sub(prefix.len()),
+            );
+            format!("{prefix}{clean}")
+        } else {
+            format!("backend status {status}")
+        }
+    } else {
+        summarize_backend_error_body(status, &parts.headers, snippet_slice)
+    };
+
+    let rebuilt_body = if hit_limit || read_res.is_err() {
+        PrefixBody {
+            prefix: Some(Bytes::from(collected)),
+            rest: body,
+        }
+        .boxed()
+    } else {
+        full_body(collected)
+    };
+    (Response::from_parts(parts, rebuilt_body), summary)
 }
 
 /// Headers the proxy authoritatively sets; these must never be removed via `Connection` tokens,
@@ -400,6 +667,8 @@ impl EgressHandler {
                 );
                 warn!("{msg}");
                 self.logger.emit_alert("warn", msg.clone()).await;
+                self.record_stream_rejection(&header, 502, "upstream_error", msg.clone())
+                    .await;
                 return Err(ExposureError::Routing(msg));
             }
         };
@@ -417,14 +686,19 @@ impl EgressHandler {
                 );
                 warn!("{msg}");
                 self.logger.emit_alert("warn", msg.clone()).await;
+                self.record_stream_rejection(&header, 403, "guard_reject", msg.clone())
+                    .await;
                 return Err(ExposureError::AccessDenied(msg));
             }
             if let Err(e) = self
                 .verify_origin_authenticity(&header, authenticated_peer_tag.as_deref())
                 .await
             {
-                warn!("{e}");
-                self.logger.emit_alert("warn", e.to_string()).await;
+                let msg = e.to_string();
+                warn!("{msg}");
+                self.logger.emit_alert("warn", msg.clone()).await;
+                self.record_stream_rejection(&header, 403, "guard_reject", msg)
+                    .await;
                 return Err(e);
             }
         }
@@ -532,6 +806,7 @@ impl EgressHandler {
         };
 
         if !self.is_local_backend_healthy(&hdr.service_tag) {
+            let msg = "backend unhealthy";
             self.logger
                 .record_access_log(
                     "egress",
@@ -544,7 +819,7 @@ impl EgressHandler {
                     false,
                     false,
                     false,
-                    Some("backend unhealthy".into()),
+                    Some(msg.into()),
                     None,
                     None,
                     None,
@@ -552,15 +827,15 @@ impl EgressHandler {
                     make_meta("upstream_error"),
                 )
                 .await;
-            return self
-                .build_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Service Unavailable",
-                    "The upstream backend failed local health checks.",
-                    svc.effective_intercept_errors(),
-                    error_html_tpl,
-                    &hdr.request_id,
-                );
+            return self.build_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "The upstream backend failed local health checks.",
+                svc.effective_intercept_errors(),
+                error_html_tpl,
+                &hdr.request_id,
+                Some(msg),
+            );
         }
 
         let req_bytes_in = req
@@ -600,7 +875,7 @@ impl EgressHandler {
                         false,
                         false,
                         false,
-                        Some(msg),
+                        Some(msg.clone()),
                         None,
                         None,
                         None,
@@ -615,6 +890,7 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    Some(&msg),
                 );
             }
             Err(_) => {
@@ -641,7 +917,7 @@ impl EgressHandler {
                         false,
                         false,
                         false,
-                        Some(msg),
+                        Some(msg.clone()),
                         None,
                         None,
                         None,
@@ -656,6 +932,7 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    Some(&msg),
                 );
             }
         };
@@ -705,14 +982,38 @@ impl EgressHandler {
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match resp_res {
-            Ok(resp) => {
+            Ok(mut resp) => {
+                // Never allow an origin response to forge the internal mesh upstream-error header.
+                resp.headers_mut().remove(INTERNAL_UPSTREAM_ERR_HEADER);
                 let status = resp.status().as_u16();
-                let resp_bytes_out = resp
+                let (final_resp, logged_err) = if status >= 500 {
+                    let (mut rebuilt_resp, err_summary) = capture_5xx_response_error(resp).await;
+                    if svc.effective_intercept_errors() {
+                        let st = rebuilt_resp.status();
+                        let (title, detail) = status_title_and_detail(st);
+                        rebuilt_resp = self.build_error_response(
+                            st,
+                            title,
+                            detail,
+                            true,
+                            error_html_tpl,
+                            &hdr.request_id,
+                            Some(&err_summary),
+                        );
+                    } else {
+                        attach_ray_id_header(&mut rebuilt_resp, &hdr.request_id);
+                        attach_internal_upstream_error(&mut rebuilt_resp, &err_summary);
+                    }
+                    (rebuilt_resp, Some(err_summary))
+                } else {
+                    (resp, None)
+                };
+                let resp_bytes_out = final_resp
                     .headers()
                     .get(header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or_else(|| resp.body().size_hint().lower());
+                    .unwrap_or_else(|| final_resp.body().size_hint().lower());
                 self.logger
                     .record_access_log(
                         "egress",
@@ -725,19 +1026,15 @@ impl EgressHandler {
                         false,
                         false,
                         false,
-                        if status >= 500 {
-                            Some(format!("backend status {status}"))
-                        } else {
-                            None
-                        },
+                        logged_err,
                         None,
                         None,
                         None,
                         false,
-                        make_meta("allow"),
+                        make_meta(if status >= 500 { "upstream_error" } else { "allow" }),
                     )
                     .await;
-                resp
+                final_resp
             }
             Err((err_status, err_msg)) => {
                 if let Some(suppressed) = self
@@ -759,7 +1056,7 @@ impl EgressHandler {
                         false,
                         false,
                         false,
-                        Some(err_msg),
+                        Some(err_msg.clone()),
                         None,
                         None,
                         None,
@@ -767,11 +1064,7 @@ impl EgressHandler {
                         make_meta("upstream_error"),
                     )
                     .await;
-                let (title, detail) = if err_status == StatusCode::GATEWAY_TIMEOUT {
-                    ("Gateway Timeout", "The upstream server did not respond in time.")
-                } else {
-                    ("Bad Gateway", "The upstream server is temporarily unavailable.")
-                };
+                let (title, detail) = status_title_and_detail(err_status);
                 self.build_error_response(
                     err_status,
                     title,
@@ -779,11 +1072,13 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    Some(&err_msg),
                 )
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_error_response(
         &self,
         status: StatusCode,
@@ -792,8 +1087,9 @@ impl EgressHandler {
         intercept: bool,
         error_html_tpl: Option<&str>,
         ray_id: &str,
+        internal_error: Option<&str>,
     ) -> Response<ProxyBody> {
-        if intercept {
+        let mut resp = if intercept {
             let html = exposure_core::assets::render_exposure_error_html_with_template(
                 error_html_tpl,
                 status.as_u16(),
@@ -802,19 +1098,59 @@ impl EgressHandler {
                 ray_id,
                 None,
             );
-            return Response::builder()
+            Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .header(header::CACHE_CONTROL, "no-store")
-                .header("x-exposure-ray", ray_id)
+                .header(RAY_ID_HEADER, ray_id)
                 .body(full_body(html))
-                .unwrap();
+                .unwrap()
+        } else {
+            Response::builder()
+                .status(status)
+                .header(RAY_ID_HEADER, ray_id)
+                .body(full_body(format!("{} {title}", status.as_u16())))
+                .unwrap()
+        };
+        if let Some(err) = internal_error {
+            attach_internal_upstream_error(&mut resp, err);
         }
-        Response::builder()
-            .status(status)
-            .header("x-exposure-ray", ray_id)
-            .body(full_body(format!("{} {title}", status.as_u16())))
-            .unwrap()
+        resp
+    }
+
+    async fn record_stream_rejection(
+        &self,
+        header: &ServiceStreamHeader,
+        status: u16,
+        action: &'static str,
+        msg: String,
+    ) {
+        let client_ip = header.client_ip.as_deref().unwrap_or("0.0.0.0");
+        self.logger
+            .record_access_log(
+                "egress",
+                &header.service_tag,
+                client_ip,
+                status,
+                0.0,
+                0,
+                0,
+                false,
+                false,
+                false,
+                Some(msg),
+                None,
+                None,
+                None,
+                false,
+                AccessLogMeta {
+                    ray_id: Some(&header.request_id),
+                    host: header.sni.as_deref(),
+                    action: Some(action),
+                    ..Default::default()
+                },
+            )
+            .await;
     }
 }
 
@@ -1079,5 +1415,57 @@ impl ServerCertVerifier for InsecureBackendCertVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.algos.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_backend_error_body_extracts_json_html_and_skips_binary() {
+        let mut json_hdrs = HeaderMap::new();
+        json_hdrs.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert_eq!(
+            summarize_backend_error_body(
+                500,
+                &json_hdrs,
+                br#"{"code":500,"error":"database deadlock on orders"}"#,
+            ),
+            "backend 500: database deadlock on orders"
+        );
+
+        let mut html_hdrs = HeaderMap::new();
+        html_hdrs.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        assert_eq!(
+            summarize_backend_error_body(
+                502,
+                &html_hdrs,
+                b"<html><head><style>body{}</style></head><body><h1>Bad Gateway</h1><p>worker exited</p></body></html>",
+            ),
+            "backend 502: Bad Gateway worker exited"
+        );
+
+        let mut gzip_hdrs = HeaderMap::new();
+        gzip_hdrs.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(
+            summarize_backend_error_body(500, &gzip_hdrs, b"\x1f\x8b\x08\x00"),
+            "backend status 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_5xx_response_error_preserves_streaming_body_beyond_prefix() {
+        let payload = "A".repeat(6000);
+        let resp = Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(full_body(payload.clone()))
+            .unwrap();
+        let (rebuilt, summary) = capture_5xx_response_error(resp).await;
+        assert!(summary.starts_with("backend 500: AAAA"), "{summary}");
+        let body = rebuilt.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 6000);
+        assert_eq!(body, payload.as_bytes());
     }
 }

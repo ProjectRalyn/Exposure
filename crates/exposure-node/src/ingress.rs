@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -27,7 +25,7 @@ use exposure_core::telemetry::EvilpotNodeReport;
 use exposure_core::Result;
 use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Limited};
-use hyper::body::{Body, Frame, Incoming};
+use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
@@ -41,7 +39,10 @@ use uuid::Uuid;
 use crate::abuseipdb::AbuseIpDbClient;
 use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
 use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
-use crate::egress::{full_body, strip_hop_by_hop_headers, ProxyBody};
+use crate::egress::{
+    attach_ray_id_header, capture_5xx_response_error, full_body, status_title_and_detail,
+    strip_hop_by_hop_headers, PrefixBody, ProxyBody, INTERNAL_UPSTREAM_ERR_HEADER, RAY_ID_HEADER,
+};
 use crate::forwarder::Forwarder;
 use crate::geoip::GeoIpManager;
 use crate::guard::{
@@ -799,7 +800,7 @@ impl IngressServer {
                 0,
                 0,
                 false,
-                true,
+                false,
                 false,
                 Some(format!("evilpot:{status_lbl}:canary")),
                 Some(client_fp.device_type.to_string()),
@@ -892,6 +893,7 @@ impl IngressServer {
         finding: WafFinding,
     ) -> Response<ProxyBody> {
         let Some(permit) = self.evilpot.try_admit(client_ip) else {
+            let reason = format!("evilpot:flood:{}", finding.category);
             self.record_offense_and_maybe_alert(
                 service_tag,
                 host,
@@ -900,9 +902,29 @@ impl IngressServer {
                 ua_str,
                 req_js_fp_hash,
                 OffenseKind::EvilpotFlood,
-                &format!("evilpot:flood:{}", finding.category),
+                &reason,
             )
             .await;
+            self.logger
+                .record_access_log(
+                    "ingress",
+                    service_tag,
+                    &client_ip.to_string(),
+                    403,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(reason),
+                    Some(client_fp.device_type.to_string()),
+                    Some(client_fp.browser_family.to_string()),
+                    Some(client_fp.os_family.to_string()),
+                    false,
+                    log_ctx.meta("waf_block", None, finding.rule_id, Some(finding.category)),
+                )
+                .await;
             return build_waf_block_response(&finding, false, false, ray_id, None);
         };
         let ep_engine = self
@@ -918,6 +940,26 @@ impl IngressServer {
         )
         .await
         else {
+            self.logger
+                .record_access_log(
+                    "ingress",
+                    service_tag,
+                    &client_ip.to_string(),
+                    403,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(format!("evilpot:timeout:{}", finding.category)),
+                    Some(client_fp.device_type.to_string()),
+                    Some(client_fp.browser_family.to_string()),
+                    Some(client_fp.os_family.to_string()),
+                    false,
+                    log_ctx.meta("waf_block", None, finding.rule_id, Some(finding.category)),
+                )
+                .await;
             return build_waf_block_response(&finding, false, false, ray_id, None);
         };
         let status_lbl = verification_status_label(outcome.session.status);
@@ -1021,7 +1063,7 @@ impl IngressServer {
                 0,
                 0,
                 false,
-                true,
+                false,
                 false,
                 Some(ban_reason),
                 Some(client_fp.device_type.to_string()),
@@ -1187,7 +1229,7 @@ impl IngressServer {
                         0,
                         0,
                         false,
-                        true,
+                        false,
                         false,
                         Some(format!("autoban:{}:{}", ban_hit.kind.as_str(), ban_hit.reason)),
                         None,
@@ -1218,6 +1260,7 @@ impl IngressServer {
                     .status(StatusCode::FORBIDDEN)
                     .header(header::CACHE_CONTROL, "no-store")
                     .header(header::CONNECTION, "close")
+                    .header(RAY_ID_HEADER, &ray_id)
                     .body(full_body("Forbidden"))
                     .unwrap();
             }
@@ -1361,6 +1404,7 @@ impl IngressServer {
                     GuardDecision::Reject { status, .. } => {
                         return Response::builder()
                             .status(status)
+                            .header(RAY_ID_HEADER, &ray_id)
                             .body(full_body("Access Denied"))
                             .unwrap();
                     }
@@ -1374,6 +1418,7 @@ impl IngressServer {
                             return Response::builder()
                                 .status(StatusCode::FORBIDDEN)
                                 .header(header::CACHE_CONTROL, "no-store")
+                                .header(RAY_ID_HEADER, &ray_id)
                                 .body(full_body("Access Denied by Region Policy"))
                                 .unwrap();
                         }
@@ -1521,7 +1566,8 @@ impl IngressServer {
 
             let mut rb = Response::builder()
                 .status(g_resp.status)
-                .header(header::CONTENT_TYPE, g_resp.content_type);
+                .header(header::CONTENT_TYPE, g_resp.content_type)
+                .header(RAY_ID_HEADER, &ray_id);
             for (k, v) in g_resp.extra_headers {
                 rb = rb.header(k, v);
             }
@@ -1613,11 +1659,13 @@ impl IngressServer {
                 if unmatched_status == StatusCode::MISDIRECTED_REQUEST {
                     return Response::builder()
                         .status(StatusCode::MISDIRECTED_REQUEST)
+                        .header(RAY_ID_HEADER, &ray_id)
                         .body(full_body("421 Misdirected Request"))
                         .unwrap();
                 }
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
+                    .header(RAY_ID_HEADER, &ray_id)
                     .body(full_body("404 Not Found"))
                     .unwrap();
             }
@@ -1636,12 +1684,52 @@ impl IngressServer {
                             node = %self.node_tag,
                             service = %rule.service_tag,
                             guard = %guard_name,
+                            ray_id = %ray_id,
                             "ingress rule references undefined guard profile; failing closed"
                         );
-                        return Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(full_body("503 Service Unavailable"))
-                            .unwrap();
+                        self.logger
+                            .record_access_log(
+                                "ingress",
+                                &rule.service_tag,
+                                &client_ip.to_string(),
+                                503,
+                                start.elapsed().as_secs_f64() * 1000.0,
+                                0,
+                                0,
+                                false,
+                                false,
+                                false,
+                                Some(format!("undefined guard profile: {guard_name}")),
+                                Some(client_fp.device_type.to_string()),
+                                Some(client_fp.browser_family.to_string()),
+                                Some(client_fp.os_family.to_string()),
+                                false,
+                                AccessLogMeta {
+                                    ray_id: Some(&ray_id),
+                                    method: Some(&method_str),
+                                    host: Some(&host),
+                                    path: Some(&path),
+                                    query: query_opt.as_deref(),
+                                    protocol: Some(protocol_str),
+                                    scheme: Some(scheme_str),
+                                    user_agent: Some(&ua_str),
+                                    referer: referer_opt.as_deref(),
+                                    action: Some("config_error"),
+                                    cache_status: None,
+                                    tls_ja3,
+                                    waf_rule_id: None,
+                                    waf_category: None,
+                                    suspicion_score: None,
+                                    client_country: local_country.as_deref(),
+                                },
+                            )
+                            .await;
+                        return build_ingress_5xx_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &ray_id,
+                            rule.effective_intercept_errors(),
+                            cfg.pages.error_html.as_deref(),
+                        );
                     }
                 }
             } else {
@@ -1770,7 +1858,7 @@ impl IngressServer {
                             0,
                             0,
                             false,
-                            true,
+                            false,
                             false,
                             Some(reason),
                             Some(client_fp.device_type.to_string()),
@@ -1807,6 +1895,7 @@ impl IngressServer {
                         .await;
                     return Response::builder()
                         .status(status)
+                        .header(RAY_ID_HEADER, &ray_id)
                         .body(full_body("Access Denied"))
                         .unwrap();
                 }
@@ -1846,7 +1935,7 @@ impl IngressServer {
                             0,
                             0,
                             false,
-                            true,
+                            false,
                             false,
                             Some(reason),
                             Some(client_fp.device_type.to_string()),
@@ -1884,6 +1973,7 @@ impl IngressServer {
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header(header::CACHE_CONTROL, "no-store")
+                        .header(RAY_ID_HEADER, &ray_id)
                         .body(full_body("Access Denied by Region Policy"))
                         .unwrap();
                 }
@@ -1951,6 +2041,7 @@ impl IngressServer {
                                 .status(StatusCode::FOUND)
                                 .header(header::LOCATION, location)
                                 .header(header::CACHE_CONTROL, "no-store")
+                                .header(RAY_ID_HEADER, &ray_id)
                                 .body(full_body(""))
                                 .unwrap();
                         }
@@ -1958,6 +2049,7 @@ impl IngressServer {
                             .status(StatusCode::FORBIDDEN)
                             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                             .header(header::CACHE_CONTROL, "no-store")
+                            .header(RAY_ID_HEADER, &ray_id)
                             .body(full_body(r#"{"error":"verification_required","reason":"geo_challenge"}"#))
                             .unwrap();
                     }
@@ -2092,11 +2184,32 @@ impl IngressServer {
                             .map_err(|_| ())
                             .and_then(|res| res.map_err(|_| ()))
                             else {
-                                return Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .header(header::CACHE_CONTROL, "no-store")
-                                    .body(full_body("503 Service Unavailable"))
-                                    .unwrap();
+                                self.logger
+                                    .record_access_log(
+                                        "ingress",
+                                        &rule.service_tag,
+                                        &client_ip.to_string(),
+                                        503,
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        0,
+                                        0,
+                                        false,
+                                        false,
+                                        false,
+                                        Some("waf:body_buffer_busy".into()),
+                                        Some(client_fp.device_type.to_string()),
+                                        Some(client_fp.browser_family.to_string()),
+                                        Some(client_fp.os_family.to_string()),
+                                        false,
+                                        log_ctx.meta("waf_overload", None, None, Some("waf-overload")),
+                                    )
+                                    .await;
+                                return build_ingress_5xx_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &ray_id,
+                                    rule.effective_intercept_errors(),
+                                    cfg.pages.error_html.as_deref(),
+                                );
                             };
                             match buffer_prefix_for_waf(req, body_limit).await {
                                 Ok((rebuilt_req, inspected_bytes)) => {
@@ -2134,6 +2247,7 @@ impl IngressServer {
                                     return Response::builder()
                                         .status(StatusCode::REQUEST_TIMEOUT)
                                         .header(header::CACHE_CONTROL, "no-store")
+                                        .header(RAY_ID_HEADER, &ray_id)
                                         .body(full_body("408 Request Timeout"))
                                         .unwrap();
                                 }
@@ -2161,6 +2275,7 @@ impl IngressServer {
                                     return Response::builder()
                                         .status(StatusCode::BAD_REQUEST)
                                         .header(header::CACHE_CONTROL, "no-store")
+                                        .header(RAY_ID_HEADER, &ray_id)
                                         .body(full_body("400 Bad Request"))
                                         .unwrap();
                                 }
@@ -2239,7 +2354,7 @@ impl IngressServer {
                                     0,
                                     0,
                                     false,
-                                    true,
+                                    false,
                                     false,
                                     Some(reason),
                                     Some(client_fp.device_type.to_string()),
@@ -2448,6 +2563,7 @@ impl IngressServer {
                             .status(StatusCode::FORBIDDEN)
                             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                             .header(header::CACHE_CONTROL, "no-store")
+                            .header(RAY_ID_HEADER, &ray_id)
                             .body(full_body(r#"{"error":"verification_required"}"#))
                             .unwrap();
                     }
@@ -2500,6 +2616,7 @@ impl IngressServer {
                         .status(StatusCode::FOUND)
                         .header(header::LOCATION, location)
                         .header(header::CACHE_CONTROL, "no-store")
+                        .header(RAY_ID_HEADER, &ray_id)
                         .body(full_body(""))
                         .unwrap();
                 }
@@ -2605,6 +2722,7 @@ impl IngressServer {
                                             "application/json; charset=utf-8",
                                         )
                                         .header(header::CACHE_CONTROL, "no-store")
+                                        .header(RAY_ID_HEADER, &ray_id)
                                         .body(full_body(
                                             serde_json::json!({
                                                 "error": "abuseipdb_verification_required",
@@ -2623,6 +2741,7 @@ impl IngressServer {
                                     .status(StatusCode::FOUND)
                                     .header(header::LOCATION, location)
                                     .header(header::CACHE_CONTROL, "no-store")
+                                    .header(RAY_ID_HEADER, &ray_id)
                                     .body(full_body(""))
                                     .unwrap();
                             }
@@ -2687,7 +2806,7 @@ impl IngressServer {
                                     0,
                                     0,
                                     false,
-                                    true,
+                                    false,
                                     false,
                                     Some(format!("abuseipdb:score={ab_score}")),
                                     Some(client_fp.device_type.to_string()),
@@ -2829,7 +2948,7 @@ impl IngressServer {
                             .get(header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
+                            .unwrap_or_else(|| resp.body().size_hint().lower());
                         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                         self.logger
                             .record_access_log(
@@ -2876,6 +2995,7 @@ impl IngressServer {
                                 0,
                             )
                             .await;
+                        attach_ray_id_header(&mut resp, &ray_id);
                         return resp;
                     }
                     self.cache.record_bypass();
@@ -2962,7 +3082,7 @@ impl IngressServer {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(|| req.body().size_hint().lower());
 
-        let request_id = Uuid::new_v4().to_string();
+        let request_id = ray_id.clone();
         let now_ts = Utc::now().timestamp();
         let origin_signing = ServiceStreamHeader::origin_signing_bytes(
             &rule.service_tag,
@@ -3003,14 +3123,14 @@ impl IngressServer {
                     if stale_entry.is_usable_stale(Instant::now()) {
                         self.cache.record_stale();
                         let lookup_h = orig_req_headers.as_ref().unwrap();
-                        let stale_resp =
+                        let mut stale_resp =
                             build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
                         let stale_bytes_out = stale_resp
                             .headers()
                             .get(header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
+                            .unwrap_or_else(|| stale_resp.body().size_hint().lower());
                         self.logger
                             .record_access_log(
                                 "ingress",
@@ -3031,6 +3151,7 @@ impl IngressServer {
                                 log_ctx.meta("cache_stale", Some("STALE"), None, None),
                             )
                             .await;
+                        attach_ray_id_header(&mut stale_resp, &ray_id);
                         return stale_resp;
                     }
                 }
@@ -3064,24 +3185,26 @@ impl IngressServer {
                         log_ctx.meta("upstream_error", None, None, None),
                     )
                     .await;
-                return Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(full_body("Bad Gateway: mesh forward failed"))
-                    .unwrap();
+                return build_ingress_5xx_response(
+                    StatusCode::BAD_GATEWAY,
+                    &ray_id,
+                    rule.effective_intercept_errors(),
+                    cfg.pages.error_html.as_deref(),
+                );
             }
             Err(_) => {
                 if let Some((_, ref stale_entry)) = stale_fallback {
                     if stale_entry.is_usable_stale(Instant::now()) {
                         self.cache.record_stale();
                         let lookup_h = orig_req_headers.as_ref().unwrap();
-                        let stale_resp =
+                        let mut stale_resp =
                             build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
                         let stale_bytes_out = stale_resp
                             .headers()
                             .get(header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
+                            .unwrap_or_else(|| stale_resp.body().size_hint().lower());
                         self.logger
                             .record_access_log(
                                 "ingress",
@@ -3102,6 +3225,7 @@ impl IngressServer {
                                 log_ctx.meta("cache_stale", Some("STALE"), None, None),
                             )
                             .await;
+                        attach_ray_id_header(&mut stale_resp, &ray_id);
                         return stale_resp;
                     }
                 }
@@ -3125,10 +3249,12 @@ impl IngressServer {
                         log_ctx.meta("upstream_error", None, None, None),
                     )
                     .await;
-                return Response::builder()
-                    .status(StatusCode::GATEWAY_TIMEOUT)
-                    .body(full_body("504 Gateway Time-out"))
-                    .unwrap();
+                return build_ingress_5xx_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    &ray_id,
+                    rule.effective_intercept_errors(),
+                    cfg.pages.error_html.as_deref(),
+                );
             }
         };
 
@@ -3236,6 +3362,15 @@ impl IngressServer {
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         match proxy_res {
             Ok(mut resp) => {
+                // Always strip internal mesh header before caching or returning to external clients.
+                let upstream_err_hdr = resp
+                    .headers_mut()
+                    .remove(INTERNAL_UPSTREAM_ERR_HEADER)
+                    .as_ref()
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 if cache_policy.enabled {
                     let lookup_h = orig_req_headers.as_ref().unwrap();
                     if sent_cache_revalidation && resp.status() == StatusCode::NOT_MODIFIED {
@@ -3331,19 +3466,45 @@ impl IngressServer {
                         req_js_fp_hash.as_deref(),
                     );
                 }
+                let cache_hdr = resp
+                    .headers()
+                    .get("x-exposure-cache")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let logged_err = if resp.status().is_server_error() {
+                    let err_msg = match upstream_err_hdr {
+                        Some(msg) => msg,
+                        None => {
+                            let (rebuilt_resp, summary) = capture_5xx_response_error(resp).await;
+                            resp = rebuilt_resp;
+                            summary
+                        }
+                    };
+                    if rule.effective_intercept_errors() {
+                        resp = build_ingress_5xx_response(
+                            resp.status(),
+                            &ray_id,
+                            true,
+                            cfg.pages.error_html.as_deref(),
+                        );
+                    }
+                    Some(err_msg)
+                } else {
+                    None
+                };
+                if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+                    attach_ray_id_header(&mut resp, &ray_id);
+                }
                 let resp_bytes_out = resp
                     .headers()
                     .get(header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or_else(|| resp.body().size_hint().lower());
-                let cache_hdr = resp
-                    .headers()
-                    .get("x-exposure-cache")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
                 let (log_action, w_rule_id, w_category) = match waf_monitor_hit {
                     Some((rid, cat)) => ("waf_monitor", rid, Some(cat)),
+                    None if cache_hdr.as_deref() == Some("STALE") => ("cache_stale", None, None),
+                    None if resp.status().is_server_error() => ("upstream_error", None, None),
                     None => ("allow", None, None),
                 };
                 self.logger
@@ -3358,7 +3519,7 @@ impl IngressServer {
                         false,
                         false,
                         false,
-                        None,
+                        logged_err,
                         Some(client_fp.device_type.to_string()),
                         Some(client_fp.browser_family.to_string()),
                         Some(client_fp.os_family.to_string()),
@@ -3398,14 +3559,14 @@ impl IngressServer {
                     if stale_entry.is_usable_stale(Instant::now()) {
                         self.cache.record_stale();
                         let lookup_h = orig_req_headers.as_ref().unwrap();
-                        let stale_resp =
+                        let mut stale_resp =
                             build_response_from_cache(stale_entry, &orig_method, lookup_h, "STALE");
                         let stale_bytes_out = stale_resp
                             .headers()
                             .get(header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
+                            .unwrap_or_else(|| stale_resp.body().size_hint().lower());
                         self.logger
                             .record_access_log(
                                 "ingress",
@@ -3426,6 +3587,7 @@ impl IngressServer {
                                 log_ctx.meta("cache_stale", Some("STALE"), None, None),
                             )
                             .await;
+                        attach_ray_id_header(&mut stale_resp, &ray_id);
                         return stale_resp;
                     }
                 }
@@ -3455,57 +3617,46 @@ impl IngressServer {
                         log_ctx.meta("upstream_error", None, None, None),
                     )
                     .await;
-                let (title, detail) = if err_status == StatusCode::GATEWAY_TIMEOUT {
-                    ("Gateway Timeout", "The upstream server did not respond in time.")
-                } else {
-                    ("Bad Gateway", "The upstream server is temporarily unavailable.")
-                };
-                if rule.effective_intercept_errors() {
-                    let html = exposure_core::assets::render_exposure_error_html_with_template(
-                        cfg.pages.error_html.as_deref(),
-                        err_status.as_u16(),
-                        title,
-                        detail,
-                        &ray_id,
-                        None,
-                    );
-                    return Response::builder()
-                        .status(err_status)
-                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-                        .header(header::CACHE_CONTROL, "no-store")
-                        .body(full_body(html))
-                        .unwrap();
-                }
-                Response::builder()
-                    .status(err_status)
-                    .body(full_body(format!("{} {title}", err_status.as_u16())))
-                    .unwrap()
+                build_ingress_5xx_response(
+                    err_status,
+                    &ray_id,
+                    rule.effective_intercept_errors(),
+                    cfg.pages.error_html.as_deref(),
+                )
             }
         }
     }
 }
 
-/// Pass-through body wrapper prepending already-buffered bytes ahead of an unconsumed stream.
-struct PrefixBody {
-    prefix: Option<Bytes>,
-    rest: ProxyBody,
-}
-
-impl Body for PrefixBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        if let Some(buf) = self.prefix.take() {
-            if !buf.is_empty() {
-                return Poll::Ready(Some(Ok(Frame::data(buf))));
-            }
-        }
-        Pin::new(&mut self.rest).poll_frame(cx)
+fn build_ingress_5xx_response(
+    status: StatusCode,
+    ray_id: &str,
+    intercept_errors: bool,
+    error_html_template: Option<&str>,
+) -> Response<ProxyBody> {
+    let (title, detail) = status_title_and_detail(status);
+    if intercept_errors {
+        let html = exposure_core::assets::render_exposure_error_html_with_template(
+            error_html_template,
+            status.as_u16(),
+            title,
+            detail,
+            ray_id,
+            None,
+        );
+        return Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(RAY_ID_HEADER, ray_id)
+            .body(full_body(html))
+            .unwrap();
     }
+    Response::builder()
+        .status(status)
+        .header(RAY_ID_HEADER, ray_id)
+        .body(full_body(format!("{} {title}", status.as_u16())))
+        .unwrap()
 }
 
 /// Collect up to `policy.max_object_bytes` from an eligible upstream response to store in `EdgeCache`.
@@ -3911,6 +4062,7 @@ fn build_rate_limit_response(
             .header(header::RETRY_AFTER, retry_after_secs.to_string())
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
+            .header(RAY_ID_HEADER, ray_id)
             .body(full_body(html))
             .unwrap();
     }
@@ -3924,6 +4076,7 @@ fn build_rate_limit_response(
         .header(header::RETRY_AFTER, retry_after_secs.to_string())
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
+        .header(RAY_ID_HEADER, ray_id)
         .body(full_body(body))
         .unwrap()
 }
@@ -3953,6 +4106,7 @@ fn is_browser_navigation(method: &http::Method, headers: &http::HeaderMap) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body::Frame;
 
     #[test]
     fn html_injection_targets_last_closing_body_tag() {
@@ -5157,6 +5311,296 @@ mod tests {
         assert!(recs.iter().any(|r| r.client_country.as_deref() == Some("CN")));
         assert!(fps.iter().any(|f| f.geo_country.as_deref() == Some("AU") && f.geo_continent.as_deref() == Some("OC")));
         assert!(fps.iter().any(|f| f.geo_country.as_deref() == Some("US") && f.geo_continent.as_deref() == Some("NA")));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn waf_block_is_not_5xx_or_pow_and_backend_5xx_logs_error_and_unified_ray_id() {
+        use exposure_core::config::{
+            AntibotMode, EgressConfig, EgressServiceConfig, GuardProfile, IngressRule,
+            LoggerConfig, NodeRoles, RelayConfig, RuleMatch, SegmentConfig, TrustedOrigin,
+            WafConfig,
+        };
+        use exposure_link::LinkManager;
+        use http_body_util::Full;
+        use hyper::service::service_fn;
+        use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
+        use std::collections::BTreeMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = backend_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        if req.uri().path() == "/boom" {
+                            return Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .header("x-exposure-upstream-error", "spoofed-by-origin")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"error":"database deadlock on orders"}"#,
+                                    )))
+                                    .unwrap(),
+                            );
+                        }
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = AutoServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("exp-ray-5xx-test-{}", Uuid::new_v4()));
+        let logger = NodeLogger::new(
+            "node-ray",
+            LoggerConfig {
+                hmac_key: generate_random_secret_hex(32),
+                store_raw_ip: false,
+                sample_rate: 1.0,
+                hll_precision: 10,
+                segment: SegmentConfig {
+                    dir: tmp_dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let kp = NodeKeyPair::generate();
+        let lm = LinkManager::new("node-ray", kp.clone(), false, vec![], Default::default());
+        let mut services = BTreeMap::new();
+        services.insert(
+            "svc-pass".to_string(),
+            EgressServiceConfig {
+                backend: backend_addr.to_string(),
+                protocol: Default::default(),
+                tls: Some(false),
+                ca_cert_path: None,
+                insecure_skip_verify: Some(false),
+                allow_from: vec!["node-ray".into()],
+                allow_any_origin: Some(false),
+                timeout_ms: 5000,
+                intercept_errors: Some(false),
+                local_health_check: None,
+            },
+        );
+        services.insert(
+            "svc-intercept".to_string(),
+            EgressServiceConfig {
+                backend: backend_addr.to_string(),
+                protocol: Default::default(),
+                tls: Some(false),
+                ca_cert_path: None,
+                insecure_skip_verify: Some(false),
+                allow_from: vec!["node-ray".into()],
+                allow_any_origin: Some(false),
+                timeout_ms: 5000,
+                intercept_errors: Some(true),
+                local_health_check: None,
+            },
+        );
+        let egress = crate::egress::EgressHandler::new(
+            "node-ray",
+            EgressConfig {
+                services,
+                ..Default::default()
+            },
+            vec![TrustedOrigin {
+                node_tag: "node-ray".into(),
+                public_key: kp.public_key_b64(),
+            }],
+            Arc::clone(&logger),
+        );
+        let (fwd, _rx) = Forwarder::new(
+            "node-ray",
+            NodeRoles {
+                ingress: true,
+                egress: true,
+                relay: false,
+                maintainer: false,
+            },
+            RelayConfig::default(),
+            lm,
+            egress,
+            Arc::clone(&logger),
+        );
+
+        let mut guards = BTreeMap::new();
+        guards.insert(
+            "waf-blk".to_string(),
+            GuardProfile {
+                antibot: AntibotMode::Off,
+                waf: Some(WafConfig {
+                    mode: WafMode::Block,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let cfg = IngressConfig {
+            rules: vec![
+                IngressRule {
+                    name: Some("pass".into()),
+                    r#match: RuleMatch {
+                        host: Some("pass.example.test".into()),
+                        ..Default::default()
+                    },
+                    service_tag: "svc-pass".into(),
+                    next_peer: "node-ray".into(),
+                    guard: Some("waf-blk".into()),
+                    intercept_errors: Some(false),
+                    js_fp_beacon: Some(false),
+                    ..Default::default()
+                },
+                IngressRule {
+                    name: Some("intercept".into()),
+                    r#match: RuleMatch {
+                        host: Some("intercept.example.test".into()),
+                        ..Default::default()
+                    },
+                    service_tag: "svc-intercept".into(),
+                    next_peer: "node-ray".into(),
+                    guard: Some("waf-blk".into()),
+                    intercept_errors: Some(true),
+                    js_fp_beacon: Some(false),
+                    ..Default::default()
+                },
+            ],
+            guards,
+            ..Default::default()
+        };
+
+        let server = IngressServer::new(
+            "node-ray",
+            kp,
+            cfg,
+            8,
+            fwd,
+            DynamicCertResolver::new(),
+            Arc::clone(&logger),
+        );
+
+        let send_raw = |srv: Arc<IngressServer>, raw_req: String| async move {
+            let (client_io, server_io) = tokio::io::duplex(16384);
+            tokio::spawn(async move {
+                srv.serve_conn(
+                    server_io,
+                    "198.51.100.77:43001".parse().unwrap(),
+                    false,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+            });
+            let (mut r, mut w) = tokio::io::split(client_io);
+            w.write_all(raw_req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let extract_header = |raw_resp: &str, name: &str| -> Option<String> {
+            raw_resp
+                .split("\r\n\r\n")
+                .next()
+                .unwrap_or("")
+                .lines()
+                .find_map(|line| {
+                    let (k, v) = line.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case(name) {
+                        Some(v.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+        };
+
+        // 1. WAF block -> 403, NOT counted as 5xx or PoW challenge
+        let waf_resp = send_raw(
+            Arc::clone(&server),
+            "GET /search?q=1%20UNION%20SELECT%201 HTTP/1.1\r\nHost: pass.example.test\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(waf_resp.starts_with("HTTP/1.1 403"), "{waf_resp}");
+        let waf_ray = extract_header(&waf_resp, "x-exposure-ray").expect("missing ray header on waf 403");
+
+        let (waf_recs, waf_sums, _) = logger.drain_for_maintainer().await;
+        assert!(waf_sums.iter().all(|s| s.errors == 0), "WAF 403 must never increment 5xx errors");
+        assert!(waf_sums.iter().all(|s| s.challenges_issued == 0), "WAF 403 must not increment PoW challenges_issued");
+        assert_eq!(waf_sums.iter().map(|s| s.blocked).sum::<u64>(), 1, "WAF 403 must increment blocked");
+        let waf_rec = waf_recs
+            .iter()
+            .find(|r| r.ray_id.as_deref() == Some(waf_ray.as_str()))
+            .expect("missing WAF log record by ray_id");
+        assert_eq!(waf_rec.status, 403);
+        assert_eq!(waf_rec.action.as_deref(), Some("waf_block"));
+        assert!(!waf_rec.challenged);
+
+        // 2. Backend 500 with intercept_errors = false -> raw body passed through, x-exposure-ray present, both ingress & egress log backend error + shared ray_id
+        let pass_500 = send_raw(
+            Arc::clone(&server),
+            "GET /boom HTTP/1.1\r\nHost: pass.example.test\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(pass_500.starts_with("HTTP/1.1 500"), "{pass_500}");
+        assert!(pass_500.contains("database deadlock on orders"), "{pass_500}");
+        assert!(extract_header(&pass_500, "x-exposure-upstream-error").is_none(), "internal header leaked");
+        let pass_ray = extract_header(&pass_500, "x-exposure-ray").expect("missing x-exposure-ray on 500");
+
+        let (pass_recs, _, _) = logger.drain_for_maintainer().await;
+        let ing_pass = pass_recs
+            .iter()
+            .find(|r| r.role == "ingress" && r.ray_id.as_deref() == Some(pass_ray.as_str()))
+            .expect("missing ingress 500 log for ray_id");
+        let eg_pass = pass_recs
+            .iter()
+            .find(|r| r.role == "egress" && r.ray_id.as_deref() == Some(pass_ray.as_str()))
+            .expect("missing egress 500 log for ray_id");
+        assert_eq!(ing_pass.action.as_deref(), Some("upstream_error"));
+        assert_eq!(eg_pass.action.as_deref(), Some("upstream_error"));
+        assert!(ing_pass.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "ingress error: {:?}", ing_pass.error);
+        assert!(eg_pass.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "egress error: {:?}", eg_pass.error);
+
+        // 3. Backend 500 with intercept_errors = true -> client gets generic HTML error page with Ray ID (no backend error leak), logs STILL capture backend error
+        let int_500 = send_raw(
+            Arc::clone(&server),
+            "GET /boom HTTP/1.1\r\nHost: intercept.example.test\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(int_500.starts_with("HTTP/1.1 500"), "{int_500}");
+        let int_ray = extract_header(&int_500, "x-exposure-ray").expect("missing x-exposure-ray on intercepted 500");
+        assert!(int_500.contains(&int_ray), "HTML error page must include ray_id: {int_500}");
+        assert!(!int_500.contains("database deadlock on orders"), "intercepted response must not leak backend error");
+        assert!(extract_header(&int_500, "x-exposure-upstream-error").is_none(), "internal header leaked");
+
+        let (int_recs, _, _) = logger.drain_for_maintainer().await;
+        let ing_int = int_recs
+            .iter()
+            .find(|r| r.role == "ingress" && r.ray_id.as_deref() == Some(int_ray.as_str()))
+            .expect("missing ingress intercepted 500 log for ray_id");
+        let eg_int = int_recs
+            .iter()
+            .find(|r| r.role == "egress" && r.ray_id.as_deref() == Some(int_ray.as_str()))
+            .expect("missing egress intercepted 500 log for ray_id");
+        assert_eq!(ing_int.action.as_deref(), Some("upstream_error"));
+        assert_eq!(eg_int.action.as_deref(), Some("upstream_error"));
+        assert!(ing_int.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "ingress intercepted error: {:?}", ing_int.error);
+        assert!(eg_int.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "egress intercepted error: {:?}", eg_int.error);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

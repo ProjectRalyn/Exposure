@@ -12,8 +12,8 @@ use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret}
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic, SegmentWriter};
 use exposure_core::telemetry::{
-    sanitize_log_text, AlertRecord, ClientJsFingerprint, FingerprintObservation, LogProtectionStats,
-    MinuteSummary, SessionSummary,
+    is_cache_served_status, is_security_block_action, sanitize_log_text, AlertRecord,
+    ClientJsFingerprint, FingerprintObservation, LogProtectionStats, MinuteSummary, SessionSummary,
 };
 use exposure_core::Result;
 use rand::Rng;
@@ -113,6 +113,11 @@ impl LogPriority {
                         | "evilpot"
                         | "guard_reject"
                         | "abuseipdb"
+                        | "geo_block"
+                        | "geo_evilpot"
+                        | "geo_challenge"
+                        | "challenge"
+                        | "rate_limit"
                 )
             )
         {
@@ -834,6 +839,11 @@ impl NodeLogger {
             }
             if challenged {
                 entry.challenges_issued = entry.challenges_issued.saturating_add(1);
+            } else if !rate_limited
+                && status < 500
+                && is_security_block_action(meta.action)
+            {
+                entry.blocked = entry.blocked.saturating_add(1);
             }
             if challenge_passed {
                 entry.challenges_passed = entry.challenges_passed.saturating_add(1);
@@ -855,7 +865,7 @@ impl NodeLogger {
             }
             entry.bytes_in = entry.bytes_in.saturating_add(bytes_in);
             entry.bytes_out = entry.bytes_out.saturating_add(bytes_out);
-            if meta.cache_status.as_deref() == Some("HIT") {
+            if is_cache_served_status(meta.cache_status) {
                 entry.cached_requests = entry.cached_requests.saturating_add(1);
                 entry.cached_bytes_out = entry.cached_bytes_out.saturating_add(bytes_out);
             }

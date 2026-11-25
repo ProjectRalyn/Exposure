@@ -24,7 +24,8 @@ use exposure_core::segment::{
     SegmentWriter,
 };
 use exposure_core::telemetry::{
-    AlertRecord, CertStatusInfo, FingerprintObservation, MinuteSummary, SessionSummary,
+    is_cache_served_status, is_security_block_action, AlertRecord, CertStatusInfo,
+    FingerprintObservation, MinuteSummary, SessionSummary,
 };
 use exposure_core::{ExposureError, Result};
 use hmac::{Hmac, Mac};
@@ -712,6 +713,11 @@ impl MaintainerService {
                                 if rec.challenged {
                                     entry.challenges_issued =
                                         entry.challenges_issued.saturating_add(extra);
+                                } else if !rec.rate_limited
+                                    && rec.status < 500
+                                    && is_security_block_action(rec.action.as_deref())
+                                {
+                                    entry.blocked = entry.blocked.saturating_add(extra);
                                 }
                                 if rec.challenge_passed {
                                     entry.challenges_passed =
@@ -720,6 +726,17 @@ impl MaintainerService {
                                 if rec.client_fp_verified {
                                     entry.client_fp_verified =
                                         entry.client_fp_verified.saturating_add(extra);
+                                }
+                                entry.bytes_in =
+                                    entry.bytes_in.saturating_add(rec.bytes_in.saturating_mul(extra));
+                                entry.bytes_out =
+                                    entry.bytes_out.saturating_add(rec.bytes_out.saturating_mul(extra));
+                                if is_cache_served_status(rec.cache_status.as_deref()) {
+                                    entry.cached_requests =
+                                        entry.cached_requests.saturating_add(extra);
+                                    entry.cached_bytes_out = entry
+                                        .cached_bytes_out
+                                        .saturating_add(rec.bytes_out.saturating_mul(extra));
                                 }
                                 if let Some(ref d) = rec.device_type {
                                     if let Some(c) = entry.device_counts.get_mut(d) {
@@ -4152,6 +4169,7 @@ mod tests {
             rate_limited: 2,
             challenges_issued: 3,
             challenges_passed: 2,
+            blocked: 0,
             bytes_in: 1000,
             bytes_out: 4000,
             uv_hll: HyperLogLog::new(12, 0),

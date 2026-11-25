@@ -8,6 +8,7 @@ import {
   renderBarList,
   renderDonutChart,
   renderGuardFunnel,
+  themeColors,
 } from "../charts.js";
 import { t } from "../i18n.js";
 import { el, esc, openModal } from "../ui.js";
@@ -87,7 +88,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
   let obsHeroMetric = "requests";
   let obsNode = "all";
   let obsSvc = "all";
-  let obsWin = 0;
+  let obsWin = -1;
   let bucketPageState = { offset: 0, limit: 50 };
 
   let loggingSubTab = "access"; // access | visitors
@@ -152,12 +153,17 @@ export function createAnalyticsViews({ api, store, navigate }) {
         <label class="filter-inline">
           <span>Window</span>
           <select id="obs-window-filter">
-            <option value="0" ${obsWin === 0 ? "selected" : ""}>All</option>
+            <option value="-1" ${obsWin === -1 ? "selected" : ""}>Global Window</option>
+            <option value="60" ${obsWin === 60 ? "selected" : ""}>1m</option>
             <option value="300" ${obsWin === 300 ? "selected" : ""}>5m</option>
             <option value="900" ${obsWin === 900 ? "selected" : ""}>15m</option>
+            <option value="1800" ${obsWin === 1800 ? "selected" : ""}>30m</option>
             <option value="3600" ${obsWin === 3600 ? "selected" : ""}>1h</option>
             <option value="21600" ${obsWin === 21600 ? "selected" : ""}>6h</option>
+            <option value="43200" ${obsWin === 43200 ? "selected" : ""}>12h</option>
             <option value="86400" ${obsWin === 86400 ? "selected" : ""}>24h</option>
+            <option value="604800" ${obsWin === 604800 ? "selected" : ""}>7d</option>
+            <option value="0" ${obsWin === 0 ? "selected" : ""}>All</option>
           </select>
         </label>
       </div>
@@ -256,7 +262,12 @@ export function createAnalyticsViews({ api, store, navigate }) {
 
     el("obs-node-filter")?.addEventListener("change", (ev) => { obsNode = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
     el("obs-svc-filter")?.addEventListener("change", (ev) => { obsSvc = ev.target.value; bucketPageState.offset = 0; refreshAnalytics(); });
-    el("obs-window-filter")?.addEventListener("change", (ev) => { obsWin = Number(ev.target.value) || 0; bucketPageState.offset = 0; refreshAnalytics(); });
+    el("obs-window-filter")?.addEventListener("change", (ev) => {
+      const v = Number(ev.target.value);
+      obsWin = Number.isFinite(v) ? v : -1;
+      bucketPageState.offset = 0;
+      refreshAnalytics();
+    });
     el("btn-open-access-logs")?.addEventListener("click", () => navigate("logging", { subTab: "access", service: obsSvc !== "all" ? obsSvc : undefined }));
     el("btn-open-fp-explorer")?.addEventListener("click", () => navigate("logging", { subTab: "visitors", service: obsSvc !== "all" ? obsSvc : undefined }));
     root.querySelectorAll("[data-cf-metric]").forEach((btn) => {
@@ -282,6 +293,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const totalRl = Number(tr.total_rate_limited) || 0;
     const totalChI = Number(tr.total_challenges_issued) || 0;
     const totalChP = Number(tr.total_challenges_passed) || 0;
+    const totalBlocked = Number(tr.total_blocked) || 0;
     const bytesIn = Number(tr.total_bytes_in) || 0;
     const bytesOut = Number(tr.total_bytes_out) || 0;
     const cachedBytesOut = Number(tr.total_cached_bytes_out) || 0;
@@ -297,19 +309,20 @@ export function createAnalyticsViews({ api, store, navigate }) {
     el("cf-sub-uv").textContent = totalUv > 0 ? `${(totalReq / totalUv).toFixed(1)} req / visitor` : "HLL union";
     el("cf-val-bandwidth").textContent = formatBytes(bytesIn + bytesOut);
     el("cf-sub-bandwidth").textContent = `${formatBytes(cachedBytesOut)} cached (${cachedPct}%) · ${formatBytes(bytesIn)} in · ${formatBytes(bytesOut)} out`;
-    el("cf-val-guard").textContent = formatCompact(totalChI + totalRl);
-    el("cf-sub-guard").textContent = `${formatCompact(totalChI)} PoW · ${formatCompact(totalRl)} 429`;
+    el("cf-val-guard").textContent = formatCompact(totalBlocked + totalChI + totalRl);
+    el("cf-sub-guard").textContent = `${formatCompact(totalBlocked)} blocked · ${formatCompact(totalChI)} PoW · ${formatCompact(totalRl)} 429`;
     el("cf-val-latency").textContent = `${p95.toFixed(1)} ms`;
     el("cf-sub-latency").textContent = `p50 ${p50.toFixed(1)}ms · p99 ${p99.toFixed(1)}ms`;
 
+    const tc = themeColors();
     const pts = data.timeseries || [];
     const labels = pts.map((p) => formatMinute(p.minute_epoch));
     const cfgs = {
-      requests: { unit: "", series: [{ name: "Requests", color: "#4DA9D6", values: pts.map((p) => p.requests), area: true }, { name: "429", color: "#FAC800", values: pts.map((p) => p.rate_limited) }, { name: "5xx", color: "#C40233", values: pts.map((p) => p.errors) }] },
-      uv: { unit: "", series: [{ name: "Unique Visitors", color: "#009F6B", values: pts.map((p) => Math.round(p.uv_estimate || 0)), area: true }, { name: "Requests", color: "#4DA9D6", values: pts.map((p) => p.requests), dashed: true }] },
-      bandwidth: { unit: "bytes", series: [{ name: "Out", color: "#4DA9D6", values: pts.map((p) => p.bytes_out), area: true }, { name: "In", color: "#6A5ACD", values: pts.map((p) => p.bytes_in), area: true }] },
-      guard: { unit: "", series: [{ name: "PoW Issued", color: "#6A5ACD", values: pts.map((p) => p.challenges_issued), area: true }, { name: "PoW Passed", color: "#009F6B", values: pts.map((p) => p.challenges_passed) }, { name: "429", color: "#FAC800", values: pts.map((p) => p.rate_limited) }] },
-      latency: { unit: "ms", series: [{ name: "p99", color: "#C40233", values: pts.map((p) => p.p99_ms), dashed: true }, { name: "p95", color: "#FAC800", values: pts.map((p) => p.p95_ms) }, { name: "p50", color: "#009F6B", values: pts.map((p) => p.p50_ms), area: true }] },
+      requests: { unit: "", series: [{ name: "Requests", color: tc.accent, values: pts.map((p) => p.requests), area: true }, { name: "429", color: tc.warn, values: pts.map((p) => p.rate_limited) }, { name: "5xx", color: tc.danger, values: pts.map((p) => p.errors) }] },
+      uv: { unit: "", series: [{ name: "Unique Visitors", color: tc.ok, values: pts.map((p) => Math.round(p.uv_estimate || 0)), area: true }, { name: "Requests", color: tc.accent, values: pts.map((p) => p.requests), dashed: true }] },
+      bandwidth: { unit: "bytes", series: [{ name: "Out", color: tc.accent, values: pts.map((p) => p.bytes_out), area: true }, { name: "In", color: tc.purple, values: pts.map((p) => p.bytes_in), area: true }] },
+      guard: { unit: "", series: [{ name: "Blocked", color: "#e07a3c", values: pts.map((p) => p.blocked || 0), area: true }, { name: "PoW Issued", color: tc.purple, values: pts.map((p) => p.challenges_issued), area: true }, { name: "PoW Passed", color: tc.ok, values: pts.map((p) => p.challenges_passed) }, { name: "429", color: tc.warn, values: pts.map((p) => p.rate_limited) }] },
+      latency: { unit: "ms", series: [{ name: "p99", color: tc.danger, values: pts.map((p) => p.p99_ms), dashed: true }, { name: "p95", color: tc.warn, values: pts.map((p) => p.p95_ms) }, { name: "p50", color: tc.ok, values: pts.map((p) => p.p50_ms), area: true }] },
     };
     const active = cfgs[obsHeroMetric] || cfgs.requests;
     renderAreaLineChart(el("obs-hero-chart"), { labels, height: 260, unit: active.unit, series: active.series });
@@ -332,7 +345,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             const ePct = req > 0 ? ((err / req) * 100).toFixed(1) : "0.0";
             const eCls = err > 0 ? "err" : "ok";
             const barW = Math.max(3, Math.round((sp99 / maxP99) * 100));
-            const barColor = sp99 >= 500 ? "#C40233" : sp99 >= 150 ? "#FAC800" : "#009F6B";
+            const barColor = sp99 >= 500 ? tc.danger : sp99 >= 150 ? tc.warn : tc.ok;
             return `
           <tr>
             <td><button type="button" class="btn sm ghost" data-obs-filter-svc="${esc(s.service_tag)}"><code>${esc(s.service_tag)}</code></button></td>
@@ -365,15 +378,16 @@ export function createAnalyticsViews({ api, store, navigate }) {
 
     renderGuardFunnel(el("obs-guard-funnel"), tr);
 
-    const cleanReqs = Math.max(0, totalReq - totalErr - totalRl - totalChI);
+    const cleanReqs = Math.max(0, totalReq - totalErr - totalRl - totalChI - totalBlocked);
     renderDonutChart(el("obs-outcome-donut"), {
       centerValue: formatCompact(totalReq),
       centerLabel: "Requests",
       slices: [
-        { label: "Clean / Passed", value: Math.min(totalReq, cleanReqs + totalChP), color: "#009F6B" },
-        { label: "PoW Pending/Drop", value: Math.max(0, totalChI - totalChP), color: "#6A5ACD" },
-        { label: "429", value: totalRl, color: "#FAC800" },
-        { label: "5xx", value: totalErr, color: "#C40233" },
+        { label: "Clean / Passed", value: Math.min(totalReq, cleanReqs + totalChP), color: tc.ok },
+        { label: "Blocked", value: totalBlocked, color: "#e07a3c" },
+        { label: "PoW Pending/Drop", value: Math.max(0, totalChI - totalChP), color: tc.purple },
+        { label: "429", value: totalRl, color: tc.warn },
+        { label: "5xx", value: totalErr, color: tc.danger },
       ],
     });
 
@@ -389,9 +403,9 @@ export function createAnalyticsViews({ api, store, navigate }) {
       }</div>`;
     };
     el("obs-fp-breakdown").innerHTML =
-      renderFpCol("Devices", data.device_counts, "#4DA9D6") +
-      renderFpCol("Browsers", data.browser_counts, "#009F6B") +
-      renderFpCol("OS", data.os_counts, "#6A5ACD");
+      renderFpCol("Devices", data.device_counts, tc.accent) +
+      renderFpCol("Browsers", data.browser_counts, tc.ok) +
+      renderFpCol("OS", data.os_counts, tc.purple);
 
     const allBuckets = (data.summaries || []).slice().reverse();
     if (bucketPageState.offset >= allBuckets.length) bucketPageState.offset = 0;
@@ -433,7 +447,8 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const qs = new URLSearchParams();
     if (obsNode !== "all") qs.set("node", obsNode);
     if (obsSvc !== "all") qs.set("service", obsSvc);
-    if (obsWin > 0) qs.set("window_secs", String(obsWin));
+    const effectiveWin = obsWin >= 0 ? obsWin : Number(el("sel-time-window")?.value || 0);
+    if (effectiveWin > 0) qs.set("window_secs", String(effectiveWin));
     const data = await api(`/api/telemetry${qs.toString() ? `?${qs}` : ""}`);
     store.telemetry = data;
     renderAnalyticsCharts();
@@ -490,8 +505,8 @@ export function createAnalyticsViews({ api, store, navigate }) {
     const totalMatched = Number(data.total_matched ?? items.length) || 0;
 
     const actionPillCls = (act, status) => {
-      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "geo_evilpot" || status >= 500) return "err";
-      if (act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
+      if (status >= 500 || act === "upstream_error" || act === "config_error" || act === "waf_overload") return "err";
+      if (act === "autoban" || act === "waf_block" || act === "evilpot" || act === "evilpot_canary" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "geo_evilpot" || act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
       if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass") return "info";
       return "ok";
     };
@@ -521,7 +536,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             ${["all", "2xx", "3xx", "4xx", "5xx"].map((st) => `<button type="button" class="fp-chip ${logFilters.status === st ? "active" : ""}" data-log-st="${st}">${st.toUpperCase()}</button>`).join("")}
           </div>
           <div class="fp-chip-group">
-            ${["all", "allow", "blocked", "waf_block", "evilpot", "autoban", "rate_limit", "geo_block", "geo_challenge", "geo_evilpot", "cache_hit", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
+            ${["all", "allow", "blocked", "upstream_error", "waf_block", "waf_monitor", "evilpot", "evilpot_canary", "autoban", "guard_reject", "rate_limit", "challenge", "geo_block", "geo_challenge", "geo_evilpot", "cache_hit", "cache_stale", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
           </div>
           <div class="btn-row">
             <select id="log-method-filter" class="select-sm">
@@ -547,10 +562,15 @@ export function createAnalyticsViews({ api, store, navigate }) {
             </select>
             <select id="log-window-filter" class="select-sm">
               <option value="0" ${logFilters.window_secs === 0 ? "selected" : ""}>Global Window</option>
+              <option value="60" ${logFilters.window_secs === 60 ? "selected" : ""}>1m</option>
               <option value="300" ${logFilters.window_secs === 300 ? "selected" : ""}>5m</option>
               <option value="900" ${logFilters.window_secs === 900 ? "selected" : ""}>15m</option>
+              <option value="1800" ${logFilters.window_secs === 1800 ? "selected" : ""}>30m</option>
               <option value="3600" ${logFilters.window_secs === 3600 ? "selected" : ""}>1h</option>
+              <option value="21600" ${logFilters.window_secs === 21600 ? "selected" : ""}>6h</option>
+              <option value="43200" ${logFilters.window_secs === 43200 ? "selected" : ""}>12h</option>
               <option value="86400" ${logFilters.window_secs === 86400 ? "selected" : ""}>24h</option>
+              <option value="604800" ${logFilters.window_secs === 604800 ? "selected" : ""}>7d</option>
             </select>
           </div>
         </div>
@@ -614,7 +634,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
                     const tsSec = Math.floor((Number(r.timestamp_ms) || 0) / 1000);
                     return `
                   <tr class="fp-table-row" data-log-idx="${idx}">
-                    <td><div>${esc(formatDateTime(tsSec))}</div><div class="muted-sm">${esc(r.ray_id ? r.ray_id.slice(0, 12) : "-")}</div></td>
+                    <td><div>${esc(formatDateTime(tsSec))}</div><div class="muted-sm" title="${esc(r.ray_id || "")}"><code>${esc(r.ray_id ? (r.ray_id.length > 20 ? `${r.ray_id.slice(0, 16)}…` : r.ray_id) : "-")}</code></div></td>
                     <td><div><strong>${esc(r.method || "-")}</strong></div><div class="muted-sm">${esc(r.scheme || "")}${r.protocol ? ` · ${esc(r.protocol)}` : ""}</div></td>
                     <td><span class="pill ${stCls}">${st}</span>${r.cache_status ? ` <span class="pill">${esc(r.cache_status)}</span>` : ""}</td>
                     <td style="max-width:340px;word-break:break-all;">
@@ -724,6 +744,17 @@ export function createAnalyticsViews({ api, store, navigate }) {
             },
           });
         }
+        if (r.ray_id) {
+          modalActions.push({
+            label: t("logging.cross.filter_ray"),
+            cls: "ghost",
+            onClick: () => {
+              logFilters.q = r.ray_id;
+              logFilters.offset = 0;
+              refreshLogs();
+            },
+          });
+        }
         if (r.path) {
           modalActions.push({
             label: t("logging.cross.filter_path"),
@@ -752,7 +783,7 @@ export function createAnalyticsViews({ api, store, navigate }) {
             </div>
             <div style="margin-top:8px;"><strong>Referer:</strong> <code>${esc(r.referer || "-")}</code></div>
             <div class="fp-ua-box" style="margin-top:8px;">${esc(r.user_agent || "(empty User-Agent)")}</div>
-            ${r.error ? `<div class="fp-ua-box" style="margin-top:8px;color:var(--err,#ff6b6b);">Error: ${esc(r.error)}</div>` : ""}
+            ${r.error ? `<div class="fp-ua-box" style="margin-top:8px;color:${(Number(r.status) || 0) >= 500 ? "var(--err,#ff6b6b)" : "var(--warn,#d4a24c)"};">${(Number(r.status) || 0) >= 500 ? "Error" : "Reason"}: ${esc(r.error)}</div>` : ""}
           `,
           actions: modalActions,
         });

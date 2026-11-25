@@ -21,7 +21,9 @@ use exposure_core::crypto::{
 use exposure_core::routing::{
     canonical_ip, is_public_routable_ip, parse_valid_host, LinkHealthState,
 };
-use exposure_core::telemetry::{HyperLogLog, LatencyHistogram, MinuteSummary};
+use exposure_core::telemetry::{
+    is_cache_served_status, is_mitigated_record, HyperLogLog, LatencyHistogram, MinuteSummary,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -964,6 +966,7 @@ fn aggregate_summaries(
     let mut total_rate_limited: u64 = 0;
     let mut total_challenges_issued: u64 = 0;
     let mut total_challenges_passed: u64 = 0;
+    let mut total_blocked: u64 = 0;
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
     let mut total_cached_requests: u64 = 0;
@@ -988,6 +991,7 @@ fn aggregate_summaries(
         total_rate_limited = total_rate_limited.saturating_add(s.rate_limited);
         total_challenges_issued = total_challenges_issued.saturating_add(s.challenges_issued);
         total_challenges_passed = total_challenges_passed.saturating_add(s.challenges_passed);
+        total_blocked = total_blocked.saturating_add(s.blocked);
         total_bytes_in = total_bytes_in.saturating_add(s.bytes_in);
         total_bytes_out = total_bytes_out.saturating_add(s.bytes_out);
         total_cached_requests = total_cached_requests.saturating_add(s.cached_requests);
@@ -1051,6 +1055,7 @@ fn aggregate_summaries(
                 "rate_limited": s.rate_limited,
                 "challenges_issued": s.challenges_issued,
                 "challenges_passed": s.challenges_passed,
+                "blocked": s.blocked,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
                 "cached_requests": s.cached_requests,
@@ -1073,6 +1078,7 @@ fn aggregate_summaries(
                 "rate_limited": s.rate_limited,
                 "challenges_issued": s.challenges_issued,
                 "challenges_passed": s.challenges_passed,
+                "blocked": s.blocked,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
                 "cached_requests": s.cached_requests,
@@ -1102,6 +1108,7 @@ fn aggregate_summaries(
                 "rate_limited": s.rate_limited,
                 "challenges_issued": s.challenges_issued,
                 "challenges_passed": s.challenges_passed,
+                "blocked": s.blocked,
                 "bytes_in": s.bytes_in,
                 "bytes_out": s.bytes_out,
                 "cached_requests": s.cached_requests,
@@ -1127,6 +1134,7 @@ fn aggregate_summaries(
         "total_rate_limited": total_rate_limited,
         "total_challenges_issued": total_challenges_issued,
         "total_challenges_passed": total_challenges_passed,
+        "total_blocked": total_blocked,
         "total_bytes_in": total_bytes_in,
         "total_bytes_out": total_bytes_out,
         "total_cached_requests": total_cached_requests,
@@ -2163,6 +2171,7 @@ struct SummaryDto {
     rate_limited: u64,
     challenges_issued: u64,
     challenges_passed: u64,
+    blocked: u64,
     bytes_in: u64,
     bytes_out: u64,
     p50_ms: f64,
@@ -2389,6 +2398,7 @@ async fn get_telemetry(
             rate_limited: s.rate_limited,
             challenges_issued: s.challenges_issued,
             challenges_passed: s.challenges_passed,
+            blocked: s.blocked,
             bytes_in: s.bytes_in,
             bytes_out: s.bytes_out,
             p50_ms: s.p50_ms(),
@@ -2846,6 +2856,8 @@ struct LogQuery {
     #[serde(default)]
     q: Option<String>,
     #[serde(default)]
+    ray_id: Option<String>,
+    #[serde(default)]
     node: Option<String>,
     #[serde(default)]
     service: Option<String>,
@@ -2888,7 +2900,22 @@ async fn list_logs(
     }
     let tel = state.client.cached_telemetry().await;
     let hmac_key = state.client.effective_logger_hmac_key().await;
+    let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
+    Json(build_logs_response_json(
+        &tel,
+        hmac_key.as_deref(),
+        store_raw_ip_enabled,
+        &q,
+    ))
+    .into_response()
+}
 
+fn build_logs_response_json(
+    tel: &crate::client::CachedTelemetry,
+    hmac_key: Option<&str>,
+    store_raw_ip_enabled: bool,
+    q: &LogQuery,
+) -> serde_json::Value {
     let cutoff_ms = q
         .window_secs
         .filter(|&w| w > 0)
@@ -2903,10 +2930,11 @@ async fn list_logs(
     let host_f = clean_filter_opt(q.host.as_deref()).map(|s| s.to_ascii_lowercase());
     let ip_str = clean_filter_opt(q.ip.as_deref()).map(|s| s.to_ascii_lowercase());
     let country_f = clean_filter_opt(q.country.as_deref()).map(|s| s.to_ascii_uppercase());
+    let ray_id_f = clean_filter_opt(q.ray_id.as_deref()).map(|s| s.to_ascii_lowercase());
     let q_str = clean_filter_opt(q.q.as_deref()).map(|s| s.to_ascii_lowercase());
 
-    let q_ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), q_str.as_deref());
-    let ip_filter_hmac = compute_query_ip_hmac(hmac_key.as_deref(), ip_str.as_deref());
+    let q_ip_hmac = compute_query_ip_hmac(hmac_key, q_str.as_deref());
+    let ip_filter_hmac = compute_query_ip_hmac(hmac_key, ip_str.as_deref());
 
     let mut available_nodes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut available_services: std::collections::BTreeSet<String> =
@@ -2991,29 +3019,7 @@ async fn list_logs(
                 continue;
             }
         }
-        let is_blocked_rec = rec.rate_limited
-            || rec.challenged
-            || rec
-                .action
-                .as_deref()
-                .map(|a| {
-                    matches!(
-                        a,
-                        "autoban"
-                            | "waf_block"
-                            | "evilpot"
-                            | "guard_reject"
-                            | "abuseipdb"
-                            | "rate_limit"
-                            | "challenge"
-                            | "geo_block"
-                            | "geo_challenge"
-                            | "geo_evilpot"
-                    )
-                })
-                .unwrap_or(false)
-            || rec.status == 403
-            || rec.status == 429;
+        let is_blocked_rec = is_mitigated_record(rec);
         if let Some(ref af) = action_f {
             if af == "blocked" {
                 if !is_blocked_rec {
@@ -3074,6 +3080,16 @@ async fn list_logs(
                 continue;
             }
         }
+        if let Some(ref rf) = ray_id_f {
+            if !rec
+                .ray_id
+                .as_deref()
+                .map(|v| contains_ascii_icase(v, rf))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
         if let Some(ref qs) = q_str {
             let hmac_exact = q_ip_hmac
                 .as_deref()
@@ -3121,6 +3137,10 @@ async fn list_logs(
                     .map(|v| contains_ascii_icase(v, qs))
                     .unwrap_or(false)
                 || rec
+                    .waf_rule_id
+                    .map(|id| id.to_string().contains(qs))
+                    .unwrap_or(false)
+                || rec
                     .action
                     .as_deref()
                     .map(|v| contains_ascii_icase(v, qs))
@@ -3152,7 +3172,7 @@ async fn list_logs(
         if rec.status >= 500 {
             error_5xx_requests = error_5xx_requests.saturating_add(weight);
         }
-        if rec.cache_status.as_deref() == Some("HIT") {
+        if is_cache_served_status(rec.cache_status.as_deref()) {
             cache_hits = cache_hits.saturating_add(weight);
         }
         unique_ips.insert(rec.ip_hmac.clone());
@@ -3213,9 +3233,7 @@ async fn list_logs(
     let (matched, total_matched, offset, limit, has_more) =
         paginate_items(matched, q.offset, q.limit);
 
-    let store_raw_ip_enabled = is_store_raw_ip_enabled(&state).await;
-
-    Json(serde_json::json!({
+    serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
         "total_matched": total_matched,
         "offset": offset,
@@ -3243,8 +3261,7 @@ async fn list_logs(
         "available_actions": available_actions.into_iter().collect::<Vec<_>>(),
         "available_countries": available_countries.into_iter().collect::<Vec<_>>(),
         "items": matched,
-    }))
-    .into_response()
+    })
 }
 
 async fn pull_telemetry(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -3566,5 +3583,129 @@ async fn serve_web_panel(uri: Uri) -> Response {
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "Control web asset not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exposure_core::telemetry::SessionSummary;
+
+    #[test]
+    fn logs_query_finds_full_ray_id_and_separates_waf_from_5xx() {
+        let uuid_ray = "550e8400-e29b-41d4-a716-446655440000";
+        let waf_ray = "a1b2c3d4e5f60708";
+        let mut r_500 = SessionSummary {
+            timestamp_ms: 1_700_000_000_000,
+            node_tag: "n1".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            status: 500,
+            ip_hmac: "ip1".into(),
+            ray_id: Some(uuid_ray.into()),
+            error: Some("backend 500: db deadlock".into()),
+            action: Some("upstream_error".into()),
+            ..Default::default()
+        };
+        r_500.sanitize();
+        let mut r_waf = SessionSummary {
+            timestamp_ms: 1_700_000_001_000,
+            node_tag: "n1".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            status: 403,
+            ip_hmac: "ip2".into(),
+            ray_id: Some(waf_ray.into()),
+            error: Some("waf:crs:942100:sql-injection:query".into()),
+            action: Some("waf_block".into()),
+            ..Default::default()
+        };
+        r_waf.sanitize();
+        let mut r_origin_403 = SessionSummary {
+            timestamp_ms: 1_700_000_002_000,
+            node_tag: "n1".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            status: 403,
+            ip_hmac: "ip3".into(),
+            ray_id: Some("origin403ray".into()),
+            action: Some("allow".into()),
+            ..Default::default()
+        };
+        r_origin_403.sanitize();
+        let mut r_canary = SessionSummary {
+            timestamp_ms: 1_700_000_003_000,
+            node_tag: "n1".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            status: 200,
+            ip_hmac: "ip4".into(),
+            ray_id: Some("canaryray1".into()),
+            action: Some("evilpot_canary".into()),
+            ..Default::default()
+        };
+        r_canary.sanitize();
+        let mut r_monitor = SessionSummary {
+            timestamp_ms: 1_700_000_004_000,
+            node_tag: "n1".into(),
+            role: "ingress".into(),
+            service_tag: "svc".into(),
+            status: 200,
+            ip_hmac: "ip5".into(),
+            ray_id: Some("monitorray1".into()),
+            action: Some("waf_monitor".into()),
+            waf_rule_id: Some(941100),
+            waf_category: Some("xss".into()),
+            ..Default::default()
+        };
+        r_monitor.sanitize();
+
+        let tel = crate::client::CachedTelemetry {
+            recent_logs: vec![r_500, r_waf, r_origin_403, r_canary, r_monitor],
+            ..Default::default()
+        };
+
+        let all = build_logs_response_json(&tel, None, false, &LogQuery::default());
+        assert_eq!(all["summary"]["blocked_requests"], 2); // waf_block + evilpot_canary (NOT origin 403)
+        assert_eq!(all["summary"]["error_5xx_requests"], 1);
+
+        let by_q = build_logs_response_json(
+            &tel,
+            None,
+            false,
+            &LogQuery {
+                q: Some(uuid_ray.into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_q["total_matched"], 1);
+        assert_eq!(by_q["items"][0]["ray_id"], uuid_ray);
+        assert_eq!(by_q["items"][0]["error"], "backend 500: db deadlock");
+
+        let by_rule = build_logs_response_json(
+            &tel,
+            None,
+            false,
+            &LogQuery {
+                q: Some("941100".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_rule["total_matched"], 1);
+        assert_eq!(by_rule["items"][0]["action"], "waf_monitor");
+
+        let by_ray = build_logs_response_json(
+            &tel,
+            None,
+            false,
+            &LogQuery {
+                ray_id: Some(waf_ray.into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_ray["total_matched"], 1);
+        assert_eq!(by_ray["items"][0]["action"], "waf_block");
+        assert_eq!(by_ray["summary"]["error_5xx_requests"], 0);
+        assert_eq!(by_ray["summary"]["blocked_requests"], 1);
     }
 }

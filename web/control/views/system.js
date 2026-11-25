@@ -151,7 +151,7 @@ export function createSystemView({ api, store }) {
             </div>
           </label>
           <div class="tri-stack" style="margin-top:8px;">
-            ${renderBinSlider({ attrName: "data-sd-ig-bin", attrVal: "intercept_errors", label: "Intercept Errors (429 / 5xx)", val: ig.intercept_errors })}
+            ${renderBinSlider({ attrName: "data-sd-ig-bin", attrVal: "intercept_errors", label: "Intercept Errors (403 / 429 / 5xx)", val: ig.intercept_errors })}
             ${renderBinSlider({ attrName: "data-sd-ig-bin", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: ig.js_fp_beacon })}
           </div>
         </div>

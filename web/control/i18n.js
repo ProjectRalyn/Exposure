@@ -35,10 +35,15 @@ const MESSAGES = {
     "sidebar.disconnected": "Disconnected",
 
     // Topbar & Global Deploy Bar
+    "topbar.window.1m": "Window: 1m",
     "topbar.window.5m": "Window: 5m",
     "topbar.window.15m": "Window: 15m",
+    "topbar.window.30m": "Window: 30m",
     "topbar.window.1h": "Window: 1h",
+    "topbar.window.6h": "Window: 6h",
+    "topbar.window.12h": "Window: 12h",
     "topbar.window.24h": "Window: 24h",
+    "topbar.window.7d": "Window: 7d",
     "topbar.window.all": "Window: All",
     "topbar.auto.off": "Auto: Off",
     "topbar.auto.10s": "Auto: 10s",
@@ -287,7 +292,7 @@ const MESSAGES = {
     "sec.under_attack": "Under Attack Mode",
     "sec.pages.preview": "Live Preview (Sandboxed)",
     "sec.pages.reset": "Reset to Built-in Defaults",
-    "sec.pages.error_html": "Custom Intercept Error Page HTML (429 / 5xx)",
+    "sec.pages.error_html": "Custom Intercept Error Page HTML (403 / 429 / 5xx)",
     "sec.pages.chal_html": "Custom PoW Challenge HTML (/cdn-cgi/)",
     "sec.pages.chal_css": "Custom PoW Challenge CSS (/cdn-cgi/styles.css)",
     "waf.title": "OWASP CRS WAF",
@@ -433,6 +438,7 @@ const MESSAGES = {
     "logs.page.per_page": "Per page",
     "logs.page.of": "Page {page} / {pages}",
     "logs.empty": "No access logs match current filters.",
+    "logging.cross.filter_ray": "Filter Ray ID",
 
     // System
     "sys.tab.defaults": "Cluster Defaults",
@@ -557,10 +563,15 @@ const MESSAGES = {
     "sidebar.disconnected": "未连接",
 
     // Topbar & Global Deploy Bar
+    "topbar.window.1m": "窗口: 1分钟",
     "topbar.window.5m": "窗口: 5分钟",
     "topbar.window.15m": "窗口: 15分钟",
+    "topbar.window.30m": "窗口: 30分钟",
     "topbar.window.1h": "窗口: 1小时",
+    "topbar.window.6h": "窗口: 6小时",
+    "topbar.window.12h": "窗口: 12小时",
     "topbar.window.24h": "窗口: 24小时",
+    "topbar.window.7d": "窗口: 7天",
     "topbar.window.all": "窗口: 全部",
     "topbar.auto.off": "自动刷新: 关",
     "topbar.auto.10s": "自动刷新: 10秒",
@@ -809,7 +820,7 @@ const MESSAGES = {
     "sec.under_attack": "Under Attack 应急模式",
     "sec.pages.preview": "沙盒实时预览",
     "sec.pages.reset": "恢复内置默认页面",
-    "sec.pages.error_html": "自定义拦截错误页 HTML (429 / 5xx)",
+    "sec.pages.error_html": "自定义拦截错误页 HTML (403 / 429 / 5xx)",
     "sec.pages.chal_html": "自定义 PoW 校验页 HTML (/cdn-cgi/)",
     "sec.pages.chal_css": "自定义 PoW 校验页 CSS (/cdn-cgi/styles.css)",
     "waf.title": "OWASP CRS WAF 防护",
@@ -955,6 +966,7 @@ const MESSAGES = {
     "logs.page.per_page": "每页",
     "logs.page.of": "第 {page} / {pages} 页",
     "logs.empty": "没有匹配的 URL 访问日志。",
+    "logging.cross.filter_ray": "按 Ray ID 过滤",
 
     // System
     "sys.tab.defaults": "集群默认策略",

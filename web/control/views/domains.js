@@ -834,7 +834,7 @@ export function createDomainsView({ api, store }) {
               if (!Number.isNaN(expMs)) daysLeft = Math.max(0, Math.round((expMs - nowMs) / 86_400_000));
             }
             const pct = daysLeft != null ? Math.min(100, Math.round((daysLeft / 90) * 100)) : 0;
-            const barColor = daysLeft == null ? "#64748b" : daysLeft > 30 ? "#009F6B" : daysLeft > 10 ? "#FAC800" : "#C40233";
+            const barColor = daysLeft == null ? "var(--muted)" : daysLeft > 30 ? "var(--ok)" : daysLeft > 10 ? "var(--warn)" : "var(--danger)";
             const targets = (c.targets || []).map((tg) => `<span class="role-chip ingress">${esc(tg)}</span>`).join(" ");
             return `
               <div class="cert-card">

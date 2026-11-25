@@ -465,7 +465,7 @@ impl SessionSummary {
         sanitize_opt(&mut self.device_type, 32);
         sanitize_opt(&mut self.browser_family, 32);
         sanitize_opt(&mut self.os_family, 32);
-        sanitize_opt(&mut self.ray_id, 32);
+        sanitize_opt(&mut self.ray_id, 64);
         sanitize_opt(&mut self.method, 16);
         sanitize_opt(&mut self.host, 128);
         if let Some(ref mut p) = self.path {
@@ -516,6 +516,46 @@ pub struct LogProtectionStats {
     pub warn_suppressed: u64,
 }
 
+/// Whether an access log `action` represents a hard security block or honeypot diversion
+/// (distinct from PoW challenges, rate limits, and 5xx errors).
+pub fn is_security_block_action(action: Option<&str>) -> bool {
+    matches!(
+        action,
+        Some(
+            "autoban"
+                | "waf_block"
+                | "evilpot"
+                | "evilpot_canary"
+                | "guard_reject"
+                | "abuseipdb"
+                | "geo_block"
+                | "geo_evilpot"
+        )
+    )
+}
+
+/// Whether an access log record represents a security/edge mitigation (rate-limit, challenge,
+/// WAF/Guard/Geo/AutoBan/AbuseIPDB block, or Evilpot diversion), without misclassifying
+/// origin-returned 403/429 responses (`action = Some("allow")`).
+pub fn is_mitigated_record(rec: &SessionSummary) -> bool {
+    if rec.rate_limited || rec.challenged {
+        return true;
+    }
+    match rec.action.as_deref() {
+        Some(a) => {
+            is_security_block_action(Some(a))
+                || matches!(a, "rate_limit" | "challenge" | "geo_challenge")
+        }
+        // Legacy pre-`action` segment logs fallback
+        None => rec.status == 403 || rec.status == 429,
+    }
+}
+
+/// Whether a response `cache_status` represents serving content from the edge cache.
+pub fn is_cache_served_status(cache_status: Option<&str>) -> bool {
+    matches!(cache_status, Some("HIT" | "STALE" | "REVALIDATED"))
+}
+
 /// Aggregated summary per `(node_tag, role, minute_epoch, service_tag)` pushed to Maintainer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MinuteSummary {
@@ -530,6 +570,8 @@ pub struct MinuteSummary {
     pub rate_limited: u64,
     pub challenges_issued: u64,
     pub challenges_passed: u64,
+    #[serde(default)]
+    pub blocked: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub uv_hll: HyperLogLog,
@@ -568,6 +610,7 @@ impl MinuteSummary {
             rate_limited: 0,
             challenges_issued: 0,
             challenges_passed: 0,
+            blocked: 0,
             bytes_in: 0,
             bytes_out: 0,
             uv_hll: HyperLogLog::new(hll_precision, hll_seed),
@@ -591,6 +634,11 @@ impl MinuteSummary {
         }
         if rec.challenged {
             self.challenges_issued = self.challenges_issued.saturating_add(1);
+        } else if !rec.rate_limited
+            && rec.status < 500
+            && is_security_block_action(rec.action.as_deref())
+        {
+            self.blocked = self.blocked.saturating_add(1);
         }
         if rec.challenge_passed {
             self.challenges_passed = self.challenges_passed.saturating_add(1);
@@ -612,6 +660,10 @@ impl MinuteSummary {
         }
         self.bytes_in = self.bytes_in.saturating_add(rec.bytes_in);
         self.bytes_out = self.bytes_out.saturating_add(rec.bytes_out);
+        if is_cache_served_status(rec.cache_status.as_deref()) {
+            self.cached_requests = self.cached_requests.saturating_add(1);
+            self.cached_bytes_out = self.cached_bytes_out.saturating_add(rec.bytes_out);
+        }
         self.uv_hll.insert(&rec.ip_hmac);
         self.latency_hist.observe(rec.latency_ms);
     }
@@ -622,6 +674,7 @@ impl MinuteSummary {
         self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
         self.challenges_issued = self.challenges_issued.saturating_add(other.challenges_issued);
         self.challenges_passed = self.challenges_passed.saturating_add(other.challenges_passed);
+        self.blocked = self.blocked.saturating_add(other.blocked);
         self.client_fp_verified = self.client_fp_verified.saturating_add(other.client_fp_verified);
         for (k, v) in &other.device_counts {
             if self.device_counts.len() < 64 || self.device_counts.contains_key(k) {
@@ -1486,5 +1539,74 @@ mod tests {
         fp.sanitize();
         assert_eq!(fp.webrtc_public_ips, vec!["9.9.9.0/24"]);
         assert!(fp.webrtc_ip_mismatch);
+    }
+
+    #[test]
+    fn session_summary_sanitize_preserves_full_uuid_ray_id() {
+        let full_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let mut rec = SessionSummary {
+            ray_id: Some(full_uuid.to_string()),
+            ..Default::default()
+        };
+        rec.sanitize();
+        assert_eq!(rec.ray_id.as_deref(), Some(full_uuid));
+    }
+
+    #[test]
+    fn minute_summary_and_mitigation_helpers_classify_blocks_cache_and_origin_403_accurately() {
+        let mut sum = MinuteSummary::new(1_700_000_040, "n1", "ingress", "svc", 10, 1, vec![10.0]);
+
+        let waf_blk = SessionSummary {
+            status: 403,
+            action: Some("waf_block".into()),
+            ip_hmac: "ip-waf".into(),
+            ..Default::default()
+        };
+        let origin_403 = SessionSummary {
+            status: 403,
+            action: Some("allow".into()),
+            ip_hmac: "ip-origin".into(),
+            ..Default::default()
+        };
+        let canary = SessionSummary {
+            status: 200,
+            action: Some("evilpot_canary".into()),
+            ip_hmac: "ip-canary".into(),
+            ..Default::default()
+        };
+        let cached = SessionSummary {
+            status: 200,
+            bytes_out: 512,
+            action: Some("cache_hit".into()),
+            cache_status: Some("HIT".into()),
+            ip_hmac: "ip-cache".into(),
+            ..Default::default()
+        };
+        let stale = SessionSummary {
+            status: 200,
+            bytes_out: 256,
+            action: Some("cache_stale".into()),
+            cache_status: Some("STALE".into()),
+            ip_hmac: "ip-stale".into(),
+            ..Default::default()
+        };
+
+        sum.record(&waf_blk);
+        sum.record(&origin_403);
+        sum.record(&canary);
+        sum.record(&cached);
+        sum.record(&stale);
+
+        assert_eq!(sum.requests, 5);
+        assert_eq!(sum.errors, 0);
+        assert_eq!(sum.challenges_issued, 0);
+        assert_eq!(sum.blocked, 2); // waf_block + evilpot_canary (NOT origin_403)
+        assert_eq!(sum.cached_requests, 2); // HIT + STALE
+        assert_eq!(sum.cached_bytes_out, 768);
+
+        assert!(is_mitigated_record(&waf_blk));
+        assert!(!is_mitigated_record(&origin_403));
+        assert!(is_mitigated_record(&canary));
+        assert!(!is_mitigated_record(&cached));
     }
 }

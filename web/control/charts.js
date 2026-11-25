@@ -53,7 +53,27 @@ function esc(v) {
   }[c]));
 }
 
-function safeColor(c, fallback = "#4DA9D6") {
+function cssVar(name, fallback) {
+  if (typeof document === "undefined") return fallback;
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+export function themeColors() {
+  return {
+    accent: cssVar("--accent", "#5b9bd5"),
+    accentHi: cssVar("--accent-hi", "#7cb4e8"),
+    ok: cssVar("--ok", "#36a87d"),
+    warn: cssVar("--warn", "#d4a24c"),
+    danger: cssVar("--danger", "#d65a65"),
+    purple: cssVar("--purple", "#8b7ec8"),
+    cyan: cssVar("--cyan", "#4ea8b8"),
+    muted: cssVar("--muted", "#71717a"),
+    text: cssVar("--text", "#fafafa"),
+  };
+}
+
+function safeColor(c, fallback = "#38bdf8") {
   return typeof c === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : fallback;
 }
 
@@ -388,17 +408,19 @@ export function renderGuardFunnel(container, traffic) {
   const rl = finiteVal(traffic?.total_rate_limited);
   const chIssued = finiteVal(traffic?.total_challenges_issued);
   const chPassed = finiteVal(traffic?.total_challenges_passed);
+  const blocked = finiteVal(traffic?.total_blocked);
   const errors = finiteVal(traffic?.total_errors);
-  const clean = Math.max(0, total - rl - chIssued - errors);
+  const clean = Math.max(0, total - rl - chIssued - blocked - errors);
   const cleanOrPassed = Math.min(total, clean + chPassed);
 
   const stages = [
-    { label: "Total Requests", val: total, color: "#4DA9D6" },
-    { label: "Clean / Passed", val: cleanOrPassed, color: "#009F6B" },
-    { label: "PoW Challenged", val: chIssued, color: "#6A5ACD" },
-    { label: "PoW Cleared", val: chPassed, color: "#00A3B8" },
-    { label: "Rate-Limited (429)", val: rl, color: "#FAC800" },
-    { label: "5xx / Backend Errors", val: errors, color: "#C40233" },
+    { label: "Total Requests", val: total, color: cssVar("--accent-hi", "#38bdf8") },
+    { label: "Clean / Passed", val: cleanOrPassed, color: cssVar("--ok", "#10b981") },
+    { label: "Blocked (WAF / Guard / Evilpot)", val: blocked, color: cssVar("--orange", "#e07a3c") },
+    { label: "PoW Challenged", val: chIssued, color: cssVar("--purple", "#8b5cf6") },
+    { label: "PoW Cleared", val: chPassed, color: cssVar("--cyan", "#06b6d4") },
+    { label: "Rate-Limited (429)", val: rl, color: cssVar("--warn", "#f59e0b") },
+    { label: "5xx / Backend Errors", val: errors, color: cssVar("--danger", "#ef4444") },
   ];
 
   const denom = Math.max(1, total);
@@ -466,6 +488,14 @@ export function renderMiniTopo(container, { spec, liveNodes = [], liveLinks = []
   });
 
   const links = Array.isArray(spec?.links) ? spec.links : [];
+  const cOk = cssVar("--ok", "#10b981");
+  const cWarn = cssVar("--warn", "#f59e0b");
+  const cErr = cssVar("--danger", "#ef4444");
+  const cAcc = cssVar("--accent-hi", "#38bdf8");
+  const cMuted = cssVar("--muted", "#71717a");
+  const cSurf = cssVar("--surface", "#0c0c0e");
+  const cBorderHi = cssVar("--border-hi", "#2e2e36");
+
   let edgesSvg = "";
   links.forEach((lk) => {
     const a = pos.get(lk.from);
@@ -474,11 +504,11 @@ export function renderMiniTopo(container, { spec, liveNodes = [], liveLinks = []
     const h = linkHealthByPair.get(`${lk.from}->${lk.peer_tag || lk.to}`) || linkHealthByPair.get(`${lk.to}->${lk.from}`);
     const st = h?.state || "UNKNOWN";
     const stroke =
-      st === "UP" ? "#009F6B" : st === "DEGRADED" ? "#FAC800" : st === "DOWN" ? "#C40233" : "#4DA9D6";
+      st === "UP" ? cOk : st === "DEGRADED" ? cWarn : st === "DOWN" ? cErr : cAcc;
     const dash = lk.mode === "tunnel" ? 'stroke-dasharray="5 4"' : "";
     const mx = (a.x + b.x) / 2;
     const my = (a.y + b.y) / 2 - 12;
-    edgesSvg += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none" stroke="${stroke}" stroke-width="2" ${dash} opacity="0.85" />`;
+    edgesSvg += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none" stroke="${stroke}" stroke-width="1.75" ${dash} opacity="0.85" />`;
     if (h?.rtt_ms != null && Number.isFinite(Number(h.rtt_ms))) {
       edgesSvg += `<text x="${mx}" y="${my - 2}" text-anchor="middle" class="mini-edge-lbl">${esc(Math.round(Number(h.rtt_ms)))}ms</text>`;
     }
@@ -490,7 +520,7 @@ export function renderMiniTopo(container, { spec, liveNodes = [], liveLinks = []
     if (!p) continue;
     const live = onlineByTag.get(tag);
     const online = live?.online ?? false;
-    const dotColor = online ? "#009F6B" : live ? "#C40233" : "#64748b";
+    const dotColor = online ? cOk : live ? cErr : cMuted;
     const r = nodeMap[tag]?.roles || {};
     const liveRoles = live?.roles || [];
     const roleLabel = ["ingress", "relay", "egress", "maintainer"]
@@ -499,8 +529,8 @@ export function renderMiniTopo(container, { spec, liveNodes = [], liveLinks = []
       .join("/") || "N";
     nodesSvg += `
       <g class="mini-node" data-mini-node="${esc(tag)}" transform="translate(${p.x - 56}, ${p.y - 20})">
-        <rect width="112" height="40" rx="0" fill="#0f172a" stroke="${online ? "#4DA9D6" : "#334155"}" stroke-width="1.4" />
-        <circle cx="13" cy="14" r="4" fill="${dotColor}" />
+        <rect width="112" height="40" rx="4" fill="${cSurf}" stroke="${online ? cAcc : cBorderHi}" stroke-width="1.25" />
+        <circle cx="13" cy="14" r="3.5" fill="${dotColor}" />
         <text x="23" y="17" class="mini-node-title">${esc(tag.slice(0, 12))}</text>
         <text x="13" y="31" class="mini-node-sub">${esc(roleLabel)} · ${online ? "ONLINE" : live ? "OFFLINE" : "DRAFT"}</text>
       </g>`;

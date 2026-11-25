@@ -1,4 +1,5 @@
 // Pure Physical Mesh Topology Canvas & Service Route Tracer
+import { themeColors } from "../charts.js";
 import { t } from "../i18n.js";
 import { resolveServiceTargetIngresses } from "../store.js";
 import { el, esc, parseNum, showToast } from "../ui.js";
@@ -79,16 +80,16 @@ export function createTopologyView({ store, navigate }) {
               <svg id="topo-svg" class="topo-svg" viewBox="-4000 -4000 8000 8000">
                 <defs>
                   <marker id="arrow-ondemand" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="#4DA9D6"></path>
+                    <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--accent)"></path>
                   </marker>
                   <marker id="arrow-tunnel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="#009F6B"></path>
+                    <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--ok)"></path>
                   </marker>
                   <marker id="arrow-selected" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="#FAC800"></path>
+                    <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--warn)"></path>
                   </marker>
                   <marker id="arrow-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
-                    <path d="M 0 1 L 10 5 L 0 9 z" fill="#C40233"></path>
+                    <path d="M 0 1 L 10 5 L 0 9 z" style="fill:var(--danger)"></path>
                   </marker>
                 </defs>
               </svg>
@@ -344,12 +345,13 @@ export function createTopologyView({ store, navigate }) {
       const isDimmed = traced && !isTraced && !isSelected;
       const liveH = state.showLiveOverlay ? findLiveLinkHealth(link) : null;
 
-      let stroke = link.mode === "tunnel" ? "#009F6B" : "#4DA9D6";
+      const tc = themeColors();
+      let stroke = link.mode === "tunnel" ? tc.ok : tc.accent;
       let marker = link.mode === "tunnel" ? "url(#arrow-tunnel)" : "url(#arrow-ondemand)";
-      if (liveH?.state === "DOWN") { stroke = "#C40233"; marker = "url(#arrow-danger)"; }
-      else if (liveH?.state === "DEGRADED") { stroke = "#FAC800"; marker = "url(#arrow-selected)"; }
-      if (isSelected) { stroke = "#FAC800"; marker = "url(#arrow-selected)"; }
-      if (isTraced) { stroke = traced.hasErr ? "#C40233" : "#4DA9D6"; }
+      if (liveH?.state === "DOWN") { stroke = tc.danger; marker = "url(#arrow-danger)"; }
+      else if (liveH?.state === "DEGRADED") { stroke = tc.warn; marker = "url(#arrow-selected)"; }
+      if (isSelected) { stroke = tc.warn; marker = "url(#arrow-selected)"; }
+      if (isTraced) { stroke = traced.hasErr ? tc.danger : tc.accent; }
 
       const isBidi = link.mode === "tunnel" || (link.mode === "on-demand" && link.bidirectional !== false && (link.reverse_endpoints || []).length > 0);
 
@@ -407,7 +409,7 @@ export function createTopologyView({ store, navigate }) {
       txt.setAttribute("x", labelPos.x.toFixed(1));
       txt.setAttribute("y", (labelPos.y + 3.5).toFixed(1));
       txt.setAttribute("text-anchor", "middle");
-      txt.setAttribute("fill", isSelected ? "#FAC800" : "#e2e8f0");
+      txt.setAttribute("fill", isSelected ? tc.warn : tc.text);
       txt.setAttribute("font-size", "10.5");
       txt.setAttribute("font-weight", "600");
       txt.style.pointerEvents = "none";
@@ -428,7 +430,7 @@ export function createTopologyView({ store, navigate }) {
       line.setAttribute("y1", start.y.toFixed(1));
       line.setAttribute("x2", state.wireDrag.curX.toFixed(1));
       line.setAttribute("y2", state.wireDrag.curY.toFixed(1));
-      line.setAttribute("stroke", "#FAC800");
+      line.setAttribute("stroke", themeColors().warn);
       line.setAttribute("stroke-width", "2.5");
       line.setAttribute("stroke-dasharray", "6 4");
       svg.appendChild(line);
@@ -546,18 +548,19 @@ export function createTopologyView({ store, navigate }) {
     const mx = (x) => ((x - ox) * sc).toFixed(1);
     const my = (y) => ((y - oy) * sc).toFixed(1);
 
+    const tc = themeColors();
     const edgesSvg = (store.spec.links || [])
       .filter((l) => store.spec.nodes[l.from] && store.spec.nodes[l.to])
       .map((l) => {
         const a = nodeRect(l.from), b = nodeRect(l.to);
-        return `<line x1="${mx(a.x + a.w / 2)}" y1="${my(a.y + a.h / 2)}" x2="${mx(b.x + b.w / 2)}" y2="${my(b.y + b.h / 2)}" stroke="${l.mode === "tunnel" ? "#009F6B" : "#4DA9D6"}" stroke-width="1" opacity="0.7" />`;
+        return `<line x1="${mx(a.x + a.w / 2)}" y1="${my(a.y + a.h / 2)}" x2="${mx(b.x + b.w / 2)}" y2="${my(b.y + b.h / 2)}" stroke="${l.mode === "tunnel" ? tc.ok : tc.accent}" stroke-width="1" opacity="0.7" />`;
       })
       .join("");
     const nodesSvg = tags
       .map((tag) => {
         const r = nodeRect(tag);
         const sel = state.selected?.type === "node" && state.selected.tag === tag;
-        return `<rect x="${mx(r.x)}" y="${my(r.y)}" width="${Math.max(4, r.w * sc).toFixed(1)}" height="${Math.max(3, r.h * sc).toFixed(1)}" rx="2" fill="${sel ? "#FAC800" : "#4DA9D6"}" />`;
+        return `<rect x="${mx(r.x)}" y="${my(r.y)}" width="${Math.max(4, r.w * sc).toFixed(1)}" height="${Math.max(3, r.h * sc).toFixed(1)}" rx="2" fill="${sel ? tc.warn : tc.accent}" />`;
       })
       .join("");
     mm.innerHTML = `<svg width="${mw}" height="${mh}" viewBox="0 0 ${mw} ${mh}">${edgesSvg}${nodesSvg}</svg>`;

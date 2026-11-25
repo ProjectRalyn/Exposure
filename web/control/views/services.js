@@ -684,7 +684,7 @@ export function createServicesView({ store, navigate }) {
           </div>
           <div class="tri-stack">
             ${renderBinSlider({ attrName: "data-sd-bin", attrVal: "auto_tls", label: t("svc.field.auto_tls"), sub: t("svc.field.auto_tls_sub"), val: draft.auto_tls })}
-            ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "intercept_errors", label: "Ingress Intercept Errors (429/5xx)", val: draft.intercept_errors, inherited: defs.ingress.intercept_errors })}
+            ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "intercept_errors", label: "Ingress Intercept Errors (403/429/5xx)", val: draft.intercept_errors, inherited: defs.ingress.intercept_errors })}
             ${renderTriSlider({ attrName: "data-sd-tri", attrVal: "js_fp_beacon", label: "Passive JS FP Beacon", val: draft.js_fp_beacon, inherited: defs.ingress.js_fp_beacon })}
             ${renderTriSlider({ attrName: "data-sd-ca-tri", attrVal: "enabled", label: "Edge HTTP Cache", sub: "Cache GET/HEAD responses in RAM on Ingress hosts", val: draft.cache?.enabled ?? null, inherited: Boolean(defs.ingress.cache?.enabled) })}
           </div>
