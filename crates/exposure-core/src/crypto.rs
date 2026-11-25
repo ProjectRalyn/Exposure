@@ -1,10 +1,10 @@
 use std::io::Write;
 use std::path::Path;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
@@ -19,22 +19,20 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Compact 128-word NATO/tech-inspired list for onboarding passphrases.
 const WORDLIST: &[&str] = &[
-    "amber", "anchor", "apex", "atlas", "aurora", "badge", "basalt", "beacon",
-    "birch", "blaze", "bolt", "breeze", "bridge", "brook", "canyon", "carbon",
-    "cedar", "cipher", "citadel", "cliff", "cloud", "cobalt", "comet", "compass",
-    "copper", "coral", "crest", "crown", "crystal", "current", "dawn", "delta",
-    "drift", "dune", "echo", "eclipse", "ember", "falcon", "fjord", "flame",
-    "flint", "forest", "forge", "frost", "galaxy", "glacier", "granite", "grove",
-    "harbor", "haven", "hawk", "hazel", "horizon", "indigo", "iron", "island",
-    "ivory", "jade", "jasper", "kelp", "kestrel", "lagoon", "lantern", "larch",
-    "laurel", "ledge", "lotus", "lunar", "maple", "marble", "meadow", "mercury",
-    "meteor", "mist", "monolith", "moss", "nebula", "nectar", "nimbus", "north",
-    "oak", "oasis", "obsidian", "ocean", "olive", "onyx", "opal", "orbit",
-    "orchid", "osprey", "otter", "pearl", "pebble", "phoenix", "pine", "plume",
-    "polar", "prism", "pulse", "quartz", "raven", "reef", "ridge", "river",
-    "robin", "ruby", "saffron", "sage", "sapphire", "sequoia", "shadow", "shield",
-    "sierra", "silver", "slate", "solar", "spruce", "star", "steel", "stone",
-    "storm", "summit", "timber", "titan", "topaz", "vector", "velvet", "zenith",
+    "amber", "anchor", "apex", "atlas", "aurora", "badge", "basalt", "beacon", "birch", "blaze",
+    "bolt", "breeze", "bridge", "brook", "canyon", "carbon", "cedar", "cipher", "citadel", "cliff",
+    "cloud", "cobalt", "comet", "compass", "copper", "coral", "crest", "crown", "crystal",
+    "current", "dawn", "delta", "drift", "dune", "echo", "eclipse", "ember", "falcon", "fjord",
+    "flame", "flint", "forest", "forge", "frost", "galaxy", "glacier", "granite", "grove",
+    "harbor", "haven", "hawk", "hazel", "horizon", "indigo", "iron", "island", "ivory", "jade",
+    "jasper", "kelp", "kestrel", "lagoon", "lantern", "larch", "laurel", "ledge", "lotus", "lunar",
+    "maple", "marble", "meadow", "mercury", "meteor", "mist", "monolith", "moss", "nebula",
+    "nectar", "nimbus", "north", "oak", "oasis", "obsidian", "ocean", "olive", "onyx", "opal",
+    "orbit", "orchid", "osprey", "otter", "pearl", "pebble", "phoenix", "pine", "plume", "polar",
+    "prism", "pulse", "quartz", "raven", "reef", "ridge", "river", "robin", "ruby", "saffron",
+    "sage", "sapphire", "sequoia", "shadow", "shield", "sierra", "silver", "slate", "solar",
+    "spruce", "star", "steel", "stone", "storm", "summit", "timber", "titan", "topaz", "vector",
+    "velvet", "zenith",
 ];
 
 /// Append a length-prefixed (`u32 BE`) byte slice to a transcript to eliminate delimiter ambiguity.
@@ -135,9 +133,7 @@ pub fn validate_dns_domain(domain: &str) -> Result<()> {
     }
     let check = d.strip_prefix("*.").unwrap_or(d);
     if check.is_empty() || check.starts_with('.') || check.ends_with('.') || check.contains("..") {
-        return Err(ExposureError::Config(format!(
-            "invalid domain '{domain}'"
-        )));
+        return Err(ExposureError::Config(format!("invalid domain '{domain}'")));
     }
     for label in check.split('.') {
         if label.is_empty() || label.len() > 63 {
@@ -147,9 +143,7 @@ pub fn validate_dns_domain(domain: &str) -> Result<()> {
         }
         if label.starts_with('-')
             || label.ends_with('-')
-            || !label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             return Err(ExposureError::Config(format!(
                 "invalid character in domain '{domain}'"
@@ -489,7 +483,9 @@ pub fn verify_clearance_cookie(secret: &str, cookie_val: &str) -> Result<Clearan
     let eq: bool = expected_b64.len() == sig_b64.len()
         && bool::from(expected_b64.as_bytes().ct_eq(sig_b64.as_bytes()));
     if !eq {
-        return Err(ExposureError::Auth("invalid clearance cookie signature".into()));
+        return Err(ExposureError::Auth(
+            "invalid clearance cookie signature".into(),
+        ));
     }
     let payload = URL_SAFE_NO_PAD
         .decode(payload_b64)
@@ -668,12 +664,35 @@ mod tests {
         assert_eq!(pass.split('-').count(), 6);
         let nonce = b"random-nonce-1234567890";
         let proof = compute_passphrase_proof(&pass, "node-a", "pk-abc", nonce);
-        assert!(verify_passphrase_proof(&pass, "node-a", "pk-abc", nonce, &proof));
-        assert!(!verify_passphrase_proof("wrong-pass-here-now-no-0000", "node-a", "pk-abc", nonce, &proof));
+        assert!(verify_passphrase_proof(
+            &pass, "node-a", "pk-abc", nonce, &proof
+        ));
+        assert!(!verify_passphrase_proof(
+            "wrong-pass-here-now-no-0000",
+            "node-a",
+            "pk-abc",
+            nonce,
+            &proof
+        ));
 
-        let reply_proof = compute_bootstrap_reply_proof(&pass, "ctrl-sig", "ctrl-link", "node-a", nonce);
-        assert!(verify_bootstrap_reply_proof(&pass, "ctrl-sig", "ctrl-link", "node-a", nonce, &reply_proof));
-        assert!(!verify_bootstrap_reply_proof(&pass, "other-sig", "ctrl-link", "node-a", nonce, &reply_proof));
+        let reply_proof =
+            compute_bootstrap_reply_proof(&pass, "ctrl-sig", "ctrl-link", "node-a", nonce);
+        assert!(verify_bootstrap_reply_proof(
+            &pass,
+            "ctrl-sig",
+            "ctrl-link",
+            "node-a",
+            nonce,
+            &reply_proof
+        ));
+        assert!(!verify_bootstrap_reply_proof(
+            &pass,
+            "other-sig",
+            "ctrl-link",
+            "node-a",
+            nonce,
+            &reply_proof
+        ));
     }
 
     #[test]
@@ -693,15 +712,42 @@ mod tests {
         }
         assert!(verify_pow_solution(token, nonce, 10));
 
-        let sig = sign_challenge_token("secret-key", "example.com", "203.0.113", token, 4_000_000_000, 10);
-        assert!(verify_challenge_token("secret-key", "example.com", "203.0.113", token, 4_000_000_000, 10, &sig));
-        assert!(!verify_challenge_token("secret-key", "other.com", "203.0.113", token, 4_000_000_000, 10, &sig));
+        let sig = sign_challenge_token(
+            "secret-key",
+            "example.com",
+            "203.0.113",
+            token,
+            4_000_000_000,
+            10,
+        );
+        assert!(verify_challenge_token(
+            "secret-key",
+            "example.com",
+            "203.0.113",
+            token,
+            4_000_000_000,
+            10,
+            &sig
+        ));
+        assert!(!verify_challenge_token(
+            "secret-key",
+            "other.com",
+            "203.0.113",
+            token,
+            4_000_000_000,
+            10,
+            &sig
+        ));
 
         let claims = ClearanceClaims {
             host: "example.com".into(),
             expires_at: 4_000_000_000,
             jti: Some("sess0123456789ab".into()),
-            ua_hash: Some(keyed_short_hmac_hex("secret-key", "exposure-ua", "Mozilla/5.0")),
+            ua_hash: Some(keyed_short_hmac_hex(
+                "secret-key",
+                "exposure-ua",
+                "Mozilla/5.0",
+            )),
             ip_prefix: Some("203.0.113.10".into()),
             fp_hash: None,
             profile_hash: None,

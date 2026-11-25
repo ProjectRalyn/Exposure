@@ -2,17 +2,17 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use exposure_control::compiler::compile_topology_with_options;
 use exposure_control::ControlRuntime;
+use exposure_control::compiler::compile_topology_with_options;
 use exposure_core::config::{
     AdminAuthConfig, BootstrapNodeTarget, ControlConfig, ControlRole, LinkListenConfig,
     MaintainerConfig, NodeConfig, NodeRoles, TopologySpec,
 };
 use exposure_core::crypto::{
-    generate_five_word_passphrase, generate_random_secret_hex, hash_password, validate_identifier,
-    write_secret_file_atomic, NodeKeyPair,
+    NodeKeyPair, generate_five_word_passphrase, generate_random_secret_hex, hash_password,
+    validate_identifier, write_secret_file_atomic,
 };
 use exposure_node::NodeRuntime;
 use tracing::info;
@@ -208,7 +208,9 @@ async fn main() -> Result<()> {
             println!("Node Tag:         {}", tag);
             println!("Public Key:       {}", kp.public_key_b64());
             println!("Fingerprint:      {}", kp.fingerprint());
-            println!("Note: A fresh one-time onboarding passphrase will be generated when `exposure node` starts before enrollment.");
+            println!(
+                "Note: A fresh one-time onboarding passphrase will be generated when `exposure node` starts before enrollment."
+            );
         }
         Commands::InitControl {
             id,
@@ -258,7 +260,9 @@ async fn main() -> Result<()> {
                 }
                 (None, None) => {
                     if boot_pass.is_some() {
-                        bail!("--bootstrap-passphrase requires both --bootstrap-tag and --bootstrap-addr");
+                        bail!(
+                            "--bootstrap-passphrase requires both --bootstrap-tag and --bootstrap-addr"
+                        );
                     }
                     vec![]
                 }
@@ -403,7 +407,7 @@ async fn main() -> Result<()> {
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}

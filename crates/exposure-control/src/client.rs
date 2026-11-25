@@ -10,15 +10,15 @@ use exposure_core::config::{
     NodeConfig, NodeRoles, ProbeConfig, SignedConfigBundle, TopologySpec,
 };
 use exposure_core::crypto::{
-    compute_bootstrap_reply_proof, compute_passphrase_proof, verify_signature_b64, NodeKeyPair,
+    NodeKeyPair, compute_bootstrap_reply_proof, compute_passphrase_proof, verify_signature_b64,
 };
 use exposure_core::protocol::{
-    dial_enroll_req_signing_bytes, discovery_resp_signing_bytes, dns_manage_req_signing_bytes,
-    dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes, pull_telemetry_req_signing_bytes,
-    query_maintainer_req_signing_bytes, read_json_frame, unban_req_signing_bytes, write_json_frame,
     DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine,
     DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerQuery, MaintainerTelemetrySnapshot,
-    NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind,
+    NodeStatusSnapshot, SpecialFrame, SpecialPayload, StreamKind, dial_enroll_req_signing_bytes,
+    discovery_resp_signing_bytes, dns_manage_req_signing_bytes, dns_sync_req_signing_bytes,
+    geoip_sync_req_signing_bytes, pull_telemetry_req_signing_bytes,
+    query_maintainer_req_signing_bytes, read_json_frame, unban_req_signing_bytes, write_json_frame,
 };
 use exposure_core::routing::canonical_ip;
 use exposure_core::telemetry::{
@@ -29,13 +29,15 @@ use exposure_core::{ExposureError, Result};
 use exposure_link::LinkManager;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::RngCore;
-use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::compiler::{compile_topology_full, compute_control_hops, inject_crs_rules, CompileReport};
+use crate::compiler::{
+    CompileReport, compile_topology_full, compute_control_hops, inject_crs_rules,
+};
 use crate::db::ControlDb;
-use exposure_core::crs::{builtin_crs_snapshot, merge_crs_snapshots, CrsRulesetSnapshot};
+use exposure_core::crs::{CrsRulesetSnapshot, builtin_crs_snapshot, merge_crs_snapshots};
 
 const KV_TELEMETRY_CACHE: &str = "telemetry_cache_json";
 pub const KV_CRS_RULESET: &str = "crs_ruleset_json";
@@ -207,7 +209,11 @@ impl ControlClient {
     /// Restore previously persisted telemetry cache from SQLite on Control startup so dashboards
     /// and analytics retain historical data across restarts even before the next mesh pull.
     pub async fn restore_telemetry_cache(&self) {
-        match self.db.get_kv_json::<CachedTelemetry>(KV_TELEMETRY_CACHE).await {
+        match self
+            .db
+            .get_kv_json::<CachedTelemetry>(KV_TELEMETRY_CACHE)
+            .await
+        {
             Ok(Some(saved)) => {
                 info!(
                     summaries = saved.summaries.len(),
@@ -231,7 +237,11 @@ impl ControlClient {
         if let Some(ref cached) = *self.cached_crs.read().await {
             return Arc::clone(cached);
         }
-        let snap = match self.db.get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET).await {
+        let snap = match self
+            .db
+            .get_kv_json::<CrsRulesetSnapshot>(KV_CRS_RULESET)
+            .await
+        {
             Ok(Some(snap)) if !snap.rules.is_empty() => {
                 merge_crs_snapshots(snap, builtin_crs_snapshot())
             }
@@ -597,9 +607,7 @@ impl ControlClient {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Err(ExposureError::Link("control RPC cancelled".into())),
-            Err(_) => Err(ExposureError::Link(format!(
-                "control RPC {id} timed out"
-            ))),
+            Err(_) => Err(ExposureError::Link(format!("control RPC {id} timed out"))),
         }
     }
 
@@ -860,10 +868,9 @@ impl ControlClient {
             .clone();
         let _guard = push_lock.lock().await;
 
-        let boot = self
-            .active_bootstrap_tag()
-            .await
-            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let boot = self.active_bootstrap_tag().await.ok_or_else(|| {
+            ExposureError::Link("Control not connected to any bootstrap node".into())
+        })?;
         let hops = compute_control_hops(&self.cfg.control_id, &boot, node_tag, topo)
             .or_else(|| {
                 if node_tag == boot {
@@ -1180,7 +1187,10 @@ impl ControlClient {
                 "config_rollback",
                 &target.revision,
                 true,
-                &format!("created release #{} rev={}", deploy.release_seq, deploy.revision),
+                &format!(
+                    "created release #{} rev={}",
+                    deploy.release_seq, deploy.revision
+                ),
             )
             .await;
         Ok(deploy)
@@ -1235,13 +1245,8 @@ impl ControlClient {
                 let now = Utc::now().timestamp();
                 let expires_at = now + 60;
                 let request_id = Uuid::new_v4().to_string();
-                let signing = query_maintainer_req_signing_bytes(
-                    &request_id,
-                    now,
-                    expires_at,
-                    &tag,
-                    &q,
-                );
+                let signing =
+                    query_maintainer_req_signing_bytes(&request_id, now, expires_at, &tag, &q);
                 let control_signature = this.signing_kp.sign_b64(&signing);
                 let frame = SpecialFrame::new(
                     Uuid::new_v4().to_string(),
@@ -1385,7 +1390,13 @@ impl ControlClient {
                     {
                         warn!(node = %node_tag, error = %e, "discovery rejected conflicting public key against pinned DB");
                         self.db
-                            .append_audit(actor, "discovery_conflict", &node_tag, false, &e.to_string())
+                            .append_audit(
+                                actor,
+                                "discovery_conflict",
+                                &node_tag,
+                                false,
+                                &e.to_string(),
+                            )
                             .await;
                         continue;
                     }
@@ -1460,7 +1471,12 @@ impl ControlClient {
                 let _ = self.db.set_node_online(&tag, false).await;
                 continue;
             };
-            if topo.nodes.get(&tag).map(|s| s.roles.maintainer).unwrap_or(false) {
+            if topo
+                .nodes
+                .get(&tag)
+                .map(|s| s.roles.maintainer)
+                .unwrap_or(false)
+            {
                 expected_maintainers += 1;
             }
             let this = Arc::clone(self);
@@ -1561,8 +1577,7 @@ impl ControlClient {
         let mut dedup_summaries: HashMap<(i64, String, String, String), MinuteSummary> =
             HashMap::new();
         let mut dedup_fingerprints: HashMap<String, FingerprintObservation> = HashMap::new();
-        let mut dedup_logs: HashMap<(String, String, i64, String), SessionSummary> =
-            HashMap::new();
+        let mut dedup_logs: HashMap<(String, String, i64, String), SessionSummary> = HashMap::new();
         let mut dedup_certs: HashMap<String, CertStatusInfo> = HashMap::new();
 
         while let Some(res) = futs.next().await {
@@ -1635,7 +1650,8 @@ impl ControlClient {
                                             && fp.last_seen_ts > existing.last_seen_ts);
                                     let max_req = existing.request_count.max(fp.request_count);
                                     let max_ch = existing.challenge_count.max(fp.challenge_count);
-                                    let max_rl = existing.rate_limited_count.max(fp.rate_limited_count);
+                                    let max_rl =
+                                        existing.rate_limited_count.max(fp.rate_limited_count);
                                     let max_ab = match (existing.abuse_score, fp.abuse_score) {
                                         (Some(a), Some(b)) => Some(a.max(b)),
                                         (a, b) => a.or(b),
@@ -1804,7 +1820,9 @@ impl ControlClient {
             persisted.recent_logs.truncate(MAX_PERSISTED_LOGS);
         }
         if persisted.alerts.len() > MAX_PERSISTED_ALERTS {
-            persisted.alerts.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            persisted
+                .alerts
+                .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             persisted.alerts.truncate(MAX_PERSISTED_ALERTS);
         }
         if let Err(e) = self.db.set_kv_json(KV_TELEMETRY_CACHE, &persisted).await {
@@ -1874,7 +1892,10 @@ impl ControlClient {
                 control_signature,
             },
         );
-        match self.send_special_rpc(frame, Duration::from_secs(10)).await? {
+        match self
+            .send_special_rpc(frame, Duration::from_secs(10))
+            .await?
+        {
             SpecialFrame {
                 payload:
                     SpecialPayload::DialEnrollResp {
@@ -1910,7 +1931,9 @@ impl ControlClient {
             }
             _ => {
                 let _ = self.db.revoke_passphrase(target_node_tag).await;
-                Err(ExposureError::Protocol("unexpected DialEnroll reply".into()))
+                Err(ExposureError::Protocol(
+                    "unexpected DialEnroll reply".into(),
+                ))
             }
         }
     }
@@ -2140,10 +2163,9 @@ impl ControlClient {
             ));
         }
 
-        let boot = self
-            .active_bootstrap_tag()
-            .await
-            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let boot = self.active_bootstrap_tag().await.ok_or_else(|| {
+            ExposureError::Link("Control not connected to any bootstrap node".into())
+        })?;
         let hops = compute_control_hops(&self.cfg.control_id, &boot, &target_maint, &topo)
             .ok_or_else(|| {
                 ExposureError::Routing(format!(
@@ -2154,13 +2176,8 @@ impl ControlClient {
         let now = Utc::now().timestamp();
         let expires_at = now + 60;
         let request_id = Uuid::new_v4().to_string();
-        let signing = dns_sync_req_signing_bytes(
-            &request_id,
-            now,
-            expires_at,
-            &target_maint,
-            &records,
-        );
+        let signing =
+            dns_sync_req_signing_bytes(&request_id, now, expires_at, &target_maint, &records);
         let control_signature = self.signing_kp.sign_b64(&signing);
 
         let frame = SpecialFrame::new(
@@ -2177,7 +2194,10 @@ impl ControlClient {
             },
         );
 
-        match self.send_special_rpc(frame, Duration::from_secs(30)).await? {
+        match self
+            .send_special_rpc(frame, Duration::from_secs(30))
+            .await?
+        {
             SpecialFrame {
                 payload:
                     SpecialPayload::DnsSyncResp {
@@ -2281,10 +2301,9 @@ impl ControlClient {
                 })?
         };
 
-        let boot = self
-            .active_bootstrap_tag()
-            .await
-            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let boot = self.active_bootstrap_tag().await.ok_or_else(|| {
+            ExposureError::Link("Control not connected to any bootstrap node".into())
+        })?;
         let hops = compute_control_hops(&self.cfg.control_id, &boot, &target_maint, &topo)
             .ok_or_else(|| {
                 ExposureError::Routing(format!(
@@ -2322,7 +2341,10 @@ impl ControlClient {
             },
         );
 
-        match self.send_special_rpc(frame, Duration::from_secs(30)).await? {
+        match self
+            .send_special_rpc(frame, Duration::from_secs(30))
+            .await?
+        {
             SpecialFrame {
                 payload:
                     SpecialPayload::DnsManageResp {
@@ -2379,14 +2401,16 @@ impl ControlClient {
         &self,
         target_node: Option<&str>,
     ) -> Result<Vec<(String, Vec<String>)>> {
-        let boot = self
-            .active_bootstrap_tag()
-            .await
-            .ok_or_else(|| ExposureError::Link("Control not connected to any bootstrap node".into()))?;
+        let boot = self.active_bootstrap_tag().await.ok_or_else(|| {
+            ExposureError::Link("Control not connected to any bootstrap node".into())
+        })?;
         let topo = self.cached_topology_spec().await?;
 
         let mut tags: Vec<String> = Vec::new();
-        if let Some(specific) = target_node.map(str::trim).filter(|s| !s.is_empty() && *s != "all") {
+        if let Some(specific) = target_node
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "all")
+        {
             let is_ingress = if let Some(spec) = topo.nodes.get(specific) {
                 spec.roles.ingress
             } else if let Ok(Some(rec)) = self.db.get_node(specific).await {
@@ -2417,7 +2441,9 @@ impl ControlClient {
             }
         }
         if tags.is_empty() {
-            return Err(ExposureError::Config("no ingress nodes found in topology".into()));
+            return Err(ExposureError::Config(
+                "no ingress nodes found in topology".into(),
+            ));
         }
         let mut out = Vec::with_capacity(tags.len());
         for tag in tags {
@@ -2443,10 +2469,7 @@ impl ControlClient {
         node_tag: Option<&str>,
     ) -> Result<serde_json::Value> {
         let kind_norm = ban_kind.trim().to_ascii_lowercase();
-        if !matches!(
-            kind_norm.as_str(),
-            "ip" | "js_fp" | "composite_fp" | "all"
-        ) {
+        if !matches!(kind_norm.as_str(), "ip" | "js_fp" | "composite_fp" | "all") {
             return Err(ExposureError::Config(format!(
                 "unsupported unban kind '{ban_kind}' (expected ip, js_fp, composite_fp, all)"
             )));
@@ -2462,7 +2485,9 @@ impl ControlClient {
         } else {
             let t = target.trim();
             if t.is_empty() {
-                return Err(ExposureError::Config("unban target must not be empty".into()));
+                return Err(ExposureError::Config(
+                    "unban target must not be empty".into(),
+                ));
             }
             t.to_string()
         };
@@ -2477,8 +2502,7 @@ impl ControlClient {
                 let now = Utc::now().timestamp();
                 let expires_at = now + 60;
                 let request_id = Uuid::new_v4().to_string();
-                let signing =
-                    unban_req_signing_bytes(&request_id, now, expires_at, &tag, &k, &t);
+                let signing = unban_req_signing_bytes(&request_id, now, expires_at, &tag, &k, &t);
                 let control_signature = this.signing_kp.sign_b64(&signing);
                 let frame = SpecialFrame::new(
                     Uuid::new_v4().to_string(),
@@ -2507,7 +2531,12 @@ impl ControlClient {
                         ..
                     }) => {
                         if resp_id != request_id {
-                            (tag, false, false, Some("UnbanResp request_id mismatch".into()))
+                            (
+                                tag,
+                                false,
+                                false,
+                                Some("UnbanResp request_id mismatch".into()),
+                            )
                         } else {
                             (resp_node, ok, removed, error)
                         }
@@ -2554,34 +2583,25 @@ impl ControlClient {
                     rep.active_ip_bans = 0;
                     rep.active_fp_bans = 0;
                 } else {
-                    rep.active_bans.retain(|b| {
-                        !(b.kind == kind_norm && b.target == clean_target)
-                    });
-                    rep.active_ip_bans = rep
-                        .active_bans
-                        .iter()
-                        .filter(|b| b.kind == "ip")
-                        .count();
-                    rep.active_fp_bans = rep
-                        .active_bans
-                        .iter()
-                        .filter(|b| b.kind != "ip")
-                        .count();
+                    rep.active_bans
+                        .retain(|b| !(b.kind == kind_norm && b.target == clean_target));
+                    rep.active_ip_bans = rep.active_bans.iter().filter(|b| b.kind == "ip").count();
+                    rep.active_fp_bans = rep.active_bans.iter().filter(|b| b.kind != "ip").count();
                 }
             }
             *guard = Arc::new(updated);
         }
 
-        let all_ok = !results.is_empty()
-            && results
-                .iter()
-                .all(|r| r["ok"].as_bool().unwrap_or(false));
+        let all_ok =
+            !results.is_empty() && results.iter().all(|r| r["ok"].as_bool().unwrap_or(false));
 
         if !succeeded_nodes.is_empty() {
             let unbanned_at_unix = Utc::now().timestamp().max(0) as u64;
             let _ = self
                 .query_maintainers(MaintainerQuery::MarkUnbanned {
-                    node_tag: node_tag.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    node_tag: node_tag
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                     ban_kind: kind_norm.clone(),
                     target: clean_target.clone(),
                     actor: actor.to_string(),
@@ -2705,7 +2725,12 @@ impl ControlClient {
                         ..
                     }) => {
                         if resp_id != request_id {
-                            (tag, false, None, Some("GeoIpSyncResp request_id mismatch".into()))
+                            (
+                                tag,
+                                false,
+                                None,
+                                Some("GeoIpSyncResp request_id mismatch".into()),
+                            )
                         } else {
                             (resp_node, ok, status, error)
                         }
@@ -2714,7 +2739,12 @@ impl ControlClient {
                         payload: SpecialPayload::ErrorReply { message },
                         ..
                     }) => (tag, false, None, Some(message)),
-                    Ok(_) => (tag, false, None, Some("unexpected GeoIpSyncReq reply".into())),
+                    Ok(_) => (
+                        tag,
+                        false,
+                        None,
+                        Some("unexpected GeoIpSyncReq reply".into()),
+                    ),
                     Err(e) => (tag, false, None, Some(e.to_string())),
                 }
             }));
@@ -2743,10 +2773,8 @@ impl ControlClient {
             }
             *guard = Arc::new(updated);
         }
-        let all_ok = !results.is_empty()
-            && results
-                .iter()
-                .all(|r| r["ok"].as_bool().unwrap_or(false));
+        let all_ok =
+            !results.is_empty() && results.iter().all(|r| r["ok"].as_bool().unwrap_or(false));
         self.db
             .append_audit(
                 actor,
@@ -2778,13 +2806,7 @@ impl ControlClient {
         let cache = self.telemetry_cache.read().await;
         let (chosen_tag, hops) = targets
             .iter()
-            .find(|(t, _)| {
-                cache
-                    .geoip_status
-                    .get(t)
-                    .map(|s| s.loaded)
-                    .unwrap_or(false)
-            })
+            .find(|(t, _)| cache.geoip_status.get(t).map(|s| s.loaded).unwrap_or(false))
             .cloned()
             .unwrap_or_else(|| targets[0].clone());
         drop(cache);
@@ -2824,7 +2846,9 @@ impl ControlClient {
             } => Err(ExposureError::Protocol(format!(
                 "GeoIP lookup on '{chosen_tag}' failed: {message}"
             ))),
-            _ => Err(ExposureError::Protocol("unexpected GeoIpLookupReq reply".into())),
+            _ => Err(ExposureError::Protocol(
+                "unexpected GeoIpLookupReq reply".into(),
+            )),
         }
     }
 }

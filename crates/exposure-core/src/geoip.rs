@@ -182,7 +182,10 @@ impl GeoIpDatabase {
         let v4_cnt = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         if v4_cnt > MAX_GEOIP_BINARY_RANGES
-            || pos.saturating_add(v4_cnt.saturating_mul(10)).saturating_add(4) > bytes.len()
+            || pos
+                .saturating_add(v4_cnt.saturating_mul(10))
+                .saturating_add(4)
+                > bytes.len()
         {
             return Err("invalid/truncated geoip v4 section".into());
         }
@@ -422,7 +425,10 @@ pub fn evaluate_geo_policy(
 
     // 2. Explicit denylist
     if !policy.deny_regions.is_empty()
-        && policy.deny_regions.iter().any(|tok| region_token_matches(tok, g))
+        && policy
+            .deny_regions
+            .iter()
+            .any(|tok| region_token_matches(tok, g))
     {
         return action_to_decision(policy.deny_action, 0, format!("geo:deny:{cc}"));
     }
@@ -498,7 +504,8 @@ mod tests {
 198.51.100.0,198.51.100.255,US
 ";
         let v6_csv = "2001:4860:4860::,2001:4860:4860:ffff:ffff:ffff:ffff:ffff,US\n";
-        let db = GeoIpDatabase::parse_csv_ranges(Some(v4_csv), Some(v6_csv), "test-cc0", 1_700_000_000);
+        let db =
+            GeoIpDatabase::parse_csv_ranges(Some(v4_csv), Some(v6_csv), "test-cc0", 1_700_000_000);
         assert_eq!(db.ipv4_len(), 6);
         assert_eq!(db.ipv6_len(), 1);
 
@@ -515,7 +522,9 @@ mod tests {
         assert_eq!(r3.continent, "AS");
 
         // IPv4-mapped IPv6 canonicalizes transparently
-        let r4 = db.lookup("::ffff:114.114.114.114".parse().unwrap()).unwrap();
+        let r4 = db
+            .lookup("::ffff:114.114.114.114".parse().unwrap())
+            .unwrap();
         assert_eq!(r4.country_str(), "CN");
 
         // IPv6 lookup
@@ -530,8 +539,18 @@ mod tests {
         // Binary roundtrip
         let bin = db.encode_binary();
         let dec = GeoIpDatabase::decode_binary(&bin).unwrap();
-        assert_eq!(dec.lookup("114.114.114.114".parse().unwrap()).unwrap().country_str(), "CN");
-        assert_eq!(dec.lookup("2001:4860:4860::8888".parse().unwrap()).unwrap().country_str(), "US");
+        assert_eq!(
+            dec.lookup("114.114.114.114".parse().unwrap())
+                .unwrap()
+                .country_str(),
+            "CN"
+        );
+        assert_eq!(
+            dec.lookup("2001:4860:4860::8888".parse().unwrap())
+                .unwrap()
+                .country_str(),
+            "US"
+        );
     }
 
     #[test]
@@ -551,16 +570,49 @@ mod tests {
             }],
         };
 
-        let cn = GeoLookupResult { country: *b"CN", continent: "AS" };
-        let jp = GeoLookupResult { country: *b"JP", continent: "AS" };
-        let us = GeoLookupResult { country: *b"US", continent: "NA" };
-        let ru = GeoLookupResult { country: *b"RU", continent: "EU" };
+        let cn = GeoLookupResult {
+            country: *b"CN",
+            continent: "AS",
+        };
+        let jp = GeoLookupResult {
+            country: *b"JP",
+            continent: "AS",
+        };
+        let us = GeoLookupResult {
+            country: *b"US",
+            continent: "NA",
+        };
+        let ru = GeoLookupResult {
+            country: *b"RU",
+            continent: "EU",
+        };
 
-        assert_eq!(evaluate_geo_policy(&policy, Some(&cn), false), GeoDecision::Allow { suspicion_boost: 0 });
-        assert_eq!(evaluate_geo_policy(&policy, Some(&jp), false), GeoDecision::Allow { suspicion_boost: 0 });
-        assert!(matches!(evaluate_geo_policy(&policy, Some(&ru), false), GeoDecision::Challenge { suspicion_boost: 30, .. }));
-        assert!(matches!(evaluate_geo_policy(&policy, Some(&us), false), GeoDecision::Block { .. }));
-        assert!(matches!(evaluate_geo_policy(&policy, None, false), GeoDecision::Monitor { .. }));
-        assert_eq!(evaluate_geo_policy(&policy, None, true), GeoDecision::Allow { suspicion_boost: 0 });
+        assert_eq!(
+            evaluate_geo_policy(&policy, Some(&cn), false),
+            GeoDecision::Allow { suspicion_boost: 0 }
+        );
+        assert_eq!(
+            evaluate_geo_policy(&policy, Some(&jp), false),
+            GeoDecision::Allow { suspicion_boost: 0 }
+        );
+        assert!(matches!(
+            evaluate_geo_policy(&policy, Some(&ru), false),
+            GeoDecision::Challenge {
+                suspicion_boost: 30,
+                ..
+            }
+        ));
+        assert!(matches!(
+            evaluate_geo_policy(&policy, Some(&us), false),
+            GeoDecision::Block { .. }
+        ));
+        assert!(matches!(
+            evaluate_geo_policy(&policy, None, false),
+            GeoDecision::Monitor { .. }
+        ));
+        assert_eq!(
+            evaluate_geo_policy(&policy, None, true),
+            GeoDecision::Allow { suspicion_boost: 0 }
+        );
     }
 }

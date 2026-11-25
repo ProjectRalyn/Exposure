@@ -89,7 +89,9 @@ impl GeoIpManager {
         drop(st);
         let need_load = self.db.read().map(|g| g.is_empty()).unwrap_or(true);
         if need_load {
-            if let Ok(Some(loaded)) = tokio::task::spawn_blocking(move || load_cached_db(&new_dir)).await {
+            if let Ok(Some(loaded)) =
+                tokio::task::spawn_blocking(move || load_cached_db(&new_dir)).await
+            {
                 if let Ok(mut g) = self.db.write() {
                     *g = Arc::new(loaded);
                 }
@@ -178,7 +180,8 @@ impl GeoIpManager {
 
         let effective_dir = resolve_cache_dir(&st.cfg, &st.cache_dir);
         let parsed = tokio::task::spawn_blocking(move || {
-            let db = GeoIpDatabase::parse_csv_ranges(Some(&v4_csv), v6_csv.as_deref(), v4_src, now_ts);
+            let db =
+                GeoIpDatabase::parse_csv_ranges(Some(&v4_csv), v6_csv.as_deref(), v4_src, now_ts);
             if !db.is_empty() {
                 let bin_bytes = db.encode_binary();
                 let _ = write_cached_db(&effective_dir, &bin_bytes);
@@ -235,7 +238,12 @@ impl GeoIpManager {
 }
 
 fn resolve_cache_dir(cfg: &GeoIpConfig, default_dir: &Path) -> PathBuf {
-    if let Some(custom) = cfg.cache_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(custom) = cfg
+        .cache_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if !custom.contains('\0') && !custom.split(['/', '\\']).any(|seg| seg == "..") {
             return PathBuf::from(custom);
         }
@@ -246,7 +254,9 @@ fn resolve_cache_dir(cfg: &GeoIpConfig, default_dir: &Path) -> PathBuf {
 fn load_cached_db(dir: &Path) -> Option<GeoIpDatabase> {
     let path = dir.join(GEOIP_CACHE_FILENAME);
     let bytes = std::fs::read(path).ok()?;
-    GeoIpDatabase::decode_binary(&bytes).ok().filter(|db| !db.is_empty())
+    GeoIpDatabase::decode_binary(&bytes)
+        .ok()
+        .filter(|db| !db.is_empty())
 }
 
 fn write_cached_db(dir: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -266,7 +276,10 @@ fn build_url_list(custom: Option<&str>, defaults: &[&str]) -> Vec<String> {
     }
 }
 
-fn parse_and_validate_url(url: &str, allow_loopback_http: bool) -> Result<(String, u16, bool), String> {
+fn parse_and_validate_url(
+    url: &str,
+    allow_loopback_http: bool,
+) -> Result<(String, u16, bool), String> {
     let (rest, default_port, is_loopback_http) = if let Some(r) = url.strip_prefix("https://") {
         (r, 443u16, false)
     } else if allow_loopback_http
@@ -379,7 +392,8 @@ async fn fetch_first_mirror(
             }
         }
         if overflow {
-            last_err = format!("GeoIP payload from {url} exceeded {MAX_GEOIP_CSV_BYTES} byte limit");
+            last_err =
+                format!("GeoIP payload from {url} exceeded {MAX_GEOIP_CSV_BYTES} byte limit");
             continue;
         }
         if let Some(err) = stream_err {
@@ -444,11 +458,15 @@ mod tests {
         assert_eq!(snap.ipv6_ranges, 1);
 
         assert_eq!(
-            mgr.lookup("114.114.114.114".parse().unwrap()).unwrap().country_str(),
+            mgr.lookup("114.114.114.114".parse().unwrap())
+                .unwrap()
+                .country_str(),
             "CN"
         );
         assert_eq!(
-            mgr.lookup("2001:4860:4860::8888".parse().unwrap()).unwrap().country_str(),
+            mgr.lookup("2001:4860:4860::8888".parse().unwrap())
+                .unwrap()
+                .country_str(),
             "US"
         );
         // Private IPs always return None
@@ -458,7 +476,9 @@ mod tests {
         let mgr2 = GeoIpManager::new_for_test(cfg, tmp.clone());
         assert!(mgr2.is_loaded());
         assert_eq!(
-            mgr2.lookup("1.1.1.1".parse().unwrap()).unwrap().country_str(),
+            mgr2.lookup("1.1.1.1".parse().unwrap())
+                .unwrap()
+                .country_str(),
             "AU"
         );
 

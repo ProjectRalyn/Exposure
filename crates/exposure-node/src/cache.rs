@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use exposure_core::config::{NodeCacheConfig, RuleCacheConfig};
-use http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, header};
 
-use crate::egress::{full_body, ProxyBody};
+use crate::egress::{ProxyBody, full_body};
 
 const DEFAULT_CACHEABLE_STATUSES: &[u16] = &[200, 203, 204, 206, 301, 308, 404, 410];
 const MAX_VARY_HEADERS: usize = 8;
@@ -519,17 +519,15 @@ impl EdgeCache {
 
         st.enforce_limits(size_bytes, &self.evictions);
         let seq = st.alloc_seq();
-        st.buckets
-            .entry(base_key.to_string())
-            .or_default()
-            .insert(
-                vary_signature.clone(),
-                StoredItem {
-                    entry,
-                    lru_seq: seq,
-                },
-            );
-        st.lru_index.insert(seq, (base_key.to_string(), vary_signature));
+        st.buckets.entry(base_key.to_string()).or_default().insert(
+            vary_signature.clone(),
+            StoredItem {
+                entry,
+                lru_seq: seq,
+            },
+        );
+        st.lru_index
+            .insert(seq, (base_key.to_string(), vary_signature));
         st.total_bytes = st.total_bytes.saturating_add(size_bytes);
         st.total_entries += 1;
         true
@@ -608,8 +606,10 @@ impl EdgeCache {
             item.entry = Arc::clone(&refreshed);
             item.lru_seq = new_seq;
             st.lru_index.remove(&old_seq);
-            st.lru_index
-                .insert(new_seq, (base_key.to_string(), old_entry.vary_signature.clone()));
+            st.lru_index.insert(
+                new_seq,
+                (base_key.to_string(), old_entry.vary_signature.clone()),
+            );
         }
         Some(refreshed)
     }
@@ -892,7 +892,9 @@ fn sanitize_cached_headers(src: &HeaderMap) -> HeaderMap {
 
 fn strip_weak_etag(tag: &str) -> &str {
     let t = tag.trim();
-    t.strip_prefix("W/").or_else(|| t.strip_prefix("w/")).unwrap_or(t)
+    t.strip_prefix("W/")
+        .or_else(|| t.strip_prefix("w/"))
+        .unwrap_or(t)
 }
 
 fn if_none_match_matches(req_headers: &HeaderMap, cached_etag: &str) -> bool {
@@ -932,20 +934,44 @@ mod tests {
 
         let mut req_gzip = HeaderMap::new();
         req_gzip.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
-        let base_key = match cache.lookup(&policy, "web", &Method::GET, "example.com", "/app.js", &req_gzip) {
+        let base_key = match cache.lookup(
+            &policy,
+            "web",
+            &Method::GET,
+            "example.com",
+            "/app.js",
+            &req_gzip,
+        ) {
             CacheLookup::Miss { base_key } => base_key,
             other => panic!("expected Miss, got {other:?}"),
         };
 
         let mut resp_h = HeaderMap::new();
-        resp_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, s-maxage=30"));
+        resp_h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, s-maxage=30"),
+        );
         resp_h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
         resp_h.insert(header::ETAG, HeaderValue::from_static("\"v1\""));
         resp_h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        assert!(cache.store(&policy, &base_key, &req_gzip, StatusCode::OK, &resp_h, Bytes::from_static(b"gz-bytes")));
+        assert!(cache.store(
+            &policy,
+            &base_key,
+            &req_gzip,
+            StatusCode::OK,
+            &resp_h,
+            Bytes::from_static(b"gz-bytes")
+        ));
 
         // Same Accept-Encoding -> HIT
-        let hit = match cache.lookup(&policy, "web", &Method::GET, "example.com", "/app.js", &req_gzip) {
+        let hit = match cache.lookup(
+            &policy,
+            "web",
+            &Method::GET,
+            "example.com",
+            "/app.js",
+            &req_gzip,
+        ) {
             CacheLookup::Hit { entry, .. } => entry,
             other => panic!("expected Hit, got {other:?}"),
         };
@@ -955,7 +981,14 @@ mod tests {
         let mut req_br = HeaderMap::new();
         req_br.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
         assert!(matches!(
-            cache.lookup(&policy, "web", &Method::GET, "example.com", "/app.js", &req_br),
+            cache.lookup(
+                &policy,
+                "web",
+                &Method::GET,
+                "example.com",
+                "/app.js",
+                &req_br
+            ),
             CacheLookup::Miss { .. }
         ));
 
@@ -972,7 +1005,15 @@ mod tests {
         let r_head = build_response_from_cache(&hit, &Method::HEAD, &req_gzip, "HIT");
         assert_eq!(r_head.status(), StatusCode::OK);
         assert_eq!(r_head.headers().get(header::CONTENT_LENGTH).unwrap(), "8");
-        assert!(r_head.into_body().collect().await.unwrap().to_bytes().is_empty());
+        assert!(
+            r_head
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -981,13 +1022,22 @@ mod tests {
         let cache = EdgeCache::new(policy.max_memory_bytes, policy.max_entries);
 
         let mut req = HeaderMap::new();
-        req.insert(header::COOKIE, HeaderValue::from_static("_ga=1; theme=dark"));
-        req.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br"));
+        req.insert(
+            header::COOKIE,
+            HeaderValue::from_static("_ga=1; theme=dark"),
+        );
+        req.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, deflate, br"),
+        );
 
         // Identity body + explicit shared lifetime: request cookies must NOT prevent caching a
         // response the origin marked as publicly cacheable (regression: edge cache was a no-op).
         let mut resp_h = HeaderMap::new();
-        resp_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+        resp_h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
         assert!(cache.store(
             &policy,
             "web|example.com|/index.html",
@@ -997,7 +1047,14 @@ mod tests {
             Bytes::from_static(b"<html></html>"),
         ));
         assert!(matches!(
-            cache.lookup(&policy, "web", &Method::GET, "example.com", "/index.html", &req),
+            cache.lookup(
+                &policy,
+                "web",
+                &Method::GET,
+                "example.com",
+                "/index.html",
+                &req
+            ),
             CacheLookup::Hit { .. }
         ));
 
@@ -1013,7 +1070,10 @@ mod tests {
 
         // Compressed bodies still require an explicit `Vary: Accept-Encoding`.
         let mut gz_h = HeaderMap::new();
-        gz_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+        gz_h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
         gz_h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         assert!(!cache.store(
             &policy,
@@ -1047,14 +1107,24 @@ mod tests {
             CacheLookup::Bypass
         ));
         let mut ck_h = HeaderMap::new();
-        ck_h.insert(header::COOKIE, HeaderValue::from_static("theme=dark; session=abc"));
+        ck_h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("theme=dark; session=abc"),
+        );
         assert!(matches!(
             cache.lookup(&policy, "web", &Method::GET, "example.com", "/me", &ck_h),
             CacheLookup::Bypass
         ));
         // POST -> Bypass
         assert!(matches!(
-            cache.lookup(&policy, "web", &Method::POST, "example.com", "/submit", &HeaderMap::new()),
+            cache.lookup(
+                &policy,
+                "web",
+                &Method::POST,
+                "example.com",
+                "/submit",
+                &HeaderMap::new()
+            ),
             CacheLookup::Bypass
         ));
 
@@ -1062,17 +1132,44 @@ mod tests {
         let mut force_policy = policy.clone();
         force_policy.respect_cache_control = false;
         let mut sc_h = HeaderMap::new();
-        sc_h.insert(header::SET_COOKIE, HeaderValue::from_static("sid=123; HttpOnly"));
-        assert!(!cache.store(&force_policy, "k1", &HeaderMap::new(), StatusCode::OK, &sc_h, Bytes::from_static(b"ok")));
+        sc_h.insert(
+            header::SET_COOKIE,
+            HeaderValue::from_static("sid=123; HttpOnly"),
+        );
+        assert!(!cache.store(
+            &force_policy,
+            "k1",
+            &HeaderMap::new(),
+            StatusCode::OK,
+            &sc_h,
+            Bytes::from_static(b"ok")
+        ));
 
         // private & no-store refused when respect_cache_control=true
         let mut priv_h = HeaderMap::new();
-        priv_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=60"));
-        assert!(!cache.store(&policy, "k2", &HeaderMap::new(), StatusCode::OK, &priv_h, Bytes::from_static(b"ok")));
+        priv_h.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=60"),
+        );
+        assert!(!cache.store(
+            &policy,
+            "k2",
+            &HeaderMap::new(),
+            StatusCode::OK,
+            &priv_h,
+            Bytes::from_static(b"ok")
+        ));
 
         let mut ns_h = HeaderMap::new();
         ns_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        assert!(!cache.store(&policy, "k3", &HeaderMap::new(), StatusCode::OK, &ns_h, Bytes::from_static(b"ok")));
+        assert!(!cache.store(
+            &policy,
+            "k3",
+            &HeaderMap::new(),
+            StatusCode::OK,
+            &ns_h,
+            Bytes::from_static(b"ok")
+        ));
     }
 
     #[test]
@@ -1090,13 +1187,25 @@ mod tests {
         assert!(cache.store(&policy, "web|a|/1", &h, StatusCode::OK, &h, big.clone()));
         assert!(cache.store(&policy, "web|a|/2", &h, StatusCode::OK, &h, big.clone()));
         // Touch /1 so /2 becomes LRU
-        assert!(matches!(cache.lookup(&policy, "web", &Method::GET, "a", "/1", &h), CacheLookup::Hit { .. }));
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "a", "/1", &h),
+            CacheLookup::Hit { .. }
+        ));
         // Inserting /3 forces LRU eviction of /2
         assert!(cache.store(&policy, "web|a|/3", &h, StatusCode::OK, &h, big));
 
-        assert!(matches!(cache.lookup(&policy, "web", &Method::GET, "a", "/1", &h), CacheLookup::Hit { .. }));
-        assert!(matches!(cache.lookup(&policy, "web", &Method::GET, "a", "/2", &h), CacheLookup::Miss { .. }));
-        assert!(matches!(cache.lookup(&policy, "web", &Method::GET, "a", "/3", &h), CacheLookup::Hit { .. }));
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "a", "/1", &h),
+            CacheLookup::Hit { .. }
+        ));
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "a", "/2", &h),
+            CacheLookup::Miss { .. }
+        ));
+        assert!(matches!(
+            cache.lookup(&policy, "web", &Method::GET, "a", "/3", &h),
+            CacheLookup::Hit { .. }
+        ));
         assert!(cache.stats().evictions >= 1);
     }
 
@@ -1114,19 +1223,36 @@ mod tests {
         resp_h.insert(header::ETAG, HeaderValue::from_static("\"etag-1\""));
         resp_h.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=1"));
         let bk = build_base_cache_key("web", "example.com", "/data", false);
-        assert!(cache.store(&policy, &bk, &h, StatusCode::OK, &resp_h, Bytes::from_static(b"payload")));
+        assert!(cache.store(
+            &policy,
+            &bk,
+            &h,
+            StatusCode::OK,
+            &resp_h,
+            Bytes::from_static(b"payload")
+        ));
 
         // Client with Cache-Control: max-age=0 triggers Stale for revalidation
         let mut reval_req = HeaderMap::new();
         reval_req.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
-        let stale_entry = match cache.lookup(&policy, "web", &Method::GET, "example.com", "/data", &reval_req) {
+        let stale_entry = match cache.lookup(
+            &policy,
+            "web",
+            &Method::GET,
+            "example.com",
+            "/data",
+            &reval_req,
+        ) {
             CacheLookup::Stale { entry, .. } => entry,
             other => panic!("expected Stale for revalidation, got {other:?}"),
         };
 
         // Upstream responds 304 Not Modified with extended max-age=120
         let mut h304 = HeaderMap::new();
-        h304.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=120"));
+        h304.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=120"),
+        );
         let refreshed = cache
             .revalidate_304(&policy, &bk, &stale_entry, &h304)
             .expect("valid 304 should refresh entry");

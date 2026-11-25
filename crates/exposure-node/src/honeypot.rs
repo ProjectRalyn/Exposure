@@ -2,8 +2,8 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::ban::{evict_half, AutoBanManager, OffenseContext, OffenseKind};
+use crate::ban::{AutoBanManager, OffenseContext, OffenseKind, evict_half};
 use crate::egress::ProxyBody;
 use crate::logger::NodeLogger;
 use crate::waf::WafFinding;
@@ -143,7 +143,10 @@ impl Drop for BoundedEvilpotBody {
                         verification_status: sess_info.status.clone(),
                         trap_kind: "SustainedTarpitRead".to_string(),
                         detail: truncate_clean(
-                            &format!("tarpit verified on {} [service={}]", hook.host, hook.service_tag),
+                            &format!(
+                                "tarpit verified on {} [service={}]",
+                                hook.host, hook.service_tag
+                            ),
                             MAX_ITEM_CHARS,
                         ),
                         evidence: sess_info
@@ -177,10 +180,15 @@ impl Drop for BoundedEvilpotBody {
                         let logger = hook.logger;
                         let ban_file = hook.ban_file;
                         handle.spawn(async move {
-                            logger.record_evilpot_interaction(sess_info, event_info).await;
+                            logger
+                                .record_evilpot_interaction(sess_info, event_info)
+                                .await;
                             if !created_bans.is_empty() {
                                 logger.record_ban_records(created_bans).await;
-                                let _ = tokio::task::spawn_blocking(move || auto_ban.save_to_file(&ban_file)).await;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    auto_ban.save_to_file(&ban_file)
+                                })
+                                .await;
                             }
                             if let Some(msg) = alert_msg {
                                 logger.emit_alert("warning", msg).await;
@@ -415,10 +423,7 @@ impl EvilpotManager {
         let ban_snap = auto_ban.map(AutoBanManager::snapshot);
         let Some(engine) = self.engine().await else {
             let snap = ban_snap?;
-            if snap.active_ip_bans == 0
-                && snap.active_fp_bans == 0
-                && snap.total_auto_bans == 0
-            {
+            if snap.active_ip_bans == 0 && snap.active_fp_bans == 0 && snap.total_auto_bans == 0 {
                 return None;
             }
             return Some(EvilpotNodeReport {
@@ -635,13 +640,12 @@ pub fn trap_outcome_to_event_info(
     detail: &str,
 ) -> EvilpotEventInfo {
     let raw_dbg = format!("{verdict:?}");
-    let trap_kind = raw_dbg
-        .split([' ', '{', '('])
-        .next()
-        .unwrap_or(&raw_dbg);
+    let trap_kind = raw_dbg.split([' ', '{', '(']).next().unwrap_or(&raw_dbg);
     EvilpotEventInfo {
         node_tag: node_tag.to_string(),
-        timestamp_unix: session.last_seen_unix.max(Utc::now().timestamp().max(0) as u64),
+        timestamp_unix: session
+            .last_seen_unix
+            .max(Utc::now().timestamp().max(0) as u64),
         epoch_id: session.epoch_id,
         persona_hostname: truncate_clean(&session.persona_hostname, 128),
         client_ip: truncate_clean(&session.client_ip, 64),
@@ -658,10 +662,7 @@ pub fn trap_outcome_to_event_info(
     }
 }
 
-pub fn build_attack_signal(
-    finding: &WafFinding,
-    fallback_payload: Option<&str>,
-) -> AttackSignal {
+pub fn build_attack_signal(finding: &WafFinding, fallback_payload: Option<&str>) -> AttackSignal {
     let mut sig = AttackSignal::from_waf_finding(
         finding.category,
         finding.location,
@@ -718,7 +719,8 @@ mod tests {
         let mgr = EvilpotManager::new("ingress-test");
         assert!(mgr.build_report().await.is_none());
 
-        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true)
+            .await;
         let engine = mgr.engine().await.expect("evilpot engine active");
         assert!(!EvilpotManager::has_triggered_traps(&engine));
 
@@ -742,7 +744,13 @@ mod tests {
             other => panic!("expected WafVerdict::Evilpot, got {other:?}"),
         };
         assert_eq!(finding.category, "path-traversal");
-        assert!(finding.matched_payload.as_deref().unwrap_or("").contains(".env"));
+        assert!(
+            finding
+                .matched_payload
+                .as_deref()
+                .unwrap_or("")
+                .contains(".env")
+        );
 
         let permit = mgr.try_admit(attacker_ip).expect("admitted");
         let sig = build_attack_signal(&finding, Some("file=../../../../.env"));
@@ -773,13 +781,7 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {}", persona.canary_api_key)).unwrap(),
         );
         let canary_out = engine
-            .handle_canary_if_present(
-                attacker_ip,
-                "GET",
-                "/api/v1/profile",
-                None,
-                &follow_headers,
-            )
+            .handle_canary_if_present(attacker_ip, "GET", "/api/v1/profile", None, &follow_headers)
             .await
             .expect("canary replay must be caught");
         assert_eq!(
@@ -802,14 +804,16 @@ mod tests {
         assert!(!report.recent_events.is_empty());
 
         // 4. Disabling tears down engine cleanly
-        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", false).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", false)
+            .await;
         assert!(mgr.build_report().await.is_none());
     }
 
     #[tokio::test]
     async fn waf_evilpot_captures_rce_malware_ioc_in_report() {
         let mgr = EvilpotManager::new("ingress-rce");
-        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true).await;
+        mgr.reconfigure(&EvilpotNodeConfig::default(), "nginx", true)
+            .await;
         let engine = mgr.engine().await.unwrap();
 
         let waf_cfg = WafConfig {
@@ -828,14 +832,19 @@ mod tests {
         let out = engine
             .handle_attack(ip, "GET", "/ping", Some(query), &headers, sig)
             .await;
-        assert_eq!(out.session.status, ExploitVerificationStatus::VerifiedExploit);
+        assert_eq!(
+            out.session.status,
+            ExploitVerificationStatus::VerifiedExploit
+        );
 
         let report = mgr.build_report().await.unwrap();
         assert_eq!(report.sessions.len(), 1);
-        assert!(report.sessions[0]
-            .captured_iocs
-            .iter()
-            .any(|ioc| ioc.contains("http://198.51.100.200/bot.sh")));
+        assert!(
+            report.sessions[0]
+                .captured_iocs
+                .iter()
+                .any(|ioc| ioc.contains("http://198.51.100.200/bot.sh"))
+        );
     }
 
     #[test]
@@ -848,7 +857,10 @@ mod tests {
         for _ in 0..MAX_PER_IP_EVILPOT_INFLIGHT {
             held.push(mgr.try_admit(ip).expect("within per-IP concurrency limit"));
         }
-        assert!(mgr.try_admit(ip).is_none(), "5th concurrent slot must be rejected");
+        assert!(
+            mgr.try_admit(ip).is_none(),
+            "5th concurrent slot must be rejected"
+        );
         held.clear();
 
         // Fresh IP verifies exact rolling 60s interaction quota cap

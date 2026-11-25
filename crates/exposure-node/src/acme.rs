@@ -2,15 +2,15 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use exposure_core::error::{ExposureError, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use exposure_core::crypto::write_secret_file_atomic;
+use exposure_core::error::{ExposureError, Result};
 use reqwest::Client;
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -97,7 +97,9 @@ impl AcmeClient {
 
         let pub_bytes = key.public_key().as_ref();
         if pub_bytes.len() != 65 || pub_bytes[0] != 0x04 {
-            return Err(ExposureError::Crypto("unexpected P-256 public key format".into()));
+            return Err(ExposureError::Crypto(
+                "unexpected P-256 public key format".into(),
+            ));
         }
         let x = b64u(&pub_bytes[1..33]);
         let y = b64u(&pub_bytes[33..65]);
@@ -152,7 +154,11 @@ impl AcmeClient {
         Ok(())
     }
 
-    async fn jws_post(&mut self, url: &str, payload: Option<&Value>) -> Result<(reqwest::header::HeaderMap, String)> {
+    async fn jws_post(
+        &mut self,
+        url: &str,
+        payload: Option<&Value>,
+    ) -> Result<(reqwest::header::HeaderMap, String)> {
         for attempt in 0..3 {
             let protected = match &self.kid {
                 Some(kid) => json!({
@@ -194,7 +200,11 @@ impl AcmeClient {
                 .map_err(|e| ExposureError::Link(format!("ACME POST {url}: {e}")))?;
 
             let mut got_fresh_nonce = false;
-            if let Some(next_nonce) = resp.headers().get("replay-nonce").and_then(|v| v.to_str().ok()) {
+            if let Some(next_nonce) = resp
+                .headers()
+                .get("replay-nonce")
+                .and_then(|v| v.to_str().ok())
+            {
                 self.nonce = next_nonce.to_string();
                 got_fresh_nonce = true;
             }
@@ -216,9 +226,13 @@ impl AcmeClient {
                 }
                 continue;
             }
-            return Err(ExposureError::Link(format!("ACME {url} failed ({status}): {text}")));
+            return Err(ExposureError::Link(format!(
+                "ACME {url} failed ({status}): {text}"
+            )));
         }
-        Err(ExposureError::Link(format!("ACME {url} failed after nonce retry")))
+        Err(ExposureError::Link(format!(
+            "ACME {url} failed after nonce retry"
+        )))
     }
 
     async fn register_account(&mut self, contact_email: &str) -> Result<()> {
@@ -226,11 +240,15 @@ impl AcmeClient {
         if !contact_email.trim().is_empty() {
             payload["contact"] = json!([format!("mailto:{}", contact_email.trim())]);
         }
-        let (headers, _) = self.jws_post(&self.dir.new_account.clone(), Some(&payload)).await?;
+        let (headers, _) = self
+            .jws_post(&self.dir.new_account.clone(), Some(&payload))
+            .await?;
         let kid = headers
             .get("location")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| ExposureError::Protocol("ACME newAccount missing Location header".into()))?
+            .ok_or_else(|| {
+                ExposureError::Protocol("ACME newAccount missing Location header".into())
+            })?
             .to_string();
         self.kid = Some(kid);
         Ok(())
@@ -352,7 +370,9 @@ where
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        found.ok_or_else(|| ExposureError::Link(format!("ACME order finalize timed out for {domain}")))?
+        found.ok_or_else(|| {
+            ExposureError::Link(format!("ACME order finalize timed out for {domain}"))
+        })?
     };
 
     let (_, cert_pem) = client.jws_post(&cert_url, None).await?;

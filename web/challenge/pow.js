@@ -122,7 +122,7 @@ async function solveChallenge(challenge, difficulty, expiresAt) {
       if (Number.isFinite(expiresAt) && Date.now() / 1000 >= expiresAt) {
         throw new Error("Challenge expired before verification completed. Please reload.");
       }
-      metaHashes.textContent = `Hashes: ${nonce}`;
+      metaHashes.textContent = String(nonce);
       const pct = Math.min(95, Math.max(12, Math.round((nonce / expected) * 85)));
       progressBar.style.width = `${pct}%`;
       await new Promise((r) => setTimeout(r, 0));
@@ -146,13 +146,13 @@ async function run() {
       throw new Error(`Invalid challenge difficulty (${data.difficulty})`);
     }
     const expiresAt = Number(data.expires_at);
-    metaDifficulty.textContent = `Difficulty: ${difficulty} bits`;
-    statusText.textContent = "Computing verification proof…";
+    metaDifficulty.textContent = `${difficulty} bits`;
+    statusText.textContent = "Computing proof of work…";
 
     // Start BrowserLeaks + WebRTC ICE collection concurrently so it overlaps PoW solving (0ms extra wait).
     const fpPromise = collectBrowserLeaksFingerprint();
     const solved = await solveChallenge(data.token, difficulty, expiresAt);
-    metaHashes.textContent = `Hashes: ${solved.hashes}`;
+    metaHashes.textContent = String(solved.hashes);
     progressBar.style.width = "100%";
     statusText.textContent = "Proof accepted, issuing clearance…";
 

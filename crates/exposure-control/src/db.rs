@@ -2,14 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
-use exposure_core::config::{compute_release_revision, ControlRetentionConfig, NodeRoles};
+use exposure_core::config::{ControlRetentionConfig, NodeRoles, compute_release_revision};
 use exposure_core::crypto::{
-    generate_random_secret_hex, parse_verifying_key_b64, pubkey_fingerprint_b64,
+    NodeKeyPair, generate_random_secret_hex, parse_verifying_key_b64, pubkey_fingerprint_b64,
     restrict_dir_permissions_0700, restrict_file_permissions_0600, verify_passphrase_proof,
-    NodeKeyPair,
 };
 use exposure_core::{ExposureError, Result};
-use rusqlite::{params, types::Value, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -396,11 +395,9 @@ impl ControlDb {
                 .map_err(|e| ExposureError::Storage(e.to_string()))?
                 .unwrap_or(0);
             let node_max: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(config_seq), 0) FROM nodes",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COALESCE(MAX(config_seq), 0) FROM nodes", [], |r| {
+                    r.get(0)
+                })
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             Ok(u64::try_from(max_ver.max(max_rel).max(kv_seq).max(node_max)).unwrap_or(0))
         })
@@ -437,11 +434,9 @@ impl ControlDb {
                 .map_err(|e| ExposureError::Storage(e.to_string()))?
                 .unwrap_or(0);
             let node_max: i64 = tx
-                .query_row(
-                    "SELECT COALESCE(MAX(config_seq), 0) FROM nodes",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COALESCE(MAX(config_seq), 0) FROM nodes", [], |r| {
+                    r.get(0)
+                })
                 .map_err(|e| ExposureError::Storage(e.to_string()))?;
             let next_seq = max_ver.max(kv_seq).max(node_max).saturating_add(1);
             tx.execute(
@@ -637,7 +632,10 @@ impl ControlDb {
         .await
     }
 
-    pub async fn get_or_create_maintainer_keypair(&self, node_tag: &str) -> Result<(String, String)> {
+    pub async fn get_or_create_maintainer_keypair(
+        &self,
+        node_tag: &str,
+    ) -> Result<(String, String)> {
         let node_tag = node_tag.to_string();
         self.run(move |conn| {
             let tx = conn
@@ -975,11 +973,7 @@ impl ControlDb {
         success: bool,
         detail: &str,
     ) {
-        let actor: String = actor
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(64)
-            .collect();
+        let actor: String = actor.chars().filter(|c| !c.is_control()).take(64).collect();
         let action: String = action.chars().take(64).collect();
         let target: String = target
             .chars()
@@ -1344,7 +1338,10 @@ impl ControlDb {
         .await
     }
 
-    fn load_release_nodes(conn: &Connection, release_seq: u64) -> Result<Vec<ConfigReleaseNodeRecord>> {
+    fn load_release_nodes(
+        conn: &Connection,
+        release_seq: u64,
+    ) -> Result<Vec<ConfigReleaseNodeRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT release_seq, node_tag, status, error, updated_at
@@ -1423,7 +1420,10 @@ impl ControlDb {
         .await
     }
 
-    pub async fn get_config_release(&self, rev_or_seq: &str) -> Result<Option<ConfigReleaseRecord>> {
+    pub async fn get_config_release(
+        &self,
+        rev_or_seq: &str,
+    ) -> Result<Option<ConfigReleaseRecord>> {
         let key = rev_or_seq.trim().to_string();
         self.run(move |conn| {
             let mut rec: Option<ConfigReleaseRecord> = conn
@@ -1467,9 +1467,11 @@ impl ControlDb {
 
     fn collect_storage_stats_sync(conn: &Connection, db_path: &str) -> ControlStorageStats {
         let count_tbl = |tbl: &str| -> u64 {
-            conn.query_row(&format!("SELECT COUNT(*) FROM {tbl}"), [], |r| r.get::<_, i64>(0))
-                .unwrap_or(0)
-                .max(0) as u64
+            conn.query_row(&format!("SELECT COUNT(*) FROM {tbl}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+            .max(0) as u64
         };
         let (db_bytes, wal_bytes) = if db_path == ":memory:" {
             (0, 0)

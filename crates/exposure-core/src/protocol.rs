@@ -234,10 +234,14 @@ impl SpecialFrame {
             )));
         }
         if self.hop_index >= self.hops.len() {
-            return Err(ExposureError::Routing("special frame hop_index out of bounds".into()));
+            return Err(ExposureError::Routing(
+                "special frame hop_index out of bounds".into(),
+            ));
         }
         if self.ttl > MAX_TTL {
-            return Err(ExposureError::Routing("special frame ttl exceeds maximum".into()));
+            return Err(ExposureError::Routing(
+                "special frame ttl exceeds maximum".into(),
+            ));
         }
         let mut seen = std::collections::HashSet::with_capacity(self.hops.len());
         for h in &self.hops {
@@ -259,7 +263,9 @@ impl SpecialFrame {
             .checked_add(1)
             .ok_or_else(|| ExposureError::Routing("special frame hop_index overflow".into()))?;
         if next >= self.hops.len() {
-            return Err(ExposureError::Routing("special frame has no next hop".into()));
+            return Err(ExposureError::Routing(
+                "special frame has no next hop".into(),
+            ));
         }
         self.ttl -= 1;
         self.hop_index = next;
@@ -1104,7 +1110,12 @@ mod tests {
     fn hop_table_reverse_symmetry_and_overflow_safety() {
         let req = SpecialFrame::new(
             "req-1",
-            vec!["control-1".into(), "boot".into(), "relay-a".into(), "egress-1".into()],
+            vec![
+                "control-1".into(),
+                "boot".into(),
+                "relay-a".into(),
+                "egress-1".into(),
+            ],
             16,
             SpecialPayload::StatusReq,
         );
@@ -1115,10 +1126,7 @@ mod tests {
         let rep = req.reverse_for_reply(SpecialPayload::ErrorReply {
             message: "ok".into(),
         });
-        assert_eq!(
-            rep.hops,
-            vec!["egress-1", "relay-a", "boot", "control-1"]
-        );
+        assert_eq!(rep.hops, vec!["egress-1", "relay-a", "boot", "control-1"]);
         assert_eq!(rep.hop_index, 0);
 
         let bad = SpecialFrame {

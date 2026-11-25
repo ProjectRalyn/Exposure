@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use exposure_core::crs::{
-    parse_crs_conf, CrsRulesetSnapshot, WafRuleDescriptor, CRS_RULE_FILES, MAX_CRS_RULES,
+    CRS_RULE_FILES, CrsRulesetSnapshot, MAX_CRS_RULES, WafRuleDescriptor, parse_crs_conf,
 };
 use exposure_core::{ExposureError, Result};
 use serde::Deserialize;
@@ -38,7 +38,10 @@ fn is_allowed_crs_redirect_host(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
     matches!(
         h.as_str(),
-        "github.com" | "api.github.com" | "raw.githubusercontent.com" | "objects.githubusercontent.com"
+        "github.com"
+            | "api.github.com"
+            | "raw.githubusercontent.com"
+            | "objects.githubusercontent.com"
     )
 }
 
@@ -80,7 +83,10 @@ pub async fn sync_owasp_crs_from_github() -> Result<CrsRulesetSnapshot> {
             return attempt.error("too many CRS redirects");
         }
         let url = attempt.url();
-        let host_ok = url.host_str().map(is_allowed_crs_redirect_host).unwrap_or(false);
+        let host_ok = url
+            .host_str()
+            .map(is_allowed_crs_redirect_host)
+            .unwrap_or(false);
         if url.scheme() == "https" && host_ok {
             attempt.follow()
         } else {

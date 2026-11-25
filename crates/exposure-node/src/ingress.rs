@@ -1,30 +1,30 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
 use evilpot::ExploitVerificationStatus;
+use exposure_core::Result;
 use exposure_core::config::{
     AbuseIpDbAction, GeoRuleAction, GuardProfile, IngressConfig, IngressListener, WafConfig,
     WafMode,
 };
 use exposure_core::crypto::{
-    generate_random_secret_hex, is_weak_secret, short_sha256_hex, NodeKeyPair,
+    NodeKeyPair, generate_random_secret_hex, is_weak_secret, short_sha256_hex,
 };
-use exposure_core::geoip::{evaluate_geo_policy, GeoDecision};
+use exposure_core::geoip::{GeoDecision, evaluate_geo_policy};
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
 use exposure_core::routing::{
     any_rule_matches_host, canonical_ip, is_public_routable_ip, match_ingress_rule, normalize_host,
     parse_valid_host,
 };
 use exposure_core::telemetry::EvilpotNodeReport;
-use exposure_core::Result;
-use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
+use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Version, header};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
@@ -39,27 +39,27 @@ use uuid::Uuid;
 
 use crate::abuseipdb::AbuseIpDbClient;
 use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
-use crate::cache::{build_response_from_cache, CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy};
+use crate::cache::{
+    CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy, build_response_from_cache,
+};
 use crate::egress::{
-    attach_ray_id_header, capture_5xx_response_error, full_body, status_title_and_detail,
-    strip_hop_by_hop_headers, PrefixBody, ProxyBody, INTERNAL_UPSTREAM_ERR_HEADER, RAY_ID_HEADER,
+    INTERNAL_UPSTREAM_ERR_HEADER, PrefixBody, ProxyBody, RAY_ID_HEADER, attach_ray_id_header,
+    capture_5xx_response_error, full_body, status_title_and_detail, strip_hop_by_hop_headers,
 };
 use crate::forwarder::Forwarder;
 use crate::geoip::GeoIpManager;
 use crate::guard::{
-    compute_server_suspicion_score_for_mode, compute_suspicion_score, matches_api_bypass,
-    sanitize_redirect, ClientFingerprint, GuardDecision, GuardEngine,
+    ClientFingerprint, GuardDecision, GuardEngine, compute_server_suspicion_score_for_mode,
+    compute_suspicion_score, matches_api_bypass, sanitize_redirect,
 };
 use crate::honeypot::{
-    build_attack_signal, clamp_input_slice, into_proxy_response_with_ban_hook,
-    session_report_to_info, trap_outcome_to_event_info, verification_status_label, EvilpotManager,
-    TarpitBanHook, EVILPOT_HANDLE_TIMEOUT, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
+    EVILPOT_HANDLE_TIMEOUT, EvilpotManager, MAX_EVILPOT_PATH_CHARS, MAX_EVILPOT_QUERY_CHARS,
+    TarpitBanHook, build_attack_signal, clamp_input_slice, into_proxy_response_with_ban_hook,
+    session_report_to_info, trap_outcome_to_event_info, verification_status_label,
 };
 use crate::logger::{AccessLogMeta, FpServerExtras, NodeLogger};
-use crate::tls::{peek_client_hello, ClientHelloSignal, DynamicCertResolver};
-use crate::waf::{
-    is_path_exempt, should_inspect_body, CompiledCrsEngine, WafFinding, WafVerdict,
-};
+use crate::tls::{ClientHelloSignal, DynamicCertResolver, peek_client_hello};
+use crate::waf::{CompiledCrsEngine, WafFinding, WafVerdict, is_path_exempt, should_inspect_body};
 
 const MAX_CONCURRENT_INGRESS_CONNS: usize = 4096;
 const MAX_CONNS_PER_IP: usize = 128;
@@ -270,9 +270,13 @@ impl IngressServer {
         let auto_ban = Arc::new(AutoBanManager::new(&cfg.auto_ban));
         let bans_path = node_bans_path(&logger.segment_dir(), &tag);
         match auto_ban.load_from_file(&bans_path) {
-            Ok(n) if n > 0 => info!(node = %tag, loaded_bans = n, path = %bans_path.display(), "restored persisted auto-ban entries from disk"),
+            Ok(n) if n > 0 => {
+                info!(node = %tag, loaded_bans = n, path = %bans_path.display(), "restored persisted auto-ban entries from disk")
+            }
             Ok(_) => {}
-            Err(e) => warn!(node = %tag, error = %e, path = %bans_path.display(), "failed to restore persisted auto-ban entries"),
+            Err(e) => {
+                warn!(node = %tag, error = %e, path = %bans_path.display(), "failed to restore persisted auto-ban entries")
+            }
         }
         let geoip = GeoIpManager::new(cfg.geoip.clone(), logger.segment_dir().join("geoip"));
         let crs = Arc::new(CompiledCrsEngine::compile(
@@ -339,7 +343,9 @@ impl IngressServer {
     }
 
     pub async fn evilpot_report(&self) -> Option<EvilpotNodeReport> {
-        self.evilpot.build_report_with_bans(Some(&self.auto_ban)).await
+        self.evilpot
+            .build_report_with_bans(Some(&self.auto_ban))
+            .await
     }
 
     pub async fn update_config(
@@ -362,24 +368,23 @@ impl IngressServer {
             !any_cache_enabled,
         );
         let any_evilpot_enabled = ingress_enabled
-            && (cfg
-                .guards
-                .values()
-                .any(|g| {
-                    g.waf.as_ref().map(|w| w.mode == WafMode::Evilpot).unwrap_or(false)
-                        || g.geo
-                            .as_ref()
-                            .map(|gp| {
-                                gp.enabled
-                                    && (gp.deny_action == GeoRuleAction::Evilpot
-                                        || gp.default_action == GeoRuleAction::Evilpot
-                                        || gp.unknown_action == GeoRuleAction::Evilpot
-                                        || gp.rules.iter().any(|r| r.action == GeoRuleAction::Evilpot))
-                            })
-                            .unwrap_or(false)
-                })
-                || (cfg.abuseipdb.enabled
-                    && cfg.abuseipdb.high_risk_action == AbuseIpDbAction::Evilpot));
+            && (cfg.guards.values().any(|g| {
+                g.waf
+                    .as_ref()
+                    .map(|w| w.mode == WafMode::Evilpot)
+                    .unwrap_or(false)
+                    || g.geo
+                        .as_ref()
+                        .map(|gp| {
+                            gp.enabled
+                                && (gp.deny_action == GeoRuleAction::Evilpot
+                                    || gp.default_action == GeoRuleAction::Evilpot
+                                    || gp.unknown_action == GeoRuleAction::Evilpot
+                                    || gp.rules.iter().any(|r| r.action == GeoRuleAction::Evilpot))
+                        })
+                        .unwrap_or(false)
+            }) || (cfg.abuseipdb.enabled
+                && cfg.abuseipdb.high_risk_action == AbuseIpDbAction::Evilpot));
         self.evilpot
             .reconfigure(&cfg.evilpot, &cfg.server_header, any_evilpot_enabled)
             .await;
@@ -397,7 +402,9 @@ impl IngressServer {
             ))
         })
         .await
-        .map_err(|e| exposure_core::ExposureError::Config(format!("compile CRS join failed: {e}")))?;
+        .map_err(|e| {
+            exposure_core::ExposureError::Config(format!("compile CRS join failed: {e}"))
+        })?;
         *self.crs.write().await = compiled_crs;
         let desired_listeners = if ingress_enabled {
             cfg.listeners.clone()
@@ -443,7 +450,10 @@ impl IngressServer {
         Ok(())
     }
 
-    pub async fn start_listener(self: &Arc<Self>, listener_cfg: IngressListener) -> Result<SocketAddr> {
+    pub async fn start_listener(
+        self: &Arc<Self>,
+        listener_cfg: IngressListener,
+    ) -> Result<SocketAddr> {
         let key = format!(
             "{}|{}|{}",
             listener_cfg.listen_addr, listener_cfg.tls, listener_cfg.redirect_https
@@ -507,15 +517,13 @@ impl IngressServer {
                 tokio::spawn(async move {
                     if let Some(acceptor) = acceptor2 {
                         let mut hello_sig = peek_client_hello(&tcp).await;
-                        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
+                        match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                            .await
                         {
                             Ok(Ok(tls_stream)) => {
                                 // Always use authoritative rustls-negotiated SNI (never fragmented peek bytes!)
-                                let auth_sni = tls_stream
-                                    .get_ref()
-                                    .1
-                                    .server_name()
-                                    .map(normalize_host);
+                                let auth_sni =
+                                    tls_stream.get_ref().1.server_name().map(normalize_host);
                                 hello_sig.sni = auth_sni.clone();
                                 this2
                                     .serve_conn_with_permits(
@@ -803,7 +811,10 @@ impl IngressServer {
         };
 
         let status_lbl = verification_status_label(outcome.session.status);
-        if let Some(suppressed) = self.logger.should_log_warn(&format!("ep:canary:{client_ip}")) {
+        if let Some(suppressed) = self
+            .logger
+            .should_log_warn(&format!("ep:canary:{client_ip}"))
+        {
             warn!(
                 node = %self.node_tag,
                 service = %service_tag,
@@ -916,7 +927,9 @@ impl IngressServer {
             &outcome.verdict,
             &format!("{method_str} {path}"),
         );
-        self.logger.record_evilpot_interaction(sess_info, ev_info).await;
+        self.logger
+            .record_evilpot_interaction(sess_info, ev_info)
+            .await;
         let ban_hook = TarpitBanHook {
             engine: ep_engine,
             auto_ban: Arc::clone(&self.auto_ban),
@@ -995,7 +1008,14 @@ impl IngressServer {
                     log_ctx.meta("waf_block", None, finding.rule_id, Some(finding.category)),
                 )
                 .await;
-            return build_waf_block_response(&finding, false, false, ray_id, None);
+            return build_waf_block_response(
+                &finding,
+                false,
+                false,
+                ray_id,
+                None,
+                accept_encoding(headers),
+            );
         };
         let ep_engine = self
             .evilpot
@@ -1030,7 +1050,14 @@ impl IngressServer {
                     log_ctx.meta("waf_block", None, finding.rule_id, Some(finding.category)),
                 )
                 .await;
-            return build_waf_block_response(&finding, false, false, ray_id, None);
+            return build_waf_block_response(
+                &finding,
+                false,
+                false,
+                ray_id,
+                None,
+                accept_encoding(headers),
+            );
         };
         let status_lbl = verification_status_label(outcome.session.status);
         if let Some(suppressed) = self
@@ -1099,9 +1126,11 @@ impl IngressServer {
         }
         let offense_kind = match outcome.session.status {
             ExploitVerificationStatus::VerifiedExploit => OffenseKind::VerifiedExploit,
-            ExploitVerificationStatus::MultiStepExploitation => OffenseKind::MultiStepExploitation {
-                trapped_requests: outcome.session.total_trapped_requests,
-            },
+            ExploitVerificationStatus::MultiStepExploitation => {
+                OffenseKind::MultiStepExploitation {
+                    trapped_requests: outcome.session.total_trapped_requests,
+                }
+            }
             ExploitVerificationStatus::Probing => {
                 if finding.category == "scanner" || client_fp.is_scanner {
                     OffenseKind::AttackScannerProbe
@@ -1175,7 +1204,9 @@ impl IngressServer {
             &outcome.verdict,
             &format!("{method_str} {path}"),
         );
-        self.logger.record_evilpot_interaction(sess_info, ev_info).await;
+        self.logger
+            .record_evilpot_interaction(sess_info, ev_info)
+            .await;
         let ban_hook = if outcome.session.status == ExploitVerificationStatus::VerifiedExploit {
             None
         } else {
@@ -1241,6 +1272,13 @@ impl IngressServer {
         let scheme_str = if is_tls { "https" } else { "http" };
         let client_ip = canonical_ip(peer_addr.ip());
         let tls_ja3 = tls_signal.and_then(|s| s.fingerprint.as_deref());
+        // Captured once, before `req` is moved into a forwarder, so intercept pages can be gzipped.
+        let accept_enc = req
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let ua_str = req
             .headers()
             .get(header::USER_AGENT)
@@ -1314,7 +1352,11 @@ impl IngressServer {
                         false,
                         false,
                         false,
-                        Some(format!("autoban:{}:{}", ban_hit.kind.as_str(), ban_hit.reason)),
+                        Some(format!(
+                            "autoban:{}:{}",
+                            ban_hit.kind.as_str(),
+                            ban_hit.reason
+                        )),
                         None,
                         None,
                         None,
@@ -1433,7 +1475,11 @@ impl IngressServer {
             let body_redirect = if method == http::Method::POST && path == "/cdn-cgi/verify" {
                 serde_json::from_slice::<serde_json::Value>(&body_bytes)
                     .ok()
-                    .and_then(|v| v.get("redirect").and_then(|r| r.as_str()).map(sanitize_redirect))
+                    .and_then(|v| {
+                        v.get("redirect")
+                            .and_then(|r| r.as_str())
+                            .map(sanitize_redirect)
+                    })
             } else {
                 None
             };
@@ -1442,20 +1488,24 @@ impl IngressServer {
                 .unwrap_or_else(|| "/".to_string());
             let target_path_only = target_path.split('?').next().unwrap_or("/");
 
-            let matched_rule = match_ingress_rule(&cfg.rules, &host, target_path_only, client_ip, auth_sni)
-                .or_else(|| match_ingress_rule(&cfg.rules, &host, "/", client_ip, auth_sni))
-                .or_else(|| {
-                    cfg.rules.iter().find(|r| {
-                        r.r#match
-                            .host
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|pat| !pat.is_empty())
-                            .map(|pat| exposure_core::routing::host_matches(pat, &host))
-                            .unwrap_or(false)
-                    })
-                });
-            if matched_rule.is_none() && !cfg.rules.is_empty() && !any_rule_matches_host(&cfg.rules, &host) {
+            let matched_rule =
+                match_ingress_rule(&cfg.rules, &host, target_path_only, client_ip, auth_sni)
+                    .or_else(|| match_ingress_rule(&cfg.rules, &host, "/", client_ip, auth_sni))
+                    .or_else(|| {
+                        cfg.rules.iter().find(|r| {
+                            r.r#match
+                                .host
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|pat| !pat.is_empty())
+                                .map(|pat| exposure_core::routing::host_matches(pat, &host))
+                                .unwrap_or(false)
+                        })
+                    });
+            if matched_rule.is_none()
+                && !cfg.rules.is_empty()
+                && !any_rule_matches_host(&cfg.rules, &host)
+            {
                 return Response::builder()
                     .status(StatusCode::MISDIRECTED_REQUEST)
                     .body(full_body("421 Misdirected Request"))
@@ -1482,6 +1532,7 @@ impl IngressServer {
                             false,
                             &ray_id,
                             cfg.pages.error_html.as_deref(),
+                            accept_encoding(&headers),
                         );
                     }
                     GuardDecision::Reject { status, .. } => {
@@ -1495,9 +1546,11 @@ impl IngressServer {
                 }
                 if !is_cdn_cgi_bypassed {
                     if let Some(gp) = profile.geo.as_ref().filter(|gp| gp.enabled) {
-                        if let GeoDecision::Block { .. } =
-                            evaluate_geo_policy(gp, local_geo.as_ref(), !is_public_routable_ip(client_ip))
-                        {
+                        if let GeoDecision::Block { .. } = evaluate_geo_policy(
+                            gp,
+                            local_geo.as_ref(),
+                            !is_public_routable_ip(client_ip),
+                        ) {
                             return Response::builder()
                                 .status(StatusCode::FORBIDDEN)
                                 .header(header::CACHE_CONTROL, "no-store")
@@ -1517,6 +1570,7 @@ impl IngressServer {
                         false,
                         &ray_id,
                         cfg.pages.error_html.as_deref(),
+                        accept_encoding(&headers),
                     );
                 }
             }
@@ -1812,6 +1866,7 @@ impl IngressServer {
                             &ray_id,
                             rule.effective_intercept_errors(),
                             cfg.pages.error_html.as_deref(),
+                            &accept_enc,
                         );
                     }
                 }
@@ -1842,8 +1897,12 @@ impl IngressServer {
         if let Some(ref gd) = geo_eval {
             let b = match gd {
                 GeoDecision::Allow { suspicion_boost }
-                | GeoDecision::Monitor { suspicion_boost, .. }
-                | GeoDecision::Challenge { suspicion_boost, .. } => *suspicion_boost,
+                | GeoDecision::Monitor {
+                    suspicion_boost, ..
+                }
+                | GeoDecision::Challenge {
+                    suspicion_boost, ..
+                } => *suspicion_boost,
                 GeoDecision::Block { .. } | GeoDecision::Evilpot { .. } => 0,
             };
             geo_score_boost = b;
@@ -1928,6 +1987,7 @@ impl IngressServer {
                         rule.effective_intercept_errors(),
                         &ray_id,
                         cfg.pages.error_html.as_deref(),
+                        &accept_enc,
                     );
                 }
                 GuardDecision::Reject { status, reason } => {
@@ -2097,7 +2157,7 @@ impl IngressServer {
                                 &client_ip.to_string(),
                                 &fallback_fp_hash,
                                 false,
-                               "none",
+                                "none",
                                 &ua_str,
                                 &al_str,
                                 client_fp.device_type,
@@ -2133,7 +2193,9 @@ impl IngressServer {
                             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
                             .header(header::CACHE_CONTROL, "no-store")
                             .header(RAY_ID_HEADER, &ray_id)
-                            .body(full_body(r#"{"error":"verification_required","reason":"geo_challenge"}"#))
+                            .body(full_body(
+                                r#"{"error":"verification_required","reason":"geo_challenge"}"#,
+                            ))
                             .unwrap();
                     }
                 }
@@ -2220,12 +2282,8 @@ impl IngressServer {
 
                     // 2. WAF inspection (pure linear-time OWASP CRS ruleset)
                     let crs_engine = Arc::clone(&*self.crs.read().await);
-                    let mut verdict = crs_engine.inspect_head(
-                        waf_cfg,
-                        &path,
-                        req.uri().query(),
-                        req.headers(),
-                    );
+                    let mut verdict =
+                        crs_engine.inspect_head(waf_cfg, &path, req.uri().query(), req.headers());
                     // 3. Unambiguous offensive vulnerability scanner UA (e.g. sqlmap, nikto, nuclei, ffuf)
                     if matches!(verdict, WafVerdict::Allow)
                         && client_fp.is_scanner
@@ -2265,8 +2323,7 @@ impl IngressServer {
                             )
                             .await
                             .map_err(|_| ())
-                            .and_then(|res| res.map_err(|_| ()))
-                            else {
+                            .and_then(|res| res.map_err(|_| ())) else {
                                 self.logger
                                     .record_access_log(
                                         "ingress",
@@ -2284,7 +2341,12 @@ impl IngressServer {
                                         Some(client_fp.browser_family.to_string()),
                                         Some(client_fp.os_family.to_string()),
                                         false,
-                                        log_ctx.meta("waf_overload", None, None, Some("waf-overload")),
+                                        log_ctx.meta(
+                                            "waf_overload",
+                                            None,
+                                            None,
+                                            Some("waf-overload"),
+                                        ),
                                     )
                                     .await;
                                 return build_ingress_5xx_response(
@@ -2292,6 +2354,7 @@ impl IngressServer {
                                     &ray_id,
                                     rule.effective_intercept_errors(),
                                     cfg.pages.error_html.as_deref(),
+                                    &accept_enc,
                                 );
                             };
                             match buffer_prefix_for_waf(req, body_limit).await {
@@ -2324,7 +2387,12 @@ impl IngressServer {
                                             Some(client_fp.browser_family.to_string()),
                                             Some(client_fp.os_family.to_string()),
                                             false,
-                                            log_ctx.meta("waf_block", None, None, Some("slow-post")),
+                                            log_ctx.meta(
+                                                "waf_block",
+                                                None,
+                                                None,
+                                                Some("slow-post"),
+                                            ),
                                         )
                                         .await;
                                     return Response::builder()
@@ -2352,7 +2420,12 @@ impl IngressServer {
                                             Some(client_fp.browser_family.to_string()),
                                             Some(client_fp.os_family.to_string()),
                                             false,
-                                            log_ctx.meta("waf_block", None, None, Some("protocol-attack")),
+                                            log_ctx.meta(
+                                                "waf_block",
+                                                None,
+                                                None,
+                                                Some("protocol-attack"),
+                                            ),
                                         )
                                         .await;
                                     return Response::builder()
@@ -2370,10 +2443,10 @@ impl IngressServer {
                         WafVerdict::Allow => {}
                         WafVerdict::Monitor(finding) => {
                             waf_monitor_hit = Some((finding.rule_id, finding.category));
-                            if let Some(suppressed) = self
-                                .logger
-                                .should_log_warn(&format!("waf:mon:{}:{}", rule.service_tag, finding.category))
-                            {
+                            if let Some(suppressed) = self.logger.should_log_warn(&format!(
+                                "waf:mon:{}:{}",
+                                rule.service_tag, finding.category
+                            )) {
                                 warn!(
                                     node = %self.node_tag,
                                     service = %rule.service_tag,
@@ -2391,10 +2464,10 @@ impl IngressServer {
                             }
                         }
                         WafVerdict::Block(finding) => {
-                            if let Some(suppressed) = self
-                                .logger
-                                .should_log_warn(&format!("waf:blk:{}:{}", client_ip, finding.category))
-                            {
+                            if let Some(suppressed) = self.logger.should_log_warn(&format!(
+                                "waf:blk:{}:{}",
+                                client_ip, finding.category
+                            )) {
                                 warn!(
                                     node = %self.node_tag,
                                     service = %rule.service_tag,
@@ -2411,11 +2484,12 @@ impl IngressServer {
                                 );
                             }
                             let reason = finding.telemetry_reason();
-                            let offense_kind = if finding.category == "scanner" || client_fp.is_scanner {
-                                OffenseKind::AttackScannerProbe
-                            } else {
-                                OffenseKind::WafAttackProbe
-                            };
+                            let offense_kind =
+                                if finding.category == "scanner" || client_fp.is_scanner {
+                                    OffenseKind::AttackScannerProbe
+                                } else {
+                                    OffenseKind::WafAttackProbe
+                                };
                             self.record_offense_and_maybe_alert(
                                 &rule.service_tag,
                                 &host,
@@ -2483,6 +2557,7 @@ impl IngressServer {
                                 is_browser_navigation(req.method(), req.headers()),
                                 &ray_id,
                                 cfg.pages.error_html.as_deref(),
+                                accept_encoding(req.headers()),
                             );
                         }
                         WafVerdict::Evilpot(finding) => {
@@ -2794,7 +2869,12 @@ impl IngressServer {
                                         Some(client_fp.browser_family.to_string()),
                                         Some(client_fp.os_family.to_string()),
                                         false,
-                                        log_ctx.meta("abuseipdb", None, None, Some("ip-reputation")),
+                                        log_ctx.meta(
+                                            "abuseipdb",
+                                            None,
+                                            None,
+                                            Some("ip-reputation"),
+                                        ),
                                     )
                                     .await;
                                 if !is_nav {
@@ -3018,7 +3098,10 @@ impl IngressServer {
                         if let Some(ref fp_token) = fp_inject_token {
                             resp = maybe_inject_fp_beacon(resp, fp_token, &self.buffer_sem).await;
                         }
-                        if !client_fp.is_scanner && suspicion_score < 50 && resp.status().as_u16() < 400 {
+                        if !client_fp.is_scanner
+                            && suspicion_score < 50
+                            && resp.status().as_u16() < 400
+                        {
                             self.auto_ban.record_benign_request_with_js_fp(
                                 client_ip,
                                 tls_ja3,
@@ -3196,7 +3279,8 @@ impl IngressServer {
 
         let mesh_stream = match tokio::time::timeout(
             MESH_PROXY_TIMEOUT,
-            self.forwarder.open_service_stream(&rule.next_peer, stream_hdr),
+            self.forwarder
+                .open_service_stream(&rule.next_peer, stream_hdr),
         )
         .await
         {
@@ -3273,6 +3357,7 @@ impl IngressServer {
                     &ray_id,
                     rule.effective_intercept_errors(),
                     cfg.pages.error_html.as_deref(),
+                    &accept_enc,
                 );
             }
             Err(_) => {
@@ -3337,6 +3422,7 @@ impl IngressServer {
                     &ray_id,
                     rule.effective_intercept_errors(),
                     cfg.pages.error_html.as_deref(),
+                    &accept_enc,
                 );
             }
         };
@@ -3364,15 +3450,17 @@ impl IngressServer {
                             Ok(Err(e)) => {
                                 Err((StatusCode::BAD_GATEWAY, format!("mesh h2 send: {e}")))
                             }
-                            Err(_) => {
-                                Err((StatusCode::GATEWAY_TIMEOUT, "mesh h2 request timed out".into()))
-                            }
+                            Err(_) => Err((
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "mesh h2 request timed out".into(),
+                            )),
                         }
                     }
                     Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("mesh h2 handshake: {e}"))),
-                    Err(_) => {
-                        Err((StatusCode::GATEWAY_TIMEOUT, "mesh h2 handshake timed out".into()))
-                    }
+                    Err(_) => Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "mesh h2 handshake timed out".into(),
+                    )),
                 }
             } else {
                 *req.version_mut() = Version::HTTP_11;
@@ -3432,9 +3520,10 @@ impl IngressServer {
                             )),
                         }
                     }
-                    Ok(Err(e)) => {
-                        Err((StatusCode::BAD_GATEWAY, format!("mesh http1 handshake: {e}")))
-                    }
+                    Ok(Err(e)) => Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("mesh http1 handshake: {e}"),
+                    )),
                     Err(_) => Err((
                         StatusCode::GATEWAY_TIMEOUT,
                         "mesh http1 handshake timed out".into(),
@@ -3569,6 +3658,7 @@ impl IngressServer {
                             &ray_id,
                             true,
                             cfg.pages.error_html.as_deref(),
+                            &accept_enc,
                         );
                     }
                     Some(err_msg)
@@ -3705,10 +3795,19 @@ impl IngressServer {
                     &ray_id,
                     rule.effective_intercept_errors(),
                     cfg.pages.error_html.as_deref(),
+                    &accept_enc,
                 )
             }
         }
     }
+}
+
+/// Client `Accept-Encoding`, used to gzip locally rendered intercept pages.
+fn accept_encoding(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
 fn build_ingress_5xx_response(
@@ -3716,6 +3815,7 @@ fn build_ingress_5xx_response(
     ray_id: &str,
     intercept_errors: bool,
     error_html_template: Option<&str>,
+    accept_enc: &str,
 ) -> Response<ProxyBody> {
     let (title, detail) = status_title_and_detail(status);
     if intercept_errors {
@@ -3727,13 +3827,19 @@ fn build_ingress_5xx_response(
             ray_id,
             None,
         );
-        return Response::builder()
+        // The built-in page inlines a ~64 KiB SVG; gzip keeps the intercept path cheap in bytes.
+        let (body, encoding) =
+            exposure_core::assets::maybe_gzip_body(html.into_bytes(), accept_enc);
+        let mut builder = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
             .header(RAY_ID_HEADER, ray_id)
-            .body(full_body(html))
-            .unwrap();
+            .header(header::VARY, "Accept-Encoding");
+        if let Some(encoding) = encoding {
+            builder = builder.header(header::CONTENT_ENCODING, encoding);
+        }
+        return builder.body(full_body(body)).unwrap();
     }
     Response::builder()
         .status(status)
@@ -3849,9 +3955,7 @@ async fn maybe_inject_fp_beacon(
         .and_then(|v| v.to_str().ok())
         .map(|ct| {
             let ct_l = ct.to_ascii_lowercase();
-            ct_l.starts_with("text/html")
-                && !ct_l.contains("utf-16")
-                && !ct_l.contains("utf-32")
+            ct_l.starts_with("text/html") && !ct_l.contains("utf-16") && !ct_l.contains("utf-32")
         })
         .unwrap_or(false);
     if !is_safe_html {
@@ -3909,9 +4013,7 @@ async fn maybe_inject_fp_beacon(
         return Response::from_parts(parts, chained.boxed());
     }
 
-    let snippet = format!(
-        r#"<script defer src="/cdn-cgi/fp.js" data-t="{fp_token}"></script>"#
-    );
+    let snippet = format!(r#"<script defer src="/cdn-cgi/fp.js" data-t="{fp_token}"></script>"#);
     let injected = inject_script_into_html(&collected, snippet.as_bytes());
     parts.headers.remove(header::ETAG);
     parts.headers.remove(header::LAST_MODIFIED);
@@ -3922,10 +4024,9 @@ async fn maybe_inject_fp_beacon(
     }
     // Use `no-store` so browsers NEVER cache HTML containing a single-use `data-t` token
     // (otherwise reload -> 304 Not Modified replays the spent token and triggers 403).
-    parts.headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Response::from_parts(parts, full_body(injected))
 }
 
@@ -3933,9 +4034,11 @@ fn rfind_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> Option<
     if needle_lower.is_empty() || haystack.len() < needle_lower.len() {
         return None;
     }
-    haystack
-        .windows(needle_lower.len())
-        .rposition(|w| w.iter().zip(needle_lower).all(|(a, b)| a.to_ascii_lowercase() == *b))
+    haystack.windows(needle_lower.len()).rposition(|w| {
+        w.iter()
+            .zip(needle_lower)
+            .all(|(a, b)| a.to_ascii_lowercase() == *b)
+    })
 }
 
 fn inject_script_into_html(html: &[u8], snippet: &[u8]) -> Vec<u8> {
@@ -4091,6 +4194,7 @@ fn build_waf_block_response(
     browser_nav: bool,
     ray_id: &str,
     error_html_template: Option<&str>,
+    accept_enc: &str,
 ) -> Response<ProxyBody> {
     if intercept_errors && browser_nav {
         let html = exposure_core::assets::render_exposure_error_html_with_template(
@@ -4101,14 +4205,19 @@ fn build_waf_block_response(
             ray_id,
             None,
         );
-        return Response::builder()
+        let (body, encoding) =
+            exposure_core::assets::maybe_gzip_body(html.into_bytes(), accept_enc);
+        let mut builder = Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
             .header("x-exposure-waf", "BLOCK")
             .header("x-exposure-ray", ray_id)
-            .body(full_body(html))
-            .unwrap();
+            .header(header::VARY, "Accept-Encoding");
+        if let Some(encoding) = encoding {
+            builder = builder.header(header::CONTENT_ENCODING, encoding);
+        }
+        return builder.body(full_body(body)).unwrap();
     }
     let body = serde_json::json!({
         "error": "waf_blocked",
@@ -4133,6 +4242,7 @@ fn build_rate_limit_response(
     intercept_errors: bool,
     ray_id: &str,
     error_html_template: Option<&str>,
+    accept_enc: &str,
 ) -> Response<ProxyBody> {
     if intercept_errors && show_error_page {
         let html = exposure_core::assets::render_exposure_error_html_with_template(
@@ -4143,14 +4253,19 @@ fn build_rate_limit_response(
             ray_id,
             Some(retry_after_secs),
         );
-        return Response::builder()
+        let (body, encoding) =
+            exposure_core::assets::maybe_gzip_body(html.into_bytes(), accept_enc);
+        let mut builder = Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .header(header::RETRY_AFTER, retry_after_secs.to_string())
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CACHE_CONTROL, "no-store")
             .header(RAY_ID_HEADER, ray_id)
-            .body(full_body(html))
-            .unwrap();
+            .header(header::VARY, "Accept-Encoding");
+        if let Some(encoding) = encoding {
+            builder = builder.header(header::CONTENT_ENCODING, encoding);
+        }
+        return builder.body(full_body(body)).unwrap();
     }
     let body = if show_error_page {
         "Too Many Requests"
@@ -4171,7 +4286,10 @@ fn is_browser_navigation(method: &http::Method, headers: &http::HeaderMap) -> bo
     if method != http::Method::GET && method != http::Method::HEAD {
         return false;
     }
-    if let Some(xrw) = headers.get("x-requested-with").and_then(|v| v.to_str().ok()) {
+    if let Some(xrw) = headers
+        .get("x-requested-with")
+        .and_then(|v| v.to_str().ok())
+    {
         if xrw.eq_ignore_ascii_case("xmlhttprequest") {
             return false;
         }
@@ -4205,7 +4323,7 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_response_degrades_after_initial_error_pages() {
-        let html_resp = build_rate_limit_response(5, true, true, "ray1", None);
+        let html_resp = build_rate_limit_response(5, true, true, "ray1", None, "");
         assert_eq!(html_resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             html_resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -4221,6 +4339,7 @@ mod tests {
             true,
             "rayc",
             Some("<html>custom {{status}} {{ray_id}}</html>"),
+            "",
         );
         let custom_bytes = custom_resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
@@ -4228,14 +4347,37 @@ mod tests {
             "<html>custom 429 rayc</html>"
         );
 
-        let degraded_resp = build_rate_limit_response(5, false, true, "ray2", None);
+        let degraded_resp = build_rate_limit_response(5, false, true, "ray2", None, "");
         assert_eq!(degraded_resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             degraded_resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/plain; charset=utf-8"
         );
-        let degraded_bytes = degraded_resp.into_body().collect().await.unwrap().to_bytes();
+        let degraded_bytes = degraded_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
         assert_eq!(&degraded_bytes[..], b"429");
+    }
+
+    #[tokio::test]
+    async fn intercept_page_is_gzipped_only_when_client_accepts_it() {
+        let plain = build_rate_limit_response(5, true, true, "ray-gz", None, "");
+        assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            plain.headers().get(header::VARY).unwrap(),
+            "Accept-Encoding"
+        );
+
+        let gz = build_rate_limit_response(5, true, true, "ray-gz", None, "gzip, deflate");
+        assert_eq!(gz.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        let body = gz.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..2], &[0x1f, 0x8b]);
+
+        let refused = build_rate_limit_response(5, true, true, "ray-gz", None, "gzip;q=0");
+        assert!(refused.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[tokio::test]
@@ -4249,7 +4391,7 @@ mod tests {
             rule_id: None,
             rule_msg: None,
         };
-        let api_resp = build_waf_block_response(&finding, true, false, "raywaf1", None);
+        let api_resp = build_waf_block_response(&finding, true, false, "raywaf1", None, "");
         assert_eq!(api_resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(api_resp.headers().get("x-exposure-waf").unwrap(), "BLOCK");
         assert_eq!(
@@ -4268,6 +4410,7 @@ mod tests {
             true,
             "raywaf2",
             Some("<html>blocked {{status}} {{ray_id}}</html>"),
+            "",
         );
         assert_eq!(html_resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(
@@ -4292,7 +4435,11 @@ mod tests {
             Ok(Frame::data(Bytes::from_static(b"1234567890"))),
         ];
         let body: ProxyBody = StreamBody::new(iter(chunks)).boxed();
-        let req = Request::builder().method("POST").uri("/submit").body(body).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .body(body)
+            .unwrap();
 
         // Limit smaller than total body -> inspects first 10 bytes, preserves entire 22 bytes on rebuilt req
         let (rebuilt, inspected) = buffer_prefix_for_waf(req, 10).await.unwrap();
@@ -4440,7 +4587,10 @@ mod tests {
             .unwrap();
         assert_eq!(r2.status(), 200);
 
-        let report = server.evilpot_report().await.expect("evilpot report active");
+        let report = server
+            .evilpot_report()
+            .await
+            .expect("evilpot report active");
         assert_eq!(report.canary_verifications, 1);
         assert_eq!(report.verified_attack_sessions, 1);
         assert_eq!(report.sessions.len(), 1);
@@ -4617,7 +4767,9 @@ mod tests {
         // 2. XSS reflects payload and sets admin_session_id; replaying admin_session_id even WITHOUT
         // Accept-Language / Sec-Fetch-Mode (which would normally trigger Guard 302 /cdn-cgi/) returns 200 Admin Console!
         let xss_r = client
-            .get(format!("{base}/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"))
+            .get(format!(
+                "{base}/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+            ))
             .header("Host", "victim.test")
             .header("User-Agent", browser_ua)
             .header("Accept", "text/html")
@@ -4651,7 +4803,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(replay_r.status(), 200, "replayed admin_session_id must not 302 to /cdn-cgi/");
+        assert_eq!(
+            replay_r.status(),
+            200,
+            "replayed admin_session_id must not 302 to /cdn-cgi/"
+        );
         let admin_html = replay_r.text().await.unwrap();
         assert!(admin_html.contains("Admin Console"));
 
@@ -4739,8 +4895,10 @@ mod tests {
             cache_ttl_secs: 3600,
             ..Default::default()
         };
-        let abuse_client =
-            AbuseIpDbClient::with_endpoint(abuse_cfg.clone(), format!("http://{abuse_addr}/api/v2/check"));
+        let abuse_client = AbuseIpDbClient::with_endpoint(
+            abuse_cfg.clone(),
+            format!("http://{abuse_addr}/api/v2/check"),
+        );
 
         let mut guards = BTreeMap::new();
         guards.insert(
@@ -4803,8 +4961,15 @@ mod tests {
         let mut raw_resp1 = Vec::new();
         r1.read_to_end(&mut raw_resp1).await.unwrap();
         let resp1_str = String::from_utf8_lossy(&raw_resp1);
-        assert!(resp1_str.starts_with("HTTP/1.1 404"), "expected 404, got: {resp1_str}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "first appearance must query AbuseIPDB");
+        assert!(
+            resp1_str.starts_with("HTTP/1.1 404"),
+            "expected 404, got: {resp1_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "first appearance must query AbuseIPDB"
+        );
 
         // 2. Second request (Guard 403 on curl) uses cache (hits stays 1) and keeps abuse_score=88 in fingerprint
         let (client_io2, server_io2) = tokio::io::duplex(8192);
@@ -4820,11 +4985,22 @@ mod tests {
         let mut raw_resp2 = Vec::new();
         r2.read_to_end(&mut raw_resp2).await.unwrap();
         let resp2_str = String::from_utf8_lossy(&raw_resp2);
-        assert!(resp2_str.starts_with("HTTP/1.1 403"), "expected 403, got: {resp2_str}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "second request must hit AbuseIPDB cache");
+        assert!(
+            resp2_str.starts_with("HTTP/1.1 403"),
+            "expected 403, got: {resp2_str}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second request must hit AbuseIPDB cache"
+        );
 
         let (_, _, fps) = logger.drain_for_maintainer().await;
-        assert_eq!(fps.len(), 2, "expected fingerprints for both 404 and Guard 403");
+        assert_eq!(
+            fps.len(),
+            2,
+            "expected fingerprints for both 404 and Guard 403"
+        );
         for fp in &fps {
             assert_eq!(fp.abuse_score, Some(88));
             assert_eq!(fp.abuse_country.as_deref(), Some("US"));
@@ -4836,7 +5012,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_browser_clients_pass_while_attacks_tarpit_confirm_and_autoban_ip_and_fingerprint() {
+    async fn non_browser_clients_pass_while_attacks_tarpit_confirm_and_autoban_ip_and_fingerprint()
+    {
         use exposure_core::config::{
             AntibotMode, AutoBanConfig, EgressConfig, GuardProfile, IngressRule, LoggerConfig,
             NodeRoles, RelayConfig, RuleMatch, SegmentConfig, WafConfig,
@@ -5163,7 +5340,8 @@ mod tests {
         let send_raw = |srv: Arc<IngressServer>, peer: SocketAddr, raw_req: String| async move {
             let (client_io, server_io) = tokio::io::duplex(16384);
             tokio::spawn(async move {
-                srv.serve_conn(server_io, peer, false, false, None, None).await;
+                srv.serve_conn(server_io, peer, false, false, None, None)
+                    .await;
             });
             let (mut r, mut w) = tokio::io::split(client_io);
             w.write_all(raw_req.as_bytes()).await.unwrap();
@@ -5187,7 +5365,10 @@ mod tests {
             "GET /unknown-route?foo=bar HTTP/1.1\r\nHost: unknown.example.test\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n".into(),
         )
         .await;
-        assert!(unmatched_resp.starts_with("HTTP/1.1 421"), "{unmatched_resp}");
+        assert!(
+            unmatched_resp.starts_with("HTTP/1.1 421"),
+            "{unmatched_resp}"
+        );
 
         // 3. Attack payload -> Evilpot diversion logged with `action = "evilpot"` & `waf_category`
         let _ = send_raw(
@@ -5198,7 +5379,11 @@ mod tests {
         .await;
 
         let (records, _summaries, _fps) = logger.drain_for_maintainer().await;
-        assert!(records.len() >= 3, "expected >=3 URL log records, got {}", records.len());
+        assert!(
+            records.len() >= 3,
+            "expected >=3 URL log records, got {}",
+            records.len()
+        );
 
         let r_orders = records
             .iter()
@@ -5213,7 +5398,13 @@ mod tests {
             r_orders.referer.as_deref(),
             Some("https://app.example.test/checkout")
         );
-        assert!(r_orders.ray_id.as_deref().map(|s| !s.is_empty()).unwrap_or(false));
+        assert!(
+            r_orders
+                .ray_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        );
 
         let r_unmatched = records
             .iter()
@@ -5272,7 +5463,10 @@ mod tests {
         );
         let (fwd, _rx) = Forwarder::new(
             "ing-geo",
-            NodeRoles { ingress: true, ..Default::default() },
+            NodeRoles {
+                ingress: true,
+                ..Default::default()
+            },
             RelayConfig::default(),
             lm,
             egress,
@@ -5350,19 +5544,22 @@ mod tests {
 9.9.9.0,9.9.9.255,CH
 114.114.114.0,114.114.115.255,CN
 ";
-        server.geoip().set_database_for_test(GeoIpDatabase::parse_csv_ranges(
-            Some(v4_csv),
-            None,
-            "test",
-            1_700_000_000,
-        ));
+        server
+            .geoip()
+            .set_database_for_test(GeoIpDatabase::parse_csv_ranges(
+                Some(v4_csv),
+                None,
+                "test",
+                1_700_000_000,
+            ));
 
         let send_browser = |srv: Arc<IngressServer>, ip: &str| {
             let addr: SocketAddr = format!("{ip}:42000").parse().unwrap();
             async move {
                 let (client_io, server_io) = tokio::io::duplex(16384);
                 tokio::spawn(async move {
-                    srv.serve_conn(server_io, addr, false, false, None, None).await;
+                    srv.serve_conn(server_io, addr, false, false, None, None)
+                        .await;
                 });
                 let (mut r, mut w) = tokio::io::split(client_io);
                 w.write_all(b"GET /.env HTTP/1.1\r\nHost: geo.example.test\r\nUser-Agent: Mozilla/5.0 Chrome/126\r\nAccept: text/html\r\nSec-Fetch-Mode: navigate\r\nConnection: close\r\n\r\n")
@@ -5376,27 +5573,60 @@ mod tests {
 
         // 1. AU (1.1.1.1) -> geo_block (403)
         let r_au = send_browser(Arc::clone(&server), "1.1.1.1").await;
-        assert!(r_au.starts_with("HTTP/1.1 403"), "expected AU 403, got: {r_au}");
+        assert!(
+            r_au.starts_with("HTTP/1.1 403"),
+            "expected AU 403, got: {r_au}"
+        );
 
         // 2. US (8.8.8.8) -> geo_challenge (302 /cdn-cgi/)
         let r_us = send_browser(Arc::clone(&server), "8.8.8.8").await;
-        assert!(r_us.starts_with("HTTP/1.1 302"), "expected US 302 challenge, got: {r_us}");
+        assert!(
+            r_us.starts_with("HTTP/1.1 302"),
+            "expected US 302 challenge, got: {r_us}"
+        );
 
         // 3. CH (9.9.9.9) -> geo_evilpot (200 decoy)
         let r_ch = send_browser(Arc::clone(&server), "9.9.9.9").await;
-        assert!(r_ch.starts_with("HTTP/1.1 200"), "expected CH evilpot 200, got: {r_ch}");
+        assert!(
+            r_ch.starts_with("HTTP/1.1 200"),
+            "expected CH evilpot 200, got: {r_ch}"
+        );
 
         // 4. CN (114.114.114.114) -> Allowed past GeoIP -> misses peer -> 502 with CN country logged
         let r_cn = send_browser(Arc::clone(&server), "114.114.114.114").await;
-        assert!(r_cn.starts_with("HTTP/1.1 502"), "expected CN 502 past Geo, got: {r_cn}");
+        assert!(
+            r_cn.starts_with("HTTP/1.1 502"),
+            "expected CN 502 past Geo, got: {r_cn}"
+        );
 
         let (recs, _, fps) = logger.drain_for_maintainer().await;
-        assert!(recs.iter().any(|r| r.client_country.as_deref() == Some("AU") && r.action.as_deref() == Some("geo_block")));
-        assert!(recs.iter().any(|r| r.client_country.as_deref() == Some("US") && r.action.as_deref() == Some("geo_challenge")));
-        assert!(recs.iter().any(|r| r.client_country.as_deref() == Some("CH") && r.action.as_deref() == Some("geo_evilpot")));
-        assert!(recs.iter().any(|r| r.client_country.as_deref() == Some("CN")));
-        assert!(fps.iter().any(|f| f.geo_country.as_deref() == Some("AU") && f.geo_continent.as_deref() == Some("OC")));
-        assert!(fps.iter().any(|f| f.geo_country.as_deref() == Some("US") && f.geo_continent.as_deref() == Some("NA")));
+        assert!(
+            recs.iter()
+                .any(|r| r.client_country.as_deref() == Some("AU")
+                    && r.action.as_deref() == Some("geo_block"))
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.client_country.as_deref() == Some("US")
+                    && r.action.as_deref() == Some("geo_challenge"))
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.client_country.as_deref() == Some("CH")
+                    && r.action.as_deref() == Some("geo_evilpot"))
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.client_country.as_deref() == Some("CN"))
+        );
+        assert!(
+            fps.iter().any(|f| f.geo_country.as_deref() == Some("AU")
+                && f.geo_continent.as_deref() == Some("OC"))
+        );
+        assert!(
+            fps.iter().any(|f| f.geo_country.as_deref() == Some("US")
+                && f.geo_continent.as_deref() == Some("NA"))
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -5623,12 +5853,23 @@ mod tests {
         )
         .await;
         assert!(waf_resp.starts_with("HTTP/1.1 403"), "{waf_resp}");
-        let waf_ray = extract_header(&waf_resp, "x-exposure-ray").expect("missing ray header on waf 403");
+        let waf_ray =
+            extract_header(&waf_resp, "x-exposure-ray").expect("missing ray header on waf 403");
 
         let (waf_recs, waf_sums, _) = logger.drain_for_maintainer().await;
-        assert!(waf_sums.iter().all(|s| s.errors == 0), "WAF 403 must never increment 5xx errors");
-        assert!(waf_sums.iter().all(|s| s.challenges_issued == 0), "WAF 403 must not increment PoW challenges_issued");
-        assert_eq!(waf_sums.iter().map(|s| s.blocked).sum::<u64>(), 1, "WAF 403 must increment blocked");
+        assert!(
+            waf_sums.iter().all(|s| s.errors == 0),
+            "WAF 403 must never increment 5xx errors"
+        );
+        assert!(
+            waf_sums.iter().all(|s| s.challenges_issued == 0),
+            "WAF 403 must not increment PoW challenges_issued"
+        );
+        assert_eq!(
+            waf_sums.iter().map(|s| s.blocked).sum::<u64>(),
+            1,
+            "WAF 403 must increment blocked"
+        );
         let waf_rec = waf_recs
             .iter()
             .find(|r| r.ray_id.as_deref() == Some(waf_ray.as_str()))
@@ -5644,9 +5885,16 @@ mod tests {
         )
         .await;
         assert!(pass_500.starts_with("HTTP/1.1 500"), "{pass_500}");
-        assert!(pass_500.contains("database deadlock on orders"), "{pass_500}");
-        assert!(extract_header(&pass_500, "x-exposure-upstream-error").is_none(), "internal header leaked");
-        let pass_ray = extract_header(&pass_500, "x-exposure-ray").expect("missing x-exposure-ray on 500");
+        assert!(
+            pass_500.contains("database deadlock on orders"),
+            "{pass_500}"
+        );
+        assert!(
+            extract_header(&pass_500, "x-exposure-upstream-error").is_none(),
+            "internal header leaked"
+        );
+        let pass_ray =
+            extract_header(&pass_500, "x-exposure-ray").expect("missing x-exposure-ray on 500");
 
         let (pass_recs, _, _) = logger.drain_for_maintainer().await;
         let ing_pass = pass_recs
@@ -5659,8 +5907,24 @@ mod tests {
             .expect("missing egress 500 log for ray_id");
         assert_eq!(ing_pass.action.as_deref(), Some("upstream_error"));
         assert_eq!(eg_pass.action.as_deref(), Some("upstream_error"));
-        assert!(ing_pass.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "ingress error: {:?}", ing_pass.error);
-        assert!(eg_pass.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "egress error: {:?}", eg_pass.error);
+        assert!(
+            ing_pass
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("database deadlock on orders"),
+            "ingress error: {:?}",
+            ing_pass.error
+        );
+        assert!(
+            eg_pass
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("database deadlock on orders"),
+            "egress error: {:?}",
+            eg_pass.error
+        );
 
         // 3. Backend 500 with intercept_errors = true -> client gets generic HTML error page with Ray ID (no backend error leak), logs STILL capture backend error
         let int_500 = send_raw(
@@ -5669,10 +5933,20 @@ mod tests {
         )
         .await;
         assert!(int_500.starts_with("HTTP/1.1 500"), "{int_500}");
-        let int_ray = extract_header(&int_500, "x-exposure-ray").expect("missing x-exposure-ray on intercepted 500");
-        assert!(int_500.contains(&int_ray), "HTML error page must include ray_id: {int_500}");
-        assert!(!int_500.contains("database deadlock on orders"), "intercepted response must not leak backend error");
-        assert!(extract_header(&int_500, "x-exposure-upstream-error").is_none(), "internal header leaked");
+        let int_ray = extract_header(&int_500, "x-exposure-ray")
+            .expect("missing x-exposure-ray on intercepted 500");
+        assert!(
+            int_500.contains(&int_ray),
+            "HTML error page must include ray_id: {int_500}"
+        );
+        assert!(
+            !int_500.contains("database deadlock on orders"),
+            "intercepted response must not leak backend error"
+        );
+        assert!(
+            extract_header(&int_500, "x-exposure-upstream-error").is_none(),
+            "internal header leaked"
+        );
 
         let (int_recs, _, _) = logger.drain_for_maintainer().await;
         let ing_int = int_recs
@@ -5685,8 +5959,24 @@ mod tests {
             .expect("missing egress intercepted 500 log for ray_id");
         assert_eq!(ing_int.action.as_deref(), Some("upstream_error"));
         assert_eq!(eg_int.action.as_deref(), Some("upstream_error"));
-        assert!(ing_int.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "ingress intercepted error: {:?}", ing_int.error);
-        assert!(eg_int.error.as_deref().unwrap_or("").contains("database deadlock on orders"), "egress intercepted error: {:?}", eg_int.error);
+        assert!(
+            ing_int
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("database deadlock on orders"),
+            "ingress intercepted error: {:?}",
+            ing_int.error
+        );
+        assert!(
+            eg_int
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("database deadlock on orders"),
+            "egress intercepted error: {:?}",
+            eg_int.error
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

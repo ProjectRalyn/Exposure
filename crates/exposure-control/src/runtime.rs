@@ -11,11 +11,11 @@ use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use hyper_util::service::TowerToHyperService;
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
-use crate::api::{build_router, ApiState};
+use crate::api::{ApiState, build_router};
 use crate::client::ControlClient;
 use crate::db::ControlDb;
 
@@ -27,17 +27,21 @@ pub struct ControlRuntime {
 
 fn build_control_tls_acceptor(tls: &ControlTlsConfig) -> Result<TlsAcceptor> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cert_bytes = std::fs::read(&tls.cert_path)
-        .map_err(|e| ExposureError::Config(format!("read control TLS cert {}: {e}", tls.cert_path)))?;
-    let key_bytes = std::fs::read(&tls.key_path)
-        .map_err(|e| ExposureError::Config(format!("read control TLS key {}: {e}", tls.key_path)))?;
+    let cert_bytes = std::fs::read(&tls.cert_path).map_err(|e| {
+        ExposureError::Config(format!("read control TLS cert {}: {e}", tls.cert_path))
+    })?;
+    let key_bytes = std::fs::read(&tls.key_path).map_err(|e| {
+        ExposureError::Config(format!("read control TLS key {}: {e}", tls.key_path))
+    })?;
 
     let mut cert_reader = BufReader::new(&cert_bytes[..]);
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| ExposureError::Crypto(format!("parse control TLS cert: {e}")))?;
     if certs.is_empty() {
-        return Err(ExposureError::Crypto("no certificates in control TLS cert file".into()));
+        return Err(ExposureError::Crypto(
+            "no certificates in control TLS cert file".into(),
+        ));
     }
     let mut key_reader = BufReader::new(&key_bytes[..]);
     let key = rustls_pemfile::private_key(&mut key_reader)
@@ -74,11 +78,14 @@ impl ControlRuntime {
         let db = ControlDb::open(&cfg.sqlite_path)?;
         if let Some(ref topo_path) = cfg.initial_topology_path {
             let existing = db.get_topology_yaml().await?;
-            if existing.trim().is_empty() && tokio::fs::try_exists(topo_path).await.unwrap_or(false) {
+            if existing.trim().is_empty() && tokio::fs::try_exists(topo_path).await.unwrap_or(false)
+            {
                 let yaml = tokio::fs::read_to_string(topo_path).await?;
                 // Validate YAML parses cleanly before persisting
-                let _: exposure_core::config::TopologySpec = serde_yaml::from_str(&yaml)
-                    .map_err(|e| ExposureError::Config(format!("invalid initial_topology_path YAML: {e}")))?;
+                let _: exposure_core::config::TopologySpec =
+                    serde_yaml::from_str(&yaml).map_err(|e| {
+                        ExposureError::Config(format!("invalid initial_topology_path YAML: {e}"))
+                    })?;
                 db.set_topology_yaml(&yaml).await?;
             }
         }
@@ -160,8 +167,9 @@ impl ControlRuntime {
                         .get_control_retention_config()
                         .await
                         .unwrap_or_default();
-                    let cleanup_every =
-                        Duration::from_secs(u64::from(ret.control_cleanup_interval_mins.max(5)) * 60);
+                    let cleanup_every = Duration::from_secs(
+                        u64::from(ret.control_cleanup_interval_mins.max(5)) * 60,
+                    );
                     if last_cleanup.elapsed() >= cleanup_every {
                         last_cleanup = std::time::Instant::now();
                         if let Err(e) = this.client.db().prune_old_records(&ret).await {

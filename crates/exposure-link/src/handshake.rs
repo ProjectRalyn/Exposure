@@ -5,10 +5,10 @@ use chrono::Utc;
 use dashmap::DashMap;
 use exposure_core::config::{LinkListenConfig, LinkMode, PeerConfig, TunnelDirection};
 use exposure_core::crypto::{
-    pubkey_fingerprint_b64, verify_passphrase_proof, verify_signature_b64, NodeKeyPair,
+    NodeKeyPair, pubkey_fingerprint_b64, verify_passphrase_proof, verify_signature_b64,
 };
 use exposure_core::protocol::{
-    read_json_frame_bounded, write_json_frame, HelloAck, HelloFrame, MAX_HANDSHAKE_FRAME_BYTES,
+    HelloAck, HelloFrame, MAX_HANDSHAKE_FRAME_BYTES, read_json_frame_bounded, write_json_frame,
 };
 use exposure_core::routing::ip_matches_cidrs;
 use exposure_core::{ExposureError, Result};
@@ -88,13 +88,13 @@ impl BootstrapAuthState {
 
     pub async fn set(&self, phrase: Option<String>) {
         let mut guard = self.inner.lock().await;
-        *guard = phrase.filter(|p| !p.trim().is_empty()).map(|p| {
-            BootstrapPassphraseEntry {
+        *guard = phrase
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| BootstrapPassphraseEntry {
                 phrase: p,
                 locked_until: None,
                 failed_attempts: 0,
-            }
-        });
+            });
     }
 
     pub async fn has_active(&self) -> bool {
@@ -247,10 +247,14 @@ pub async fn client_hello<S: AsyncRead + AsyncWrite + Unpin>(
     // Verify responder's HelloAck Ed25519 signature bound to the exact Noise handshake hash & client nonce!
     let now = Utc::now().timestamp();
     if ack.nonce.len() < MIN_NONCE_LEN || ack.nonce.len() > MAX_NONCE_LEN {
-        return Err(ExposureError::Auth("invalid server hello ack nonce length".into()));
+        return Err(ExposureError::Auth(
+            "invalid server hello ack nonce length".into(),
+        ));
     }
     if now.abs_diff(ack.timestamp) > HELLO_MAX_SKEW_SECS {
-        return Err(ExposureError::Auth("server hello ack timestamp skew exceeded".into()));
+        return Err(ExposureError::Auth(
+            "server hello ack timestamp skew exceeded".into(),
+        ));
     }
     let ack_signing = HelloAck::signing_bytes(
         noise_handshake_hash,
@@ -274,7 +278,10 @@ pub async fn client_hello<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
-    if let Some(exp_pk) = expected_remote_pubkey.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(exp_pk) = expected_remote_pubkey
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if ack.public_key.trim() != exp_pk {
             return Err(ExposureError::Auth(format!(
                 "remote public key mismatch for {}",
@@ -455,7 +462,8 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
                         return Err(ExposureError::Auth(msg));
                     }
                     Err(reason) => {
-                        let msg = format!("control {} from {} {reason}", hello.node_tag, remote_addr);
+                        let msg =
+                            format!("control {} from {} {reason}", hello.node_tag, remote_addr);
                         warn!("{msg}");
                         let ack = build_signed_ack(
                             keypair,
@@ -488,7 +496,10 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
                 return Err(ExposureError::Auth(msg));
             }
         } else {
-            let msg = format!("bootstrap disabled on listener; rejected control {}", hello.node_tag);
+            let msg = format!(
+                "bootstrap disabled on listener; rejected control {}",
+                hello.node_tag
+            );
             warn!("{msg}");
             let ack = build_signed_ack(
                 keypair,
@@ -505,10 +516,13 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
         }
     } else if let Some(peer) = peers.iter().find(|p| p.node_tag == hello.node_tag) {
         // Enforce LinkListenConfig policy flags
-        let is_inbound_tunnel =
-            peer.mode == LinkMode::Tunnel && peer.tunnel_direction == Some(TunnelDirection::Inbound);
+        let is_inbound_tunnel = peer.mode == LinkMode::Tunnel
+            && peer.tunnel_direction == Some(TunnelDirection::Inbound);
         if is_inbound_tunnel && !listen_policy.effective_allow_tunnel() {
-            let msg = format!("inbound tunnel peer {} rejected by listener policy", hello.node_tag);
+            let msg = format!(
+                "inbound tunnel peer {} rejected by listener policy",
+                hello.node_tag
+            );
             warn!("{msg}");
             let ack = build_signed_ack(
                 keypair,
@@ -524,7 +538,10 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(ExposureError::Auth(msg));
         }
         if !is_inbound_tunnel && !listen_policy.effective_allow_on_demand() {
-            let msg = format!("on-demand peer {} rejected by listener policy", hello.node_tag);
+            let msg = format!(
+                "on-demand peer {} rejected by listener policy",
+                hello.node_tag
+            );
             warn!("{msg}");
             let ack = build_signed_ack(
                 keypair,
@@ -551,7 +568,12 @@ pub async fn server_hello<S: AsyncRead + AsyncWrite + Unpin>(
             .is_some_and(|s| !s.trim().is_empty());
         let mut pk_ok = has_pk || has_fp;
 
-        if let Some(exp_pk) = peer.public_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(exp_pk) = peer
+            .public_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if exp_pk != hello.public_key.trim() {
                 pk_ok = false;
             }

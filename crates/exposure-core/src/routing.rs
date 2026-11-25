@@ -50,7 +50,12 @@ pub fn is_public_routable_ip(ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             let s = v6.segments();
-            let is_nat64 = (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+            let is_nat64 = (s[0] == 0x0064
+                && s[1] == 0xff9b
+                && s[2] == 0
+                && s[3] == 0
+                && s[4] == 0
+                && s[5] == 0)
                 || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1);
             let is_site_local = (s[0] & 0xffc0) == 0xfec0;
             let is_doc = s[0] == 0x2001 && s[1] == 0x0db8;
@@ -88,9 +93,7 @@ pub fn ip_matches_cidrs(ip: IpAddr, cidrs: &[String]) -> bool {
 fn has_forbidden_host_chars(s: &str) -> bool {
     s.is_empty()
         || s.bytes().any(|b| {
-            b <= 0x20
-                || b >= 0x7f
-                || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#' | b'[' | b']')
+            b <= 0x20 || b >= 0x7f || matches!(b, b'@' | b'/' | b'\\' | b'?' | b'#' | b'[' | b']')
         })
 }
 
@@ -239,7 +242,11 @@ fn percent_decode_path_chars(input: &str) -> String {
                 if decoded.is_ascii_graphic() && decoded != b'?' && decoded != b'#' {
                     // Treat a percent-encoded backslash as a path separator too, so `..%5c`
                     // cannot be viewed differently by rule matching vs. a `\`-aware backend.
-                    out.push(if decoded == b'\\' { '/' } else { decoded as char });
+                    out.push(if decoded == b'\\' {
+                        '/'
+                    } else {
+                        decoded as char
+                    });
                     i += 3;
                     continue;
                 }
@@ -272,8 +279,7 @@ fn path_matches_prefix(normalized_path: &str, raw_prefix: &str) -> bool {
     if !normalized_path.starts_with(&prefix) {
         return false;
     }
-    normalized_path.len() == prefix.len()
-        || normalized_path.as_bytes()[prefix.len()] == b'/'
+    normalized_path.len() == prefix.len() || normalized_path.as_bytes()[prefix.len()] == b'/'
 }
 
 /// Check whether any configured ingress rule explicitly matches the given `host`.
@@ -449,22 +455,40 @@ mod tests {
 
         // Normal match + trailing dot + IPv4-mapped IPv6 + traversal path normalization
         let mapped_v6: IpAddr = "::ffff:203.0.113.42".parse().unwrap();
-        let r1 = match_ingress_rule(&rules, "api.example.com.:443", "/x/../%61pi/v1", mapped_v6, None);
+        let r1 = match_ingress_rule(
+            &rules,
+            "api.example.com.:443",
+            "/x/../%61pi/v1",
+            mapped_v6,
+            None,
+        );
         assert_eq!(r1.unwrap().service_tag, "web@region-a");
 
         // Segment boundary: /api-public must NOT match /api
         let r_seg = match_ingress_rule(&rules, "api.example.com", "/api-public", mapped_v6, None);
         assert_eq!(r_seg.unwrap().service_tag, "web@default");
 
-        let r2 = match_ingress_rule(&rules, "api.example.com", "/api/v1", "198.51.100.5".parse().unwrap(), None);
+        let r2 = match_ingress_rule(
+            &rules,
+            "api.example.com",
+            "/api/v1",
+            "198.51.100.5".parse().unwrap(),
+            None,
+        );
         assert_eq!(r2.unwrap().service_tag, "web@default");
 
         // IPv6 bracket host normalization & strict port validation
         assert_eq!(normalize_host("[2001:db8::1]:443"), "2001:db8::1");
         assert!(host_matches("2001:db8::1", "[2001:db8::1]:443"));
         assert_eq!(normalize_host("allowed.example:@evil.example"), "");
-        assert!(!any_rule_matches_host(&rules, "api.example.com:@evil.example"));
-        assert_eq!(parse_valid_host("App.Example.COM.:443").as_deref(), Some("app.example.com:443"));
+        assert!(!any_rule_matches_host(
+            &rules,
+            "api.example.com:@evil.example"
+        ));
+        assert_eq!(
+            parse_valid_host("App.Example.COM.:443").as_deref(),
+            Some("app.example.com:443")
+        );
         assert_eq!(parse_valid_host("allowed.example:@evil.example"), None);
         assert_eq!(parse_valid_host("good.example/path"), None);
         assert!(!is_public_routable_ip("0.0.0.1".parse().unwrap()));
@@ -502,15 +526,29 @@ mod tests {
             },
             ..hostless[0].clone()
         }];
-        assert!(match_ingress_rule(&explicit_wildcard, "anything.test", "/", mapped_v6, None).is_some());
+        assert!(
+            match_ingress_rule(&explicit_wildcard, "anything.test", "/", mapped_v6, None).is_some()
+        );
     }
 
     #[test]
     fn endpoint_priority_weight_and_backup_zero() {
         let eps = vec![
-            PeerEndpoint { address: "a:1".into(), priority: 10, weight: 70 },
-            PeerEndpoint { address: "b:1".into(), priority: 10, weight: 30 },
-            PeerEndpoint { address: "backup:1".into(), priority: 1, weight: 0 },
+            PeerEndpoint {
+                address: "a:1".into(),
+                priority: 10,
+                weight: 70,
+            },
+            PeerEndpoint {
+                address: "b:1".into(),
+                priority: 10,
+                weight: 30,
+            },
+            PeerEndpoint {
+                address: "backup:1".into(),
+                priority: 1,
+                weight: 0,
+            },
         ];
         let mut health = HashMap::new();
         health.insert("a:1".into(), LinkHealthState::Up);
@@ -522,6 +560,9 @@ mod tests {
 
         health.insert("a:1".into(), LinkHealthState::Down);
         health.insert("b:1".into(), LinkHealthState::Down);
-        assert_eq!(select_endpoint(&eps, &health, 0).unwrap().address, "backup:1");
+        assert_eq!(
+            select_endpoint(&eps, &health, 0).unwrap().address,
+            "backup:1"
+        );
     }
 }

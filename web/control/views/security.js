@@ -1533,27 +1533,67 @@ export function createSecurityView({ api, store }) {
     });
   }
 
+  // Built-in page fallbacks (mirror crates/exposure-core/src/assets.rs + web/challenge/*):
+  // monospace, one hairline rule, no card chrome — the semi-immersive portal / SSO language.
+  // The illustration is inlined only in the real pages; the sandboxed preview omits it.
+  const BUILTIN_PAGE_CSS =
+    ":root{color-scheme:light dark;--bg:#ffffff;--text:#1a1a1a;--line:#1a1a1a;--muted:#6a6a6a;--soft:#f2f2f2;--track:#e4e4e4;--accent:#C40233;--accent-ink:#ffffff;--danger:#c40233}" +
+    "@media (prefers-color-scheme:dark){:root{--bg:#121212;--text:#ededed;--line:#5a5a5a;--muted:#8c8c8c;--soft:#1e1e1e;--track:#2b2b2b;--danger:#e0737c}}" +
+    ".page.is-429{--accent:#9A6A00;--accent-ink:#ffffff}" +
+    ".page.is-4xx{--accent:#C40233;--accent-ink:#ffffff}" +
+    ".page.is-5xx{--accent:#7E0C1A;--accent-ink:#ffffff}" +
+    "@media (prefers-color-scheme:dark){.page.is-429{--accent:#DCA93F;--accent-ink:#121212}.page.is-4xx{--accent:#E4595F;--accent-ink:#121212}.page.is-5xx{--accent:#C2606A;--accent-ink:#121212}}" +
+    "*{box-sizing:border-box}" +
+    "body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:ui-monospace,'Sarasa Mono SC','Cascadia Code',Menlo,Consolas,monospace;font-size:14px;line-height:1.5}" +
+    ".page{position:relative;min-height:100vh;display:flex;align-items:center;padding:64px min(9vw,120px)}" +
+    ".col{position:relative;z-index:1;width:min(520px,100%)}" +
+    ".tag{display:inline-block;padding:4px 9px;background:var(--accent);color:var(--accent-ink);font-size:10px;font-weight:900;letter-spacing:.2em;text-transform:uppercase}" +
+    "h1{margin:12px 0 0;font-size:clamp(22px,4.6vw,40px);line-height:1.05;font-weight:900;text-transform:uppercase;letter-spacing:.01em}" +
+    ".rule{height:1px;margin:22px 0 0;background:var(--line);opacity:.5}" +
+    ".detail{margin:20px 0 0;max-width:42ch;color:var(--muted);font-size:15px;line-height:1.7}" +
+    ".meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 28px;margin:32px 0 0;padding:0}" +
+    ".meta div{display:flex;flex-direction:column;gap:3px}" +
+    ".meta dt{margin:0;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}" +
+    ".meta dd{margin:0;font-size:13px;font-weight:900}" +
+    ".retry{display:flex;align-items:center;gap:14px;margin:26px 0 0}" +
+    ".retry span{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);white-space:nowrap}" +
+    ".retry i{position:relative;flex:1;height:6px;background:var(--track);overflow:hidden}" +
+    ".retry i::after{content:'';position:absolute;top:0;bottom:0;left:0;background:var(--accent);animation:load var(--d,12s) linear forwards}" +
+    "@keyframes load{from{width:0}to{width:100%}}" +
+    ".foot{display:flex;justify-content:space-between;gap:16px;margin:52px 0 0;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);opacity:.75}" +
+    ".track{position:relative;height:6px;margin:26px 0 0;background:var(--track);overflow:hidden}" +
+    ".bar{width:15%;height:100%;background:var(--accent)}" +
+    ".error{margin:20px 0 0;max-width:42ch;color:var(--danger);font-size:12px;line-height:1.6;word-break:break-word}" +
+    ".hidden{display:none}" +
+    "@media (max-width:980px){.page{align-items:flex-start;padding:52px 24px 0}.foot{margin-top:36px}}";
+
   function buildPreviewHtml() {
     const pages = store.spec.defaults?.pages || {};
     if (previewMode === "error") {
       const tpl =
         pages.error_html ||
-        `<!DOCTYPE html><html><head><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#020617;color:#e2e8f0;font-family:system-ui,sans-serif}.card{width:min(440px,90vw);background:#0f172a;border:1px solid #1e293b;border-top:3px solid {{accent}};padding:24px}.tag{font-size:11px;letter-spacing:.14em;color:{{accent}};font-weight:700;margin-bottom:8px}h1{margin:0 0 8px;font-size:20px}p{color:#94a3b8;font-size:13px}</style></head><body><main class="card"><div class="tag">HTTP {{status}}</div><h1>{{title}}</h1><p>{{detail}}</p><small style="color:#64748b">Ray ID: {{ray_id}}</small></main></body></html>`;
+        `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>{{status}} {{title}}</title><style>${BUILTIN_PAGE_CSS}</style></head><body><main class="page is-429"><section class="col"><div class="tag">HTTP {{status}}</div><h1>{{title}}</h1><div class="rule"></div><p class="detail">{{detail}}</p>{{retry_note}}<div class="foot"><span>Exposure Edge</span><span>Ray {{ray_id}}</span></div></section></main></body></html>`;
       return tpl
         .replaceAll("{{status}}", "429")
         .replaceAll("{{title}}", "Too Many Requests")
         .replaceAll("{{detail}}", "Rate limit exceeded on edge guard. Please wait a moment and retry.")
         .replaceAll("{{ray_id}}", "exp-preview-8f91c2a0")
         .replaceAll("{{retry_after}}", "12")
-        .replaceAll("{{accent}}", "#FAC800")
-        .replaceAll("{{retry_note}}", "<p style='font-size:12px;color:#94a3b8'>Retry-After: 12s</p>");
+        .replaceAll("{{accent}}", "#9A6A00")
+        .replaceAll(
+          "{{retry_note}}",
+          `<dl class="meta"><div><dt>Status</dt><dd>429</dd></div><div><dt>Retry after</dt><dd>12s</dd></div></dl><div class="retry"><span>Auto-retry</span><i style="--d:12000ms"></i></div>`
+        );
     }
     const css =
       pages.challenge_css ||
-      "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#020617;color:#e2e8f0;font-family:system-ui,sans-serif}.box{padding:24px;border:1px solid #1e293b;border-radius:10px;background:#0f172a;width:360px}";
+      BUILTIN_PAGE_CSS.replace(
+        "--accent:#C40233;--accent-ink:#ffffff;--danger:#c40233}",
+        "--accent:#3c7499;--accent-ink:#ffffff;--danger:#c40233}"
+      ) + "@media (prefers-color-scheme:dark){:root{--accent:#8fb9d6;--accent-ink:#121212}}";
     const html =
       pages.challenge_html ||
-      `<!DOCTYPE html><html><head><style>${css}</style></head><body><div class="box"><h3>Checking your browser…</h3><p id="status-text" style="color:#94a3b8;font-size:13px">Solving SHA-256 PoW (16 bits)</p></div></body></html>`;
+      `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="color-scheme" content="light dark"/><title>Security Check</title><style>${css}</style></head><body><main class="page"><section class="col"><div class="tag">Security Check</div><h1>Verifying your browser</h1><div class="rule"></div><p id="status-text" class="detail">Running a lightweight proof-of-work check before forwarding your request.</p><div class="track"><div id="progress-bar" class="bar" style="width:62%"></div></div><dl class="meta"><div><dt>Difficulty</dt><dd id="meta-difficulty">18 bits</dd></div><div><dt>Hashes</dt><dd id="meta-hashes">131072</dd></div></dl><p id="error-text" class="error hidden"></p><div class="foot"><span>Exposure Edge</span><span>PoW / SHA-256</span></div></section></main></body></html>`;
     return html.includes("</head>")
       ? html.replace("</head>", `<style>${css}</style></head>`)
       : `<style>${css}</style>${html}`;

@@ -80,8 +80,10 @@ impl HyperLogLog {
         let self_has_nonzero_regs = self.registers.iter().any(|&r| r > 0);
         let other_has_nonzero_regs = other.registers.iter().any(|&r| r > 0);
         // Handle legacy sketches serialized without exact_set populated
-        let self_legacy = !self.exact_overflow && self.exact_set.is_empty() && self_has_nonzero_regs;
-        let other_legacy = !other.exact_overflow && other.exact_set.is_empty() && other_has_nonzero_regs;
+        let self_legacy =
+            !self.exact_overflow && self.exact_set.is_empty() && self_has_nonzero_regs;
+        let other_legacy =
+            !other.exact_overflow && other.exact_set.is_empty() && other_has_nonzero_regs;
 
         for (a, &b) in self.registers.iter_mut().zip(other.registers.iter()) {
             if b > *a {
@@ -199,7 +201,11 @@ impl LatencyHistogram {
             acc = acc.saturating_add(c);
             if acc >= target {
                 if i < self.boundaries_ms.len() {
-                    let lower = if i == 0 { 0.0 } else { self.boundaries_ms[i - 1] };
+                    let lower = if i == 0 {
+                        0.0
+                    } else {
+                        self.boundaries_ms[i - 1]
+                    };
                     let upper = self.boundaries_ms[i];
                     let frac = if c > 0 {
                         (target.saturating_sub(prev_acc)) as f64 / c as f64
@@ -707,12 +713,18 @@ impl MinuteSummary {
         self.requests = self.requests.saturating_add(other.requests);
         self.errors = self.errors.saturating_add(other.errors);
         self.rate_limited = self.rate_limited.saturating_add(other.rate_limited);
-        self.challenges_issued = self.challenges_issued.saturating_add(other.challenges_issued);
-        self.challenges_passed = self.challenges_passed.saturating_add(other.challenges_passed);
+        self.challenges_issued = self
+            .challenges_issued
+            .saturating_add(other.challenges_issued);
+        self.challenges_passed = self
+            .challenges_passed
+            .saturating_add(other.challenges_passed);
         self.blocked = self.blocked.saturating_add(other.blocked);
         self.evilpot_hits = self.evilpot_hits.saturating_add(other.evilpot_hits);
         self.autoban_hits = self.autoban_hits.saturating_add(other.autoban_hits);
-        self.client_fp_verified = self.client_fp_verified.saturating_add(other.client_fp_verified);
+        self.client_fp_verified = self
+            .client_fp_verified
+            .saturating_add(other.client_fp_verified);
         for (k, v) in &other.device_counts {
             if self.device_counts.len() < 64 || self.device_counts.contains_key(k) {
                 let e = self.device_counts.entry(k.clone()).or_insert(0);
@@ -982,7 +994,11 @@ impl ClientJsFingerprint {
             let raw_pubs: Vec<std::net::IpAddr> = self
                 .webrtc_public_ips
                 .iter()
-                .filter_map(|s| s.parse::<std::net::IpAddr>().ok().map(crate::routing::canonical_ip))
+                .filter_map(|s| {
+                    s.parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(crate::routing::canonical_ip)
+                })
                 .collect();
             if !raw_pubs.is_empty() && !raw_pubs.contains(&canon_obs) {
                 self.webrtc_ip_mismatch = true;
@@ -1080,7 +1096,9 @@ impl ClientJsFingerprint {
                 return true;
             }
             if ua_l.contains("iphone")
-                && (plat_l.contains("win") || plat_l.contains("linux") || plat_l.contains("macintel"))
+                && (plat_l.contains("win")
+                    || plat_l.contains("linux")
+                    || plat_l.contains("macintel"))
             {
                 return true;
             }
@@ -1236,7 +1254,9 @@ impl FingerprintObservation {
     }
 
     pub fn merge_from(&mut self, other: &FingerprintObservation) {
-        if other.first_seen_ts > 0 && (self.first_seen_ts == 0 || other.first_seen_ts < self.first_seen_ts) {
+        if other.first_seen_ts > 0
+            && (self.first_seen_ts == 0 || other.first_seen_ts < self.first_seen_ts)
+        {
             self.first_seen_ts = other.first_seen_ts;
         }
         if other.last_seen_ts >= self.last_seen_ts {
@@ -1629,7 +1649,9 @@ mod tests {
         assert!(!fp.tamper_flags.iter().any(|f| f == "webrtc_ip_leak"));
         assert!(fp.tamper_flags.iter().any(|f| f == "webrtc_lan_leak"));
         // VPN/network leak never triggers false headless rejection
-        assert!(!fp.detect_headless("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0"));
+        assert!(
+            !fp.detect_headless("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0")
+        );
         // Canonical fingerprint hash stays invariant across network IPs
         assert_eq!(fp.canonical_hash(), base_hash);
 

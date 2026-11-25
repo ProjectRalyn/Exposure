@@ -5,8 +5,8 @@ use bytes::Bytes;
 use exposure_control::ControlRuntime;
 use exposure_core::config::*;
 use exposure_core::crypto::{
-    generate_five_word_passphrase, generate_random_secret_hex, hash_password, verify_pow_solution,
-    NodeKeyPair,
+    NodeKeyPair, generate_five_word_passphrase, generate_random_secret_hex, hash_password,
+    verify_pow_solution,
 };
 use exposure_core::protocol::{SpecialFrame, SpecialPayload};
 use exposure_node::NodeRuntime;
@@ -39,11 +39,7 @@ async fn spawn_echo_backend() -> std::net::SocketAddr {
                                 .unwrap(),
                         );
                     }
-                    let body = format!(
-                        "echo:ver={:?}:path={}",
-                        req.version(),
-                        req.uri().path()
-                    );
+                    let body = format!("echo:ver={:?}:path={}", req.version(), req.uri().path());
                     Ok::<_, hyper::Error>(
                         Response::builder()
                             .status(StatusCode::OK)
@@ -518,12 +514,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
 
     // --- TEST B: Multi-hop HTTP/2 (h2c) with signed origin ACL ---
     let tcp = tokio::net::TcpStream::connect(ingress_http).await.unwrap();
-    let (mut h2_send, h2_conn) = hyper::client::conn::http2::handshake(
-        TokioExecutor::new(),
-        TokioIo::new(tcp),
-    )
-    .await
-    .unwrap();
+    let (mut h2_send, h2_conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp))
+            .await
+            .unwrap();
     tokio::spawn(async move {
         let _ = h2_conn.await;
     });
@@ -535,7 +529,13 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     let h2_resp = h2_send.send_request(h2_req).await.unwrap();
     assert_eq!(h2_resp.status(), StatusCode::OK);
     let h2_body = String::from_utf8(
-        h2_resp.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        h2_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
     assert!(
@@ -551,10 +551,17 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert_eq!(local_resp.status(), 200);
-    assert!(local_resp.text().await.unwrap().contains("path=/local-direct"));
+    assert!(
+        local_resp
+            .text()
+            .await
+            .unwrap()
+            .contains("path=/local-direct")
+    );
 
     // --- TEST C2: Adaptive Passive JS Fingerprint Beacon Injection + Secure /cdn-cgi/fp-report ---
-    let browser_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
+    let browser_ua =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
     let html_resp = http_client
         .get(format!("http://{ingress_http}/page.html"))
         .header("Host", "remote.test")
@@ -566,7 +573,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .unwrap();
     assert_eq!(html_resp.status(), 200);
     assert_eq!(
-        html_resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+        html_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
         Some("no-store"),
         "injected HTML must set Cache-Control: no-store to prevent 304 token replay"
     );
@@ -717,7 +727,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     assert_eq!(rl_resp1.status(), 429);
     assert!(rl_resp1.headers().contains_key("retry-after"));
     let rl_body1 = rl_resp1.text().await.unwrap();
-    assert!(rl_body1.contains("<!DOCTYPE html>"), "first hit should serve error page");
+    assert!(
+        rl_body1.contains("<!DOCTYPE html>"),
+        "first hit should serve error page"
+    );
 
     // Before degradation, /cdn-cgi/ PoW page must remain unaffected
     let pre_deg_pow = http_client
@@ -738,7 +751,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
             .unwrap();
         assert_eq!(rl_resp.status(), 429);
         let body = rl_resp.text().await.unwrap();
-        assert!(body.contains("<!DOCTYPE html>"), "hit {hit} should serve error page");
+        assert!(
+            body.contains("<!DOCTYPE html>"),
+            "hit {hit} should serve error page"
+        );
     }
 
     // Hit 4+: bucket is degraded -> normal route AND /cdn-cgi/ PoW endpoints return ultra-short "429"
@@ -763,13 +779,15 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert_eq!(bot_resp.status(), 302);
-    assert!(bot_resp
-        .headers()
-        .get("location")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("/cdn-cgi/?redirect="));
+    assert!(
+        bot_resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("/cdn-cgi/?redirect=")
+    );
 
     let html_resp = http_client
         .get(format!("http://{ingress_http}/cdn-cgi/"))
@@ -873,7 +891,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     // Push ingress logs & fingerprint observations along Hop Table to Maintainer
     let (recs, sums, fps) = ingress_rt.logger().drain_for_maintainer().await;
     assert!(!sums.is_empty());
-    assert!(!fps.is_empty(), "expected collected fingerprint observations");
+    assert!(
+        !fps.is_empty(),
+        "expected collected fingerprint observations"
+    );
     let log_frame = SpecialFrame::new(
         uuid::Uuid::new_v4().to_string(),
         vec!["ingress-a".into(), "relay-1".into(), "maintainer-1".into()],
@@ -926,17 +947,28 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(ctrl_rt.client().is_bootstrap_connected().await);
     assert_eq!(
-        ingress_rt.config_snapshot().await.control_public_key.as_deref(),
+        ingress_rt
+            .config_snapshot()
+            .await
+            .control_public_key
+            .as_deref(),
         Some(kp_ctrl_sign.public_key_b64().as_str())
     );
     assert_eq!(
-        ingress_rt.config_snapshot().await.control_link_public_key.as_deref(),
+        ingress_rt
+            .config_snapshot()
+            .await
+            .control_link_public_key
+            .as_deref(),
         Some(kp_ctrl_link.public_key_b64().as_str())
     );
 
     // Run Discovery across mesh: control-1 -> ingress-a -> relay-1 -> (egress-1, maintainer-1)
     let discovered = ctrl_rt.client().run_discovery("test").await.unwrap();
-    assert!(discovered >= 3, "expected >= 3 discovered nodes, got {discovered}");
+    assert!(
+        discovered >= 3,
+        "expected >= 3 discovered nodes, got {discovered}"
+    );
 
     // Test Control Admin Panel HTML, security headers, Argon2 login, HttpOnly cookie & logout revocation
     let panel_resp = http_client
@@ -945,10 +977,7 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert!(panel_resp.headers().contains_key("content-security-policy"));
-    assert_eq!(
-        panel_resp.headers().get("x-frame-options").unwrap(),
-        "DENY"
-    );
+    assert_eq!(panel_resp.headers().get("x-frame-options").unwrap(), "DENY");
     let panel_html = panel_resp.text().await.unwrap();
     assert!(panel_html.contains("EXPOSURE CONTROL"));
 
@@ -1022,7 +1051,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
                 "expected recent URL access logs in Maintainer snapshot"
             );
             assert!(
-                snap.fingerprints.iter().any(|f| f.js_verified && f.fp_source == "beacon"),
+                snap.fingerprints
+                    .iter()
+                    .any(|f| f.js_verified && f.fp_source == "beacon"),
                 "expected JS-verified beacon fingerprint in Maintainer snapshot"
             );
             assert_eq!(snap.certificates.len(), 1);
@@ -1037,7 +1068,12 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
     let min_topo_yaml = format!(
         "global_logger:\n  hmac_key: \"{shared_hmac}\"\nnodes:\n  ingress-a:\n    roles:\n      ingress: true\n  relay-1:\n    roles:\n      relay: true\n  maintainer-1:\n    roles:\n      maintainer: true\nlinks:\n  - from: ingress-a\n    to: relay-1\n    mode: tunnel\n    tunnel_direction: outbound\n    endpoints:\n      - address: \"198.51.100.1:9443\"\n  - from: relay-1\n    to: maintainer-1\n    mode: on-demand\n    bidirectional: false\n    endpoints:\n      - address: \"198.51.100.2:9443\"\n"
     );
-    ctrl_rt.client().db().set_topology_yaml(&min_topo_yaml).await.unwrap();
+    ctrl_rt
+        .client()
+        .db()
+        .set_topology_yaml(&min_topo_yaml)
+        .await
+        .unwrap();
     let pull_api_resp = http_client
         .post(format!("http://{panel_addr}/api/telemetry/pull"))
         .header("Authorization", format!("Bearer {bearer}"))
@@ -1048,7 +1084,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
 
     // Verify exact UV == 1 (single 127.0.0.1 visitor across multiple requests/services/roles, never double-counted!)
     let tel_json: serde_json::Value = http_client
-        .get(format!("http://{panel_addr}/api/telemetry?window_secs=3600"))
+        .get(format!(
+            "http://{panel_addr}/api/telemetry?window_secs=3600"
+        ))
         .header("Authorization", format!("Bearer {bearer}"))
         .send()
         .await
@@ -1064,7 +1102,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
 
     // Verify /api/fingerprints search by IP (auto-HMAC matched!) AND by browser FP (canvas_hash / webgl)
     let fp_by_ip: serde_json::Value = http_client
-        .get(format!("http://{panel_addr}/api/fingerprints?ip=127.0.0.1&verified=js"))
+        .get(format!(
+            "http://{panel_addr}/api/fingerprints?ip=127.0.0.1&verified=js"
+        ))
         .header("Authorization", format!("Bearer {bearer}"))
         .send()
         .await
@@ -1073,11 +1113,16 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert!(
-        fp_by_ip["items"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        fp_by_ip["items"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "IP search must match via HMAC even when store_raw_ip is false: {fp_by_ip}"
     );
     let fp_by_canvas: serde_json::Value = http_client
-        .get(format!("http://{panel_addr}/api/fingerprints?fp=cafebabe99"))
+        .get(format!(
+            "http://{panel_addr}/api/fingerprints?fp=cafebabe99"
+        ))
         .header("Authorization", format!("Bearer {bearer}"))
         .send()
         .await
@@ -1156,7 +1201,10 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         )
         .unwrap();
     assert!(
-        ingress_rt.apply_signed_config(preflight_bundle).await.is_err(),
+        ingress_rt
+            .apply_signed_config(preflight_bundle)
+            .await
+            .is_err(),
         "Preflight bundle must NEVER be accepted by apply_signed_config"
     );
 
@@ -1188,14 +1236,22 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         .await
         .unwrap();
     assert_eq!(custom_pow_css.status(), 200);
-    assert_eq!(custom_pow_css.text().await.unwrap(), "body{background:#010203}");
+    assert_eq!(
+        custom_pow_css.text().await.unwrap(),
+        "body{background:#010203}"
+    );
 
     // Attempt rollback with seq=1 -> must be rejected and seq remains 2
     let bundle_rollback = ctrl_rt
         .client()
         .sign_config_bundle("ingress-a", 1, updated_cfg)
         .unwrap();
-    assert!(ingress_rt.apply_signed_config(bundle_rollback).await.is_err());
+    assert!(
+        ingress_rt
+            .apply_signed_config(bundle_rollback)
+            .await
+            .is_err()
+    );
     assert_eq!(ingress_rt.config_snapshot().await.config_sequence, 2);
 
     // Verify authenticated /api/nodes and /api/overview (ensuring no private key field leaked!)

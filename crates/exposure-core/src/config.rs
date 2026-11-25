@@ -48,7 +48,9 @@ fn default_hll_seed() -> u64 {
     0x517c_c1b7_2722_0a95
 }
 fn default_histogram_buckets() -> Vec<f64> {
-    vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]
+    vec![
+        1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    ]
 }
 fn default_sample_rate() -> f64 {
     1.0
@@ -909,7 +911,9 @@ impl GuardProfile {
         self.js_fp_beacon.unwrap_or(true)
     }
     pub fn effective_js_fp_ttl_secs(&self) -> u64 {
-        self.js_fp_ttl_secs.unwrap_or_else(default_js_fp_ttl_secs).max(60)
+        self.js_fp_ttl_secs
+            .unwrap_or_else(default_js_fp_ttl_secs)
+            .max(60)
     }
     pub fn effective_waf(&self) -> Option<&WafConfig> {
         self.waf.as_ref().filter(|w| w.mode != WafMode::Off)
@@ -1111,7 +1115,9 @@ impl IngressConfig {
         self.js_fp_beacon.unwrap_or(true)
     }
     pub fn effective_js_fp_ttl_secs(&self) -> u64 {
-        self.js_fp_ttl_secs.unwrap_or_else(default_js_fp_ttl_secs).max(60)
+        self.js_fp_ttl_secs
+            .unwrap_or_else(default_js_fp_ttl_secs)
+            .max(60)
     }
 }
 
@@ -1658,7 +1664,10 @@ pub fn resolve_domain_binding<'a>(
     domains: &'a BTreeMap<String, DomainBindingConfig>,
     target_domain: &str,
 ) -> Option<(&'a str, &'a DomainBindingConfig)> {
-    let raw = target_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let raw = target_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if raw.is_empty() {
         return None;
     }
@@ -2429,7 +2438,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        resolve_domain_binding, CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig,
+        CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig, resolve_domain_binding,
     };
 
     #[test]

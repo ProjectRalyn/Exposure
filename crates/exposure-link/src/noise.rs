@@ -224,7 +224,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for NoiseStream<S> {
                 &mut this.read_plain_scratch[..cipher_len],
             )
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("noise decrypt failed: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("noise decrypt failed: {e}"),
+                )
             })?;
 
         if plain_len == 0 {

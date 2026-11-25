@@ -10,6 +10,7 @@ base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+flate2.workspace = true
 hex.workspace = true
 hmac.workspace = true
 ipnet.workspace = true

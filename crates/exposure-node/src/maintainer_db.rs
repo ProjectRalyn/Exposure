@@ -7,12 +7,12 @@ use exposure_core::config::MaintainerRetentionConfig;
 use exposure_core::crypto::{restrict_dir_permissions_0700, restrict_file_permissions_0600};
 use exposure_core::segment::read_json_snapshot;
 use exposure_core::telemetry::{
-    is_cache_served_status, is_mitigated_record, normalize_alert_severity, AlertRecord, BanRecord,
-    ClientJsFingerprint, EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation,
-    HyperLogLog, LatencyHistogram, MaintainerStorageStats, MinuteSummary, SessionSummary,
+    AlertRecord, BanRecord, ClientJsFingerprint, EvilpotEventInfo, EvilpotSessionInfo,
+    FingerprintObservation, HyperLogLog, LatencyHistogram, MaintainerStorageStats, MinuteSummary,
+    SessionSummary, is_cache_served_status, is_mitigated_record, normalize_alert_severity,
 };
 use exposure_core::{ExposureError, Result};
-use rusqlite::{params, types::Value, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -97,16 +97,24 @@ fn parse_alert_timestamp_ms(a: &AlertRecord) -> i64 {
 }
 
 fn compute_access_dedup_key(rec: &SessionSummary) -> String {
-    let suffix = rec.ray_id.as_deref().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| {
-        format!(
-            "{}:{}:{}:{}",
-            rec.ip_hmac,
-            rec.path.as_deref().unwrap_or(""),
-            rec.action.as_deref().unwrap_or(""),
-            rec.status
-        )
-    });
-    format!("{}|{}|{}|{}", rec.node_tag, rec.role, rec.timestamp_ms, suffix)
+    let suffix = rec
+        .ray_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}:{}",
+                rec.ip_hmac,
+                rec.path.as_deref().unwrap_or(""),
+                rec.action.as_deref().unwrap_or(""),
+                rec.status
+            )
+        });
+    format!(
+        "{}|{}|{}|{}",
+        rec.node_tag, rec.role, rec.timestamp_ms, suffix
+    )
 }
 
 fn compute_evilpot_event_dedup_key(ev: &EvilpotEventInfo) -> String {
@@ -144,7 +152,11 @@ fn status_rank(s: &str) -> i64 {
     }
 }
 
-fn merge_bounded_string_list(existing: Vec<String>, incoming: Vec<String>, cap: usize) -> Vec<String> {
+fn merge_bounded_string_list(
+    existing: Vec<String>,
+    incoming: Vec<String>,
+    cap: usize,
+) -> Vec<String> {
     let mut out = existing;
     for item in incoming {
         if out.len() >= cap {
@@ -227,8 +239,9 @@ impl MaintainerDb {
             }
         }
 
-        let write_conn = Connection::open(&db_path)
-            .map_err(|e| ExposureError::Storage(format!("open maintainer sqlite {}: {e}", db_path.display())))?;
+        let write_conn = Connection::open(&db_path).map_err(|e| {
+            ExposureError::Storage(format!("open maintainer sqlite {}: {e}", db_path.display()))
+        })?;
         let _ = restrict_file_permissions_0600(&db_path);
 
         write_conn
@@ -450,8 +463,13 @@ impl MaintainerDb {
                 )
                 .unwrap_or(false);
             if empty_db {
-                if let Ok(Some(st)) = read_json_snapshot::<LegacyMaintainerPersistedState>(&legacy_path) {
-                    let count = st.recent_logs.len() + st.summaries.len() + st.fingerprints.len() + st.alerts.len();
+                if let Ok(Some(st)) =
+                    read_json_snapshot::<LegacyMaintainerPersistedState>(&legacy_path)
+                {
+                    let count = st.recent_logs.len()
+                        + st.summaries.len()
+                        + st.fingerprints.len()
+                        + st.alerts.len();
                     if count > 0 {
                         if let Err(e) = Self::ingest_sync(
                             &write_conn,
@@ -739,7 +757,10 @@ impl MaintainerDb {
                     .map_err(|e| ExposureError::Storage(e.to_string()))?;
 
                 for s in summaries.into_iter().take(1024) {
-                    if s.minute_epoch < stats_min_ts || s.minute_epoch > max_allowed || !s.uv_hll.is_valid() {
+                    if s.minute_epoch < stats_min_ts
+                        || s.minute_epoch > max_allowed
+                        || !s.uv_hll.is_valid()
+                    {
                         continue;
                     }
                     let existing: Option<MinuteSummary> = sel
@@ -769,10 +790,14 @@ impl MaintainerDb {
                                     cached_requests: row.get::<_, i64>(10)?.max(0) as u64,
                                     cached_bytes_out: row.get::<_, i64>(11)?.max(0) as u64,
                                     client_fp_verified: row.get::<_, i64>(12)?.max(0) as u64,
-                                    uv_hll: serde_json::from_str(&uv_json).unwrap_or_else(|_| s.uv_hll.clone()),
-                                    latency_hist: serde_json::from_str(&hist_json).unwrap_or_else(|_| s.latency_hist.clone()),
-                                    device_counts: serde_json::from_str(&dev_json).unwrap_or_default(),
-                                    browser_counts: serde_json::from_str(&br_json).unwrap_or_default(),
+                                    uv_hll: serde_json::from_str(&uv_json)
+                                        .unwrap_or_else(|_| s.uv_hll.clone()),
+                                    latency_hist: serde_json::from_str(&hist_json)
+                                        .unwrap_or_else(|_| s.latency_hist.clone()),
+                                    device_counts: serde_json::from_str(&dev_json)
+                                        .unwrap_or_default(),
+                                    browser_counts: serde_json::from_str(&br_json)
+                                        .unwrap_or_default(),
                                     os_counts: serde_json::from_str(&os_json).unwrap_or_default(),
                                 })
                             },
@@ -788,9 +813,12 @@ impl MaintainerDb {
                     };
                     let uv_json = serde_json::to_string(&merged.uv_hll).unwrap_or_default();
                     let hist_json = serde_json::to_string(&merged.latency_hist).unwrap_or_default();
-                    let dev_json = serde_json::to_string(&merged.device_counts).unwrap_or_else(|_| "{}".into());
-                    let br_json = serde_json::to_string(&merged.browser_counts).unwrap_or_else(|_| "{}".into());
-                    let os_json = serde_json::to_string(&merged.os_counts).unwrap_or_else(|_| "{}".into());
+                    let dev_json = serde_json::to_string(&merged.device_counts)
+                        .unwrap_or_else(|_| "{}".into());
+                    let br_json = serde_json::to_string(&merged.browser_counts)
+                        .unwrap_or_else(|_| "{}".into());
+                    let os_json =
+                        serde_json::to_string(&merged.os_counts).unwrap_or_else(|_| "{}".into());
 
                     up.execute(params![
                         merged.minute_epoch,
@@ -905,7 +933,8 @@ impl MaintainerDb {
                     let existing: Option<FingerprintObservation> = sel
                         .query_row(params![&fp.id], |row| {
                             let js_str: Option<String> = row.get(27)?;
-                            let js_fp = js_str.and_then(|s| serde_json::from_str::<ClientJsFingerprint>(&s).ok());
+                            let js_fp = js_str
+                                .and_then(|s| serde_json::from_str::<ClientJsFingerprint>(&s).ok());
                             Ok(FingerprintObservation {
                                 id: fp.id.clone(),
                                 ip_hmac: row.get(0)?,
@@ -925,11 +954,14 @@ impl MaintainerDb {
                                 is_bot: row.get::<_, i64>(14)? != 0,
                                 is_headless: row.get::<_, i64>(15)? != 0,
                                 suspicion_score: row.get::<_, i64>(16)?.clamp(0, 255) as u8,
-                                tls_cipher_count: row.get::<_, i64>(17)?.clamp(0, u16::MAX as i64) as u16,
+                                tls_cipher_count: row.get::<_, i64>(17)?.clamp(0, u16::MAX as i64)
+                                    as u16,
                                 tls_alpn: row.get::<_, i64>(18)? != 0,
                                 tls_ja3: row.get(19)?,
                                 tls_grease: row.get::<_, i64>(20)? != 0,
-                                abuse_score: row.get::<_, Option<i64>>(21)?.map(|v| v.clamp(0, 100) as u8),
+                                abuse_score: row
+                                    .get::<_, Option<i64>>(21)?
+                                    .map(|v| v.clamp(0, 100) as u8),
                                 abuse_country: row.get(22)?,
                                 abuse_isp: row.get(23)?,
                                 abuse_is_tor: row.get::<_, i64>(24)? != 0,
@@ -1042,7 +1074,8 @@ impl MaintainerDb {
                     .map_err(|e| ExposureError::Storage(e.to_string()))?;
 
                 for mut s in evilpot_sessions.into_iter().take(1024) {
-                    if s.last_seen_unix < ep_min_ts || s.last_seen_unix > max_allowed.max(0) as u64 {
+                    if s.last_seen_unix < ep_min_ts || s.last_seen_unix > max_allowed.max(0) as u64
+                    {
                         continue;
                     }
                     if s.node_tag.is_empty() {
@@ -1068,9 +1101,11 @@ impl MaintainerDb {
                                     canary_triggers: row.get::<_, i64>(7)?.max(0) as u32,
                                     sqli_probes: row.get::<_, i64>(8)?.max(0) as u32,
                                     sqli_distinct_positions: row.get::<_, i64>(9)?.max(0) as usize,
-                                    rce_commands_executed: serde_json::from_str(&rce_s).unwrap_or_default(),
+                                    rce_commands_executed: serde_json::from_str(&rce_s)
+                                        .unwrap_or_default(),
                                     captured_iocs: serde_json::from_str(&ioc_s).unwrap_or_default(),
-                                    distinct_paths: serde_json::from_str(&path_s).unwrap_or_default(),
+                                    distinct_paths: serde_json::from_str(&path_s)
+                                        .unwrap_or_default(),
                                     tarpit_bytes_consumed: row.get::<_, i64>(13)?.max(0) as u64,
                                     tarpit_max_duration_ms: row.get::<_, i64>(14)?.max(0) as u64,
                                     evidence: serde_json::from_str(&ev_s).unwrap_or_default(),
@@ -1104,7 +1139,9 @@ impl MaintainerDb {
                             },
                             first_seen_unix: first_seen,
                             last_seen_unix: s.last_seen_unix.max(old.last_seen_unix),
-                            total_trapped_requests: s.total_trapped_requests.max(old.total_trapped_requests),
+                            total_trapped_requests: s
+                                .total_trapped_requests
+                                .max(old.total_trapped_requests),
                             status: best_status,
                             canary_triggers: s.canary_triggers.max(old.canary_triggers),
                             sqli_probes: s.sqli_probes.max(old.sqli_probes),
@@ -1126,7 +1163,9 @@ impl MaintainerDb {
                                 s.distinct_paths,
                                 MAX_BOUNDED_LIST,
                             ),
-                            tarpit_bytes_consumed: s.tarpit_bytes_consumed.max(old.tarpit_bytes_consumed),
+                            tarpit_bytes_consumed: s
+                                .tarpit_bytes_consumed
+                                .max(old.tarpit_bytes_consumed),
                             tarpit_max_duration_ms: s
                                 .tarpit_max_duration_ms
                                 .max(old.tarpit_max_duration_ms),
@@ -1155,9 +1194,12 @@ impl MaintainerDb {
                         i64::from(merged.canary_triggers),
                         i64::from(merged.sqli_probes),
                         merged.sqli_distinct_positions as i64,
-                        serde_json::to_string(&merged.rce_commands_executed).unwrap_or_else(|_| "[]".into()),
-                        serde_json::to_string(&merged.captured_iocs).unwrap_or_else(|_| "[]".into()),
-                        serde_json::to_string(&merged.distinct_paths).unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&merged.rce_commands_executed)
+                            .unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&merged.captured_iocs)
+                            .unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&merged.distinct_paths)
+                            .unwrap_or_else(|_| "[]".into()),
                         merged.tarpit_bytes_consumed as i64,
                         merged.tarpit_max_duration_ms as i64,
                         serde_json::to_string(&merged.evidence).unwrap_or_else(|_| "[]".into()),
@@ -1178,7 +1220,9 @@ impl MaintainerDb {
                     .map_err(|e| ExposureError::Storage(e.to_string()))?;
 
                 for mut ev in evilpot_events.into_iter().take(2048) {
-                    if ev.timestamp_unix < ep_min_ts || ev.timestamp_unix > max_allowed.max(0) as u64 {
+                    if ev.timestamp_unix < ep_min_ts
+                        || ev.timestamp_unix > max_allowed.max(0) as u64
+                    {
                         continue;
                     }
                     if ev.node_tag.is_empty() {
@@ -1412,8 +1456,10 @@ impl MaintainerDb {
     pub async fn storage_stats(&self, max_db_bytes: u64) -> Result<MaintainerStorageStats> {
         let tag = self.node_tag.clone();
         let db_path = self.db_path.clone();
-        self.run_read(move |conn| Self::collect_storage_stats_sync(conn, &tag, &db_path, max_db_bytes))
-            .await
+        self.run_read(move |conn| {
+            Self::collect_storage_stats_sync(conn, &tag, &db_path, max_db_bytes)
+        })
+        .await
     }
 
     fn collect_storage_stats_sync(
@@ -1438,11 +1484,9 @@ impl MaintainerDb {
             .unwrap_or(0)
             .max(0) as u64;
         let last_cleanup_at: Option<String> = conn
-            .query_row(
-                "SELECT v FROM meta WHERE k = 'last_cleanup_at'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT v FROM meta WHERE k = 'last_cleanup_at'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .unwrap_or(None);
 
@@ -1467,7 +1511,10 @@ impl MaintainerDb {
         })
     }
 
-    pub async fn run_cleanup(&self, retention: &MaintainerRetentionConfig) -> Result<CleanupReport> {
+    pub async fn run_cleanup(
+        &self,
+        retention: &MaintainerRetentionConfig,
+    ) -> Result<CleanupReport> {
         let ret = retention.clone();
         let tag = self.node_tag.clone();
         let db_path = self.db_path.clone();
@@ -1674,7 +1721,11 @@ impl MaintainerDb {
         .await
     }
 
-    pub async fn snapshot_summaries(&self, since_minute: Option<i64>, limit: usize) -> Result<Vec<MinuteSummary>> {
+    pub async fn snapshot_summaries(
+        &self,
+        since_minute: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MinuteSummary>> {
         self.run_read(move |conn| {
             let mut stmt = if since_minute.is_some() {
                 conn.prepare_cached(
@@ -1725,8 +1776,10 @@ impl MaintainerDb {
                     cached_requests: row.get::<_, i64>(14)?.max(0) as u64,
                     cached_bytes_out: row.get::<_, i64>(15)?.max(0) as u64,
                     client_fp_verified: row.get::<_, i64>(16)?.max(0) as u64,
-                    uv_hll: serde_json::from_str(&uv_json).unwrap_or_else(|_| HyperLogLog::new(12, 0)),
-                    latency_hist: serde_json::from_str(&hist_json).unwrap_or_else(|_| LatencyHistogram::new(vec![])),
+                    uv_hll: serde_json::from_str(&uv_json)
+                        .unwrap_or_else(|_| HyperLogLog::new(12, 0)),
+                    latency_hist: serde_json::from_str(&hist_json)
+                        .unwrap_or_else(|_| LatencyHistogram::new(vec![])),
                     device_counts: serde_json::from_str(&dev_json).unwrap_or_default(),
                     browser_counts: serde_json::from_str(&br_json).unwrap_or_default(),
                     os_counts: serde_json::from_str(&os_json).unwrap_or_default(),
@@ -1753,7 +1806,11 @@ impl MaintainerDb {
         .await
     }
 
-    pub async fn query_overview(&self, from_ms: Option<i64>, to_ms: Option<i64>) -> Result<serde_json::Value> {
+    pub async fn query_overview(
+        &self,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+    ) -> Result<serde_json::Value> {
         self.run_read(move |conn| {
             let from_sec = from_ms.map(|ms| ms.div_euclid(1000));
             let to_sec = to_ms.map(|ms| ms.div_euclid(1000));
@@ -1838,8 +1895,14 @@ impl MaintainerDb {
             let node_f = clean_opt_str(node.as_deref());
             let svc_f = clean_opt_str(service.as_deref());
 
-            let avail_nodes = Self::distinct_strings(conn, "SELECT DISTINCT node_tag FROM minute_summaries ORDER BY 1")?;
-            let avail_svcs = Self::distinct_strings(conn, "SELECT DISTINCT service_tag FROM minute_summaries ORDER BY 1")?;
+            let avail_nodes = Self::distinct_strings(
+                conn,
+                "SELECT DISTINCT node_tag FROM minute_summaries ORDER BY 1",
+            )?;
+            let avail_svcs = Self::distinct_strings(
+                conn,
+                "SELECT DISTINCT service_tag FROM minute_summaries ORDER BY 1",
+            )?;
 
             let raw_sums = Self::load_summaries_in_range(
                 conn,
@@ -1962,8 +2025,10 @@ impl MaintainerDb {
                     cached_requests: row.get::<_, i64>(14)?.max(0) as u64,
                     cached_bytes_out: row.get::<_, i64>(15)?.max(0) as u64,
                     client_fp_verified: row.get::<_, i64>(16)?.max(0) as u64,
-                    uv_hll: serde_json::from_str(&uv_json).unwrap_or_else(|_| HyperLogLog::new(12, 0)),
-                    latency_hist: serde_json::from_str(&hist_json).unwrap_or_else(|_| LatencyHistogram::new(vec![])),
+                    uv_hll: serde_json::from_str(&uv_json)
+                        .unwrap_or_else(|_| HyperLogLog::new(12, 0)),
+                    latency_hist: serde_json::from_str(&hist_json)
+                        .unwrap_or_else(|_| LatencyHistogram::new(vec![])),
                     device_counts: serde_json::from_str(&dev_json).unwrap_or_default(),
                     browser_counts: serde_json::from_str(&br_json).unwrap_or_default(),
                     os_counts: serde_json::from_str(&os_json).unwrap_or_default(),
@@ -3297,7 +3362,15 @@ mod tests {
             ray_id: Some("ray-ep-1".into()),
             ..Default::default()
         };
-        let mut sum = MinuteSummary::new(now_min, "edge-1", "ingress", "www-static", 12, 42, vec![10.0, 50.0, 100.0]);
+        let mut sum = MinuteSummary::new(
+            now_min,
+            "edge-1",
+            "ingress",
+            "www-static",
+            12,
+            42,
+            vec![10.0, 50.0, 100.0],
+        );
         sum.record(&rec_evil);
 
         let ep_sess = EvilpotSessionInfo {
@@ -3314,7 +3387,11 @@ mod tests {
             sqli_distinct_positions: 0,
             rce_commands_executed: vec![],
             captured_iocs: vec![],
-            distinct_paths: vec!["/.env".into(), "/etc/passwd".into(), "/wp-config.php".into()],
+            distinct_paths: vec![
+                "/.env".into(),
+                "/etc/passwd".into(),
+                "/wp-config.php".into(),
+            ],
             tarpit_bytes_consumed: 0,
             tarpit_max_duration_ms: 0,
             evidence: vec!["recon:paths=3".into()],
@@ -3454,7 +3531,10 @@ mod tests {
         assert_eq!(alerts_res["items"][0]["severity"], "warning");
 
         // Run cleanup & verify stats
-        let cleanup = db.run_cleanup(&MaintainerRetentionConfig::default()).await.unwrap();
+        let cleanup = db
+            .run_cleanup(&MaintainerRetentionConfig::default())
+            .await
+            .unwrap();
         assert!(cleanup.storage_stats.db_bytes > 0);
         assert_eq!(cleanup.storage_stats.access_logs_rows, 1);
 
@@ -3468,21 +3548,22 @@ mod tests {
         let db = MaintainerDb::open(&dir_s, "maint-1").unwrap();
         let now_ms = Utc::now().timestamp_millis();
 
-        let mk = |role: &'static str, ts: i64, ray: &str, status: u16, latency: f64| SessionSummary {
-            timestamp_ms: ts,
-            node_tag: if role == "ingress" { "ing-1" } else { "egr-1" }.into(),
-            role: role.into(),
-            service_tag: "web".into(),
-            status,
-            latency_ms: latency,
-            ip_hmac: "hmac".into(),
-            method: Some("GET".into()),
-            host: Some("app.test".into()),
-            path: Some("/x".into()),
-            action: Some("allow".into()),
-            ray_id: Some(ray.into()),
-            ..Default::default()
-        };
+        let mk =
+            |role: &'static str, ts: i64, ray: &str, status: u16, latency: f64| SessionSummary {
+                timestamp_ms: ts,
+                node_tag: if role == "ingress" { "ing-1" } else { "egr-1" }.into(),
+                role: role.into(),
+                service_tag: "web".into(),
+                status,
+                latency_ms: latency,
+                ip_hmac: "hmac".into(),
+                method: Some("GET".into()),
+                host: Some("app.test".into()),
+                path: Some("/x".into()),
+                action: Some("allow".into()),
+                ray_id: Some(ray.into()),
+                ..Default::default()
+            };
 
         // r1: ingress + egress (one client request, must collapse to a single row)
         // r2: ingress only (upstream failed before egress logged)
@@ -3524,7 +3605,11 @@ mod tests {
         let items = res["items"].as_array().unwrap();
         assert_eq!(items.len(), 3);
         let rays: Vec<&str> = items.iter().filter_map(|i| i["ray_id"].as_str()).collect();
-        assert_eq!(rays, vec!["r3", "r2", "r1"], "newest entry first, ingress time preferred");
+        assert_eq!(
+            rays,
+            vec!["r3", "r2", "r1"],
+            "newest entry first, ingress time preferred"
+        );
 
         let r1 = items.iter().find(|i| i["ray_id"] == "r1").unwrap();
         assert_eq!(r1["hops"], 2);

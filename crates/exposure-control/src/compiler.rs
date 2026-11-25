@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 
 use exposure_core::config::{
-    resolve_domain_binding, AbuseIpDbConfig, AntibotMode, AntibotProfile, AutoBanConfig,
-    CertOrderConfig, CrsUpdateConfig, CustomPagesConfig, DomainLineRecordType, EgressConfig,
-    EgressDefaults, EgressServiceConfig, EvilpotNodeConfig, GeoIpConfig, GeoPolicyConfig,
-    GuardDefaults, GuardProfile, IngressConfig, IngressDefaults, IngressRule, LinkListenConfig,
-    LinkListenerDefaults, LinkMode, LoggerConfig, MaintainerRetentionConfig, NodeCacheConfig,
-    NodeConfig, PeerConfig, ProbeConfig, RateLimitBucket, RelayConfig, RelayRule, RuleMatch,
-    ServiceIngressMode, ServiceRoutingMode, TopologySpec, TrustedMaintainer, TrustedOrigin,
-    TunnelDirection, WafConfig, WafMode,
+    AbuseIpDbConfig, AntibotMode, AntibotProfile, AutoBanConfig, CertOrderConfig, CrsUpdateConfig,
+    CustomPagesConfig, DomainLineRecordType, EgressConfig, EgressDefaults, EgressServiceConfig,
+    EvilpotNodeConfig, GeoIpConfig, GeoPolicyConfig, GuardDefaults, GuardProfile, IngressConfig,
+    IngressDefaults, IngressRule, LinkListenConfig, LinkListenerDefaults, LinkMode, LoggerConfig,
+    MaintainerRetentionConfig, NodeCacheConfig, NodeConfig, PeerConfig, ProbeConfig,
+    RateLimitBucket, RelayConfig, RelayRule, RuleMatch, ServiceIngressMode, ServiceRoutingMode,
+    TopologySpec, TrustedMaintainer, TrustedOrigin, TunnelDirection, WafConfig, WafMode,
+    resolve_domain_binding,
 };
 use exposure_core::crs::WafRuleDescriptor;
 use exposure_core::crypto::{is_weak_secret, validate_dns_domain, validate_identifier};
@@ -45,16 +45,11 @@ pub struct CompileReport {
     pub paths: Vec<ServiceRouteTrace>,
 }
 
-fn validate_endpoint_address(
-    raw: &str,
-    label: &str,
-    errors: &mut Vec<String>,
-) {
+fn validate_endpoint_address(raw: &str, label: &str, errors: &mut Vec<String>) {
     let trimmed = raw.trim();
     match trimmed.rsplit_once(':') {
         Some((host, port_str))
-            if !host.is_empty()
-                && port_str.parse::<u16>().map(|p| p > 0).unwrap_or(false) =>
+            if !host.is_empty() && port_str.parse::<u16>().map(|p| p > 0).unwrap_or(false) =>
         {
             let clean = host
                 .trim_matches(|c| c == '[' || c == ']')
@@ -91,10 +86,7 @@ fn validate_cidr_list(cidrs: &[String], label: &str, errors: &mut Vec<String>) {
     }
 }
 
-fn resolve_link_listener(
-    ll: &LinkListenConfig,
-    defs: &LinkListenerDefaults,
-) -> LinkListenConfig {
+fn resolve_link_listener(ll: &LinkListenConfig, defs: &LinkListenerDefaults) -> LinkListenConfig {
     LinkListenConfig {
         listen_addr: ll.listen_addr.clone(),
         allow_on_demand: Some(ll.allow_on_demand.unwrap_or(defs.allow_on_demand)),
@@ -132,7 +124,13 @@ fn resolve_antibot_profile(ab: &AntibotProfile, defs: &GuardDefaults) -> Antibot
 
 fn resolve_guard_profile(g: &GuardProfile, defs: &GuardDefaults) -> GuardProfile {
     let mut out = g.clone();
-    if out.rate_limit_bucket.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if out
+        .rate_limit_bucket
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.rate_limit_bucket = defs.rate_limit_bucket.clone();
     }
     out.bind_ua = Some(out.bind_ua.unwrap_or(defs.bind_ua));
@@ -230,17 +228,15 @@ fn synthesize_guard_from_sets(
 
 fn validate_set_name(name: &str, kind: &str, errors: &mut Vec<String>) {
     if name.starts_with("__sec:") {
-        errors.push(format!("{kind} name '{name}' uses reserved '__sec:' prefix"));
+        errors.push(format!(
+            "{kind} name '{name}' uses reserved '__sec:' prefix"
+        ));
     } else if let Err(e) = validate_identifier(name, kind) {
         errors.push(e.to_string());
     }
 }
 
-fn validate_rate_limit_bucket(
-    bucket: &RateLimitBucket,
-    label: &str,
-    errors: &mut Vec<String>,
-) {
+fn validate_rate_limit_bucket(bucket: &RateLimitBucket, label: &str, errors: &mut Vec<String>) {
     if !bucket.capacity.is_finite() || bucket.capacity < 1.0 {
         errors.push(format!(
             "{label}.capacity ({}) must be a finite number >= 1",
@@ -255,11 +251,7 @@ fn validate_rate_limit_bucket(
     }
 }
 
-fn validate_geo_policy_cfg(
-    geo: &GeoPolicyConfig,
-    label: &str,
-    errors: &mut Vec<String>,
-) {
+fn validate_geo_policy_cfg(geo: &GeoPolicyConfig, label: &str, errors: &mut Vec<String>) {
     for tok in &geo.allow_regions {
         if !is_valid_region_token(tok) {
             errors.push(format!(
@@ -294,9 +286,7 @@ fn validate_geo_policy_cfg(
 fn validate_geoip_config(cfg: &GeoIpConfig, label: &str, errors: &mut Vec<String>) {
     if let Some(ref raw_dir) = cfg.cache_dir {
         let dir = raw_dir.trim();
-        if !dir.is_empty()
-            && (dir.contains('\0')
-                || dir.split(['/', '\\']).any(|seg| seg == ".."))
+        if !dir.is_empty() && (dir.contains('\0') || dir.split(['/', '\\']).any(|seg| seg == ".."))
         {
             errors.push(format!(
                 "{label}.cache_dir ('{raw_dir}') must not contain NUL or '..' traversal segments"
@@ -309,10 +299,7 @@ fn validate_geoip_config(cfg: &GeoIpConfig, label: &str, errors: &mut Vec<String
                 errors.push(format!("{label}.{field} ('{raw}') must use https://"));
                 continue;
             };
-            let authority = after_scheme
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or("");
+            let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
             if authority.is_empty() || authority.contains('@') {
                 errors.push(format!(
                     "{label}.{field} ('{raw}') has invalid URL authority"
@@ -427,17 +414,35 @@ fn resolve_ingress_config(
     }
     out.guards = eff_guards;
 
-    if out.default_bucket.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if out
+        .default_bucket
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.default_bucket = opt_non_empty(&ingress_defs.default_bucket);
     } else {
         out.default_bucket = opt_non_empty(&out.default_bucket);
     }
-    if out.default_antibot.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if out
+        .default_antibot
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.default_antibot = opt_non_empty(&ingress_defs.default_antibot);
     } else {
         out.default_antibot = opt_non_empty(&out.default_antibot);
     }
-    if out.default_waf.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if out
+        .default_waf
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.default_waf = opt_non_empty(&ingress_defs.default_waf);
     } else {
         out.default_waf = opt_non_empty(&out.default_waf);
@@ -449,11 +454,21 @@ fn resolve_ingress_config(
     if out.server_header.trim().is_empty() && !ingress_defs.server_header.trim().is_empty() {
         out.server_header = ingress_defs.server_header.clone();
     }
-    if out.cert_store_dir.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if out
+        .cert_store_dir
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         out.cert_store_dir = ingress_defs.cert_store_dir.clone();
     }
     out.js_fp_beacon = Some(out.js_fp_beacon.unwrap_or(ingress_defs.js_fp_beacon));
-    out.js_fp_ttl_secs = Some(out.js_fp_ttl_secs.unwrap_or(ingress_defs.js_fp_ttl_secs).max(60));
+    out.js_fp_ttl_secs = Some(
+        out.js_fp_ttl_secs
+            .unwrap_or(ingress_defs.js_fp_ttl_secs)
+            .max(60),
+    );
 
     if out.geoip == GeoIpConfig::default() {
         out.geoip = ingress_defs.geoip.clone();
@@ -608,10 +623,7 @@ fn resolve_ingress_config(
 }
 
 /// Inject active OWASP CRS ruleset descriptors into every compiled Ingress node config.
-pub fn inject_crs_rules(
-    compiled: &mut BTreeMap<String, NodeConfig>,
-    rules: &[WafRuleDescriptor],
-) {
+pub fn inject_crs_rules(compiled: &mut BTreeMap<String, NodeConfig>, rules: &[WafRuleDescriptor]) {
     for cfg in compiled.values_mut() {
         if cfg.roles.ingress {
             cfg.ingress.crs_rules = rules.to_vec();
@@ -629,7 +641,13 @@ fn resolve_egress_config(
     let mut out = src.clone();
     for svc in out.services.values_mut() {
         svc.tls = Some(svc.tls.unwrap_or(defs.tls));
-        if svc.ca_cert_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if svc
+            .ca_cert_path
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             svc.ca_cert_path = defs.ca_cert_path.clone();
         }
         svc.insecure_skip_verify = Some(
@@ -688,7 +706,10 @@ pub fn compile_topology_with_options(
 }
 
 fn cert_covers_host(cert_domain: &str, host: &str) -> bool {
-    let cert = cert_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let cert = cert_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if cert.is_empty() || h.is_empty() {
         return false;
@@ -707,19 +728,27 @@ fn cert_covers_host(cert_domain: &str, host: &str) -> bool {
 fn build_mesh_adj(topo: &TopologySpec) -> HashMap<String, Vec<String>> {
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
     for link in &topo.links {
-        if !topo.nodes.contains_key(&link.from) || !topo.nodes.contains_key(&link.to) || link.from == link.to {
+        if !topo.nodes.contains_key(&link.from)
+            || !topo.nodes.contains_key(&link.to)
+            || link.from == link.to
+        {
             continue;
         }
-        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound) {
+        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound)
+        {
             continue;
         }
-        adj.entry(link.from.clone()).or_default().insert(link.to.clone());
+        adj.entry(link.from.clone())
+            .or_default()
+            .insert(link.to.clone());
         if link.mode == LinkMode::Tunnel
             || (link.mode == LinkMode::OnDemand
                 && link.bidirectional
                 && !link.reverse_endpoints.is_empty())
         {
-            adj.entry(link.to.clone()).or_default().insert(link.from.clone());
+            adj.entry(link.to.clone())
+                .or_default()
+                .insert(link.from.clone());
         }
     }
     adj.into_iter()
@@ -1033,16 +1062,12 @@ fn expand_declarative_services(
             let eff_antibot = ov
                 .and_then(|o| o.antibot.clone())
                 .or_else(|| svc.antibot.clone());
-            let eff_waf = ov
-                .and_then(|o| o.waf.clone())
-                .or_else(|| svc.waf.clone());
+            let eff_waf = ov.and_then(|o| o.waf.clone()).or_else(|| svc.waf.clone());
             let eff_cidrs = ov
                 .filter(|o| !o.source_cidrs.is_empty())
                 .map(|o| o.source_cidrs.clone())
                 .unwrap_or_else(|| svc.source_cidrs.clone());
-            let eff_intercept = ov
-                .and_then(|o| o.intercept_errors)
-                .or(svc.intercept_errors);
+            let eff_intercept = ov.and_then(|o| o.intercept_errors).or(svc.intercept_errors);
             let eff_beacon = ov.and_then(|o| o.js_fp_beacon).or(svc.js_fp_beacon);
             let eff_cache = ov
                 .and_then(|o| o.cache.clone())
@@ -1234,7 +1259,11 @@ pub fn compile_topology_full(
             "defaults.ingress.clearance_secret uses a weak or default secret; set a high-entropy random secret (>=16 chars)".into(),
         );
     }
-    validate_geoip_config(&topo.defaults.ingress.geoip, "defaults.ingress.geoip", &mut errors);
+    validate_geoip_config(
+        &topo.defaults.ingress.geoip,
+        "defaults.ingress.geoip",
+        &mut errors,
+    );
     if let Some(ref bname) = opt_non_empty(&topo.defaults.ingress.default_bucket) {
         if !topo.bucket_templates.contains_key(bname) {
             warnings.push(format!(
@@ -1276,7 +1305,11 @@ pub fn compile_topology_full(
             &mut errors,
         );
         if let Some(ref geo) = ab.geo {
-            validate_geo_policy_cfg(geo, &format!("antibot_templates '{a_name}'.geo"), &mut errors);
+            validate_geo_policy_cfg(
+                geo,
+                &format!("antibot_templates '{a_name}'.geo"),
+                &mut errors,
+            );
         }
     }
     for (g_name, g) in &topo.guard_templates {
@@ -1311,7 +1344,9 @@ pub fn compile_topology_full(
         }
         let prov = binding.provider.trim();
         if prov.is_empty() {
-            errors.push(format!("domain '{dom_key}' is missing DNS provider account"));
+            errors.push(format!(
+                "domain '{dom_key}' is missing DNS provider account"
+            ));
         } else if !topo.dns_providers.contains_key(prov) {
             errors.push(format!(
                 "domain '{dom_key}' references unknown dns_provider '{prov}'"
@@ -1424,8 +1459,16 @@ pub fn compile_topology_full(
         if let Err(e) = validate_identifier(node_tag, "node_tag") {
             errors.push(e.to_string());
         }
-        validate_custom_pages(&spec.ingress.pages, &format!("node '{node_tag}'.ingress"), &mut errors);
-        validate_custom_pages(&spec.egress.pages, &format!("node '{node_tag}'.egress"), &mut errors);
+        validate_custom_pages(
+            &spec.ingress.pages,
+            &format!("node '{node_tag}'.ingress"),
+            &mut errors,
+        );
+        validate_custom_pages(
+            &spec.egress.pages,
+            &format!("node '{node_tag}'.egress"),
+            &mut errors,
+        );
         for raw_ip in &spec.external_ips {
             let trimmed = raw_ip.trim();
             match trimmed.parse::<IpAddr>() {
@@ -1449,9 +1492,17 @@ pub fn compile_topology_full(
             }
         }
         if let Some(ing) = resolved_ingress.get(node_tag) {
-            validate_geoip_config(&ing.geoip, &format!("ingress '{node_tag}'.geoip"), &mut errors);
+            validate_geoip_config(
+                &ing.geoip,
+                &format!("ingress '{node_tag}'.geoip"),
+                &mut errors,
+            );
             for (b_name, b) in &spec.ingress.rate_limit_buckets {
-                validate_set_name(b_name, &format!("ingress '{node_tag}'.rate_limit_buckets"), &mut errors);
+                validate_set_name(
+                    b_name,
+                    &format!("ingress '{node_tag}'.rate_limit_buckets"),
+                    &mut errors,
+                );
                 validate_rate_limit_bucket(
                     b,
                     &format!("ingress '{node_tag}' rate_limit_bucket '{b_name}'"),
@@ -1459,10 +1510,18 @@ pub fn compile_topology_full(
                 );
             }
             for a_name in spec.ingress.antibot_sets.keys() {
-                validate_set_name(a_name, &format!("ingress '{node_tag}'.antibot_sets"), &mut errors);
+                validate_set_name(
+                    a_name,
+                    &format!("ingress '{node_tag}'.antibot_sets"),
+                    &mut errors,
+                );
             }
             for w_name in spec.ingress.waf_sets.keys() {
-                validate_set_name(w_name, &format!("ingress '{node_tag}'.waf_sets"), &mut errors);
+                validate_set_name(
+                    w_name,
+                    &format!("ingress '{node_tag}'.waf_sets"),
+                    &mut errors,
+                );
             }
             if let Some(ref bname) = ing.default_bucket {
                 if !ing.rate_limit_buckets.contains_key(bname) {
@@ -1561,7 +1620,10 @@ pub fn compile_topology_full(
                 }
                 validate_cidr_list(
                     &rule.r#match.source_cidrs,
-                    &format!("ingress '{node_tag}' rule '{}' source_cidrs", rule.service_tag),
+                    &format!(
+                        "ingress '{node_tag}' rule '{}' source_cidrs",
+                        rule.service_tag
+                    ),
                     &mut errors,
                 );
                 if let Some(ref bname) = rule.bucket {
@@ -1612,7 +1674,10 @@ pub fn compile_topology_full(
     // 1. Validate links and build per-node Peer lists
     for link in &topo.links {
         if !topo.nodes.contains_key(&link.from) {
-            errors.push(format!("link references unknown source node '{}'", link.from));
+            errors.push(format!(
+                "link references unknown source node '{}'",
+                link.from
+            ));
             continue;
         }
         if !topo.nodes.contains_key(&link.to) {
@@ -1645,7 +1710,8 @@ pub fn compile_topology_full(
             }
         }
         if source_pk.is_none()
-            && (link.mode == LinkMode::Tunnel || (link.mode == LinkMode::OnDemand && link.bidirectional))
+            && (link.mode == LinkMode::Tunnel
+                || (link.mode == LinkMode::OnDemand && link.bidirectional))
         {
             let msg = format!(
                 "link '{} -> {}' source node '{}' is not enrolled (missing pinned public_key)",
@@ -1676,7 +1742,10 @@ pub fn compile_topology_full(
                     ));
                 }
                 let target_listener = resolved_listeners.get(&link.to);
-                if !target_listener.map(|l| l.effective_allow_on_demand()).unwrap_or(false) {
+                if !target_listener
+                    .map(|l| l.effective_allow_on_demand())
+                    .unwrap_or(false)
+                {
                     errors.push(format!(
                         "on-demand link '{} -> {}' target '{}' does not enable link_listener.allow_on_demand",
                         link.from, link.to, link.to
@@ -1692,7 +1761,10 @@ pub fn compile_topology_full(
                         ));
                     }
                     let target_listener = resolved_listeners.get(&link.to);
-                    if !target_listener.map(|l| l.effective_allow_tunnel()).unwrap_or(false) {
+                    if !target_listener
+                        .map(|l| l.effective_allow_tunnel())
+                        .unwrap_or(false)
+                    {
                         errors.push(format!(
                             "tunnel outbound link '{} -> {}' target '{}' does not enable link_listener.allow_tunnel",
                             link.from, link.to, link.to
@@ -1736,7 +1808,10 @@ pub fn compile_topology_full(
 
         if link.mode == LinkMode::OnDemand && link.bidirectional {
             let source_listener = resolved_listeners.get(&link.from);
-            if !source_listener.map(|l| l.effective_allow_on_demand()).unwrap_or(false) {
+            if !source_listener
+                .map(|l| l.effective_allow_on_demand())
+                .unwrap_or(false)
+            {
                 errors.push(format!(
                     "bidirectional on-demand link '{} -> {}' source '{}' does not enable link_listener.allow_on_demand",
                     link.from, link.to, link.from
@@ -1891,7 +1966,9 @@ pub fn compile_topology_full(
                     } else {
                         let svc = &resolved_egress[&cur_node].services[&rule.service_tag];
                         trace_backend = Some(svc.backend.clone());
-                        if !svc.effective_allow_any_origin() && !svc.allow_from.contains(ingress_tag) {
+                        if !svc.effective_allow_any_origin()
+                            && !svc.allow_from.contains(ingress_tag)
+                        {
                             let msg = format!(
                                 "ACL mismatch: egress '{}' service '{}' does not allow origin '{}'",
                                 cur_node, rule.service_tag, ingress_tag
@@ -2008,7 +2085,8 @@ pub fn compile_topology_full(
                     break;
                 }
                 let next_spec = &topo.nodes[&next];
-                if next_spec.roles.egress && next_spec.egress.services.contains_key(&rr.service_tag) {
+                if next_spec.roles.egress && next_spec.egress.services.contains_key(&rr.service_tag)
+                {
                     break;
                 }
                 if next_spec.roles.relay {
@@ -2051,10 +2129,14 @@ pub fn compile_topology_full(
     let mut effective_logger: LoggerConfig = topo.global_logger.clone().unwrap_or_default();
     effective_logger.segment.max_recent_logs =
         effective_logger.segment.max_recent_logs.clamp(100, 10_000);
-    effective_logger.protection.max_records_per_sec =
-        effective_logger.protection.max_records_per_sec.clamp(10, 100_000);
-    effective_logger.protection.max_per_ip_per_sec =
-        effective_logger.protection.max_per_ip_per_sec.clamp(1, 50_000);
+    effective_logger.protection.max_records_per_sec = effective_logger
+        .protection
+        .max_records_per_sec
+        .clamp(10, 100_000);
+    effective_logger.protection.max_per_ip_per_sec = effective_logger
+        .protection
+        .max_per_ip_per_sec
+        .clamp(1, 50_000);
     effective_logger.protection.max_bytes_per_min = effective_logger
         .protection
         .max_bytes_per_min
@@ -2175,7 +2257,10 @@ pub fn compile_topology_full(
                         &adj,
                         topo,
                         &mut errors,
-                        &format!("maintainer '{node_tag}' cert '{}' hop to '{target}'", order.domain),
+                        &format!(
+                            "maintainer '{node_tag}' cert '{}' hop to '{target}'",
+                            order.domain
+                        ),
                     );
                 }
             }
@@ -2204,21 +2289,16 @@ pub fn compile_topology_full(
         }
 
         // Only emit config sections for enabled roles (prevents distributing ingress secrets to non-ingress nodes!)
-        let ingress_cfg = resolved_ingress
-            .get(node_tag)
-            .cloned()
-            .unwrap_or_default();
-        let egress_cfg = resolved_egress
-            .get(node_tag)
-            .cloned()
-            .unwrap_or_default();
+        let ingress_cfg = resolved_ingress.get(node_tag).cloned().unwrap_or_default();
+        let egress_cfg = resolved_egress.get(node_tag).cloned().unwrap_or_default();
         let relay_cfg = if spec.roles.relay {
             spec.relay.clone()
         } else {
             RelayConfig::default()
         };
 
-        let resolved_maintainer_hops = if spec.maintainer_hops.is_empty() && !spec.roles.maintainer {
+        let resolved_maintainer_hops = if spec.maintainer_hops.is_empty() && !spec.roles.maintainer
+        {
             find_nearest_maintainer_hops(node_tag, &adj, topo).unwrap_or_default()
         } else {
             spec.maintainer_hops.clone()
@@ -2305,7 +2385,12 @@ fn find_nearest_maintainer_hops(
             }
             let mut next_path = path.clone();
             next_path.push(nb.clone());
-            if topo.nodes.get(nb).map(|n| n.roles.maintainer).unwrap_or(false) {
+            if topo
+                .nodes
+                .get(nb)
+                .map(|n| n.roles.maintainer)
+                .unwrap_or(false)
+            {
                 return Some(next_path);
             }
             queue.push_back(next_path);
@@ -2351,7 +2436,12 @@ fn validate_hop_path(
     }
     if end_must_be_maintainer {
         if let Some(last) = hops.last() {
-            if !topo.nodes.get(last).map(|n| n.roles.maintainer).unwrap_or(false) {
+            if !topo
+                .nodes
+                .get(last)
+                .map(|n| n.roles.maintainer)
+                .unwrap_or(false)
+            {
                 errors.push(format!(
                     "{label}: hop path target '{last}' is not a maintainer node"
                 ));
@@ -2388,16 +2478,21 @@ pub fn compute_control_hops(
     }
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for link in &topo.links {
-        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound) {
+        if link.mode == LinkMode::Tunnel && link.tunnel_direction == Some(TunnelDirection::Inbound)
+        {
             continue;
         }
-        adj.entry(link.from.as_str()).or_default().push(link.to.as_str());
+        adj.entry(link.from.as_str())
+            .or_default()
+            .push(link.to.as_str());
         if link.mode == LinkMode::Tunnel
             || (link.mode == LinkMode::OnDemand
                 && link.bidirectional
                 && !link.reverse_endpoints.is_empty())
         {
-            adj.entry(link.to.as_str()).or_default().push(link.from.as_str());
+            adj.entry(link.to.as_str())
+                .or_default()
+                .push(link.from.as_str());
         }
     }
 
@@ -2448,7 +2543,8 @@ mod tests {
         pubkeys.insert("egress-1".into(), kp_eg.public_key_b64());
 
         let mut topo = TopologySpec::default();
-        topo.defaults.ingress.clearance_secret = "super-secret-global-clearance-key-0123456789".into();
+        topo.defaults.ingress.clearance_secret =
+            "super-secret-global-clearance-key-0123456789".into();
         topo.defaults.guard.block_bots = true;
         topo.bucket_templates.insert(
             "global-std".into(),
@@ -2468,7 +2564,10 @@ mod tests {
         topo.nodes.insert(
             "ingress-a".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { ingress: true, ..Default::default() },
+                roles: NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
                 link_listener: Some(LinkListenConfig {
                     listen_addr: "0.0.0.0:9443".into(),
                     allow_on_demand: None,
@@ -2478,7 +2577,10 @@ mod tests {
                 ingress: IngressConfig {
                     rules: vec![IngressRule {
                         name: None,
-                        r#match: RuleMatch { host: Some("example.com".into()), ..Default::default() },
+                        r#match: RuleMatch {
+                            host: Some("example.com".into()),
+                            ..Default::default()
+                        },
                         service_tag: "web".into(),
                         next_peer: "relay-1".into(),
                         guard: Some("global-web".into()),
@@ -2495,7 +2597,10 @@ mod tests {
         topo.nodes.insert(
             "relay-1".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { relay: true, ..Default::default() },
+                roles: NodeRoles {
+                    relay: true,
+                    ..Default::default()
+                },
                 link_listener: Some(LinkListenConfig {
                     listen_addr: "0.0.0.0:9443".into(),
                     allow_on_demand: Some(true),
@@ -2530,14 +2635,20 @@ mod tests {
         topo.nodes.insert(
             "egress-1".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { egress: true, ..Default::default() },
+                roles: NodeRoles {
+                    egress: true,
+                    ..Default::default()
+                },
                 link_listener: Some(LinkListenConfig {
                     listen_addr: "0.0.0.0:9443".into(),
                     allow_on_demand: Some(true),
                     allow_tunnel: Some(true),
                     allow_bootstrap: Some(false),
                 }),
-                egress: EgressConfig { services, ..Default::default() },
+                egress: EgressConfig {
+                    services,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -2548,7 +2659,11 @@ mod tests {
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9001".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.1:9001".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
@@ -2559,13 +2674,18 @@ mod tests {
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.2:9002".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.2:9002".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
 
         // Missing pubkeys MUST fail compilation by default
-        let (unpinned_report, _) = compile_topology(&topo, "ctrl-pk", &HashMap::new(), &HashMap::new());
+        let (unpinned_report, _) =
+            compile_topology(&topo, "ctrl-pk", &HashMap::new(), &HashMap::new());
         assert!(!unpinned_report.valid);
 
         // With pinned pubkeys, compiles cleanly, resolves global templates/defaults, and injects trusted_origins into egress-1
@@ -2581,14 +2701,22 @@ mod tests {
         assert!(report.valid, "errors: {:?}", report.errors);
         assert_eq!(compiled.len(), 3);
         assert_eq!(compiled["egress-1"].trusted_origins.len(), 1);
-        assert_eq!(compiled["egress-1"].trusted_origins[0].node_tag, "ingress-a");
+        assert_eq!(
+            compiled["egress-1"].trusted_origins[0].node_tag,
+            "ingress-a"
+        );
         // Verify global templates + defaults inheritance + cluster hmac key consistency
         assert_eq!(
             compiled["ingress-a"].ingress.clearance_secret,
             "super-secret-global-clearance-key-0123456789"
         );
         assert!(compiled["ingress-a"].ingress.guards["global-web"].effective_block_bots());
-        assert!(compiled["ingress-a"].ingress.rate_limit_buckets.contains_key("global-std"));
+        assert!(
+            compiled["ingress-a"]
+                .ingress
+                .rate_limit_buckets
+                .contains_key("global-std")
+        );
         assert_eq!(
             compiled["ingress-a"].logger.hmac_key,
             "cluster-hmac-secret-key-0123456789abcdef"
@@ -2600,10 +2728,23 @@ mod tests {
 
         // Missing match.host MUST fail compilation unless explicitly '*'
         let mut topo_no_host = topo.clone();
-        topo_no_host.nodes.get_mut("ingress-a").unwrap().ingress.rules[0].r#match.host = None;
-        let (no_host_report, _) = compile_topology(&topo_no_host, "ctrl-pk", &pubkeys, &HashMap::new());
+        topo_no_host
+            .nodes
+            .get_mut("ingress-a")
+            .unwrap()
+            .ingress
+            .rules[0]
+            .r#match
+            .host = None;
+        let (no_host_report, _) =
+            compile_topology(&topo_no_host, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!no_host_report.valid);
-        assert!(no_host_report.errors.iter().any(|e| e.contains("match.host")));
+        assert!(
+            no_host_report
+                .errors
+                .iter()
+                .any(|e| e.contains("match.host"))
+        );
 
         // Introduce loop: relay-1 -> ingress-a
         topo.nodes.get_mut("relay-1").unwrap().relay.rules[0].next_peer = "ingress-a".into();
@@ -2614,7 +2755,11 @@ mod tests {
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.3:9003".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.3:9003".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
@@ -2732,7 +2877,12 @@ mod tests {
 
         // Invalid external IP fails validation
         let mut bad_ip = topo.clone();
-        bad_ip.nodes.get_mut("ingress-a").unwrap().external_ips.push("not-an-ip".into());
+        bad_ip
+            .nodes
+            .get_mut("ingress-a")
+            .unwrap()
+            .external_ips
+            .push("not-an-ip".into());
         let (bad_ip_rep, _) = compile_topology(&bad_ip, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_ip_rep.valid);
         assert!(bad_ip_rep.errors.iter().any(|e| e.contains("external_ip")));
@@ -2742,7 +2892,12 @@ mod tests {
         bad_dom.domains.get_mut("example.com").unwrap().provider = "missing".into();
         let (bad_dom_rep, _) = compile_topology(&bad_dom, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_dom_rep.valid);
-        assert!(bad_dom_rep.errors.iter().any(|e| e.contains("dns_provider")));
+        assert!(
+            bad_dom_rep
+                .errors
+                .iter()
+                .any(|e| e.contains("dns_provider"))
+        );
     }
 
     #[test]
@@ -2753,15 +2908,42 @@ mod tests {
         };
 
         let mut topo = TopologySpec::default();
-        topo.defaults.ingress.clearance_secret = "super-secret-global-clearance-key-0123456789".into();
-        topo.guard_templates.insert("std".into(), GuardProfile::default());
-        topo.guard_templates.insert("strict".into(), GuardProfile::default());
+        topo.defaults.ingress.clearance_secret =
+            "super-secret-global-clearance-key-0123456789".into();
+        topo.guard_templates
+            .insert("std".into(), GuardProfile::default());
+        topo.guard_templates
+            .insert("strict".into(), GuardProfile::default());
 
         for (tag, roles) in [
-            ("ingress-hk", NodeRoles { ingress: true, ..Default::default() }),
-            ("ingress-jp", NodeRoles { ingress: true, ..Default::default() }),
-            ("relay-sg", NodeRoles { relay: true, ..Default::default() }),
-            ("egress-home", NodeRoles { egress: true, ..Default::default() }),
+            (
+                "ingress-hk",
+                NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "ingress-jp",
+                NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "relay-sg",
+                NodeRoles {
+                    relay: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "egress-home",
+                NodeRoles {
+                    egress: true,
+                    ..Default::default()
+                },
+            ),
         ] {
             topo.nodes.insert(
                 tag.into(),
@@ -2786,7 +2968,11 @@ mod tests {
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.1:9443".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
@@ -2797,7 +2983,11 @@ mod tests {
             mode: LinkMode::OnDemand,
             tunnel_direction: None,
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.1:9443".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
@@ -2808,7 +2998,11 @@ mod tests {
             mode: LinkMode::Tunnel,
             tunnel_direction: Some(TunnelDirection::Outbound),
             bidirectional: false,
-            endpoints: vec![PeerEndpoint { address: "198.51.100.1:9443".into(), priority: 10, weight: 100 }],
+            endpoints: vec![PeerEndpoint {
+                address: "198.51.100.1:9443".into(),
+                priority: 10,
+                weight: 100,
+            }],
             reverse_endpoints: vec![],
             expected_client_addr: None,
         });
@@ -2879,8 +3073,14 @@ mod tests {
         // Both ingress nodes receive 2 rules (one per host)
         assert_eq!(compiled["ingress-hk"].ingress.rules.len(), 2);
         assert_eq!(compiled["ingress-jp"].ingress.rules.len(), 2);
-        assert_eq!(compiled["ingress-hk"].ingress.rules[0].guard.as_deref(), Some("std"));
-        assert_eq!(compiled["ingress-jp"].ingress.rules[0].guard.as_deref(), Some("strict"));
+        assert_eq!(
+            compiled["ingress-hk"].ingress.rules[0].guard.as_deref(),
+            Some("std")
+        );
+        assert_eq!(
+            compiled["ingress-jp"].ingress.rules[0].guard.as_deref(),
+            Some("strict")
+        );
         // Relay receives deduplicated relay rule
         assert_eq!(compiled["relay-sg"].relay.rules.len(), 1);
         assert_eq!(compiled["relay-sg"].relay.rules[0].next_peer, "egress-home");
@@ -2932,17 +3132,26 @@ mod tests {
         use exposure_core::config::{GeoPolicyConfig, GeoRule, GeoRuleAction};
 
         let mut topo = TopologySpec::default();
-        topo.defaults.ingress.clearance_secret = "super-secret-global-clearance-key-0123456789".into();
+        topo.defaults.ingress.clearance_secret =
+            "super-secret-global-clearance-key-0123456789".into();
         topo.defaults.ingress.default_bucket = Some("std-rate".into());
         topo.defaults.ingress.default_waf = Some("strict-crs".into());
 
         topo.bucket_templates.insert(
             "std-rate".into(),
-            RateLimitBucket { capacity: 120.0, refill_per_sec: 20.0, per_ip: Some(true) },
+            RateLimitBucket {
+                capacity: 120.0,
+                refill_per_sec: 20.0,
+                per_ip: Some(true),
+            },
         );
         topo.bucket_templates.insert(
             "tight-rate".into(),
-            RateLimitBucket { capacity: 20.0, refill_per_sec: 2.0, per_ip: Some(true) },
+            RateLimitBucket {
+                capacity: 20.0,
+                refill_per_sec: 2.0,
+                per_ip: Some(true),
+            },
         );
         topo.antibot_templates.insert(
             "cn-challenge".into(),
@@ -2974,7 +3183,10 @@ mod tests {
         topo.nodes.insert(
             "ingress-cn".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { ingress: true, ..Default::default() },
+                roles: NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
                 ingress: IngressConfig {
                     // ingress-cn leaves default_antibot unset (should stay AntibotMode::Off!)
                     ..Default::default()
@@ -2985,7 +3197,10 @@ mod tests {
         topo.nodes.insert(
             "ingress-us".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { ingress: true, ..Default::default() },
+                roles: NodeRoles {
+                    ingress: true,
+                    ..Default::default()
+                },
                 ingress: IngressConfig {
                     default_bucket: Some("tight-rate".into()),
                     default_antibot: Some("cn-challenge".into()),
@@ -2997,7 +3212,10 @@ mod tests {
         topo.nodes.insert(
             "egress-us".into(),
             TopologyNodeSpec {
-                roles: NodeRoles { egress: true, ..Default::default() },
+                roles: NodeRoles {
+                    egress: true,
+                    ..Default::default()
+                },
                 link_listener: Some(LinkListenConfig {
                     listen_addr: "0.0.0.0:9443".into(),
                     allow_on_demand: Some(true),
@@ -3015,7 +3233,11 @@ mod tests {
                 mode: LinkMode::OnDemand,
                 tunnel_direction: None,
                 bidirectional: false,
-                endpoints: vec![PeerEndpoint { address: "198.51.100.2:9443".into(), priority: 10, weight: 100 }],
+                endpoints: vec![PeerEndpoint {
+                    address: "198.51.100.2:9443".into(),
+                    priority: 10,
+                    weight: 100,
+                }],
                 reverse_endpoints: vec![],
                 expected_client_addr: None,
             });
@@ -3042,7 +3264,10 @@ mod tests {
 
         // ingress-cn gets std-rate + Evilpot WAF, with antibot and bot/browser/beacon flags strictly disabled!
         let cn_ing = &compiled["ingress-cn"].ingress;
-        let cn_g = cn_ing.guards.get(cn_ing.rules[0].guard.as_ref().unwrap()).unwrap();
+        let cn_g = cn_ing
+            .guards
+            .get(cn_ing.rules[0].guard.as_ref().unwrap())
+            .unwrap();
         assert_eq!(cn_g.antibot, AntibotMode::Off);
         assert_eq!(cn_g.block_bots, Some(false));
         assert_eq!(cn_g.browser_only, Some(false));
@@ -3054,7 +3279,10 @@ mod tests {
 
         // ingress-us gets per-ingress tight-rate + cn-challenge + cluster strict-crs WAF
         let us_ing = &compiled["ingress-us"].ingress;
-        let us_g = us_ing.guards.get(us_ing.rules[0].guard.as_ref().unwrap()).unwrap();
+        let us_g = us_ing
+            .guards
+            .get(us_ing.rules[0].guard.as_ref().unwrap())
+            .unwrap();
         assert_eq!(us_g.antibot, AntibotMode::Challenge);
         assert_eq!(us_g.rate_limit_bucket.as_deref(), Some("tight-rate"));
         assert_eq!(us_g.waf.as_ref().unwrap().mode, WafMode::Evilpot);
@@ -3081,7 +3309,12 @@ mod tests {
         let hyb_g = hyb_comp["ingress-cn"]
             .ingress
             .guards
-            .get(hyb_comp["ingress-cn"].ingress.rules[0].guard.as_ref().unwrap())
+            .get(
+                hyb_comp["ingress-cn"].ingress.rules[0]
+                    .guard
+                    .as_ref()
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(hyb_g.waf.as_ref().unwrap().mode, WafMode::Block);
         assert_eq!(hyb_g.rate_limit_bucket.as_deref(), Some("std-rate"));
@@ -3089,8 +3322,12 @@ mod tests {
 
         // compute_control_hops treats LinkMode::Tunnel with tunnel_direction: None as Outbound
         let mut tun_topo = TopologySpec::default();
-        tun_topo.nodes.insert("ing-a".into(), TopologyNodeSpec::default());
-        tun_topo.nodes.insert("eg-b".into(), TopologyNodeSpec::default());
+        tun_topo
+            .nodes
+            .insert("ing-a".into(), TopologyNodeSpec::default());
+        tun_topo
+            .nodes
+            .insert("eg-b".into(), TopologyNodeSpec::default());
         tun_topo.links.push(TopologyLinkSpec {
             from: "ing-a".into(),
             to: "eg-b".into(),
@@ -3113,24 +3350,51 @@ mod tests {
         bad_geoip.defaults.ingress.geoip.ipv4_url = Some("https://127.0.0.1/geo.csv".into());
         bad_geoip.bucket_templates.insert(
             "bad-bkt".into(),
-            RateLimitBucket { capacity: 0.0, refill_per_sec: -1.0, per_ip: None },
+            RateLimitBucket {
+                capacity: 0.0,
+                refill_per_sec: -1.0,
+                per_ip: None,
+            },
         );
         let (bad_gip_rep, _) = compile_topology(&bad_geoip, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_gip_rep.valid);
         assert!(bad_gip_rep.errors.iter().any(|e| e.contains("cache_dir")));
-        assert!(bad_gip_rep.errors.iter().any(|e| e.contains("public HTTPS host")));
+        assert!(
+            bad_gip_rep
+                .errors
+                .iter()
+                .any(|e| e.contains("public HTTPS host"))
+        );
         assert!(bad_gip_rep.errors.iter().any(|e| e.contains("bad-bkt")));
 
         // Invalid Geo region token fails validation
         let mut bad_geo = topo.clone();
-        bad_geo.antibot_templates.get_mut("cn-challenge").unwrap().geo.as_mut().unwrap().deny_regions.push("INVALID_REGION".into());
+        bad_geo
+            .antibot_templates
+            .get_mut("cn-challenge")
+            .unwrap()
+            .geo
+            .as_mut()
+            .unwrap()
+            .deny_regions
+            .push("INVALID_REGION".into());
         let (bad_rep, _) = compile_topology(&bad_geo, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_rep.valid);
-        assert!(bad_rep.errors.iter().any(|e| e.contains("Geo region token")));
+        assert!(
+            bad_rep
+                .errors
+                .iter()
+                .any(|e| e.contains("Geo region token"))
+        );
 
         // Unknown WAF set reference fails validation
         let mut bad_waf = topo;
-        bad_waf.nodes.get_mut("ingress-cn").unwrap().ingress.default_waf = Some("missing-waf".into());
+        bad_waf
+            .nodes
+            .get_mut("ingress-cn")
+            .unwrap()
+            .ingress
+            .default_waf = Some("missing-waf".into());
         let (bad_waf_rep, _) = compile_topology(&bad_waf, "ctrl-pk", &pubkeys, &HashMap::new());
         assert!(!bad_waf_rep.valid);
         assert!(bad_waf_rep.errors.iter().any(|e| e.contains("missing-waf")));

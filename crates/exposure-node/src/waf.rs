@@ -3,10 +3,10 @@ use std::collections::HashSet;
 
 use exposure_core::config::{WafCategory, WafConfig, WafMode};
 use exposure_core::crs::{
-    builtin_crs_snapshot, WafRuleDescriptor, CRS_REGEX_SIZE_LIMIT, MAX_CRS_RULES,
+    CRS_REGEX_SIZE_LIMIT, MAX_CRS_RULES, WafRuleDescriptor, builtin_crs_snapshot,
 };
 use exposure_core::routing::normalize_path_for_match;
-use http::{header, HeaderMap, Method};
+use http::{HeaderMap, Method, header};
 use regex::{Regex, RegexBuilder};
 
 /// Hard ceiling on request body bytes buffered for WAF inspection (prevents OOM DoS).
@@ -81,7 +81,8 @@ pub fn is_path_exempt(path: &str, exempt_paths: &[String]) -> bool {
             return true;
         }
         if norm_path == norm_p
-            || (norm_path.starts_with(&norm_p) && norm_path.as_bytes().get(norm_p.len()) == Some(&b'/'))
+            || (norm_path.starts_with(&norm_p)
+                && norm_path.as_bytes().get(norm_p.len()) == Some(&b'/'))
         {
             return true;
         }
@@ -434,7 +435,8 @@ impl CrsTargetFlags {
         for t in targets {
             let u = t.to_ascii_uppercase();
             match u.as_str() {
-                "REQUEST_URI" | "REQUEST_URI_RAW" | "REQUEST_FILENAME" | "REQUEST_BASENAME" | "REQUEST_LINE" => {
+                "REQUEST_URI" | "REQUEST_URI_RAW" | "REQUEST_FILENAME" | "REQUEST_BASENAME"
+                | "REQUEST_LINE" => {
                     f.uri = true;
                 }
                 "ARGS" | "ARGS_NAMES" | "ARGS_GET" | "ARGS_POST" | "QUERY_STRING" => {
@@ -537,7 +539,9 @@ fn crs_category_enabled(rule_cat: &'static str, enabled: &[WafCategory]) -> bool
         WafCategory::SqlInjection => rule_cat == "sql-injection",
         WafCategory::Xss => rule_cat == "xss",
         WafCategory::PathTraversal => rule_cat == "path-traversal",
-        WafCategory::CommandInjection => rule_cat == "command-injection" || rule_cat == "php-attack",
+        WafCategory::CommandInjection => {
+            rule_cat == "command-injection" || rule_cat == "php-attack"
+        }
         WafCategory::NoSqlInjection => rule_cat == "nosql-injection",
         WafCategory::Ssrf => rule_cat == "ssrf",
         WafCategory::Ssti => rule_cat == "ssti" || rule_cat == "deserialization",
@@ -728,7 +732,12 @@ impl CompiledCrsEngine {
                 if rule.matcher.is_match(slice)
                     || (has_decoded && rule.matcher.is_match(decoded.as_ref()))
                 {
-                    return Some(Self::make_verdict(cfg.mode, rule, location, decoded.as_ref()));
+                    return Some(Self::make_verdict(
+                        cfg.mode,
+                        rule,
+                        location,
+                        decoded.as_ref(),
+                    ));
                 }
             }
             let consumed_end = start + slice.len();
@@ -854,7 +863,12 @@ impl CompiledCrsEngine {
                 if rule.targets.cookies {
                     for cv in &cookie_items {
                         if rule.matcher.is_match(cv.as_ref()) {
-                            return Self::make_verdict(cfg.mode, rule, "header:cookie", cv.as_ref());
+                            return Self::make_verdict(
+                                cfg.mode,
+                                rule,
+                                "header:cookie",
+                                cv.as_ref(),
+                            );
                         }
                     }
                 }
@@ -918,9 +932,12 @@ impl CompiledCrsEngine {
             if let Some(parsed) = parse_multipart_parts(boundary, bounded) {
                 for part in parsed.parts {
                     if let Some(ref name) = part.name {
-                        if let Some(v) =
-                            self.match_text_against_body_rules(cfg, max_pl, "body:multipart-name", name)
-                        {
+                        if let Some(v) = self.match_text_against_body_rules(
+                            cfg,
+                            max_pl,
+                            "body:multipart-name",
+                            name,
+                        ) {
                             return v;
                         }
                     }
@@ -1091,7 +1108,10 @@ mod tests {
         );
         assert!(large_json.len() > 2500);
         let bv = crs.inspect_body(&cfg, Some("application/json"), large_json.as_bytes());
-        assert!(matches!(bv, WafVerdict::Allow), "unexpected body verdict: {bv:?}");
+        assert!(
+            matches!(bv, WafVerdict::Allow),
+            "unexpected body verdict: {bv:?}"
+        );
     }
 
     #[test]
@@ -1101,46 +1121,68 @@ mod tests {
         let empty = HeaderMap::new();
 
         // SQLi in query (both %20 and + space encoding)
-        assert!(crs.inspect_head(&cfg, "/search", Some("q=admin'+OR+'1'='1'+--"), &empty).is_block());
-        assert!(crs
-            .inspect_head(
+        assert!(
+            crs.inspect_head(&cfg, "/search", Some("q=admin'+OR+'1'='1'+--"), &empty)
+                .is_block()
+        );
+        assert!(
+            crs.inspect_head(
                 &cfg,
                 "/items",
                 Some("id=1%20UNION%20SELECT%20username,password%20FROM%20users"),
                 &empty
             )
-            .is_block());
+            .is_block()
+        );
 
         // Path Traversal in path
-        assert!(crs.inspect_head(&cfg, "/files/../../../../etc/passwd", None, &empty).is_block());
+        assert!(
+            crs.inspect_head(&cfg, "/files/../../../../etc/passwd", None, &empty)
+                .is_block()
+        );
 
         // XSS in query
-        assert!(crs
-            .inspect_head(&cfg, "/profile", Some("bio=%3Csvg%20onload%3Dalert(1)%3E"), &empty)
-            .is_block());
+        assert!(
+            crs.inspect_head(
+                &cfg,
+                "/profile",
+                Some("bio=%3Csvg%20onload%3Dalert(1)%3E"),
+                &empty
+            )
+            .is_block()
+        );
 
         // Command Injection in query
-        assert!(crs
-            .inspect_head(&cfg, "/ping", Some("host=1.1.1.1;cat${IFS}/etc/passwd"), &empty)
-            .is_block());
+        assert!(
+            crs.inspect_head(
+                &cfg,
+                "/ping",
+                Some("host=1.1.1.1;cat${IFS}/etc/passwd"),
+                &empty
+            )
+            .is_block()
+        );
 
         // SSRF in query
-        assert!(crs
-            .inspect_head(
+        assert!(
+            crs.inspect_head(
                 &cfg,
                 "/fetch",
                 Some("url=http://169.254.169.254/latest/meta-data/"),
                 &empty
             )
-            .is_block());
+            .is_block()
+        );
 
         // SSTI arithmetic template expression in query
-        assert!(crs
-            .inspect_head(&cfg, "/render", Some("name={{7*7}}"), &empty)
-            .is_block());
-        assert!(crs
-            .inspect_head(&cfg, "/render", Some("name=${7*7}"), &empty)
-            .is_block());
+        assert!(
+            crs.inspect_head(&cfg, "/render", Some("name={{7*7}}"), &empty)
+                .is_block()
+        );
+        assert!(
+            crs.inspect_head(&cfg, "/render", Some("name=${7*7}"), &empty)
+                .is_block()
+        );
         // Benign template interpolation without arithmetic must NOT be flagged
         assert!(matches!(
             crs.inspect_head(&cfg, "/render", Some("name={{username}}"), &empty),
@@ -1173,14 +1215,23 @@ mod tests {
 
         // SQLi in form-urlencoded body with `+` spaces
         let form = b"user=admin'+OR+'1'='1'+--&pass=123";
-        assert!(crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form).is_block());
+        assert!(
+            crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form)
+                .is_block()
+        );
         // Double-equals tautology (`1==1`) in a password field must still be blocked.
         let form_eq = b"username=zhouyitian2403&password=%27+or+1%3D%3D1+--";
-        assert!(crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form_eq).is_block());
+        assert!(
+            crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), form_eq)
+                .is_block()
+        );
 
         // XXE in XML body
         let xxe = br#"<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><r>&xxe;</r>"#;
-        assert!(crs.inspect_body(&cfg, Some("application/xml"), xxe).is_block());
+        assert!(
+            crs.inspect_body(&cfg, Some("application/xml"), xxe)
+                .is_block()
+        );
     }
 
     #[test]
@@ -1215,12 +1266,18 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            crs.inspect_head(&sqli_only, "/search", Some("q=<script>alert(1)</script>"), &empty),
+            crs.inspect_head(
+                &sqli_only,
+                "/search",
+                Some("q=<script>alert(1)</script>"),
+                &empty
+            ),
             WafVerdict::Allow
         ));
-        assert!(crs
-            .inspect_head(&sqli_only, "/search", Some("q=' OR '1'='1"), &empty)
-            .is_block());
+        assert!(
+            crs.inspect_head(&sqli_only, "/search", Some("q=' OR '1'='1"), &empty)
+                .is_block()
+        );
 
         // Exempt path respects segment boundary
         let exempt = WafConfig {
@@ -1229,12 +1286,23 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            crs.inspect_head(&exempt, "/api/webhooks/stripe", Some("q=' OR '1'='1"), &empty),
+            crs.inspect_head(
+                &exempt,
+                "/api/webhooks/stripe",
+                Some("q=' OR '1'='1"),
+                &empty
+            ),
             WafVerdict::Allow
         ));
-        assert!(crs
-            .inspect_head(&exempt, "/api/webhooks-other", Some("q=' OR '1'='1"), &empty)
-            .is_block());
+        assert!(
+            crs.inspect_head(
+                &exempt,
+                "/api/webhooks-other",
+                Some("q=' OR '1'='1"),
+                &empty
+            )
+            .is_block()
+        );
     }
 
     #[test]
@@ -1261,7 +1329,10 @@ mod tests {
         );
 
         let mut h_json = HeaderMap::new();
-        h_json.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));
+        h_json.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
         assert_eq!(
             should_inspect_body(&cfg, &Method::POST, &h_json, false),
             Some(32 * 1024)
@@ -1285,7 +1356,10 @@ mod tests {
 
         let cfg = block_cfg();
         let mut h_scan = HeaderMap::new();
-        h_scan.insert(header::USER_AGENT, HeaderValue::from_static("sqlmap/1.8.2#stable"));
+        h_scan.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("sqlmap/1.8.2#stable"),
+        );
         match engine.inspect_head(&cfg, "/", None, &h_scan) {
             WafVerdict::Block(f) => {
                 assert_eq!(f.rule_id, Some(913100));
@@ -1331,14 +1405,25 @@ mod tests {
         let mut h_benign = HeaderMap::new();
         h_benign.insert(
             header::USER_AGENT,
-            HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"),
+            HeaderValue::from_static(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+            ),
         );
-        h_benign.insert(header::COOKIE, HeaderValue::from_static("a=1; id=2; session=ok"));
+        h_benign.insert(
+            header::COOKIE,
+            HeaderValue::from_static("a=1; id=2; session=ok"),
+        );
         assert!(matches!(
-            crs.inspect_head(&cfg, "/oauth/authorize", Some("client_id=web-portal&state=xyz"), &h_benign),
+            crs.inspect_head(
+                &cfg,
+                "/oauth/authorize",
+                Some("client_id=web-portal&state=xyz"),
+                &h_benign
+            ),
             WafVerdict::Allow
         ));
-        let benign_json_dash = br##"{"bio":"#rust","flag":"--help","note":"please select or check"}"##;
+        let benign_json_dash =
+            br##"{"bio":"#rust","flag":"--help","note":"please select or check"}"##;
         assert!(matches!(
             crs.inspect_body(&cfg, Some("application/json"), benign_json_dash),
             WafVerdict::Allow
@@ -1386,7 +1471,10 @@ mod tests {
         });
         let synced_engine = CompiledCrsEngine::compile(&with_942440, &[]);
         assert!(
-            matches!(synced_engine.inspect_body(&evilpot_cfg, Some(ct), body.as_bytes()), WafVerdict::Allow),
+            matches!(
+                synced_engine.inspect_body(&evilpot_cfg, Some(ct), body.as_bytes()),
+                WafVerdict::Allow
+            ),
             "legitimate WebKitFormBoundary password submission must NOT trigger SQL comment/SQLi rule"
         );
     }
@@ -1503,7 +1591,11 @@ mod tests {
             let q = format!("q={p}");
             let hv = crs.inspect_head(&cfg, "/search", Some(&q), &empty);
             assert!(hv.is_block(), "query SQLi missed: {p:?} => {hv:?}");
-            let bv = crs.inspect_body(&cfg, Some("application/x-www-form-urlencoded"), q.as_bytes());
+            let bv = crs.inspect_body(
+                &cfg,
+                Some("application/x-www-form-urlencoded"),
+                q.as_bytes(),
+            );
             assert!(bv.is_block(), "body SQLi missed: {p:?} => {bv:?}");
         }
 
@@ -1515,7 +1607,8 @@ mod tests {
         ] {
             let q = format!("q={enc}");
             assert!(
-                crs.inspect_head(&cfg, "/search", Some(&q), &empty).is_block(),
+                crs.inspect_head(&cfg, "/search", Some(&q), &empty)
+                    .is_block(),
                 "double-encoded SQLi missed: {enc}"
             );
         }
@@ -1529,7 +1622,10 @@ mod tests {
         ] {
             let q = format!("q={benign}");
             assert!(
-                matches!(crs.inspect_head(&cfg, "/search", Some(&q), &empty), WafVerdict::Allow),
+                matches!(
+                    crs.inspect_head(&cfg, "/search", Some(&q), &empty),
+                    WafVerdict::Allow
+                ),
                 "benign phrase falsely flagged: {benign:?}"
             );
         }
@@ -1590,7 +1686,10 @@ mod tests {
         ];
         for (path, q) in benign {
             let v = crs.inspect_head(&cfg, path, Some(*q), &empty);
-            assert!(matches!(v, WafVerdict::Allow), "benign falsely flagged: {q:?} => {v:?}");
+            assert!(
+                matches!(v, WafVerdict::Allow),
+                "benign falsely flagged: {q:?} => {v:?}"
+            );
         }
     }
 
@@ -1634,21 +1733,23 @@ mod tests {
         ));
 
         // 2. Across Content-Type variants (charset, JSON, raw/empty, multipart w/ spoofed binary MIME on non-file field)
-        assert!(crs
-            .inspect_body(
+        assert!(
+            crs.inspect_body(
                 &cfg,
                 Some("application/x-www-form-urlencoded; charset=UTF-8"),
                 payload
             )
-            .is_block());
+            .is_block()
+        );
         assert!(crs.inspect_body(&cfg, None, payload).is_block());
-        assert!(crs
-            .inspect_body(
+        assert!(
+            crs.inspect_body(
                 &cfg,
                 Some("application/json"),
                 br#"{"username":"zhouyitian2403","password":"' or 1==1 --"}"#
             )
-            .is_block());
+            .is_block()
+        );
 
         let mp_ct = "multipart/form-data; boundary=----B123";
         let mp_spoof_mime = concat!(
@@ -1658,46 +1759,60 @@ mod tests {
             "' or 1==1 --\r\n",
             "------B123--\r\n"
         );
-        assert!(crs
-            .inspect_body(&cfg, Some(mp_ct), mp_spoof_mime.as_bytes())
-            .is_block());
+        assert!(
+            crs.inspect_body(&cfg, Some(mp_ct), mp_spoof_mime.as_bytes())
+                .is_block()
+        );
 
         // 3. Preceded by invalid UTF-8 bytes must not truncate inspection
         let invalid_utf8 = b"username=\xff\xfe&password=%27+or+1%3D%3D1+--";
-        assert!(crs
-            .inspect_body(&cfg, Some("application/x-www-form-urlencoded"), invalid_utf8)
-            .is_block());
+        assert!(
+            crs.inspect_body(
+                &cfg,
+                Some("application/x-www-form-urlencoded"),
+                invalid_utf8
+            )
+            .is_block()
+        );
 
         // 4. Padded past 8 KiB (`MAX_CRS_SCAN_BYTES`) and past 256 form params (`MAX_WAF_FORM_PARAMS`)
         let pad_8k = format!(
             "username=zhouyitian2403&pad={}&password=%27+or+1%3D%3D1+--",
             "a".repeat(12_000)
         );
-        assert!(crs
-            .inspect_body(
+        assert!(
+            crs.inspect_body(
                 &cfg,
                 Some("application/x-www-form-urlencoded"),
                 pad_8k.as_bytes()
             )
-            .is_block());
+            .is_block()
+        );
 
         let mut many_params = String::new();
         for i in 0..270 {
             many_params.push_str(&format!("k{i}=v{i}&"));
         }
         many_params.push_str("password=%27+or+1%3D%3D1+--");
-        assert!(crs
-            .inspect_body(
+        assert!(
+            crs.inspect_body(
                 &cfg,
                 Some("application/x-www-form-urlencoded"),
                 many_params.as_bytes()
             )
-            .is_block());
+            .is_block()
+        );
 
         // 5. Comment obfuscation (`*/or/**/1==1`), path traversal exemption bypass, and multi-Cookie HTTP/2 headers
-        assert!(crs
-            .inspect_head(&cfg, "/login", Some("p=1/**/or/**/1==1--"), &HeaderMap::new())
-            .is_block());
+        assert!(
+            crs.inspect_head(
+                &cfg,
+                "/login",
+                Some("p=1/**/or/**/1==1--"),
+                &HeaderMap::new()
+            )
+            .is_block()
+        );
         assert!(!is_path_exempt(
             "/api/webhooks/../../login",
             &["/api/webhooks/".into()]
@@ -1705,7 +1820,13 @@ mod tests {
 
         let mut h2_cookies = HeaderMap::new();
         h2_cookies.append(header::COOKIE, HeaderValue::from_static("session=abc"));
-        h2_cookies.append(header::COOKIE, HeaderValue::from_static("auth=' or 1==1 --"));
-        assert!(crs.inspect_head(&cfg, "/login", None, &h2_cookies).is_block());
+        h2_cookies.append(
+            header::COOKIE,
+            HeaderValue::from_static("auth=' or 1==1 --"),
+        );
+        assert!(
+            crs.inspect_head(&cfg, "/login", None, &h2_cookies)
+                .is_block()
+        );
     }
 }

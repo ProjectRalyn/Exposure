@@ -114,8 +114,7 @@ impl<T: Serialize> SegmentWriter<T> {
         let final_path = Path::new(&self.cfg.dir).join(&filename);
         // Random suffix + `create_new` prevents symlink-follow/truncation in a shared directory.
         let rand_suffix = crate::crypto::generate_random_secret_hex(8);
-        let tmp_path =
-            Path::new(&self.cfg.dir).join(format!(".{filename}.{rand_suffix}.tmp"));
+        let tmp_path = Path::new(&self.cfg.dir).join(format!(".{filename}.{rand_suffix}.tmp"));
 
         {
             let mut opts = OpenOptions::new();
@@ -172,7 +171,10 @@ impl<T: Serialize> SegmentWriter<T> {
 
         // Sort oldest first and trim until total disk bytes <= max_disk_bytes (preserving newest file).
         files.sort_by_key(|(_, _, m)| *m);
-        let mut total: u64 = files.iter().map(|(_, len, _)| *len).fold(0u64, u64::saturating_add);
+        let mut total: u64 = files
+            .iter()
+            .map(|(_, len, _)| *len)
+            .fold(0u64, u64::saturating_add);
         let mut remaining = files.len();
         for (path, len, _) in files {
             if total <= self.cfg.max_disk_bytes || remaining <= 1 {

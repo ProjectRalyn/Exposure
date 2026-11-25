@@ -7,17 +7,17 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use dashmap::DashMap;
+use exposure_core::Result;
 use exposure_core::config::{LogProtectionConfig, LoggerConfig};
 use exposure_core::crypto::{generate_random_secret_hex, hmac_ip, is_weak_secret};
 use exposure_core::routing::canonical_ip;
-use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic, SegmentWriter};
+use exposure_core::segment::{SegmentWriter, read_json_snapshot, write_json_snapshot_atomic};
 use exposure_core::telemetry::{
-    is_autoban_action, is_cache_served_status, is_evilpot_action, is_security_block_action,
-    normalize_alert_severity, sanitize_log_text, AlertRecord, BanRecord, ClientJsFingerprint,
-    EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation, LogProtectionStats,
-    MinuteSummary, SessionSummary,
+    AlertRecord, BanRecord, ClientJsFingerprint, EvilpotEventInfo, EvilpotSessionInfo,
+    FingerprintObservation, LogProtectionStats, MinuteSummary, SessionSummary, is_autoban_action,
+    is_cache_served_status, is_evilpot_action, is_security_block_action, normalize_alert_severity,
+    sanitize_log_text,
 };
-use exposure_core::Result;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -245,7 +245,10 @@ impl LogDoSGuard {
     }
 
     fn push_displaced(&self, summary: SessionSummary) {
-        let mut disp = self.displaced_folded.lock().unwrap_or_else(|e| e.into_inner());
+        let mut disp = self
+            .displaced_folded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if disp.len() < MAX_FOLDED_LOG_KEYS {
             disp.push(summary);
         } else {
@@ -426,7 +429,8 @@ impl LogDoSGuard {
                 *mb = (now, 0);
             }
             let cap_bytes = if priority == LogPriority::High {
-                cfg.max_bytes_per_min.saturating_add(cfg.max_bytes_per_min / 10)
+                cfg.max_bytes_per_min
+                    .saturating_add(cfg.max_bytes_per_min / 10)
             } else {
                 cfg.max_bytes_per_min
             };
@@ -456,7 +460,10 @@ impl LogDoSGuard {
     fn drain_folded(&self, flush_all: bool, dedup_window: Duration) -> Vec<SessionSummary> {
         let now = Instant::now();
         let mut out = {
-            let mut disp = self.displaced_folded.lock().unwrap_or_else(|e| e.into_inner());
+            let mut disp = self
+                .displaced_folded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *disp)
         };
         let expired_keys: Vec<(String, u16, String, String)> = self
@@ -528,7 +535,9 @@ impl LogDoSGuard {
         let now = Instant::now();
         let prefix: String = msg.chars().take(64).collect();
         let key = (severity.to_string(), prefix);
-        if self.alert_cooldowns.len() >= MAX_ALERT_DEDUP_KEYS && !self.alert_cooldowns.contains_key(&key) {
+        if self.alert_cooldowns.len() >= MAX_ALERT_DEDUP_KEYS
+            && !self.alert_cooldowns.contains_key(&key)
+        {
             self.alert_cooldowns
                 .retain(|_, ts| now.duration_since(*ts) < ALERT_DEDUP_COOLDOWN);
             if self.alert_cooldowns.len() >= MAX_ALERT_DEDUP_KEYS {
@@ -597,7 +606,13 @@ struct NodeLoggerCheckpoint {
 fn node_checkpoint_path(dir: &str, node_tag: &str) -> PathBuf {
     let safe: String = node_tag
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(64)
         .collect();
     let name = if safe.is_empty() || safe.contains("..") {
@@ -654,7 +669,8 @@ pub struct NodeLogger {
     writer: Arc<StdMutex<SegmentWriter<SessionSummary>>>,
     minute_buckets: Arc<Mutex<HashMap<(i64, String, String), MinuteSummary>>>,
     fp_observations: Arc<Mutex<HashMap<String, FingerprintObservation>>>,
-    recent_abuse_backfills: Mutex<HashMap<String, (Instant, u8, Option<String>, Option<String>, bool)>>,
+    recent_abuse_backfills:
+        Mutex<HashMap<String, (Instant, u8, Option<String>, Option<String>, bool)>>,
     pending_disk_records: Arc<Mutex<Vec<SessionSummary>>>,
     pending_disk_bytes: Arc<Mutex<usize>>,
     recent_records: Arc<Mutex<Vec<SessionSummary>>>,
@@ -893,10 +909,7 @@ impl NodeLogger {
             }
             if challenged {
                 entry.challenges_issued = entry.challenges_issued.saturating_add(1);
-            } else if !rate_limited
-                && status < 500
-                && is_security_block_action(meta.action)
-            {
+            } else if !rate_limited && status < 500 && is_security_block_action(meta.action) {
                 entry.blocked = entry.blocked.saturating_add(1);
             }
             if is_evilpot_action(meta.action) {
@@ -1049,7 +1062,9 @@ impl NodeLogger {
                 pending.push(rec.clone());
                 *pbytes = pbytes.saturating_add(est_bytes);
             } else {
-                self.dos_guard.dropped_records.fetch_add(1, Ordering::Relaxed);
+                self.dos_guard
+                    .dropped_records
+                    .fetch_add(1, Ordering::Relaxed);
             }
             (pending.len(), *pbytes)
         };
@@ -1075,13 +1090,23 @@ impl NodeLogger {
 
         let max_recs = cfg.segment.max_batch_records.clamp(1, MAX_RECENT_RECORDS);
         let max_bytes = cfg.segment.max_batch_bytes.max(4096);
-        if disk_len >= max_recs || disk_bytes >= max_bytes || rec_len >= max_recs || byte_len >= max_bytes {
+        if disk_len >= max_recs
+            || disk_bytes >= max_bytes
+            || rec_len >= max_recs
+            || byte_len >= max_bytes
+        {
             self.flush_notify.notify_one();
         }
     }
 
     async fn promote_expired_folded(&self, flush_all: bool) {
-        let dedup_secs = self.cfg.read().await.protection.dedup_window_secs.clamp(1, 300);
+        let dedup_secs = self
+            .cfg
+            .read()
+            .await
+            .protection
+            .dedup_window_secs
+            .clamp(1, 300);
         let folded = self
             .dos_guard
             .drain_folded(flush_all, Duration::from_secs(dedup_secs));
@@ -1121,7 +1146,10 @@ impl NodeLogger {
             .try_read()
             .map(|c| c.protection.enabled)
             .unwrap_or(true);
-        if !self.dos_guard.should_emit_alert(norm_sev, &clean_msg, prot_enabled) {
+        if !self
+            .dos_guard
+            .should_emit_alert(norm_sev, &clean_msg, prot_enabled)
+        {
             return;
         }
         let now = Utc::now();
@@ -1223,7 +1251,13 @@ impl NodeLogger {
         let cp = if self.dirty.swap(false, Ordering::AcqRel) {
             Some(NodeLoggerCheckpoint {
                 summaries: self.minute_buckets.lock().await.values().cloned().collect(),
-                fingerprints: self.fp_observations.lock().await.values().cloned().collect(),
+                fingerprints: self
+                    .fp_observations
+                    .lock()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect(),
                 alerts: self.alerts.lock().await.clone(),
                 pending_evilpot_sessions: self
                     .pending_evilpot_sessions
@@ -1349,7 +1383,11 @@ impl NodeLogger {
         let mut obs = FingerprintObservation {
             id: id.clone(),
             ip_hmac: ip_tag,
-            client_ip: if cfg.store_raw_ip { Some(canon_ip) } else { None },
+            client_ip: if cfg.store_raw_ip {
+                Some(canon_ip)
+            } else {
+                None
+            },
             ip_prefix: prefix,
             fp_hash: fp_hash.to_string(),
             js_verified,
@@ -1413,8 +1451,10 @@ impl NodeLogger {
             map.retain(|_, v| v.last_seen_ts >= cutoff);
             if map.len() >= MAX_FP_OBSERVATIONS {
                 // Evict oldest 25% entries
-                let mut entries: Vec<(String, i64)> =
-                    map.iter().map(|(k, v)| (k.clone(), v.last_seen_ts)).collect();
+                let mut entries: Vec<(String, i64)> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.last_seen_ts))
+                    .collect();
                 entries.sort_by_key(|(_, ts)| *ts);
                 for (k, _) in entries.into_iter().take(MAX_FP_OBSERVATIONS / 4) {
                     map.remove(&k);
@@ -1465,7 +1505,13 @@ impl NodeLogger {
             }
             bf.insert(
                 ip_tag.clone(),
-                (now_inst, abuse_score, cc_owned.clone(), isp_owned.clone(), abuse_is_tor),
+                (
+                    now_inst,
+                    abuse_score,
+                    cc_owned.clone(),
+                    isp_owned.clone(),
+                    abuse_is_tor,
+                ),
             );
         }
 
@@ -1473,7 +1519,10 @@ impl NodeLogger {
         let mut changed = false;
         for obs in map.values_mut() {
             if obs.ip_hmac == ip_tag {
-                obs.abuse_score = Some(obs.abuse_score.map_or(abuse_score, |old| old.max(abuse_score)));
+                obs.abuse_score = Some(
+                    obs.abuse_score
+                        .map_or(abuse_score, |old| old.max(abuse_score)),
+                );
                 if obs.abuse_country.is_none() {
                     obs.abuse_country = cc_owned.clone();
                 }
@@ -1726,12 +1775,27 @@ mod tests {
             )
             .await;
         logger
-            .record_session("ingress", "web", "203.0.113.6", 200, 18.0, 120, 600, false, false, false, None)
+            .record_session(
+                "ingress",
+                "web",
+                "203.0.113.6",
+                200,
+                18.0,
+                120,
+                600,
+                false,
+                false,
+                false,
+                None,
+            )
             .await;
         // wait_early_flush should resolve immediately because notify_one() stored a permit
-        tokio::time::timeout(std::time::Duration::from_millis(200), logger.wait_early_flush())
-            .await
-            .expect("early flush should have been signalled on batch threshold");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            logger.wait_early_flush(),
+        )
+        .await
+        .expect("early flush should have been signalled on batch threshold");
 
         logger.flush_segments().await.unwrap();
 
@@ -1740,7 +1804,10 @@ mod tests {
         let rows: Vec<SessionSummary> = read_segment_file(&segs[0]).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].path.as_deref(), Some("/dashboard"));
-        assert_eq!(rows[0].query.as_deref(), Some("tab=overview&token=[REDACTED]"));
+        assert_eq!(
+            rows[0].query.as_deref(),
+            Some("tab=overview&token=[REDACTED]")
+        );
         assert_eq!(rows[0].method.as_deref(), Some("GET"));
         assert_eq!(rows[0].ray_id.as_deref(), Some("ray-1"));
 
@@ -1754,7 +1821,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dos_log_protection_folds_floods_keeps_exact_metrics_and_preserves_high_priority_logs() {
+    async fn dos_log_protection_folds_floods_keeps_exact_metrics_and_preserves_high_priority_logs()
+    {
         let dir = std::env::temp_dir().join(format!("exposure-nlog-dos-{}", uuid::Uuid::new_v4()));
         let cfg = LoggerConfig {
             hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
@@ -1907,9 +1975,18 @@ mod tests {
         );
         let folded_total: u32 = recs.iter().map(|r| r.repeat_count).sum();
         assert_eq!(folded_total, 552);
-        assert!(recs.iter().any(|r| r.path.as_deref() == Some("/api/profile") && r.status == 200));
-        assert!(recs.iter().any(|r| r.path.as_deref() == Some("/api/checkout") && r.status == 502));
-        assert!(recs.iter().any(|r| r.status == 429 && r.repeat_count >= 499));
+        assert!(
+            recs.iter()
+                .any(|r| r.path.as_deref() == Some("/api/profile") && r.status == 200)
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.path.as_deref() == Some("/api/checkout") && r.status == 502)
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.status == 429 && r.repeat_count >= 499)
+        );
 
         let stats = logger.protection_stats();
         assert!(stats.folded_records >= 530);
@@ -1929,7 +2006,8 @@ mod tests {
 
     #[tokio::test]
     async fn dos_log_protection_enforces_per_minute_byte_budget() {
-        let dir = std::env::temp_dir().join(format!("exposure-nlog-bytes-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("exposure-nlog-bytes-{}", uuid::Uuid::new_v4()));
         let cfg = LoggerConfig {
             hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
             segment: SegmentConfig {
@@ -1980,7 +2058,11 @@ mod tests {
         }
         let (recs, sums, _) = logger.drain_for_maintainer().await;
         assert_eq!(sums[0].requests, 30);
-        assert!(recs.len() < 15, "byte budget should cap emitted rows, got {}", recs.len());
+        assert!(
+            recs.len() < 15,
+            "byte budget should cap emitted rows, got {}",
+            recs.len()
+        );
         assert!(logger.protection_stats().dropped_records > 0);
 
         let _ = std::fs::remove_dir_all(&dir);

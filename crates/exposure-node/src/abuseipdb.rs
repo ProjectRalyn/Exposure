@@ -211,10 +211,7 @@ impl AbuseIpDbClient {
 
     fn consume_daily_quota(&self, limit: u32) -> bool {
         let today = current_utc_day();
-        let mut q = self
-            .daily_quota
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut q = self.daily_quota.lock().unwrap_or_else(|e| e.into_inner());
         if q.0 != today {
             *q = (today, 0);
         }
@@ -231,7 +228,10 @@ impl AbuseIpDbClient {
         let mut resp = match self
             .http
             .get(&self.api_base)
-            .query(&[("ipAddress", ip_str.as_str()), ("maxAgeInDays", max_age.as_str())])
+            .query(&[
+                ("ipAddress", ip_str.as_str()),
+                ("maxAgeInDays", max_age.as_str()),
+            ])
             .header("Key", cfg.api_key.trim())
             .header("Accept", "application/json")
             .send()
@@ -246,9 +246,12 @@ impl AbuseIpDbClient {
         };
 
         if resp.status().as_u16() == 429 {
-            let until = (Utc::now().timestamp().max(0) as u64).saturating_add(RATE_LIMIT_BACKOFF_SECS);
+            let until =
+                (Utc::now().timestamp().max(0) as u64).saturating_add(RATE_LIMIT_BACKOFF_SECS);
             self.backoff_until_unix.store(until, Ordering::Relaxed);
-            warn!("abuseipdb returned 429 Too Many Requests; backing off for {RATE_LIMIT_BACKOFF_SECS}s");
+            warn!(
+                "abuseipdb returned 429 Too Many Requests; backing off for {RATE_LIMIT_BACKOFF_SECS}s"
+            );
             self.insert_cache(ip, None, NEGATIVE_CACHE_TTL);
             return None;
         }

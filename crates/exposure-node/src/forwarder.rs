@@ -5,13 +5,13 @@ use std::time::Duration;
 use dashmap::DashMap;
 use exposure_core::config::{NodeRoles, RelayConfig};
 use exposure_core::protocol::{
-    read_json_frame, read_json_frame_bounded, write_json_frame, ServiceStreamHeader, SpecialFrame,
-    SpecialPayload, StreamKind, MAX_HEADER_FRAME_BYTES, MAX_TTL,
+    MAX_HEADER_FRAME_BYTES, MAX_TTL, ServiceStreamHeader, SpecialFrame, SpecialPayload, StreamKind,
+    read_json_frame, read_json_frame_bounded, write_json_frame,
 };
 use exposure_core::{ExposureError, Result};
 use exposure_link::{IncomingMuxStream, LinkManager};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::egress::EgressHandler;
@@ -107,7 +107,10 @@ impl Forwarder {
             let egress = Arc::clone(&self.egress);
             let self_tag = self.node_tag.clone();
             tokio::spawn(async move {
-                if let Err(e) = egress.handle_stream(header, Some(self_tag), server_io).await {
+                if let Err(e) = egress
+                    .handle_stream(header, Some(self_tag), server_io)
+                    .await
+                {
                     debug!(error = %e, "local egress service stream ended");
                 }
             });
@@ -124,15 +127,21 @@ impl Forwarder {
 
     /// Send a `SpecialFrame` along its Hop Table using `StreamKind::Special` (authenticated links only).
     pub async fn send_special(&self, frame: SpecialFrame) -> Result<()> {
-        self.send_special_with_kind(frame, StreamKind::Special).await
+        self.send_special_with_kind(frame, StreamKind::Special)
+            .await
     }
 
     /// Send a bootstrap frame (`BootstrapForward` / `BootstrapReply`) using `StreamKind::Bootstrap`.
     pub async fn send_bootstrap(&self, frame: SpecialFrame) -> Result<()> {
-        self.send_special_with_kind(frame, StreamKind::Bootstrap).await
+        self.send_special_with_kind(frame, StreamKind::Bootstrap)
+            .await
     }
 
-    async fn send_special_with_kind(&self, mut frame: SpecialFrame, kind: StreamKind) -> Result<()> {
+    async fn send_special_with_kind(
+        &self,
+        mut frame: SpecialFrame,
+        kind: StreamKind,
+    ) -> Result<()> {
         frame.validate_hops()?;
         if frame.is_final_hop(&self.node_tag) {
             // Locally-originated request terminating here: enqueue as an *incoming request*

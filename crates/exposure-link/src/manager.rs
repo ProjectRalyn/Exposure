@@ -1,22 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use exposure_core::config::{LinkListenConfig, LinkMode, PeerConfig, ProbeConfig, TunnelDirection};
-use exposure_core::crypto::{pubkey_fingerprint_b64, NodeKeyPair};
+use exposure_core::crypto::{NodeKeyPair, pubkey_fingerprint_b64};
 use exposure_core::protocol::StreamKind;
-use exposure_core::routing::{select_endpoint, LinkHealthState};
+use exposure_core::routing::{LinkHealthState, select_endpoint};
 use exposure_core::telemetry::LinkStatusSnapshot;
 use exposure_core::{ExposureError, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::handshake::{
-    client_hello, server_hello, BootstrapAuthState, HandshakeOutcome, NonceReplayCache,
+    BootstrapAuthState, HandshakeOutcome, NonceReplayCache, client_hello, server_hello,
 };
 use crate::mux::{IncomingMuxStream, MuxSession, MuxStream};
 use crate::noise::NoiseStream;
@@ -85,7 +85,12 @@ fn peer_matches_pubkey(peer: &PeerConfig, pubkey_b64: &str) -> bool {
     if !has_pk && !has_fp {
         return false;
     }
-    if let Some(exp_pk) = peer.public_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(exp_pk) = peer
+        .public_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         if exp_pk != pubkey_b64.trim() {
             return false;
         }
@@ -226,9 +231,9 @@ impl LinkManager {
                 to_close.push(sess.session.clone());
                 return false;
             }
-            let valid = peers
-                .iter()
-                .any(|p| p.node_tag == *node_tag && peer_matches_pubkey(p, &sess.remote_public_key));
+            let valid = peers.iter().any(|p| {
+                p.node_tag == *node_tag && peer_matches_pubkey(p, &sess.remote_public_key)
+            });
             if !valid {
                 to_close.push(sess.session.clone());
             }
@@ -391,7 +396,8 @@ impl LinkManager {
             }
         } else if outcome.bootstrap_pending && listen_policy.effective_allow_bootstrap() {
             // Strictly isolate unauthenticated bootstrap sessions so they can NEVER overwrite inbound_sessions
-            self.bootstrap_sessions.retain(|_, v| !v.session.is_closed());
+            self.bootstrap_sessions
+                .retain(|_, v| !v.session.is_closed());
             if self.bootstrap_sessions.len() >= MAX_BOOTSTRAP_SESSIONS {
                 active.session.close().await;
                 return Err(ExposureError::Link("bootstrap session pool full".into()));
@@ -710,11 +716,7 @@ impl LinkManager {
 
     /// Open a stream to a Peer Tag (used by the Forwarding Layer for service traffic).
     /// Applies priority, weight, weight-0 backup, live probe health states, and automatic multi-endpoint failover.
-    pub async fn open_stream_to_peer(
-        &self,
-        peer_tag: &str,
-        kind: StreamKind,
-    ) -> Result<MuxStream> {
+    pub async fn open_stream_to_peer(&self, peer_tag: &str, kind: StreamKind) -> Result<MuxStream> {
         let peers = self.peers.read().await.clone();
         // Prioritize exact peer_tag match before falling back to node_tag match
         let peer = peers
@@ -857,11 +859,7 @@ impl LinkManager {
     }
 
     /// Open a stream to a target `node_tag` (used for Hop Table routing, including Control replies).
-    pub async fn open_stream_to_node(
-        &self,
-        node_tag: &str,
-        kind: StreamKind,
-    ) -> Result<MuxStream> {
+    pub async fn open_stream_to_node(&self, node_tag: &str, kind: StreamKind) -> Result<MuxStream> {
         // Check authenticated inbound/registered sessions first
         if let Some(entry) = self.inbound_sessions.get(node_tag) {
             if entry.authenticated && !entry.session.is_closed() {
@@ -937,38 +935,40 @@ impl LinkManager {
         let mut out = Vec::new();
         for peer in peers {
             if is_inbound_tunnel(&peer) {
-                let (state, ep, rtt, loss) = if let Some(sess) =
-                    self.inbound_sessions.get(&peer.node_tag)
-                {
-                    let ep = sess.endpoint.clone();
-                    let alive = sess.authenticated && !sess.session.is_closed();
-                    let tr = self
-                        .probe_trackers
-                        .get(&(peer.peer_tag.clone(), INBOUND_TUNNEL_TRACKER_KEY.to_string()))
-                        .map(|t| (t.state, t.last_rtt_ms, t.loss_rate()));
-                    match tr {
-                        Some((st, r, l)) => {
-                            (if alive { st } else { LinkHealthState::Down }, ep, r, l)
+                let (state, ep, rtt, loss) =
+                    if let Some(sess) = self.inbound_sessions.get(&peer.node_tag) {
+                        let ep = sess.endpoint.clone();
+                        let alive = sess.authenticated && !sess.session.is_closed();
+                        let tr = self
+                            .probe_trackers
+                            .get(&(
+                                peer.peer_tag.clone(),
+                                INBOUND_TUNNEL_TRACKER_KEY.to_string(),
+                            ))
+                            .map(|t| (t.state, t.last_rtt_ms, t.loss_rate()));
+                        match tr {
+                            Some((st, r, l)) => {
+                                (if alive { st } else { LinkHealthState::Down }, ep, r, l)
+                            }
+                            None => (
+                                if alive {
+                                    LinkHealthState::Up
+                                } else {
+                                    LinkHealthState::Down
+                                },
+                                ep,
+                                None,
+                                0.0,
+                            ),
                         }
-                        None => (
-                            if alive {
-                                LinkHealthState::Up
-                            } else {
-                                LinkHealthState::Down
-                            },
-                            ep,
+                    } else {
+                        (
+                            LinkHealthState::Down,
+                            INBOUND_TUNNEL_TRACKER_KEY.into(),
                             None,
-                            0.0,
-                        ),
-                    }
-                } else {
-                    (
-                        LinkHealthState::Down,
-                        INBOUND_TUNNEL_TRACKER_KEY.into(),
-                        None,
-                        1.0,
-                    )
-                };
+                            1.0,
+                        )
+                    };
                 out.push(LinkStatusSnapshot {
                     node_tag: self.local_tag.clone(),
                     peer_tag: peer.peer_tag,
@@ -983,8 +983,7 @@ impl LinkManager {
                         .probe_trackers
                         .get(&(peer.peer_tag.clone(), ep.address.clone()))
                         .map(|t| (t.state, t.last_rtt_ms, t.loss_rate()));
-                    let (state, rtt_ms, loss_rate) =
-                        tr.unwrap_or((LinkHealthState::Up, None, 0.0));
+                    let (state, rtt_ms, loss_rate) = tr.unwrap_or((LinkHealthState::Up, None, 0.0));
                     out.push(LinkStatusSnapshot {
                         node_tag: self.local_tag.clone(),
                         peer_tag: peer.peer_tag.clone(),

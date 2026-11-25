@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use exposure_core::config::{
-    resolve_domain_binding, CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig,
-    MaintainerConfig,
+    CertOrderConfig, DnsProviderAccountConfig, DomainBindingConfig, MaintainerConfig,
+    resolve_domain_binding,
 };
-use exposure_core::crypto::{validate_dns_domain, write_secret_file_atomic, NodeKeyPair};
+use exposure_core::crypto::{NodeKeyPair, validate_dns_domain, write_secret_file_atomic};
 use exposure_core::protocol::{
-    cert_bundle_signing_bytes, DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities,
-    DnsRemoteRecord, DnsSupportLine, DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerQuery,
-    MaintainerTelemetrySnapshot, SpecialFrame, SpecialPayload,
+    DnsLineSyncEntry, DnsManageOp, DnsProviderCapabilities, DnsRemoteRecord, DnsSupportLine,
+    DnsSyncDomainResult, DnsSyncRecordSpec, MaintainerQuery, MaintainerTelemetrySnapshot,
+    SpecialFrame, SpecialPayload, cert_bundle_signing_bytes,
 };
 use exposure_core::routing::is_public_routable_ip;
 use exposure_core::telemetry::{
@@ -26,7 +26,7 @@ use exposure_core::{ExposureError, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -43,7 +43,9 @@ fn validate_cloudflare_id(val: &str, field: &str) -> Result<()> {
     let s = val.trim();
     if s.is_empty()
         || s.len() > 64
-        || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(ExposureError::Config(format!(
             "invalid Cloudflare {field}: '{val}'"
@@ -59,7 +61,9 @@ fn validate_aliyun_credentials<'a>(
     let ak = access_key_id.trim();
     if ak.is_empty()
         || ak.len() > 128
-        || ak.chars().any(|c| c.is_control() || c.is_whitespace() || c == ',')
+        || ak
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == ',')
     {
         return Err(ExposureError::Config(
             "invalid Aliyun DNS access_key_id".into(),
@@ -78,7 +82,9 @@ fn validate_aliyun_record_id(val: &str) -> Result<()> {
     let s = val.trim();
     if s.is_empty()
         || s.len() > 64
-        || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(ExposureError::Config(format!(
             "invalid Aliyun DNS record_id: '{val}'"
@@ -311,18 +317,13 @@ fn cloudflare_zone_candidates(domain: &str, root_domain: Option<&str>) -> Result
     if let Some(rd) = root_domain.map(str::trim).filter(|s| !s.is_empty()) {
         let clean_rd = rd.trim_end_matches('.');
         if clean_rd.contains('*') {
-            return Err(ExposureError::Config(format!(
-                "invalid root_domain '{rd}'"
-            )));
+            return Err(ExposureError::Config(format!("invalid root_domain '{rd}'")));
         }
         validate_dns_domain(clean_rd)?;
         out.push(clean_rd.to_string());
     }
 
-    let base = domain
-        .trim()
-        .trim_start_matches("*.")
-        .trim_end_matches('.');
+    let base = domain.trim().trim_start_matches("*.").trim_end_matches('.');
     if base.is_empty() {
         return Err(ExposureError::Config(format!("invalid domain '{domain}'")));
     }
@@ -336,7 +337,10 @@ fn cloudflare_zone_candidates(domain: &str, root_domain: Option<&str>) -> Result
     };
     for i in 0..max_start {
         let cand = labels[i..].join(".");
-        if !out.iter().any(|existing| existing.eq_ignore_ascii_case(&cand)) {
+        if !out
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&cand))
+        {
             out.push(cand);
         }
     }
@@ -734,10 +738,8 @@ impl MaintainerService {
                 offset,
                 limit,
             } => {
-                db.query_bans(
-                    from_ms, to_ms, node, status, kind, target, q, offset, limit,
-                )
-                .await
+                db.query_bans(from_ms, to_ms, node, status, kind, target, q, offset, limit)
+                    .await
             }
             MaintainerQuery::Alerts {
                 from_ms,
@@ -782,7 +784,10 @@ impl MaintainerService {
         let db = self.current_db().await;
         let max_db_bytes = self.cfg.read().await.logger.retention.max_db_bytes;
         let effective_since = since_minute.or_else(|| Some(Utc::now().timestamp() - 6 * 3600));
-        let summaries = db.snapshot_summaries(effective_since, 1000).await.unwrap_or_default();
+        let summaries = db
+            .snapshot_summaries(effective_since, 1000)
+            .await
+            .unwrap_or_default();
         let alerts = db.recent_alerts(50).await.unwrap_or_default();
         let storage_stats = db.storage_stats(max_db_bytes).await.ok();
         // The snapshot still carries recent logs & fingerprints for Control's cached telemetry
@@ -807,13 +812,7 @@ impl MaintainerService {
             .and_then(|v| v.get("items").cloned())
             .and_then(|v| serde_json::from_value::<Vec<FingerprintObservation>>(v).ok())
             .unwrap_or_default();
-        let certificates = self
-            .cert_statuses
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect();
+        let certificates = self.cert_statuses.lock().await.values().cloned().collect();
         let merge_latency_ms = *self.last_merge_latency_ms.lock().await;
 
         MaintainerTelemetrySnapshot {
@@ -859,7 +858,8 @@ impl MaintainerService {
         let canonical_query = build_aliyun_canonical_query(params);
         let date = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let nonce = Uuid::new_v4().to_string();
-        let auth = sign_aliyun_v3_post(&host_header, action, &canonical_query, ak, sk, date, nonce)?;
+        let auth =
+            sign_aliyun_v3_post(&host_header, action, &canonical_query, ak, sk, date, nonce)?;
 
         let trimmed_base = base_url.trim_end_matches('/');
         let url = if canonical_query.is_empty() {
@@ -1151,9 +1151,7 @@ impl MaintainerService {
             for rec in batch {
                 let rec_rr = rec["RR"].as_str().unwrap_or("");
                 let rec_type = rec["Type"].as_str().unwrap_or("");
-                if rec_rr.eq_ignore_ascii_case(&rr)
-                    && matches!(rec_type, "A" | "AAAA" | "CNAME")
-                {
+                if rec_rr.eq_ignore_ascii_case(&rr) && matches!(rec_type, "A" | "AAAA" | "CNAME") {
                     existing.push(rec);
                 }
             }
@@ -1690,7 +1688,10 @@ impl MaintainerService {
             )
             .await?;
         let fqdn = format!("_acme-challenge.{}", domain.trim().trim_start_matches("*."));
-        let url = format!("{}/zones/{zone_id}/dns_records", cf_base.trim_end_matches('/'));
+        let url = format!(
+            "{}/zones/{zone_id}/dns_records",
+            cf_base.trim_end_matches('/')
+        );
         let resp = self
             .http_client
             .post(&url)
@@ -1873,7 +1874,9 @@ impl MaintainerService {
                             raw_content.trim().to_string()
                         }
                     });
-                if desired.contains(norm_content.as_str()) && matched_ips.insert(norm_content.clone()) {
+                if desired.contains(norm_content.as_str())
+                    && matched_ips.insert(norm_content.clone())
+                {
                     let cur_ttl = rec["ttl"].as_u64();
                     let cur_proxied = rec["proxied"].as_bool().unwrap_or(false);
                     if cur_ttl != Some(ttl as u64) || cur_proxied != proxied {
@@ -1951,9 +1954,10 @@ impl MaintainerService {
                     .send()
                     .await
                     .map_err(|e| ExposureError::Link(format!("cloudflare delete record: {e}")))?;
-                let body: serde_json::Value = resp.json().await.map_err(|e| {
-                    ExposureError::Protocol(format!("cloudflare delete json: {e}"))
-                })?;
+                let body: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ExposureError::Protocol(format!("cloudflare delete json: {e}")))?;
                 if body["success"].as_bool() != Some(true) {
                     return Err(ExposureError::Protocol(format!(
                         "cloudflare delete dns_record failed: {body}"
@@ -2028,11 +2032,12 @@ impl MaintainerService {
                             .bearer_auth(api_token)
                             .send()
                             .await
-                            .map_err(|e| ExposureError::Link(format!("cloudflare list records: {e}")))?;
-                        let body: serde_json::Value = resp
-                            .json()
-                            .await
-                            .map_err(|e| ExposureError::Protocol(format!("cloudflare list json: {e}")))?;
+                            .map_err(|e| {
+                                ExposureError::Link(format!("cloudflare list records: {e}"))
+                            })?;
+                        let body: serde_json::Value = resp.json().await.map_err(|e| {
+                            ExposureError::Protocol(format!("cloudflare list json: {e}"))
+                        })?;
                         if body["success"].as_bool() != Some(true) {
                             return Err(ExposureError::Protocol(format!(
                                 "cloudflare list dns_records failed: {body}"
@@ -2289,7 +2294,10 @@ impl MaintainerService {
 
     /// Execute Control-authorized declarative DNS A/AAAA sync for one or more domains
     /// using this Maintainer's local `dns_providers` credentials.
-    pub async fn sync_dns_records(&self, records: &[DnsSyncRecordSpec]) -> Vec<DnsSyncDomainResult> {
+    pub async fn sync_dns_records(
+        &self,
+        records: &[DnsSyncRecordSpec],
+    ) -> Vec<DnsSyncDomainResult> {
         let cfg = self.cfg.read().await.clone();
         let mut results = Vec::with_capacity(records.len());
 
@@ -2754,12 +2762,9 @@ impl MaintainerService {
         validate_dns_domain(&order.domain)?;
 
         let cfg = self.cfg.read().await.clone();
-        let signing_secret = cfg
-            .cert_signing_secret_key
-            .as_deref()
-            .ok_or_else(|| {
-                ExposureError::Config("maintainer missing cert_signing_secret_key".into())
-            })?;
+        let signing_secret = cfg.cert_signing_secret_key.as_deref().ok_or_else(|| {
+            ExposureError::Config("maintainer missing cert_signing_secret_key".into())
+        })?;
         let kp = NodeKeyPair::from_secret_b64(signing_secret)?;
 
         let binding = resolve_domain_binding(&cfg.domains, &order.domain).map(|(_, b)| b);
@@ -2776,7 +2781,12 @@ impl MaintainerService {
 
         let now = Utc::now();
         let cached = if !cfg.acme.storage_dir.is_empty() {
-            load_valid_cached_cert(&cfg.acme.storage_dir, &order.domain, order.renew_before_days, now)
+            load_valid_cached_cert(
+                &cfg.acme.storage_dir,
+                &order.domain,
+                order.renew_before_days,
+                now,
+            )
         } else {
             None
         };
@@ -2846,7 +2856,13 @@ impl MaintainerService {
                         let domain = order.domain.clone();
                         async move {
                             let _ = self
-                                .dns01_cleanup(provider, binding, &domain, &txt_val, rec_id.as_deref())
+                                .dns01_cleanup(
+                                    provider,
+                                    binding,
+                                    &domain,
+                                    &txt_val,
+                                    rec_id.as_deref(),
+                                )
                                 .await;
                         }
                     },
@@ -2977,7 +2993,11 @@ impl MaintainerService {
                 targets: order.target_nodes.clone(),
                 expires_at: Some(exp_dt.to_rfc3339()),
                 last_renewed: Some(now.to_rfc3339()),
-                status: if all_ok { "valid".into() } else { "degraded".into() },
+                status: if all_ok {
+                    "valid".into()
+                } else {
+                    "degraded".into()
+                },
             },
         );
         Ok(())
@@ -3050,7 +3070,8 @@ impl MaintainerService {
                                         Ok(exp_dt) => {
                                             // Clamp to a sane range so a misconfigured value cannot
                                             // panic (`ChronoDuration::days`) or overflow.
-                                            let renew_days = order.renew_before_days.clamp(1, 89) as i64;
+                                            let renew_days =
+                                                order.renew_before_days.clamp(1, 89) as i64;
                                             let renew_at = exp_dt.with_timezone(&Utc)
                                                 - ChronoDuration::days(renew_days);
                                             now >= renew_at
@@ -3095,10 +3116,8 @@ impl MaintainerService {
                                 .map(|s| s.status != "valid")
                                 .unwrap_or(false);
                             if still_degraded {
-                                retry_after.insert(
-                                    order.domain.clone(),
-                                    now + ChronoDuration::minutes(5),
-                                );
+                                retry_after
+                                    .insert(order.domain.clone(), now + ChronoDuration::minutes(5));
                             } else {
                                 retry_after.remove(&order.domain);
                                 fail_counts.remove(&order.domain);
@@ -3162,7 +3181,10 @@ mod tests {
 
     #[test]
     fn aliyun_percent_encode_and_canonical_query() {
-        assert_eq!(aliyun_percent_encode("abc-123_456.789~"), "abc-123_456.789~");
+        assert_eq!(
+            aliyun_percent_encode("abc-123_456.789~"),
+            "abc-123_456.789~"
+        );
         assert_eq!(aliyun_percent_encode("a b/c+d=e"), "a%20b%2Fc%2Bd%3De");
 
         let q = build_aliyun_canonical_query(&[
@@ -3277,7 +3299,11 @@ mod tests {
                 let mut lines = req_str.split("\r\n");
                 let request_line = lines.next().unwrap_or("");
                 let target = request_line.split_whitespace().nth(1).unwrap_or("/");
-                let query = target.split_once('?').map(|(_, q)| q).unwrap_or("").to_string();
+                let query = target
+                    .split_once('?')
+                    .map(|(_, q)| q)
+                    .unwrap_or("")
+                    .to_string();
 
                 let mut action = String::new();
                 let mut authorization = String::new();
@@ -3331,7 +3357,10 @@ mod tests {
                 200,
                 r#"{"RequestId":"req-1","RecordId":"987654321"}"#.to_string(),
             ),
-            (200, r#"{"RequestId":"req-2","RecordId":"987654321"}"#.to_string()),
+            (
+                200,
+                r#"{"RequestId":"req-2","RecordId":"987654321"}"#.to_string(),
+            ),
         ])
         .await;
 
@@ -3368,9 +3397,11 @@ mod tests {
             "DomainName=example.com&RR=_acme-challenge.sub&TTL=600&Type=TXT&Value=txt-challenge-value"
         );
         assert_eq!(captured[0].content_sha256, EMPTY_BODY_SHA256);
-        assert!(captured[0]
-            .authorization
-            .starts_with("ACS3-HMAC-SHA256 Credential=LTAI5tKey,"));
+        assert!(
+            captured[0]
+                .authorization
+                .starts_with("ACS3-HMAC-SHA256 Credential=LTAI5tKey,")
+        );
         assert!(!captured[0].host.is_empty());
 
         assert_eq!(captured[1].action, "DeleteDomainRecord");
@@ -3711,11 +3742,13 @@ mod tests {
         assert!(!results[0].ok);
         assert!(results[0].error.as_deref().unwrap().contains("zero target"));
         assert!(!results[1].ok);
-        assert!(results[1]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("no DNS provider"));
+        assert!(
+            results[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no DNS provider")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3774,7 +3807,13 @@ mod tests {
             proxied: None,
         };
         let res = svc
-            .aliyun_sync_records_with_base(&base_url, "LTAI5tKey", "Secret", Some("example.com"), &spec)
+            .aliyun_sync_records_with_base(
+                &base_url,
+                "LTAI5tKey",
+                "Secret",
+                Some("example.com"),
+                &spec,
+            )
             .await
             .expect("split sync ok");
         assert!(res.ok);
@@ -3835,10 +3874,11 @@ mod tests {
 
     #[tokio::test]
     async fn maintainer_persists_state_across_restart_and_prunes_limits() {
-        use std::collections::BTreeMap;
         use exposure_core::telemetry::{HyperLogLog, LatencyHistogram};
+        use std::collections::BTreeMap;
 
-        let dir = std::env::temp_dir().join(format!("exposure-maint-persist-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("exposure-maint-persist-{}", uuid::Uuid::new_v4()));
         let mut cfg = MaintainerConfig::default();
         cfg.logger.segment.dir = dir.to_string_lossy().to_string();
         cfg.logger.retention.stats_retention_days = 1;
@@ -3887,7 +3927,10 @@ mod tests {
                 vec![],
             )
             .await;
-        assert_eq!(ingested, 1, "expired summary older than stats_retention_days must be dropped");
+        assert_eq!(
+            ingested, 1,
+            "expired summary older than stats_retention_days must be dropped"
+        );
 
         svc.flush_segments().await.unwrap();
         drop(svc);

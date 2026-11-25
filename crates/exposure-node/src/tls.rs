@@ -6,9 +6,9 @@ use dashmap::DashMap;
 use exposure_core::config::TlsCertEntry;
 use exposure_core::routing::normalize_host;
 use exposure_core::{ExposureError, Result};
+use rustls::ServerConfig;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -21,7 +21,11 @@ pub struct DynamicCertResolver {
     file_certs: DashMap<String, Arc<CertifiedKey>>,
 }
 
-fn parse_certified_key_pem(domain: &str, cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>> {
+fn parse_certified_key_pem(
+    domain: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<CertifiedKey>> {
     let mut cert_reader = BufReader::new(cert_pem.as_bytes());
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -42,7 +46,9 @@ fn parse_certified_key_pem(domain: &str, cert_pem: &str, key_pem: &str) -> Resul
 
     let ck = CertifiedKey::new(certs, signing_key);
     ck.keys_match().map_err(|e| {
-        ExposureError::Crypto(format!("certificate and private key mismatch for {domain}: {e}"))
+        ExposureError::Crypto(format!(
+            "certificate and private key mismatch for {domain}: {e}"
+        ))
     })?;
     Ok(Arc::new(ck))
 }
@@ -374,7 +380,9 @@ mod tests {
         let store = DynamicCertResolver::new();
         let (cert_a, key_a) = generate_self_signed_pem("dyn.example.com").unwrap();
         let (cert_b, key_b) = generate_self_signed_pem("file.example.com").unwrap();
-        store.load_from_pem("dyn.example.com", &cert_a, &key_a).unwrap();
+        store
+            .load_from_pem("dyn.example.com", &cert_a, &key_a)
+            .unwrap();
         let tmp = std::env::temp_dir().join(format!("exp-tls-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let cp = tmp.join("f.crt");

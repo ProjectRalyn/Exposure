@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -12,15 +12,15 @@ use exposure_core::config::{
     TlsCertEntry, TunnelDirection,
 };
 use exposure_core::crypto::{
-    compute_bootstrap_reply_proof, compute_passphrase_proof, validate_dns_domain,
-    verify_bootstrap_reply_proof, verify_signature_b64, write_secret_file_atomic, NodeKeyPair,
+    NodeKeyPair, compute_bootstrap_reply_proof, compute_passphrase_proof, validate_dns_domain,
+    verify_bootstrap_reply_proof, verify_signature_b64, write_secret_file_atomic,
 };
 use exposure_core::protocol::{
+    DiscoveryNeighbor, DnsManageOp, DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot,
+    PreflightCheckItem, PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
     cert_bundle_signing_bytes, dial_enroll_req_signing_bytes, discovery_resp_signing_bytes,
     dns_manage_req_signing_bytes, dns_sync_req_signing_bytes, geoip_sync_req_signing_bytes,
     pull_telemetry_req_signing_bytes, query_maintainer_req_signing_bytes, unban_req_signing_bytes,
-    DiscoveryNeighbor, DnsManageOp, DnsProviderCapabilities, DnsSyncRecordSpec, NodeStatusSnapshot,
-    PreflightCheckItem, PreflightReport, SpecialFrame, SpecialPayload, StreamKind,
 };
 use exposure_core::routing::is_public_routable_ip;
 use exposure_core::telemetry::BanRecord;
@@ -93,7 +93,10 @@ fn load_persisted_certs_from_dir(cert_resolver: &DynamicCertResolver, dir: &Path
             continue;
         }
         let domain = stem.replace("_wildcard_", "*");
-        match (std::fs::read_to_string(&path), std::fs::read_to_string(&key_path)) {
+        match (
+            std::fs::read_to_string(&path),
+            std::fs::read_to_string(&key_path),
+        ) {
             (Ok(cert_pem), Ok(key_pem)) => {
                 if let Err(e) = cert_resolver.load_from_pem(&domain, &cert_pem, &key_pem) {
                     warn!(domain = %domain, error = %e, "skipped invalid persisted TLS cert on startup");
@@ -347,9 +350,7 @@ impl NodeRuntime {
             (collect_trusted_control_keys(&cfg), cfg.clone())
         };
         self.persist_config_yaml(&cfg_snapshot).await?;
-        self.link_manager
-            .set_trusted_control_pubkeys(trusted)
-            .await;
+        self.link_manager.set_trusted_control_pubkeys(trusted).await;
         self.revoke_passphrase().await;
         Ok(())
     }
@@ -380,9 +381,7 @@ impl NodeRuntime {
                                 (collect_trusted_control_keys(&cfg), cfg.clone())
                             };
                             let _ = rt.persist_config_yaml(&cfg_snapshot).await;
-                            rt.link_manager
-                                .set_trusted_control_pubkeys(trusted)
-                                .await;
+                            rt.link_manager.set_trusted_control_pubkeys(trusted).await;
                             info!(
                                 node = %rt.node_tag(),
                                 control = %incoming.remote_node_tag,
@@ -743,7 +742,9 @@ impl NodeRuntime {
                         nonce: vec![],
                         error: Some("bootstrap via_node does not match relay node".into()),
                     })
-                } else if let Ok(_fwd_permit) = Arc::clone(&self.bootstrap_fwd_sem).try_acquire_owned() {
+                } else if let Ok(_fwd_permit) =
+                    Arc::clone(&self.bootstrap_fwd_sem).try_acquire_owned()
+                {
                     let ctrl_tag = self.connected_control_tag.read().await.clone();
                     if let Some(ctrl) = ctrl_tag {
                         let fwd_frame = SpecialFrame::new(
@@ -950,7 +951,9 @@ impl NodeRuntime {
                     return;
                 }
 
-                let link_pk = control_link_public_key.clone().unwrap_or_else(|| pk.clone());
+                let link_pk = control_link_public_key
+                    .clone()
+                    .unwrap_or_else(|| pk.clone());
 
                 // Verify passphrase proof when not already authenticated directly as Control
                 let verified = if incoming.is_control && incoming.authenticated {
@@ -1009,7 +1012,9 @@ impl NodeRuntime {
                     // Allow updating signing key during initial Control-authenticated bootstrap handshake if link_pk was set first
                     let update_snap = {
                         let mut cfg = self.config.write().await;
-                        if cfg.control_public_key.as_deref() == cfg.control_link_public_key.as_deref() {
+                        if cfg.control_public_key.as_deref()
+                            == cfg.control_link_public_key.as_deref()
+                        {
                             cfg.control_public_key = Some(pk);
                             cfg.control_link_public_key = Some(link_pk);
                             Some((collect_trusted_control_keys(&cfg), cfg.clone()))
@@ -1019,15 +1024,10 @@ impl NodeRuntime {
                     };
                     if let Some((trusted, cfg_snapshot)) = update_snap {
                         let _ = self.persist_config_yaml(&cfg_snapshot).await;
-                        self.link_manager
-                            .set_trusted_control_pubkeys(trusted)
-                            .await;
+                        self.link_manager.set_trusted_control_pubkeys(trusted).await;
                         self.revoke_passphrase().await;
                     }
-                } else if let Err(e) = self
-                    .install_enrolled_control_keys(pk, Some(link_pk))
-                    .await
-                {
+                } else if let Err(e) = self.install_enrolled_control_keys(pk, Some(link_pk)).await {
                     warn!(node = %self.node_tag(), error = %e, "failed to install enrolled control keys");
                 } else {
                     info!(node = %self.node_tag(), "enrolled with Control and revoked passphrase");
@@ -1253,13 +1253,8 @@ impl NodeRuntime {
             error: Some(msg),
         };
 
-        let signing = dns_manage_req_signing_bytes(
-            &request_id,
-            issued_at,
-            expires_at,
-            &maintainer_tag,
-            &op,
-        );
+        let signing =
+            dns_manage_req_signing_bytes(&request_id, issued_at, expires_at, &maintainer_tag, &op);
         if let Err(msg) = self
             .verify_control_signed_cmd(
                 "DnsManageReq",
@@ -1494,7 +1489,11 @@ impl NodeRuntime {
                 .iter()
                 .map(|l| l.listen_addr.clone())
                 .collect();
-            (cfg.control_public_key.clone(), cfg.config_sequence, listeners)
+            (
+                cfg.control_public_key.clone(),
+                cfg.config_sequence,
+                listeners,
+            )
         };
         let Some(control_pk) = control_pk else {
             return SpecialPayload::PreflightResp(PreflightReport {
@@ -1954,9 +1953,7 @@ impl NodeRuntime {
             .trusted_maintainers
             .iter()
             .find(|m| m.node_tag == maintainer_tag)
-            .ok_or_else(|| {
-                ExposureError::Auth(format!("untrusted maintainer {maintainer_tag}"))
-            })?;
+            .ok_or_else(|| ExposureError::Auth(format!("untrusted maintainer {maintainer_tag}")))?;
 
         let signing = cert_bundle_signing_bytes(
             domain,
@@ -1970,7 +1967,8 @@ impl NodeRuntime {
         verify_signature_b64(&trusted.public_key, &signing, signature)?;
 
         // Hot-reload into TLS SNI resolver first (validates PEM + keys_match before touching disk)
-        self.cert_resolver.load_from_pem(domain, cert_pem, key_pem)?;
+        self.cert_resolver
+            .load_from_pem(domain, cert_pem, key_pem)?;
         self.cert_last_issued_at.insert(norm_domain, issued_at);
 
         // Persist to disk with atomic 0600 permissions for private key
@@ -1981,8 +1979,14 @@ impl NodeRuntime {
             let key_owned = key_pem.to_string();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 std::fs::create_dir_all(&dir)?;
-                write_secret_file_atomic(&dir.join(format!("{safe}.crt.pem")), cert_owned.as_bytes())?;
-                write_secret_file_atomic(&dir.join(format!("{safe}.key.pem")), key_owned.as_bytes())?;
+                write_secret_file_atomic(
+                    &dir.join(format!("{safe}.crt.pem")),
+                    cert_owned.as_bytes(),
+                )?;
+                write_secret_file_atomic(
+                    &dir.join(format!("{safe}.key.pem")),
+                    key_owned.as_bytes(),
+                )?;
                 Ok(())
             })
             .await
@@ -2057,7 +2061,8 @@ impl NodeRuntime {
                         .send_bootstrap_rpc(req, Duration::from_secs(10))
                         .await
                     {
-                        let ctrl_link_pk = control_link_public_key.unwrap_or_else(|| ctrl_pk.clone());
+                        let ctrl_link_pk =
+                            control_link_public_key.unwrap_or_else(|| ctrl_pk.clone());
                         // Mutual authentication: verify Control proved knowledge of our onboarding passphrase!
                         if verify_bootstrap_reply_proof(
                             &pass,

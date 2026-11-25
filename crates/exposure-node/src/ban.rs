@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use dashmap::DashMap;
+use exposure_core::Result;
 use exposure_core::config::AutoBanConfig;
 use exposure_core::crypto::short_sha256_hex;
 use exposure_core::routing::canonical_ip;
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic};
 use exposure_core::telemetry::{ActiveBanInfo, BanRecord};
-use exposure_core::Result;
 use serde::{Deserialize, Serialize};
 
 const MAX_BANNED_IPS: usize = 65_536;
@@ -180,9 +180,12 @@ struct PersistedBanState {
 }
 
 fn clean_opt_meta(v: Option<&str>, max_chars: usize) -> Option<String> {
-    v.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.chars().filter(|c| !c.is_control()).take(max_chars).collect())
+    v.map(str::trim).filter(|s| !s.is_empty()).map(|s| {
+        s.chars()
+            .filter(|c| !c.is_control())
+            .take(max_chars)
+            .collect()
+    })
 }
 
 fn ban_entry_to_record(node_tag: &str, kind: BanKind, target: String, e: &BanEntry) -> BanRecord {
@@ -323,7 +326,8 @@ impl AutoBanManager {
             None => false,
         };
         if expired {
-            self.banned_ips.remove_if(&canon, |_, e| now >= e.expires_at);
+            self.banned_ips
+                .remove_if(&canon, |_, e| now >= e.expires_at);
         }
         false
     }
@@ -353,7 +357,9 @@ impl AutoBanManager {
 
         // 2. Verified JS fingerprint ban (high-entropy device hash; catches rotating IPs)
         if let Some(js_h) = js_fp_hash.filter(|s| !s.is_empty()) {
-            if let Some(m) = self.check_map_str(&self.banned_js_fps, BanKind::JsFingerprint, js_h, now) {
+            if let Some(m) =
+                self.check_map_str(&self.banned_js_fps, BanKind::JsFingerprint, js_h, now)
+            {
                 return Some(m);
             }
         }
@@ -526,7 +532,9 @@ impl AutoBanManager {
                 // Confirm after at least 2 multi-step interactions (or earlier if threshold is 1)
                 trapped_requests >= 2.min(confirm_threshold as u64)
             }
-            OffenseKind::AttackScannerProbe => self.add_offense_points(ip, 2, now) >= confirm_threshold,
+            OffenseKind::AttackScannerProbe => {
+                self.add_offense_points(ip, 2, now) >= confirm_threshold
+            }
             OffenseKind::WafAttackProbe | OffenseKind::HeadlessOrVerifyAbuse => {
                 self.add_offense_points(ip, 1, now) >= confirm_threshold
             }
@@ -541,9 +549,7 @@ impl AutoBanManager {
         let base_ttl = self.ban_ttl_secs.load(Ordering::Relaxed).max(60);
         let max_ttl = self.max_ban_ttl_secs.load(Ordering::Relaxed).max(base_ttl);
         let shift = (level.saturating_sub(1)).min(6) as u32;
-        let ttl_secs = base_ttl
-            .saturating_mul(1u64 << shift)
-            .min(max_ttl);
+        let ttl_secs = base_ttl.saturating_mul(1u64 << shift).min(max_ttl);
 
         let now_unix = now_unix_secs();
         let expires_at = now + Duration::from_secs(ttl_secs);
@@ -957,19 +963,31 @@ mod tests {
 
         // Attacker IP is now dropped at TCP & HTTP
         assert!(mgr.is_ip_banned_for_tcp(attacker_ip));
-        assert!(mgr
-            .check_request(attacker_ip, Some(chrome_ja3), chrome_ua, None)
-            .is_some());
+        assert!(
+            mgr.check_request(attacker_ip, Some(chrome_ja3), chrome_ua, None)
+                .is_some()
+        );
 
         // Normal Chrome user is 100% unaffected!
         assert!(!mgr.is_ip_banned_for_tcp(normal_ip));
-        assert!(mgr
-            .check_request(normal_ip, Some(chrome_ja3), chrome_ua, Some("jsfp-normal-user"))
-            .is_none());
+        assert!(
+            mgr.check_request(
+                normal_ip,
+                Some(chrome_ja3),
+                chrome_ua,
+                Some("jsfp-normal-user")
+            )
+            .is_none()
+        );
 
         // Attacker rotating to a new IP with same JS FP is STILL blocked!
         let js_hit = mgr
-            .check_request(rotated_ip, Some(chrome_ja3), chrome_ua, Some("jsfp-attacker-1"))
+            .check_request(
+                rotated_ip,
+                Some(chrome_ja3),
+                chrome_ua,
+                Some("jsfp-attacker-1"),
+            )
             .expect("banned JS fingerprint must catch rotated IP");
         assert_eq!(js_hit.kind, BanKind::JsFingerprint);
 
@@ -1082,9 +1100,15 @@ mod tests {
         assert_eq!(o2.offense_level, 1);
 
         assert!(mgr.unban("js_fp", "jsfpdeadbeef"));
-        assert!(mgr
-            .check_request("198.51.100.99".parse().unwrap(), None, "Mozilla", Some("jsfpdeadbeef"))
-            .is_none());
+        assert!(
+            mgr.check_request(
+                "198.51.100.99".parse().unwrap(),
+                None,
+                "Mozilla",
+                Some("jsfpdeadbeef")
+            )
+            .is_none()
+        );
 
         let snap = mgr.snapshot();
         let comp_target = snap
@@ -1173,7 +1197,10 @@ mod tests {
             reason: "evilpot:verified_exploit:rce",
         });
         assert_eq!(out.created_bans.len(), 3);
-        assert_eq!(out.created_bans[0].service_tag.as_deref(), Some("www-static"));
+        assert_eq!(
+            out.created_bans[0].service_tag.as_deref(),
+            Some("www-static")
+        );
         mgr1.save_to_file(&path).unwrap();
 
         let mgr2 = AutoBanManager::new(&cfg);
@@ -1182,7 +1209,11 @@ mod tests {
         assert!(mgr2.is_ip_banned_for_tcp(attacker));
         let active = mgr2.active_ban_records("edge-1");
         assert_eq!(active.len(), 3);
-        assert!(active.iter().all(|b| b.node_tag == "edge-1" && b.service_tag.as_deref() == Some("www-static")));
+        assert!(
+            active
+                .iter()
+                .all(|b| b.node_tag == "edge-1" && b.service_tag.as_deref() == Some("www-static"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

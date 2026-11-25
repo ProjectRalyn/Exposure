@@ -4,29 +4,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use exposure_core::assets::{load_web_asset, WebApp};
+use exposure_core::assets::{WebApp, load_web_asset};
 use exposure_core::config::{
     ControlConfig, ControlRetentionConfig, ControlRole, DnsProviderAccountConfig,
     MaintainerRetentionConfig, NodeConfig, TopologySpec,
 };
-use exposure_core::protocol::{DnsManageOp, MaintainerQuery};
 use exposure_core::crypto::{
     ct_eq_hashed, generate_random_secret_hex, hmac_ip, validate_identifier, verify_password,
 };
+use exposure_core::protocol::{DnsManageOp, MaintainerQuery};
 use exposure_core::routing::{
-    canonical_ip, is_public_routable_ip, parse_valid_host, LinkHealthState,
+    LinkHealthState, canonical_ip, is_public_routable_ip, parse_valid_host,
 };
 use exposure_core::telemetry::{
-    is_cache_served_status, is_evilpot_action, is_mitigated_record, normalize_alert_severity,
     AlertRecord, BanRecord, EvilpotEventInfo, EvilpotSessionInfo, FingerprintObservation,
     HyperLogLog, LatencyHistogram, MaintainerStorageStats, MinuteSummary, SessionSummary,
+    is_cache_served_status, is_evilpot_action, is_mitigated_record, normalize_alert_severity,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,7 @@ const MAX_YAML_BYTES: usize = 256 * 1024;
 const REDACTED_SECRET: &str = "********";
 const LOGIN_MAX_FAILURES: u32 = 5;
 const LOGIN_LOCKOUT_SECS: u64 = 60;
-const PANEL_CSP: &str =
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'";
+const PANEL_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'";
 
 #[derive(Clone)]
 struct AdminSession {
@@ -104,14 +103,23 @@ pub fn build_router(state: ApiState) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/nodes", get(list_nodes))
         .route("/api/nodes/{tag}/push", post(push_single_node))
-        .route("/api/topology", get(get_topology).post(save_topology).put(save_topology))
+        .route(
+            "/api/topology",
+            get(get_topology).post(save_topology).put(save_topology),
+        )
         .route("/api/topology/validate", post(validate_topology))
         .route("/api/topology/preflight", post(preflight_topology))
         .route("/api/config-versions", get(list_config_versions))
         .route("/api/config-versions/{id}/rollback", post(rollback_version))
         .route("/api/config-releases", get(list_config_releases))
-        .route("/api/config-releases/{rev}/rollback", post(rollback_release))
-        .route("/api/passphrases", get(list_passphrases).post(register_passphrase))
+        .route(
+            "/api/config-releases/{rev}/rollback",
+            post(rollback_release),
+        )
+        .route(
+            "/api/passphrases",
+            get(list_passphrases).post(register_passphrase),
+        )
         .route("/api/passphrases/{tag}/revoke", post(revoke_passphrase))
         .route("/api/discovery/run", post(run_discovery))
         .route("/api/dns/sync", post(sync_dns))
@@ -384,8 +392,12 @@ fn create_admin_session(state: &ApiState, username: &str) -> String {
 }
 
 fn verify_admin_auth(state: &ApiState, headers: &HeaderMap) -> Result<String, Box<Response>> {
-    let raw_token = extract_raw_session_token(headers)
-        .ok_or_else(|| Box::new(json_err(StatusCode::UNAUTHORIZED, "missing session authentication")))?;
+    let raw_token = extract_raw_session_token(headers).ok_or_else(|| {
+        Box::new(json_err(
+            StatusCode::UNAUTHORIZED,
+            "missing session authentication",
+        ))
+    })?;
     let key = hash_session_token(&state.cfg.admin.token_secret, &raw_token);
     let now = Utc::now().timestamp();
     let Some(entry) = state.sessions.get(&key) else {
@@ -397,7 +409,10 @@ fn verify_admin_auth(state: &ApiState, headers: &HeaderMap) -> Result<String, Bo
     if entry.expires_at < now || entry.username != state.cfg.admin.username {
         drop(entry);
         state.sessions.remove(&key);
-        return Err(Box::new(json_err(StatusCode::UNAUTHORIZED, "session expired")));
+        return Err(Box::new(json_err(
+            StatusCode::UNAUTHORIZED,
+            "session expired",
+        )));
     }
     Ok(entry.username.clone())
 }
@@ -650,7 +665,8 @@ fn restore_redacted_secrets(
             .get(g_name)
             .map(|g| g.api_bypass_headers.as_slice())
             .unwrap_or(&[]);
-        restore_api_bypass_headers(&mut new_g.api_bypass_headers, old).map_err(bad_redacted_secret)?;
+        restore_api_bypass_headers(&mut new_g.api_bypass_headers, old)
+            .map_err(bad_redacted_secret)?;
     }
     for (ab_name, new_ab) in &mut incoming.antibot_templates {
         let old = existing
@@ -855,7 +871,13 @@ async fn login(
     state
         .client
         .db()
-        .append_audit(&state.cfg.admin.username, "login", "control", true, "admin login")
+        .append_audit(
+            &state.cfg.admin.username,
+            "login",
+            "control",
+            true,
+            "admin login",
+        )
         .await;
 
     let secure_flag = cookie_secure_suffix(&state, &headers);
@@ -1307,7 +1329,13 @@ async fn overview(
         Ok(n) => n,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let latest_rel = state.client.db().get_latest_config_release().await.ok().flatten();
+    let latest_rel = state
+        .client
+        .db()
+        .get_latest_config_release()
+        .await
+        .ok()
+        .flatten();
     let seq = state
         .client
         .db()
@@ -1354,7 +1382,11 @@ async fn overview(
                     }
                 }
             }
-            max_total = max_total.max(rep.get("alerts_total").and_then(|v| v.as_u64()).unwrap_or(0));
+            max_total = max_total.max(
+                rep.get("alerts_total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            );
         }
         all_alerts.extend(tel.alerts.iter().cloned());
         let mut deduped = collect_normalized_cached_alerts(&all_alerts, from_ms, to_ms);
@@ -1369,10 +1401,19 @@ async fn overview(
         (agg, deduped, tot)
     };
 
-    let certs_valid = tel.certificates.iter().filter(|c| c.status == "valid").count();
+    let certs_valid = tel
+        .certificates
+        .iter()
+        .filter(|c| c.status == "valid")
+        .count();
     let certs_degraded = tel.certificates.len().saturating_sub(certs_valid);
 
-    let yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+    let yaml = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .unwrap_or_default();
     let spec: TopologySpec = if yaml.trim().is_empty() {
         TopologySpec::default()
     } else {
@@ -1422,7 +1463,13 @@ async fn list_nodes(State(state): State<ApiState>, headers: HeaderMap) -> Respon
     };
     let tel = state.client.cached_telemetry().await;
     let boot = state.client.active_bootstrap_tag().await;
-    let latest_release = state.client.db().get_latest_config_release().await.ok().flatten();
+    let latest_release = state
+        .client
+        .db()
+        .get_latest_config_release()
+        .await
+        .ok()
+        .flatten();
     let enriched_nodes: Vec<serde_json::Value> = nodes
         .into_iter()
         .map(|n| {
@@ -1478,7 +1525,10 @@ async fn push_single_node(
         );
     }
     let Some(cfg) = compiled.get(&tag).cloned() else {
-        return json_err(StatusCode::NOT_FOUND, format!("node '{tag}' not in topology"));
+        return json_err(
+            StatusCode::NOT_FOUND,
+            format!("node '{tag}' not in topology"),
+        );
     };
     match state
         .client
@@ -1660,7 +1710,12 @@ async fn resolve_and_merge_topo_yaml(
     state: &ApiState,
     req: &TopoReq,
 ) -> Result<String, Box<Response>> {
-    let existing_yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+    let existing_yaml = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .unwrap_or_default();
     let existing_spec: TopologySpec = if existing_yaml.trim().is_empty() {
         TopologySpec::default()
     } else {
@@ -1671,8 +1726,12 @@ async fn resolve_and_merge_topo_yaml(
         spec.clone()
     } else if let Some(yaml) = &req.yaml {
         reject_yaml_bomb(yaml)?;
-        serde_yaml::from_str(yaml)
-            .map_err(|e| Box::new(json_err(StatusCode::BAD_REQUEST, format!("parse topology yaml: {e}"))))?
+        serde_yaml::from_str(yaml).map_err(|e| {
+            Box::new(json_err(
+                StatusCode::BAD_REQUEST,
+                format!("parse topology yaml: {e}"),
+            ))
+        })?
     } else {
         return Err(Box::new(json_err(
             StatusCode::BAD_REQUEST,
@@ -1681,8 +1740,12 @@ async fn resolve_and_merge_topo_yaml(
     };
 
     let merged = restore_redacted_secrets(parsed_spec, &existing_spec)?;
-    let out_yaml = serde_yaml::to_string(&merged)
-        .map_err(|e| Box::new(json_err(StatusCode::BAD_REQUEST, format!("serialize spec: {e}"))))?;
+    let out_yaml = serde_yaml::to_string(&merged).map_err(|e| {
+        Box::new(json_err(
+            StatusCode::BAD_REQUEST,
+            format!("serialize spec: {e}"),
+        ))
+    })?;
     if out_yaml.len() > MAX_YAML_BYTES {
         return Err(Box::new(json_err(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1809,7 +1872,13 @@ async fn save_topology(
     state
         .client
         .db()
-        .append_audit(&actor, "topology_save", "topology", true, "saved valid topology")
+        .append_audit(
+            &actor,
+            "topology_save",
+            "topology",
+            true,
+            "saved valid topology",
+        )
         .await;
 
     let mut pushed_count = 0usize;
@@ -1821,7 +1890,14 @@ async fn save_topology(
     if req.push {
         match state
             .client
-            .deploy_topology_release(&actor, &yaml, &topo, compiled, "topology_push", "Deploy topology")
+            .deploy_topology_release(
+                &actor,
+                &yaml,
+                &topo,
+                compiled,
+                "topology_push",
+                "Deploy topology",
+            )
             .await
         {
             Ok(dep) => {
@@ -1894,7 +1970,13 @@ async fn list_config_releases(
         Ok(res) => res,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let latest = state.client.db().get_latest_config_release().await.ok().flatten();
+    let latest = state
+        .client
+        .db()
+        .get_latest_config_release()
+        .await
+        .ok()
+        .flatten();
     Json(serde_json::json!({
         "latest_revision": latest.as_ref().map(|r| r.revision.as_str()).unwrap_or(""),
         "latest_release_seq": latest.as_ref().map(|r| r.release_seq).unwrap_or(0),
@@ -1978,7 +2060,12 @@ async fn rollback_version(
         Ok(c) => c,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+    let yaml = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .unwrap_or_default();
     let topo = serde_yaml::from_str(&yaml).unwrap_or_default();
     match state
         .client
@@ -2086,7 +2173,10 @@ async fn register_passphrase(
         if !existing.public_key.trim().is_empty() {
             return json_err(
                 StatusCode::CONFLICT,
-                format!("node '{}' is already enrolled with a pinned public key", req.node_tag),
+                format!(
+                    "node '{}' is already enrolled with a pinned public key",
+                    req.node_tag
+                ),
             );
         }
     }
@@ -2120,7 +2210,13 @@ async fn register_passphrase(
     state
         .client
         .db()
-        .append_audit(&actor, "register_passphrase", &req.node_tag, true, &req.mode)
+        .append_audit(
+            &actor,
+            "register_passphrase",
+            &req.node_tag,
+            true,
+            &req.mode,
+        )
         .await;
 
     if req.mode == "listening" {
@@ -2304,7 +2400,11 @@ async fn create_dns_record(
         ttl: req.ttl,
         proxied: req.proxied,
     };
-    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+    match state
+        .client
+        .manage_dns(&actor, op, req.maintainer_tag)
+        .await
+    {
         Ok((maintainer_tag, _, _, _, record_id)) => Json(serde_json::json!({
             "ok": true,
             "maintainer_tag": maintainer_tag,
@@ -2337,7 +2437,11 @@ async fn update_dns_record(
         ttl: req.ttl,
         proxied: req.proxied,
     };
-    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+    match state
+        .client
+        .manage_dns(&actor, op, req.maintainer_tag)
+        .await
+    {
         Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
             "ok": true,
             "maintainer_tag": maintainer_tag,
@@ -2373,7 +2477,11 @@ async fn set_dns_record_status(
         record_id,
         enabled: req.enabled,
     };
-    match state.client.manage_dns(&actor, op, req.maintainer_tag).await {
+    match state
+        .client
+        .manage_dns(&actor, op, req.maintainer_tag)
+        .await
+    {
         Ok((maintainer_tag, _, _, _, rid)) => Json(serde_json::json!({
             "ok": true,
             "maintainer_tag": maintainer_tag,
@@ -2521,8 +2629,10 @@ async fn get_evilpot(
     for rep in &tel.evilpot_reports {
         live_requests_handled = live_requests_handled.saturating_add(rep.requests_handled);
         live_traps_triggered = live_traps_triggered.saturating_add(rep.traps_triggered);
-        live_canary_verifications = live_canary_verifications.saturating_add(rep.canary_verifications);
-        live_verified_sessions = live_verified_sessions.saturating_add(rep.verified_attack_sessions);
+        live_canary_verifications =
+            live_canary_verifications.saturating_add(rep.canary_verifications);
+        live_verified_sessions =
+            live_verified_sessions.saturating_add(rep.verified_attack_sessions);
         live_tarpit_bytes = live_tarpit_bytes.saturating_add(rep.tarpit_bytes_dripped);
         live_active_tarpit = live_active_tarpit.saturating_add(rep.active_tarpit_connections);
         live_active_ip_bans = live_active_ip_bans.saturating_add(rep.active_ip_bans);
@@ -2548,7 +2658,10 @@ async fn get_evilpot(
         for b in &rep.active_bans {
             let mut v = serde_json::to_value(b).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
-                o.insert("node_tag".into(), serde_json::Value::String(rep.node_tag.clone()));
+                o.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
             }
             live_active_bans.push(v);
         }
@@ -2574,9 +2687,14 @@ async fn get_evilpot(
         .collect();
 
     if !maint_replies.is_empty() {
-        let mut avail_nodes: BTreeSet<String> = tel.evilpot_reports.iter().map(|r| r.node_tag.clone()).collect();
+        let mut avail_nodes: BTreeSet<String> = tel
+            .evilpot_reports
+            .iter()
+            .map(|r| r.node_tag.clone())
+            .collect();
         let mut sess_map: HashMap<(String, String), EvilpotSessionInfo> = HashMap::new();
-        let mut ev_map: HashMap<(String, u64, String, String, String), EvilpotEventInfo> = HashMap::new();
+        let mut ev_map: HashMap<(String, u64, String, String, String), EvilpotEventInfo> =
+            HashMap::new();
         let mut db_traps = 0u64;
         let mut db_canaries = 0u64;
         let mut db_tarpit = 0u64;
@@ -2598,7 +2716,8 @@ async fn get_evilpot(
                         sess_map
                             .entry(k)
                             .and_modify(|cur| {
-                                if evilpot_status_rank(&s.status) >= evilpot_status_rank(&cur.status)
+                                if evilpot_status_rank(&s.status)
+                                    >= evilpot_status_rank(&cur.status)
                                     && s.last_seen_unix >= cur.last_seen_unix
                                 {
                                     *cur = s.clone();
@@ -2635,8 +2754,14 @@ async fn get_evilpot(
                 .cmp(&evilpot_status_rank(&a.status))
                 .then_with(|| b.last_seen_unix.cmp(&a.last_seen_unix))
         });
-        let verified_cnt = sessions.iter().filter(|s| s.status == "verified_exploit").count() as u64;
-        let multi_cnt = sessions.iter().filter(|s| s.status == "multi_step_exploitation").count() as u64;
+        let verified_cnt = sessions
+            .iter()
+            .filter(|s| s.status == "verified_exploit")
+            .count() as u64;
+        let multi_cnt = sessions
+            .iter()
+            .filter(|s| s.status == "multi_step_exploitation")
+            .count() as u64;
         let probing_cnt = sessions.iter().filter(|s| s.status == "probing").count() as u64;
         let sess_total = if maint_replies.len() == 1 {
             s_total_max.max(sessions.len())
@@ -2652,7 +2777,11 @@ async fn get_evilpot(
         } else {
             recent_events.len()
         };
-        let ev_page: Vec<_> = recent_events.into_iter().skip(ev_off).take(ev_lim).collect();
+        let ev_page: Vec<_> = recent_events
+            .into_iter()
+            .skip(ev_off)
+            .take(ev_lim)
+            .collect();
 
         return Json(serde_json::json!({
             "last_pulled_at": tel.last_pulled_at,
@@ -2707,7 +2836,10 @@ async fn get_evilpot(
             }
             let mut val = serde_json::to_value(s).unwrap_or_default();
             if let Some(obj) = val.as_object_mut() {
-                obj.insert("node_tag".into(), serde_json::Value::String(rep.node_tag.clone()));
+                obj.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
             }
             sessions.push(val);
         }
@@ -2724,7 +2856,10 @@ async fn get_evilpot(
             }
             let mut val = serde_json::to_value(ev).unwrap_or_default();
             if let Some(obj) = val.as_object_mut() {
-                obj.insert("node_tag".into(), serde_json::Value::String(rep.node_tag.clone()));
+                obj.insert(
+                    "node_tag".into(),
+                    serde_json::Value::String(rep.node_tag.clone()),
+                );
             }
             recent_events.push(val);
         }
@@ -2732,18 +2867,34 @@ async fn get_evilpot(
     sessions.sort_by(|a, b| {
         let ra = evilpot_status_rank(a.get("status").and_then(|v| v.as_str()).unwrap_or(""));
         let rb = evilpot_status_rank(b.get("status").and_then(|v| v.as_str()).unwrap_or(""));
-        let ta = a.get("last_seen_unix").and_then(|v| v.as_u64()).unwrap_or(0);
-        let tb = b.get("last_seen_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ta = a
+            .get("last_seen_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let tb = b
+            .get("last_seen_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         rb.cmp(&ra).then_with(|| tb.cmp(&ta))
     });
     let sess_total = sessions.len();
     let sess_page: Vec<_> = sessions.into_iter().skip(sess_off).take(sess_lim).collect();
     recent_events.sort_by(|a, b| {
-        b.get("timestamp_unix").and_then(|v| v.as_u64()).unwrap_or(0)
-            .cmp(&a.get("timestamp_unix").and_then(|v| v.as_u64()).unwrap_or(0))
+        b.get("timestamp_unix")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .cmp(
+                &a.get("timestamp_unix")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            )
     });
     let ev_total = recent_events.len();
-    let ev_page: Vec<_> = recent_events.into_iter().skip(ev_off).take(ev_lim).collect();
+    let ev_page: Vec<_> = recent_events
+        .into_iter()
+        .skip(ev_off)
+        .take(ev_lim)
+        .collect();
 
     Json(serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
@@ -2833,7 +2984,11 @@ async fn list_bans(
         .collect();
 
     if !maint_replies.is_empty() {
-        let mut avail_nodes: BTreeSet<String> = tel.evilpot_reports.iter().map(|r| r.node_tag.clone()).collect();
+        let mut avail_nodes: BTreeSet<String> = tel
+            .evilpot_reports
+            .iter()
+            .map(|r| r.node_tag.clone())
+            .collect();
         let mut ban_map: HashMap<(String, String, String, u64), BanRecord> = HashMap::new();
         let mut total_max = 0usize;
         for rep in &maint_replies {
@@ -2847,7 +3002,12 @@ async fn list_bans(
             if let Some(arr) = rep.get("items").and_then(|v| v.as_array()) {
                 for v in arr {
                     if let Ok(b) = serde_json::from_value::<BanRecord>(v.clone()) {
-                        let k = (b.node_tag.clone(), b.kind.clone(), b.target.clone(), b.banned_at_unix);
+                        let k = (
+                            b.node_tag.clone(),
+                            b.kind.clone(),
+                            b.target.clone(),
+                            b.banned_at_unix,
+                        );
                         ban_map
                             .entry(k)
                             .and_modify(|cur| {
@@ -2867,7 +3027,12 @@ async fn list_bans(
         // Freshen hits_blocked from live active_bans snapshot (without resurrecting already-unbanned rows)
         for rep in &tel.evilpot_reports {
             for ab in &rep.active_bans {
-                let k = (rep.node_tag.clone(), ab.kind.clone(), ab.target.clone(), ab.banned_at_unix);
+                let k = (
+                    rep.node_tag.clone(),
+                    ab.kind.clone(),
+                    ab.target.clone(),
+                    ab.banned_at_unix,
+                );
                 if let Some(cur) = ban_map.get_mut(&k) {
                     cur.hits_blocked = cur.hits_blocked.max(ab.hits_blocked);
                 }
@@ -2886,8 +3051,14 @@ async fn list_bans(
         let summary = if maint_replies.len() == 1 {
             maint_replies[0]["summary"].clone()
         } else {
-            let active_ip = items.iter().filter(|b| b.status == "active" && b.kind == "ip").count();
-            let active_fp = items.iter().filter(|b| b.status == "active" && b.kind != "ip").count();
+            let active_ip = items
+                .iter()
+                .filter(|b| b.status == "active" && b.kind == "ip")
+                .count();
+            let active_fp = items
+                .iter()
+                .filter(|b| b.status == "active" && b.kind != "ip")
+                .count();
             let expired = items.iter().filter(|b| b.status == "expired").count() as u64;
             let unbanned = items.iter().filter(|b| b.status == "unbanned").count() as u64;
             let hits: u64 = items.iter().map(|b| b.hits_blocked).sum();
@@ -2926,7 +3097,11 @@ async fn list_bans(
     let kind_f = clean_filter_opt(q.kind.as_deref()).map(|s| s.to_ascii_lowercase());
     let target_f = clean_filter_opt(q.target.as_deref()).map(|s| s.to_ascii_lowercase());
     let q_f = clean_filter_opt(q.q.as_deref()).map(|s| s.to_ascii_lowercase());
-    let avail_nodes: BTreeSet<String> = tel.evilpot_reports.iter().map(|r| r.node_tag.clone()).collect();
+    let avail_nodes: BTreeSet<String> = tel
+        .evilpot_reports
+        .iter()
+        .map(|r| r.node_tag.clone())
+        .collect();
     let mut rows: Vec<BanRecord> = Vec::new();
     for rep in &tel.evilpot_reports {
         if let Some(ref nf) = node_f {
@@ -3064,7 +3239,12 @@ async fn list_alerts(
                 for v in arr {
                     if let Ok(a) = serde_json::from_value::<AlertRecord>(v.clone()) {
                         let a = normalize_alert_record(a);
-                        let key = (a.timestamp_ms, a.source.clone(), a.severity.clone(), a.message.clone());
+                        let key = (
+                            a.timestamp_ms,
+                            a.source.clone(),
+                            a.severity.clone(),
+                            a.message.clone(),
+                        );
                         if seen.insert(key) {
                             items.push(a);
                         }
@@ -3074,7 +3254,11 @@ async fn list_alerts(
             total_max = total_max.max(rep["total_matched"].as_u64().unwrap_or(0) as usize);
         }
         items.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-        let total_matched = if maint_replies.len() == 1 { total_max } else { items.len() };
+        let total_matched = if maint_replies.len() == 1 {
+            total_max
+        } else {
+            items.len()
+        };
         let sev_counts = if maint_replies.len() == 1 {
             maint_replies[0]["severity_counts"].clone()
         } else {
@@ -3101,7 +3285,8 @@ async fn list_alerts(
 
     // Fallback to CachedTelemetry alerts
     let node_f = clean_filter_opt(q.node.as_deref());
-    let sev_f = clean_filter_opt(q.severity.as_deref()).map(|s| normalize_alert_severity(&s).to_string());
+    let sev_f =
+        clean_filter_opt(q.severity.as_deref()).map(|s| normalize_alert_severity(&s).to_string());
     let q_f = clean_filter_opt(q.q.as_deref()).map(|s| s.to_ascii_lowercase());
     let all = collect_normalized_cached_alerts(&tel.alerts, from_ms, to_ms);
     let avail_sources: BTreeSet<String> = all.iter().map(|a| a.source.clone()).collect();
@@ -3177,7 +3362,8 @@ async fn get_telemetry(
         let mut avail_svcs: BTreeSet<String> = BTreeSet::new();
         let (by_m, by_s, by_n) = merge_maintainer_traffic_maps(&maint_replies);
         let agg = build_aggregated_traffic_from_maps(by_m, by_s, by_n);
-        let mut bucket_map: HashMap<(i64, String, String, String), serde_json::Value> = HashMap::new();
+        let mut bucket_map: HashMap<(i64, String, String, String), serde_json::Value> =
+            HashMap::new();
         let mut max_buckets_total = 0usize;
         for rep in &maint_replies {
             if let Some(arr) = rep.get("available_nodes").and_then(|v| v.as_array()) {
@@ -3204,18 +3390,23 @@ async fn get_telemetry(
                     bucket_map
                         .entry(k)
                         .and_modify(|cur| {
-                            if b["requests"].as_u64().unwrap_or(0) > cur["requests"].as_u64().unwrap_or(0) {
+                            if b["requests"].as_u64().unwrap_or(0)
+                                > cur["requests"].as_u64().unwrap_or(0)
+                            {
                                 *cur = b.clone();
                             }
                         })
                         .or_insert_with(|| b.clone());
                 }
             }
-            max_buckets_total = max_buckets_total.max(rep["buckets_total"].as_u64().unwrap_or(0) as usize);
+            max_buckets_total =
+                max_buckets_total.max(rep["buckets_total"].as_u64().unwrap_or(0) as usize);
         }
         let mut buckets: Vec<serde_json::Value> = bucket_map.into_values().collect();
         buckets.sort_by(|a, b| {
-            b["minute_epoch"].as_i64().unwrap_or(0)
+            b["minute_epoch"]
+                .as_i64()
+                .unwrap_or(0)
                 .cmp(&a["minute_epoch"].as_i64().unwrap_or(0))
                 .then_with(|| a["node_tag"].as_str().cmp(&b["node_tag"].as_str()))
         });
@@ -3273,7 +3464,10 @@ async fn get_telemetry(
             from_sec.map(|f| s.minute_epoch + 60 > f).unwrap_or(true)
                 && to_sec.map(|t| s.minute_epoch <= t).unwrap_or(true)
                 && node_f.as_deref().map(|n| s.node_tag == n).unwrap_or(true)
-                && svc_f.as_deref().map(|sv| s.service_tag == sv).unwrap_or(true)
+                && svc_f
+                    .as_deref()
+                    .map(|sv| s.service_tag == sv)
+                    .unwrap_or(true)
         })
         .map(|s| SummaryDto {
             minute_epoch: s.minute_epoch,
@@ -3413,7 +3607,9 @@ fn contains_ascii_icase(haystack: &str, needle_lower: &str) -> bool {
         let hb = haystack.as_bytes();
         return hb.len() >= nb.len() && hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb));
     }
-    haystack.to_lowercase().contains(&needle_lower.to_lowercase())
+    haystack
+        .to_lowercase()
+        .contains(&needle_lower.to_lowercase())
 }
 
 async fn list_fingerprints(
@@ -3465,8 +3661,14 @@ async fn list_fingerprints(
     if maint_replies.len() == 1 {
         let mut val = maint_replies[0].clone();
         if let Some(obj) = val.as_object_mut() {
-            obj.insert("last_pulled_at".into(), serde_json::json!(tel.last_pulled_at));
-            obj.insert("store_raw_ip_enabled".into(), serde_json::json!(store_raw_ip_enabled));
+            obj.insert(
+                "last_pulled_at".into(),
+                serde_json::json!(tel.last_pulled_at),
+            );
+            obj.insert(
+                "store_raw_ip_enabled".into(),
+                serde_json::json!(store_raw_ip_enabled),
+            );
         }
         return Json(val).into_response();
     } else if maint_replies.len() > 1 {
@@ -3508,15 +3710,37 @@ async fn list_fingerprints(
         let pow_count = all_obs.iter().filter(|o| o.fp_source == "pow").count();
         let bots = all_obs.iter().filter(|o| o.is_bot).count();
         let headless = all_obs.iter().filter(|o| o.is_headless).count();
-        let webrtc_leaks = all_obs.iter().filter(|o| o.js_fp.as_ref().map(|j| j.webrtc_ip_mismatch).unwrap_or(false)).count();
-        let webrtc_lan_leaks = all_obs.iter().filter(|o| o.js_fp.as_ref().map(|j| !j.webrtc_local_ips.is_empty()).unwrap_or(false)).count();
+        let webrtc_leaks = all_obs
+            .iter()
+            .filter(|o| {
+                o.js_fp
+                    .as_ref()
+                    .map(|j| j.webrtc_ip_mismatch)
+                    .unwrap_or(false)
+            })
+            .count();
+        let webrtc_lan_leaks = all_obs
+            .iter()
+            .filter(|o| {
+                o.js_fp
+                    .as_ref()
+                    .map(|j| !j.webrtc_local_ips.is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
         let unique_ips_len = unique_ips.len();
         let unique_fps_len = unique_fps.len();
         let (mut dev_c, mut br_c, mut os_c) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         for o in &all_obs {
-            if !o.device_type.is_empty() { *dev_c.entry(o.device_type.clone()).or_insert(0u64) += 1; }
-            if !o.browser_family.is_empty() { *br_c.entry(o.browser_family.clone()).or_insert(0u64) += 1; }
-            if !o.os_family.is_empty() { *os_c.entry(o.os_family.clone()).or_insert(0u64) += 1; }
+            if !o.device_type.is_empty() {
+                *dev_c.entry(o.device_type.clone()).or_insert(0u64) += 1;
+            }
+            if !o.browser_family.is_empty() {
+                *br_c.entry(o.browser_family.clone()).or_insert(0u64) += 1;
+            }
+            if !o.os_family.is_empty() {
+                *os_c.entry(o.os_family.clone()).or_insert(0u64) += 1;
+            }
         }
         let (page, total_matched, off, lim, has_more) = paginate_items(all_obs, q.offset, q.limit);
         return Json(serde_json::json!({
@@ -3574,24 +3798,21 @@ async fn list_fingerprints(
         .map(str::trim)
         .unwrap_or("all")
         .to_ascii_lowercase();
-    let q_str = q
-        .q
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase());
-    let ip_str = q
-        .ip
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase());
-    let fp_str = q
-        .fp
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase());
+    let q_str =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
+    let ip_str =
+        q.ip.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
+    let fp_str =
+        q.fp.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
 
     // Auto-compute cluster IP HMAC when the search query or IP filter is a literal IP address,
     // allowing exact IP lookup even when `store_raw_ip: false`!
@@ -3610,7 +3831,11 @@ async fn list_fingerprints(
             .geo_country
             .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| obs.abuse_country.as_deref().filter(|s| !s.trim().is_empty()))
+            .or_else(|| {
+                obs.abuse_country
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+            })
         {
             available_countries.insert(cc.to_ascii_uppercase());
         }
@@ -3626,8 +3851,10 @@ async fn list_fingerprints(
     let mut headless_count: usize = 0;
     let mut webrtc_leak_count: usize = 0;
     let mut webrtc_lan_leak_count: usize = 0;
-    let mut device_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut browser_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut device_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let mut browser_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut os_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
 
     for obs in &tel.fingerprints {
@@ -3654,7 +3881,11 @@ async fn list_fingerprints(
                 .geo_country
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| obs.abuse_country.as_deref().filter(|s| !s.trim().is_empty()))
+                .or_else(|| {
+                    obs.abuse_country
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                })
                 .unwrap_or("");
             if !obs_cc.eq_ignore_ascii_case(cf) {
                 continue;
@@ -3677,7 +3908,7 @@ async fn list_fingerprints(
                     .map(|j| j.webrtc_ip_mismatch || !j.webrtc_local_ips.is_empty())
                     .unwrap_or(false) =>
             {
-                continue
+                continue;
             }
             "suspicious" if obs.suspicion_score < 40 && !obs.is_bot && !obs.is_headless => continue,
             "clean" if obs.is_bot || obs.is_headless || obs.suspicion_score >= 40 => continue,
@@ -3832,7 +4063,9 @@ async fn list_fingerprints(
             *device_counts.entry(obs.device_type.clone()).or_insert(0) += 1;
         }
         if !obs.browser_family.is_empty() {
-            *browser_counts.entry(obs.browser_family.clone()).or_insert(0) += 1;
+            *browser_counts
+                .entry(obs.browser_family.clone())
+                .or_insert(0) += 1;
         }
         if !obs.os_family.is_empty() {
             *os_counts.entry(obs.os_family.clone()).or_insert(0) += 1;
@@ -3918,12 +4151,18 @@ fn clean_filter_opt(v: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn log_protection_totals(tel: &crate::client::CachedTelemetry) -> exposure_core::telemetry::LogProtectionStats {
+fn log_protection_totals(
+    tel: &crate::client::CachedTelemetry,
+) -> exposure_core::telemetry::LogProtectionStats {
     let mut prot_totals = exposure_core::telemetry::LogProtectionStats::default();
     for st in tel.log_stats.values() {
-        prot_totals.dropped_records = prot_totals.dropped_records.saturating_add(st.dropped_records);
+        prot_totals.dropped_records = prot_totals
+            .dropped_records
+            .saturating_add(st.dropped_records);
         prot_totals.folded_records = prot_totals.folded_records.saturating_add(st.folded_records);
-        prot_totals.warn_suppressed = prot_totals.warn_suppressed.saturating_add(st.warn_suppressed);
+        prot_totals.warn_suppressed = prot_totals
+            .warn_suppressed
+            .saturating_add(st.warn_suppressed);
     }
     prot_totals
 }
@@ -3942,8 +4181,14 @@ async fn list_logs(
     let (from_ms, to_ms) = resolve_time_window(q.from_ms, q.to_ms, q.window_secs);
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let q_ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), clean_filter_opt(q.q.as_deref()).as_deref());
-    let ip_hmac = compute_query_ip_hmac(hmac_key.as_deref(), clean_filter_opt(q.ip.as_deref()).as_deref());
+    let q_ip_hmac = compute_query_ip_hmac(
+        hmac_key.as_deref(),
+        clean_filter_opt(q.q.as_deref()).as_deref(),
+    );
+    let ip_hmac = compute_query_ip_hmac(
+        hmac_key.as_deref(),
+        clean_filter_opt(q.ip.as_deref()).as_deref(),
+    );
 
     let maint_replies: Vec<serde_json::Value> = state
         .client
@@ -3978,17 +4223,33 @@ async fn list_logs(
         let total = val["total_matched"].as_u64().unwrap_or(0) as usize;
         if offset > 0 {
             if let Some(items) = val.get_mut("items").and_then(|v| v.as_array_mut()) {
-                let sliced: Vec<_> = std::mem::take(items).into_iter().skip(offset).take(limit).collect();
+                let sliced: Vec<_> = std::mem::take(items)
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
                 *items = sliced;
             }
         }
         if let Some(obj) = val.as_object_mut() {
             obj.insert("offset".into(), serde_json::json!(offset));
             obj.insert("limit".into(), serde_json::json!(limit));
-            obj.insert("has_more".into(), serde_json::json!(offset.saturating_add(limit) < total));
-            obj.insert("last_pulled_at".into(), serde_json::json!(tel.last_pulled_at));
-            obj.insert("store_raw_ip_enabled".into(), serde_json::json!(store_raw_ip_enabled));
-            obj.insert("log_protection".into(), serde_json::json!(log_protection_totals(&tel)));
+            obj.insert(
+                "has_more".into(),
+                serde_json::json!(offset.saturating_add(limit) < total),
+            );
+            obj.insert(
+                "last_pulled_at".into(),
+                serde_json::json!(tel.last_pulled_at),
+            );
+            obj.insert(
+                "store_raw_ip_enabled".into(),
+                serde_json::json!(store_raw_ip_enabled),
+            );
+            obj.insert(
+                "log_protection".into(),
+                serde_json::json!(log_protection_totals(&tel)),
+            );
             obj.insert("node_log_stats".into(), serde_json::json!(tel.log_stats));
         }
         return Json(val).into_response();
@@ -4009,7 +4270,9 @@ async fn list_logs(
             ] {
                 if let Some(arr) = rep.get(k).and_then(|v| v.as_array()) {
                     for x in arr {
-                        if let Some(s) = x.as_str() { set.insert(s.to_string()); }
+                        if let Some(s) = x.as_str() {
+                            set.insert(s.to_string());
+                        }
                     }
                 }
             }
@@ -4020,11 +4283,20 @@ async fn list_logs(
                             r.node_tag.clone(),
                             r.role.clone(),
                             r.timestamp_ms,
-                            r.ray_id.clone().unwrap_or_else(|| format!("{}:{}:{}", r.ip_hmac, r.path.as_deref().unwrap_or(""), r.status)),
+                            r.ray_id.clone().unwrap_or_else(|| {
+                                format!(
+                                    "{}:{}:{}",
+                                    r.ip_hmac,
+                                    r.path.as_deref().unwrap_or(""),
+                                    r.status
+                                )
+                            }),
                         );
                         rec_map
                             .entry(k)
-                            .and_modify(|cur| cur.repeat_count = cur.repeat_count.max(r.repeat_count))
+                            .and_modify(|cur| {
+                                cur.repeat_count = cur.repeat_count.max(r.repeat_count)
+                            })
                             .or_insert(r);
                     }
                 }
@@ -4032,14 +4304,32 @@ async fn list_logs(
         }
         let mut merged_tel = (*tel).clone();
         merged_tel.recent_logs = rec_map.into_values().collect();
-        merged_tel.recent_logs.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
-        let mut out = build_logs_response_json(&merged_tel, hmac_key.as_deref(), store_raw_ip_enabled, &q);
+        merged_tel
+            .recent_logs
+            .sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+        let mut out =
+            build_logs_response_json(&merged_tel, hmac_key.as_deref(), store_raw_ip_enabled, &q);
         if let Some(obj) = out.as_object_mut() {
-            obj.insert("available_nodes".into(), serde_json::json!(avail_nodes.into_iter().collect::<Vec<_>>()));
-            obj.insert("available_services".into(), serde_json::json!(avail_svcs.into_iter().collect::<Vec<_>>()));
-            obj.insert("available_hosts".into(), serde_json::json!(avail_hosts.into_iter().collect::<Vec<_>>()));
-            obj.insert("available_actions".into(), serde_json::json!(avail_actions.into_iter().collect::<Vec<_>>()));
-            obj.insert("available_countries".into(), serde_json::json!(avail_countries.into_iter().collect::<Vec<_>>()));
+            obj.insert(
+                "available_nodes".into(),
+                serde_json::json!(avail_nodes.into_iter().collect::<Vec<_>>()),
+            );
+            obj.insert(
+                "available_services".into(),
+                serde_json::json!(avail_svcs.into_iter().collect::<Vec<_>>()),
+            );
+            obj.insert(
+                "available_hosts".into(),
+                serde_json::json!(avail_hosts.into_iter().collect::<Vec<_>>()),
+            );
+            obj.insert(
+                "available_actions".into(),
+                serde_json::json!(avail_actions.into_iter().collect::<Vec<_>>()),
+            );
+            obj.insert(
+                "available_countries".into(),
+                serde_json::json!(avail_countries.into_iter().collect::<Vec<_>>()),
+            );
         }
         return Json(out).into_response();
     }
@@ -4195,7 +4485,10 @@ fn build_logs_response_json(
                 "3xx" => (300..400).contains(&rec.status),
                 "4xx" => (400..500).contains(&rec.status),
                 "5xx" => (500..600).contains(&rec.status),
-                exact => exact.parse::<u16>().map(|code| rec.status == code).unwrap_or(false),
+                exact => exact
+                    .parse::<u16>()
+                    .map(|code| rec.status == code)
+                    .unwrap_or(false),
             };
             if !ok {
                 continue;
@@ -4348,7 +4641,8 @@ fn build_logs_response_json(
         hops.sort_by(|a, b| {
             let ai = u8::from(!a.role.eq_ignore_ascii_case("ingress"));
             let bi = u8::from(!b.role.eq_ignore_ascii_case("ingress"));
-            ai.cmp(&bi).then_with(|| a.timestamp_ms.cmp(&b.timestamp_ms))
+            ai.cmp(&bi)
+                .then_with(|| a.timestamp_ms.cmp(&b.timestamp_ms))
         });
         let hop_count = hops.len() as u32;
         let entered_ms = hops
@@ -4385,7 +4679,8 @@ fn build_logs_response_json(
         let is_blocked_rec = is_mitigated_record(rec);
         let weight = u64::from(rec.repeat_count.max(1));
         total_requests = total_requests.saturating_add(weight);
-        folded_requests = folded_requests.saturating_add(u64::from(rec.repeat_count.saturating_sub(1)));
+        folded_requests =
+            folded_requests.saturating_add(u64::from(rec.repeat_count.saturating_sub(1)));
         if is_blocked_rec {
             blocked_requests = blocked_requests.saturating_add(weight);
         }
@@ -4452,16 +4747,13 @@ fn build_logs_response_json(
         prot_totals.dropped_records = prot_totals
             .dropped_records
             .saturating_add(st.dropped_records);
-        prot_totals.folded_records = prot_totals
-            .folded_records
-            .saturating_add(st.folded_records);
+        prot_totals.folded_records = prot_totals.folded_records.saturating_add(st.folded_records);
         prot_totals.warn_suppressed = prot_totals
             .warn_suppressed
             .saturating_add(st.warn_suppressed);
     }
 
-    let (items, total_matched, offset, limit, has_more) =
-        paginate_items(items, q.offset, q.limit);
+    let (items, total_matched, offset, limit, has_more) = paginate_items(items, q.offset, q.limit);
 
     serde_json::json!({
         "last_pulled_at": tel.last_pulled_at,
@@ -4543,7 +4835,9 @@ async fn list_audit(
     match state
         .client
         .db()
-        .query_audit_logs(from_ms, to_ms, q.actor, q.action, q.target, q.q, offset, limit)
+        .query_audit_logs(
+            from_ms, to_ms, q.actor, q.action, q.target, q.q, offset, limit,
+        )
         .await
     {
         Ok(mut res) => {
@@ -4569,7 +4863,12 @@ async fn get_storage_retention(State(state): State<ApiState>, headers: HeaderMap
         .await
         .unwrap_or_default();
     let control_stats = state.client.db().storage_stats().await.unwrap_or_default();
-    let yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+    let yaml = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .unwrap_or_default();
     let topo: TopologySpec = serde_yaml::from_str(&yaml).unwrap_or_default();
     let maintainer_retention = topo
         .global_logger
@@ -4640,11 +4939,21 @@ async fn update_storage_retention(
     let mut release_info: Option<serde_json::Value> = None;
     let mut push_errors: Vec<String> = Vec::new();
     if let Some(ref m_ret) = req.maintainer_retention {
-        let yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+        let yaml = state
+            .client
+            .db()
+            .get_topology_yaml()
+            .await
+            .unwrap_or_default();
         if !yaml.trim().is_empty() {
             let mut topo: TopologySpec = match serde_yaml::from_str(&yaml) {
                 Ok(t) => t,
-                Err(e) => return json_err(StatusCode::BAD_REQUEST, format!("parse saved topology: {e}")),
+                Err(e) => {
+                    return json_err(
+                        StatusCode::BAD_REQUEST,
+                        format!("parse saved topology: {e}"),
+                    );
+                }
             };
             let gl = topo.global_logger.get_or_insert_with(Default::default);
             gl.retention = m_ret.clone();
@@ -4655,12 +4964,16 @@ async fn update_storage_retention(
                 Ok(y) => y,
                 Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             };
-            let (compiled_topo, report, compiled) = match state.client.compile_yaml_and_provision(&new_yaml).await {
-                Ok(t) => t,
-                Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()),
-            };
+            let (compiled_topo, report, compiled) =
+                match state.client.compile_yaml_and_provision(&new_yaml).await {
+                    Ok(t) => t,
+                    Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()),
+                };
             if !report.valid {
-                return json_err(StatusCode::BAD_REQUEST, format!("compiled topology invalid: {:?}", report.errors));
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("compiled topology invalid: {:?}", report.errors),
+                );
             }
             if let Err(e) = state.client.db().set_topology_yaml(&new_yaml).await {
                 return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
@@ -4703,11 +5016,27 @@ async fn update_storage_retention(
     state
         .client
         .db()
-        .append_audit(&actor, "storage.retention_update", "storage", push_errors.is_empty(), "updated retention policy")
+        .append_audit(
+            &actor,
+            "storage.retention_update",
+            "storage",
+            push_errors.is_empty(),
+            "updated retention policy",
+        )
         .await;
 
-    let control_retention = state.client.db().get_control_retention_config().await.unwrap_or_default();
-    let yaml = state.client.db().get_topology_yaml().await.unwrap_or_default();
+    let control_retention = state
+        .client
+        .db()
+        .get_control_retention_config()
+        .await
+        .unwrap_or_default();
+    let yaml = state
+        .client
+        .db()
+        .get_topology_yaml()
+        .await
+        .unwrap_or_default();
     let maintainer_retention = serde_yaml::from_str::<TopologySpec>(&yaml)
         .ok()
         .and_then(|t| t.global_logger.map(|l| l.retention))
@@ -4731,12 +5060,20 @@ async fn run_storage_cleanup(State(state): State<ApiState>, headers: HeaderMap) 
     if let Err(r) = require_active_role(&state) {
         return *r;
     }
-    let c_ret = state.client.db().get_control_retention_config().await.unwrap_or_default();
+    let c_ret = state
+        .client
+        .db()
+        .get_control_retention_config()
+        .await
+        .unwrap_or_default();
     let control_cleanup = match state.client.db().prune_old_records(&c_ret).await {
         Ok(rep) => rep,
         Err(e) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let maint_replies = state.client.query_maintainers(MaintainerQuery::RunCleanup).await;
+    let maint_replies = state
+        .client
+        .query_maintainers(MaintainerQuery::RunCleanup)
+        .await;
     let maintainer_cleanups: Vec<serde_json::Value> = maint_replies
         .into_iter()
         .map(|(tag, res)| match res {
@@ -4756,7 +5093,13 @@ async fn run_storage_cleanup(State(state): State<ApiState>, headers: HeaderMap) 
     state
         .client
         .db()
-        .append_audit(&actor, "storage.cleanup", "storage", true, "triggered manual storage cleanup")
+        .append_audit(
+            &actor,
+            "storage.cleanup",
+            "storage",
+            true,
+            "triggered manual storage cleanup",
+        )
         .await;
 
     Json(serde_json::json!({
@@ -4894,7 +5237,12 @@ async fn test_abuseipdb_key(
         .await
     {
         Ok(r) => r,
-        Err(e) => return json_err(StatusCode::BAD_GATEWAY, format!("AbuseIPDB request failed: {e}")),
+        Err(e) => {
+            return json_err(
+                StatusCode::BAD_GATEWAY,
+                format!("AbuseIPDB request failed: {e}"),
+            );
+        }
     };
 
     let status = resp.status();
@@ -4913,7 +5261,7 @@ async fn test_abuseipdb_key(
             return json_err(
                 StatusCode::BAD_GATEWAY,
                 format!("parse AbuseIPDB JSON failed: {e}"),
-            )
+            );
         }
     };
     let d = &parsed["data"];
@@ -4959,7 +5307,11 @@ async fn unban_security_target(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"));
-    match state.client.unban_target(&actor, kind, target, node_tag).await {
+    match state
+        .client
+        .unban_target(&actor, kind, target, node_tag)
+        .await
+    {
         Ok(val) => Json(val).into_response(),
         Err(e) => json_err(StatusCode::BAD_REQUEST, e.to_string()),
     }

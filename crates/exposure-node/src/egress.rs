@@ -13,16 +13,18 @@ use exposure_core::crypto::verify_signature_b64;
 use exposure_core::protocol::ServiceStreamHeader;
 use exposure_core::{ExposureError, Result};
 use http::header::{HeaderName, HeaderValue};
-use http::{header, HeaderMap, Request, Response, StatusCode};
-use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
+use http::{HeaderMap, Request, Response, StatusCode, header};
+use http_body_util::{BodyExt, Empty, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -74,7 +76,14 @@ impl Body for PrefixBody {
 
 pub(crate) fn status_title_and_detail(status: StatusCode) -> (&'static str, &'static str) {
     match status {
-        StatusCode::BAD_GATEWAY => ("Bad Gateway", "The upstream server is temporarily unavailable."),
+        StatusCode::NOT_IMPLEMENTED => (
+            "Not Implemented",
+            "The upstream server does not support this request.",
+        ),
+        StatusCode::BAD_GATEWAY => (
+            "Bad Gateway",
+            "The upstream server returned an invalid response.",
+        ),
         StatusCode::SERVICE_UNAVAILABLE => (
             "Service Unavailable",
             "The upstream server is temporarily unavailable.",
@@ -284,10 +293,8 @@ pub(crate) async fn capture_5xx_response_error(
     let summary = if snippet_slice.is_empty() {
         if let Some(ref e) = io_err {
             let prefix = format!("backend {status} (body error): ");
-            let clean = sanitize_single_line_text(
-                e,
-                ERROR_SUMMARY_MAX_CHARS.saturating_sub(prefix.len()),
-            );
+            let clean =
+                sanitize_single_line_text(e, ERROR_SUMMARY_MAX_CHARS.saturating_sub(prefix.len()));
             format!("{prefix}{clean}")
         } else {
             format!("backend status {status}")
@@ -487,7 +494,8 @@ impl EgressHandler {
                             this.check_http_health(&svc, http_path, timeout).await
                         } else {
                             matches!(
-                                tokio::time::timeout(timeout, TcpStream::connect(&svc.backend)).await,
+                                tokio::time::timeout(timeout, TcpStream::connect(&svc.backend))
+                                    .await,
                                 Ok(Ok(_))
                             )
                         };
@@ -541,10 +549,9 @@ impl EgressHandler {
                 let resp = sender.send_request(req).await.ok()?;
                 Some(resp.status().as_u16() < 500)
             } else {
-                let (mut sender, conn) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(tcp))
-                        .await
-                        .ok()?;
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                    .await
+                    .ok()?;
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
@@ -781,6 +788,13 @@ impl EgressHandler {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        // Captured before `req` is handed to the forwarder; used to gzip locally rendered pages.
+        let accept_enc = req
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let referer_opt = req
             .headers()
             .get(header::REFERER)
@@ -834,6 +848,7 @@ impl EgressHandler {
                 svc.effective_intercept_errors(),
                 error_html_tpl,
                 &hdr.request_id,
+                &accept_enc,
                 Some(msg),
             );
         }
@@ -890,6 +905,7 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    &accept_enc,
                     Some(&msg),
                 );
             }
@@ -932,6 +948,7 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    &accept_enc,
                     Some(&msg),
                 );
             }
@@ -944,10 +961,14 @@ impl EgressHandler {
             }
         }
 
-        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc.effective_tls() {
+        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc
+            .effective_tls()
+        {
             match self.get_tls_client_config(svc, use_h2).await {
                 Ok(tls_cfg) => {
-                    match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, &tls_cfg)).await {
+                    match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, &tls_cfg))
+                        .await
+                    {
                         Ok(Ok(tls_stream)) => {
                             let negotiated_h2 =
                                 tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
@@ -998,6 +1019,7 @@ impl EgressHandler {
                             true,
                             error_html_tpl,
                             &hdr.request_id,
+                            &accept_enc,
                             Some(&err_summary),
                         );
                     } else {
@@ -1031,7 +1053,11 @@ impl EgressHandler {
                         None,
                         None,
                         false,
-                        make_meta(if status >= 500 { "upstream_error" } else { "allow" }),
+                        make_meta(if status >= 500 {
+                            "upstream_error"
+                        } else {
+                            "allow"
+                        }),
                     )
                     .await;
                 final_resp
@@ -1072,6 +1098,7 @@ impl EgressHandler {
                     svc.effective_intercept_errors(),
                     error_html_tpl,
                     &hdr.request_id,
+                    &accept_enc,
                     Some(&err_msg),
                 )
             }
@@ -1087,6 +1114,7 @@ impl EgressHandler {
         intercept: bool,
         error_html_tpl: Option<&str>,
         ray_id: &str,
+        accept_enc: &str,
         internal_error: Option<&str>,
     ) -> Response<ProxyBody> {
         let mut resp = if intercept {
@@ -1098,13 +1126,20 @@ impl EgressHandler {
                 ray_id,
                 None,
             );
-            Response::builder()
+            // The built-in page inlines a ~64 KiB SVG; gzip keeps the intercept path cheap in
+            // bytes without buffering anything that is not already buffered here.
+            let (body, encoding) =
+                exposure_core::assets::maybe_gzip_body(html.into_bytes(), accept_enc);
+            let mut builder = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
                 .header(header::CACHE_CONTROL, "no-store")
                 .header(RAY_ID_HEADER, ray_id)
-                .body(full_body(html))
-                .unwrap()
+                .header(header::VARY, "Accept-Encoding");
+            if let Some(encoding) = encoding {
+                builder = builder.header(header::CONTENT_ENCODING, encoding);
+            }
+            builder.body(full_body(body)).unwrap()
         } else {
             Response::builder()
                 .status(status)
@@ -1297,12 +1332,21 @@ where
                         }
                         Ok(resp.map(|b| b.boxed()))
                     }
-                    Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("http1 upstream error: {e}"))),
+                    Ok(Err(e)) => Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("http1 upstream error: {e}"),
+                    )),
                     Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "http1 upstream timeout".into())),
                 }
             }
-            Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("http1 handshake failed: {e}"))),
-            Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, "http1 handshake timeout".into())),
+            Ok(Err(e)) => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("http1 handshake failed: {e}"),
+            )),
+            Err(_) => Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "http1 handshake timeout".into(),
+            )),
         }
     }
 }
@@ -1425,7 +1469,10 @@ mod tests {
     #[test]
     fn summarize_backend_error_body_extracts_json_html_and_skips_binary() {
         let mut json_hdrs = HeaderMap::new();
-        json_hdrs.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        json_hdrs.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         assert_eq!(
             summarize_backend_error_body(
                 500,

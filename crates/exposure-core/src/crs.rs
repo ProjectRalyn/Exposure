@@ -346,7 +346,10 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
 /// engine cannot evaluate safely (`@detectSQLi`, chained rules, PCRE lookarounds, anomaly-scoring
 /// `pass` rules). Without this union a partial sync could silently drop SQLi/XSS/RCE coverage and
 /// leave the node effectively unprotected.
-pub fn merge_crs_snapshots(mut synced: CrsRulesetSnapshot, builtin: CrsRulesetSnapshot) -> CrsRulesetSnapshot {
+pub fn merge_crs_snapshots(
+    mut synced: CrsRulesetSnapshot,
+    builtin: CrsRulesetSnapshot,
+) -> CrsRulesetSnapshot {
     let mut merged: Vec<WafRuleDescriptor> = builtin.rules;
     let mut seen: std::collections::HashSet<u32> = merged.iter().map(|r| r.id).collect();
     for rule in synced.rules {
@@ -550,7 +553,10 @@ pub fn parse_crs_conf(file_name: &str, conf_text: &str) -> (Vec<WafRuleDescripto
         let tags = extract_all_quoted_actions(actions_quoted, "tag:");
         let paranoia_level = tags
             .iter()
-            .find_map(|t| t.strip_prefix("paranoia-level/").and_then(|n| n.parse::<u8>().ok()))
+            .find_map(|t| {
+                t.strip_prefix("paranoia-level/")
+                    .and_then(|n| n.parse::<u8>().ok())
+            })
             .unwrap_or(1)
             .clamp(1, 4);
         let msg = extract_quoted_action(actions_quoted, "msg:")
@@ -742,7 +748,11 @@ SecRule ARGS "@rx (?<=foo)bar" \
         assert!(crs.rules.len() >= 14);
         for r in &crs.rules {
             assert_eq!(r.source, "owasp-crs");
-            assert!(validate_crs_regex(&r.pattern), "invalid builtin CRS regex id={}", r.id);
+            assert!(
+                validate_crs_regex(&r.pattern),
+                "invalid builtin CRS regex id={}",
+                r.id
+            );
         }
     }
 

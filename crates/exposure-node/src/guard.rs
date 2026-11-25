@@ -3,21 +3,21 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use dashmap::DashMap;
-use exposure_core::assets::{load_web_asset, WebApp};
+use exposure_core::assets::{WebApp, load_web_asset};
 use exposure_core::config::{AntibotMode, CustomPagesConfig, GuardProfile, RateLimitBucket};
 use exposure_core::crypto::{
-    ct_eq_hashed, keyed_short_hmac_hex, short_sha256_hex, sign_challenge_token,
-    sign_clearance_cookie, sign_fp_cookie, sign_fp_token, verify_challenge_token,
-    verify_clearance_cookie, verify_fp_cookie, verify_fp_token, verify_pow_solution,
-    ClearanceClaims, FpCookieClaims,
+    ClearanceClaims, FpCookieClaims, ct_eq_hashed, keyed_short_hmac_hex, short_sha256_hex,
+    sign_challenge_token, sign_clearance_cookie, sign_fp_cookie, sign_fp_token,
+    verify_challenge_token, verify_clearance_cookie, verify_fp_cookie, verify_fp_token,
+    verify_pow_solution,
 };
 use exposure_core::routing::{canonical_ip, ip_matches_cidrs, normalize_host};
 use exposure_core::telemetry::ClientJsFingerprint;
-use http::{header, HeaderMap, Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -37,8 +37,7 @@ const FP_INJECT_COOLDOWN: Duration = Duration::from_secs(15);
 const ADAPTIVE_WINDOW: Duration = Duration::from_secs(60);
 const VERIFY_FAILURE_WINDOW: Duration = Duration::from_secs(300);
 const MAX_RATE_LIMIT_HTML_RESPONSES: u32 = 3;
-const CHALLENGE_CSP: &str =
-    "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
+const CHALLENGE_CSP: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'self'";
 
 fn profile_binding_hash(profile: Option<&GuardProfile>) -> String {
     let def = GuardProfile::default();
@@ -84,8 +83,13 @@ pub enum GuardDecision {
         retry_after_secs: u64,
         show_error_page: bool,
     },
-    Reject { status: StatusCode, reason: String },
-    ChallengeRedirect { location: String },
+    Reject {
+        status: StatusCode,
+        reason: String,
+    },
+    ChallengeRedirect {
+        location: String,
+    },
 }
 
 pub struct GuardHttpResponse {
@@ -155,7 +159,11 @@ fn check_same_origin_json_post(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !ct.trim().to_ascii_lowercase().starts_with("application/json") {
+    if !ct
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("application/json")
+    {
         return Some(GuardHttpResponse {
             status: non_json_status,
             content_type: "text/plain; charset=utf-8",
@@ -235,7 +243,11 @@ impl GuardEngine {
     }
 
     /// Evaluate ONLY CIDR allow/deny rules (used on `/cdn-cgi/*` before isolated `/cdn-cgi/` rate limits).
-    pub fn evaluate_access_cidrs(&self, profile: &GuardProfile, client_ip: IpAddr) -> GuardDecision {
+    pub fn evaluate_access_cidrs(
+        &self,
+        profile: &GuardProfile,
+        client_ip: IpAddr,
+    ) -> GuardDecision {
         let client_ip = canonical_ip(client_ip);
         if !profile.deny_cidrs.is_empty() && ip_matches_cidrs(client_ip, &profile.deny_cidrs) {
             return GuardDecision::Reject {
@@ -303,7 +315,9 @@ impl GuardEngine {
         if entry.blocked_hits < MAX_RATE_LIMIT_HTML_RESPONSES {
             return None;
         }
-        let elapsed = Instant::now().duration_since(entry.last_refill).as_secs_f64();
+        let elapsed = Instant::now()
+            .duration_since(entry.last_refill)
+            .as_secs_f64();
         let effective_tokens = (entry.tokens + elapsed * def.refill_per_sec).min(def.capacity);
         if effective_tokens >= 1.0 {
             return None;
@@ -390,15 +404,15 @@ impl GuardEngine {
         }
         let ip_key = client_ip_binding_key(client_ip);
         let (ip_challenges, ip_failures) = {
-            let mut entry = self
-                .challenge_activity
-                .entry(ip_key)
-                .or_insert_with(|| ChallengeActivity {
-                    window_start: now,
-                    challenges_issued: 0,
-                    failure_window_start: now,
-                    verify_failures: 0,
-                });
+            let mut entry =
+                self.challenge_activity
+                    .entry(ip_key)
+                    .or_insert_with(|| ChallengeActivity {
+                        window_start: now,
+                        challenges_issued: 0,
+                        failure_window_start: now,
+                        verify_failures: 0,
+                    });
             if now.duration_since(entry.window_start) >= ADAPTIVE_WINDOW {
                 entry.window_start = now;
                 entry.challenges_issued = 1;
@@ -597,7 +611,9 @@ impl GuardEngine {
 
         // 4c. Block headless browsers previously caught by passive FP cookie if block_headless is enabled
         if profile.effective_block_headless() {
-            if let Some(fp_claims) = self.valid_fp_cookie(clearance_secret, host, client_ip, headers) {
+            if let Some(fp_claims) =
+                self.valid_fp_cookie(clearance_secret, host, client_ip, headers)
+            {
                 if fp_claims.is_headless {
                     return GuardDecision::Reject {
                         status: StatusCode::FORBIDDEN,
@@ -1047,21 +1063,22 @@ impl GuardEngine {
             ]
         };
 
-        let rate_limit_resp = |retry_after: u64, msg: &[u8]| -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
-            let mut extra = sec_headers();
-            extra.push(("Retry-After".into(), retry_after.to_string()));
-            extra.push(("Cache-Control".into(), "no-store".into()));
-            (
-                GuardHttpResponse {
-                    status: StatusCode::TOO_MANY_REQUESTS,
-                    content_type: "text/plain; charset=utf-8",
-                    body: msg.to_vec(),
-                    extra_headers: extra,
-                    record_verify_offense: false,
-                },
-                None,
-            )
-        };
+        let rate_limit_resp =
+            |retry_after: u64, msg: &[u8]| -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
+                let mut extra = sec_headers();
+                extra.push(("Retry-After".into(), retry_after.to_string()));
+                extra.push(("Cache-Control".into(), "no-store".into()));
+                (
+                    GuardHttpResponse {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        content_type: "text/plain; charset=utf-8",
+                        body: msg.to_vec(),
+                        extra_headers: extra,
+                        record_verify_offense: false,
+                    },
+                    None,
+                )
+            };
 
         if method == Method::GET && sub == "/challenge" {
             if let Err(retry_after) = Self::consume_per_ip_limiter(
@@ -1890,12 +1907,19 @@ pub fn classify_client(headers: &HeaderMap) -> ClientFingerprint {
     let device_type = if is_scanner {
         "Scanner"
     } else if is_bot {
-        if ua_l.contains("curl") || ua_l.contains("wget") || ua_l.contains("python") || ua_l.contains("go-http") {
+        if ua_l.contains("curl")
+            || ua_l.contains("wget")
+            || ua_l.contains("python")
+            || ua_l.contains("go-http")
+        {
             "API/CLI"
         } else {
             "Bot"
         }
-    } else if ch_mobile == "?1" || ua_l.contains("iphone") || (ua_l.contains("android") && ua_l.contains("mobile")) {
+    } else if ch_mobile == "?1"
+        || ua_l.contains("iphone")
+        || (ua_l.contains("android") && ua_l.contains("mobile"))
+    {
         "Mobile"
     } else if ua_l.contains("ipad") || ua_l.contains("tablet") {
         "Tablet"
@@ -1982,17 +2006,43 @@ mod tests {
         let ip: IpAddr = "203.0.113.10".parse().unwrap();
         let headers = HeaderMap::new();
         assert!(matches!(
-            engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None),
+            engine.evaluate(
+                &profile,
+                &buckets,
+                "sec",
+                ip,
+                "example.com",
+                "/",
+                &headers,
+                None
+            ),
             GuardDecision::Allow
         ));
         assert!(matches!(
-            engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None),
+            engine.evaluate(
+                &profile,
+                &buckets,
+                "sec",
+                ip,
+                "example.com",
+                "/",
+                &headers,
+                None
+            ),
             GuardDecision::Allow
         ));
         assert!(engine.is_bucket_degraded(&profile, &buckets, ip).is_none());
         for hit in 1..=5 {
-            match engine.evaluate(&profile, &buckets, "sec", ip, "example.com", "/", &headers, None)
-            {
+            match engine.evaluate(
+                &profile,
+                &buckets,
+                "sec",
+                ip,
+                "example.com",
+                "/",
+                &headers,
+                None,
+            ) {
                 GuardDecision::RateLimited {
                     show_error_page, ..
                 } => {
@@ -2270,7 +2320,10 @@ mod tests {
             &headers,
             None,
         );
-        assert!(matches!(dec_no_cookie, GuardDecision::ChallengeRedirect { .. }));
+        assert!(matches!(
+            dec_no_cookie,
+            GuardDecision::ChallengeRedirect { .. }
+        ));
 
         // Replaying the same solved challenge token must fail!
         let (replay, _) = engine.handle_cdn_cgi(
@@ -2290,7 +2343,10 @@ mod tests {
 
         // Passive JS FP beacon token mint, report, cookie verification, and replay rejection
         let mut browser_hdrs = HeaderMap::new();
-        browser_hdrs.insert(header::USER_AGENT, "Mozilla/5.0 Chrome/130".parse().unwrap());
+        browser_hdrs.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 Chrome/130".parse().unwrap(),
+        );
         browser_hdrs.insert(header::ACCEPT, "text/html".parse().unwrap());
         browser_hdrs.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
         browser_hdrs.insert("sec-fetch-site", "same-origin".parse().unwrap());
@@ -2359,7 +2415,10 @@ mod tests {
             &browser_hdrs,
             None,
         );
-        assert!(matches!(dec_after_beacon, GuardDecision::ChallengeRedirect { .. }));
+        assert!(matches!(
+            dec_after_beacon,
+            GuardDecision::ChallengeRedirect { .. }
+        ));
         // Replay must be rejected
         let (fp_replay, _) = engine.handle_cdn_cgi(
             &Method::POST,
@@ -2524,15 +2583,42 @@ mod tests {
         let mut with_cookie = hdrs.clone();
         with_cookie.insert(header::COOKIE, cookie_pair.parse().unwrap());
         assert!(matches!(
-            engine.evaluate(&profile, &BTreeMap::new(), secret, ip1, "app.local", "/", &with_cookie, None),
+            engine.evaluate(
+                &profile,
+                &BTreeMap::new(),
+                secret,
+                ip1,
+                "app.local",
+                "/",
+                &with_cookie,
+                None
+            ),
             GuardDecision::Allow
         ));
         assert!(matches!(
-            engine.evaluate(&profile, &BTreeMap::new(), secret, ip1, "app.local", "/", &hdrs, None),
+            engine.evaluate(
+                &profile,
+                &BTreeMap::new(),
+                secret,
+                ip1,
+                "app.local",
+                "/",
+                &hdrs,
+                None
+            ),
             GuardDecision::ChallengeRedirect { .. }
         ));
         assert!(matches!(
-            engine.evaluate(&profile, &BTreeMap::new(), secret, ip2_same_24, "app.local", "/", &with_cookie, None),
+            engine.evaluate(
+                &profile,
+                &BTreeMap::new(),
+                secret,
+                ip2_same_24,
+                "app.local",
+                "/",
+                &with_cookie,
+                None
+            ),
             GuardDecision::ChallengeRedirect { .. }
         ));
 
@@ -2555,7 +2641,9 @@ mod tests {
             );
             if resp.status == StatusCode::TOO_MANY_REQUESTS {
                 assert!(
-                    resp.extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("retry-after")),
+                    resp.extra_headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("retry-after")),
                     "429 must include Retry-After header"
                 );
                 got_429 = true;
@@ -2643,7 +2731,16 @@ mod tests {
         poc_accept.insert(header::ACCEPT, "*/*".parse().unwrap());
         assert!(compute_suspicion_score(&poc_accept, None) >= 50);
         assert!(matches!(
-            engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &poc_accept, None),
+            engine.evaluate(
+                &default_profile,
+                &BTreeMap::new(),
+                "sec",
+                ip,
+                "app.local",
+                "/index.html",
+                &poc_accept,
+                None
+            ),
             GuardDecision::ChallengeRedirect { .. }
         ));
 
@@ -2653,25 +2750,56 @@ mod tests {
         assert!(compute_suspicion_score(&poc_empty_accept, None) >= 65);
 
         // 3. Honest non-browser clients (APIs, CLIs, mobile SDKs) MUST NOT be blindly blocked in default mode!
-        for api_ua in ["curl/8.5.0", "Go-http-client/2.0", "okhttp/4.12.0", "MyServiceSDK/1.0"] {
+        for api_ua in [
+            "curl/8.5.0",
+            "Go-http-client/2.0",
+            "okhttp/4.12.0",
+            "MyServiceSDK/1.0",
+        ] {
             let mut h = HeaderMap::new();
             h.insert(header::USER_AGENT, api_ua.parse().unwrap());
             h.insert(header::ACCEPT, "application/json".parse().unwrap());
-            assert_eq!(compute_suspicion_score(&h, None), 0, "honest non-browser `{api_ua}` must score 0");
+            assert_eq!(
+                compute_suspicion_score(&h, None),
+                0,
+                "honest non-browser `{api_ua}` must score 0"
+            );
             assert!(matches!(
-                engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "api.local", "/v1/items", &h, None),
+                engine.evaluate(
+                    &default_profile,
+                    &BTreeMap::new(),
+                    "sec",
+                    ip,
+                    "api.local",
+                    "/v1/items",
+                    &h,
+                    None
+                ),
                 GuardDecision::Allow
             ));
         }
 
         // 3b. Offensive attack scanners MUST still score high even in default non-browser-safe mode!
-        for scanner_ua in ["sqlmap/1.8.2", "Nikto/2.1.6", "Nuclei - Open-source project"] {
+        for scanner_ua in [
+            "sqlmap/1.8.2",
+            "Nikto/2.1.6",
+            "Nuclei - Open-source project",
+        ] {
             let mut h = HeaderMap::new();
             h.insert(header::USER_AGENT, scanner_ua.parse().unwrap());
             assert!(classify_client(&h).is_scanner);
             assert!(compute_suspicion_score(&h, None) >= 80);
             assert!(!matches!(
-                engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "api.local", "/v1/items", &h, None),
+                engine.evaluate(
+                    &default_profile,
+                    &BTreeMap::new(),
+                    "sec",
+                    ip,
+                    "api.local",
+                    "/v1/items",
+                    &h,
+                    None
+                ),
                 GuardDecision::Allow
             ));
         }
@@ -2682,7 +2810,16 @@ mod tests {
             h.insert(header::USER_AGENT, custom_ua.parse().unwrap());
             assert!(compute_server_suspicion_score_for_mode(&h, None, None, true) >= 85);
             assert!(!matches!(
-                engine.evaluate(&strict_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                engine.evaluate(
+                    &strict_profile,
+                    &BTreeMap::new(),
+                    "sec",
+                    ip,
+                    "app.local",
+                    "/index.html",
+                    &h,
+                    None
+                ),
                 GuardDecision::Allow
             ));
             // Even with Accept + Accept-Language, missing Sec-Fetch-Mode + non-Mozilla UA still >= 50
@@ -2690,7 +2827,16 @@ mod tests {
             h.insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
             assert!(compute_server_suspicion_score_for_mode(&h, None, None, true) >= 50);
             assert!(!matches!(
-                engine.evaluate(&strict_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &h, None),
+                engine.evaluate(
+                    &strict_profile,
+                    &BTreeMap::new(),
+                    "sec",
+                    ip,
+                    "app.local",
+                    "/index.html",
+                    &h,
+                    None
+                ),
                 GuardDecision::Allow
             ));
         }
@@ -2703,11 +2849,23 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        real_http_browser.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+        real_http_browser.insert(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml".parse().unwrap(),
+        );
         real_http_browser.insert(header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9".parse().unwrap());
         assert!(compute_suspicion_score(&real_http_browser, None) < 50);
         assert!(matches!(
-            engine.evaluate(&default_profile, &BTreeMap::new(), "sec", ip, "app.local", "/index.html", &real_http_browser, None),
+            engine.evaluate(
+                &default_profile,
+                &BTreeMap::new(),
+                "sec",
+                ip,
+                "app.local",
+                "/index.html",
+                &real_http_browser,
+                None
+            ),
             GuardDecision::Allow
         ));
     }
@@ -2721,7 +2879,10 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        h.insert(header::ACCEPT, "text/html,application/xhtml+xml".parse().unwrap());
+        h.insert(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml".parse().unwrap(),
+        );
         h.insert(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
         h.insert("sec-fetch-mode", "navigate".parse().unwrap());
         h.insert("sec-ch-ua", "\"Chromium\";v=\"130\"".parse().unwrap());
@@ -2739,7 +2900,10 @@ mod tests {
             fingerprint: Some("deadbeef".into()),
         };
         let clean_score = compute_server_suspicion_score(&h, Some(&genuine_tls), Some(0));
-        assert!(clean_score < 20, "genuine browser TLS + clean IP scored {clean_score}");
+        assert!(
+            clean_score < 20,
+            "genuine browser TLS + clean IP scored {clean_score}"
+        );
 
         // Impersonated TLS without GREASE/ALPN h2 + contradictory Sec-Ch-Ua-Platform + high AbuseIPDB score
         let fake_tls = crate::tls::ClientHelloSignal {
@@ -2756,6 +2920,9 @@ mod tests {
         let mut spoof_h = h.clone();
         spoof_h.insert("sec-ch-ua-platform", "\"Linux\"".parse().unwrap());
         let high_score = compute_server_suspicion_score(&spoof_h, Some(&fake_tls), Some(85));
-        assert!(high_score >= 70, "spoofed TLS + AbuseIPDB 85 scored only {high_score}");
+        assert!(
+            high_score >= 70,
+            "spoofed TLS + AbuseIPDB 85 scored only {high_score}"
+        );
     }
 }

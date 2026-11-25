@@ -78,7 +78,10 @@ fn find_native_esbuild(node_modules: &Path) -> Option<PathBuf> {
         "esbuild"
     };
     let direct_pkg = node_modules.join("@esbuild").join(target_pkg);
-    for candidate in [direct_pkg.join("bin").join(bin_name), direct_pkg.join(bin_name)] {
+    for candidate in [
+        direct_pkg.join("bin").join(bin_name),
+        direct_pkg.join(bin_name),
+    ] {
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -139,7 +142,10 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
         let css_ok = Command::new(&esbuild)
             .arg(src.join("styles.css"))
             .arg("--minify")
-            .arg(format!("--outfile={}", assets.join("styles.min.css").display()))
+            .arg(format!(
+                "--outfile={}",
+                assets.join("styles.min.css").display()
+            ))
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -153,9 +159,18 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
         };
         let patched = html
             .replace("./styles.css", &format!("{base}assets/styles.min.css"))
-            .replace(&format!("./{entry_js}"), &format!("{base}assets/app.min.js"))
-            .replace("/cdn-cgi/styles.css", &format!("{base}assets/styles.min.css"))
-            .replace(&format!("/cdn-cgi/{entry_js}"), &format!("{base}assets/app.min.js"));
+            .replace(
+                &format!("./{entry_js}"),
+                &format!("{base}assets/app.min.js"),
+            )
+            .replace(
+                "/cdn-cgi/styles.css",
+                &format!("{base}assets/styles.min.css"),
+            )
+            .replace(
+                &format!("/cdn-cgi/{entry_js}"),
+                &format!("{base}assets/app.min.js"),
+            );
         if fs::write(dst.join("index.html"), patched).is_err() {
             return false;
         }
@@ -213,8 +228,14 @@ fn main() {
 
     watch_dir(&web_dir.join("control"));
     watch_dir(&web_dir.join("challenge"));
-    println!("cargo:rerun-if-changed={}", web_dir.join("build.mjs").display());
-    println!("cargo:rerun-if-changed={}", web_dir.join("package.json").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        web_dir.join("build.mjs").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        web_dir.join("package.json").display()
+    );
     println!("cargo:rerun-if-env-changed=EXPOSURE_USE_PREBUILT_WEB");
 
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
@@ -230,7 +251,9 @@ fn main() {
     let stage_dir = out_dir.join("web_dist");
     let vite_ok = run_pnpm_build(&web_dir, &stage_dir);
 
-    let effective_dist = if (vite_ok && stage_dir.join("control").exists() && stage_dir.join("challenge").exists())
+    let effective_dist = if (vite_ok
+        && stage_dir.join("control").exists()
+        && stage_dir.join("challenge").exists())
         || build_with_native_esbuild(&web_dir, &stage_dir)
     {
         stage_dir
@@ -238,7 +261,9 @@ fn main() {
         && web_dir.join("dist").join("control").exists()
         && web_dir.join("dist").join("challenge").exists()
     {
-        println!("cargo:warning=Using prebuilt web/dist assets because EXPOSURE_USE_PREBUILT_WEB=1");
+        println!(
+            "cargo:warning=Using prebuilt web/dist assets because EXPOSURE_USE_PREBUILT_WEB=1"
+        );
         web_dir.join("dist")
     } else {
         panic!(
