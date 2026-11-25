@@ -1614,8 +1614,11 @@ impl NodeRuntime {
             {
                 Ok(Ok(tcp)) => {
                     if svc.tls.unwrap_or(false) {
-                        let use_h2 = svc.protocol == exposure_core::config::BackendProtocol::H2;
-                        match self.egress.get_tls_client_config(svc, use_h2).await {
+                        // `auto`/`h2` both offer h2 via ALPN; only an explicit `http1` service
+                        // must not advertise h2.
+                        let offer_h2 = svc.protocol
+                            != exposure_core::config::BackendProtocol::Http1;
+                        match self.egress.get_tls_client_config(svc, offer_h2).await {
                             Ok(tls_cfg) => {
                                 match tokio::time::timeout(
                                     Duration::from_millis(2000),

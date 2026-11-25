@@ -152,7 +152,7 @@ export function createSystemView({ api, store }) {
           <div class="inspector-row">
             <label><span>Protocol</span>
               <select id="sd-eg-proto">
-                <option value="auto" ${eg.protocol === "auto" ? "selected" : ""}>auto</option>
+                <option value="auto" ${eg.protocol === "auto" ? "selected" : ""}>auto (TLS: ALPN h2/h1; plaintext: h1)</option>
                 <option value="http1" ${eg.protocol === "http1" ? "selected" : ""}>http1</option>
                 <option value="h2" ${eg.protocol === "h2" ? "selected" : ""}>h2</option>
               </select>

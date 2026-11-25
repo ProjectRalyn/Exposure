@@ -531,37 +531,30 @@ impl EgressHandler {
         } else {
             "/"
         };
+        let backend_tls = svc.effective_tls();
+        let offer_h2 = svc.protocol != BackendProtocol::Http1;
         let fut = async {
             let tcp = TcpStream::connect(&svc.backend).await.ok()?;
-            let req = Request::builder()
-                .method(http::Method::GET)
-                .uri(path)
-                .header(header::HOST, &svc.backend)
-                .header(header::CONNECTION, "close")
-                .header(header::USER_AGENT, "Exposure-HealthCheck/1.0")
-                .body(Empty::<Bytes>::new())
-                .ok()?;
-            if svc.effective_tls() {
-                let tls_cfg = self.get_tls_client_config(svc, false).await.ok()?;
+            if backend_tls {
+                let tls_cfg = self.get_tls_client_config(svc, offer_h2).await.ok()?;
                 let tls_stream = connect_backend_tls(tcp, svc, &tls_cfg).await.ok()?;
-                let (mut sender, conn) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-                        .await
-                        .ok()?;
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                let resp = sender.send_request(req).await.ok()?;
-                Some(resp.status().as_u16() < 500)
+                let negotiated_h2 =
+                    tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                let use_h2 = if svc.protocol == BackendProtocol::H2 {
+                    // Explicit h2 service: an http/1.1-only backend is a misconfiguration, and the
+                    // proxy hop would fail too, so report it as unhealthy instead of probing H1.
+                    if !negotiated_h2 {
+                        return None;
+                    }
+                    true
+                } else {
+                    negotiated_h2
+                };
+                health_probe(tls_stream, use_h2, "https", &svc.backend, path).await
             } else {
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
-                    .await
-                    .ok()?;
-                tokio::spawn(async move {
-                    let _ = conn.await;
-                });
-                let resp = sender.send_request(req).await.ok()?;
-                Some(resp.status().as_u16() < 500)
+                // Plaintext: h2c prior-knowledge only when `protocol: h2` is explicit.
+                let use_h2 = svc.protocol == BackendProtocol::H2;
+                health_probe(tcp, use_h2, "http", &svc.backend, path).await
             }
         };
         tokio::time::timeout(timeout, fut)
@@ -754,7 +747,7 @@ impl EgressHandler {
 
     async fn proxy_http_request(
         &self,
-        mut req: Request<Incoming>,
+        req: Request<Incoming>,
         svc: &EgressServiceConfig,
         hdr: &ServiceStreamHeader,
         error_html_tpl: Option<&str>,
@@ -775,18 +768,22 @@ impl EgressHandler {
         let path_str = req.uri().path().to_string();
         let query_opt = req.uri().query().map(str::to_string);
         let is_upgrade = req.headers().get(header::UPGRADE).is_some();
-        let use_h2 = svc.protocol == BackendProtocol::H2
-            || (svc.protocol == BackendProtocol::Auto
-                && req.version() == http::Version::HTTP_2
-                && !is_upgrade);
-        let proto_str: &'static str = if is_upgrade {
+        // The upstream HTTP version is a property of the *backend*, never of the client request.
+        // Plaintext backends cannot negotiate h2 (there is no ALPN on a bare TCP hop), so `auto`
+        // means HTTP/1.1 there and h2c prior-knowledge is used only when `protocol: h2` is set
+        // explicitly. TLS backends negotiate through ALPN (`auto`/`h2` both offer h2) and the
+        // negotiated protocol is the one actually used.
+        let backend_tls = svc.effective_tls();
+        let h2c_upstream = !is_upgrade && !backend_tls && svc.protocol == BackendProtocol::H2;
+        let offer_h2_alpn = !is_upgrade && svc.protocol != BackendProtocol::Http1;
+        let proto_hint: &'static str = if is_upgrade {
             "WS"
-        } else if use_h2 {
+        } else if h2c_upstream || (backend_tls && svc.protocol != BackendProtocol::Http1) {
             "HTTP/2"
         } else {
             "HTTP/1.1"
         };
-        let scheme_str = if svc.effective_tls() { "https" } else { "http" };
+        let scheme_str = if backend_tls { "https" } else { "http" };
         let ua_str = req
             .headers()
             .get(header::USER_AGENT)
@@ -805,13 +802,13 @@ impl EgressHandler {
             .get(header::REFERER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let make_meta = |action: &'static str| AccessLogMeta {
+        let make_meta = |action: &'static str, protocol: &'static str| AccessLogMeta {
             ray_id: Some(&hdr.request_id),
             method: Some(&method_str),
             host: (!host_str.is_empty()).then_some(host_str.as_str()),
             path: Some(&path_str),
             query: query_opt.as_deref(),
-            protocol: Some(proto_str),
+            protocol: Some(protocol),
             scheme: Some(scheme_str),
             user_agent: (!ua_str.is_empty()).then_some(ua_str.as_str()),
             referer: referer_opt.as_deref(),
@@ -843,7 +840,7 @@ impl EgressHandler {
                     None,
                     None,
                     false,
-                    make_meta("upstream_error"),
+                    make_meta("upstream_error", proto_hint),
                 )
                 .await;
             return self.build_error_response(
@@ -900,7 +897,7 @@ impl EgressHandler {
                         None,
                         None,
                         false,
-                        make_meta("upstream_error"),
+                        make_meta("upstream_error", proto_hint),
                     )
                     .await;
                 return self.build_error_response(
@@ -943,7 +940,7 @@ impl EgressHandler {
                         None,
                         None,
                         false,
-                        make_meta("upstream_error"),
+                        make_meta("upstream_error", proto_hint),
                     )
                     .await;
                 return self.build_error_response(
@@ -959,17 +956,11 @@ impl EgressHandler {
             }
         };
 
-        // Ensure Host header is present for HTTP/1.1 backends (HTTP/2 uses :authority below)
-        if !use_h2 && !req.headers().contains_key(header::HOST) {
-            if let Ok(hv) = svc.backend.parse() {
-                req.headers_mut().insert(header::HOST, hv);
-            }
-        }
-
-        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if svc
-            .effective_tls()
+        // Protocol label for the access log; refined once TLS ALPN negotiation has happened.
+        let mut upstream_proto: &'static str = proto_hint;
+        let resp_res: std::result::Result<Response<ProxyBody>, (StatusCode, String)> = if backend_tls
         {
-            match self.get_tls_client_config(svc, use_h2).await {
+            match self.get_tls_client_config(svc, offer_h2_alpn).await {
                 Ok(tls_cfg) => {
                     match tokio::time::timeout(timeout, connect_backend_tls(tcp, svc, &tls_cfg))
                         .await
@@ -977,21 +968,40 @@ impl EgressHandler {
                         Ok(Ok(tls_stream)) => {
                             let negotiated_h2 =
                                 tls_stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
-                            let actual_use_h2 = if svc.protocol == BackendProtocol::Auto {
-                                negotiated_h2
+                            let actual_use_h2 = negotiated_h2 && !is_upgrade;
+                            upstream_proto = if is_upgrade {
+                                "WS"
+                            } else if actual_use_h2 {
+                                "HTTP/2"
                             } else {
-                                use_h2
+                                "HTTP/1.1"
                             };
-                            forward_http_stream(
-                                tls_stream,
-                                req,
-                                actual_use_h2,
-                                is_upgrade,
-                                true,
-                                &svc.backend,
-                                timeout,
-                            )
-                            .await
+                            if svc.protocol == BackendProtocol::H2
+                                && !is_upgrade
+                                && !negotiated_h2
+                            {
+                                // `protocol: h2` is an explicit requirement; never downgrade it
+                                // silently (the pre-fix code sent h2 frames over an http/1.1
+                                // connection, which surfaced as an opaque upstream error).
+                                Err((
+                                    StatusCode::BAD_GATEWAY,
+                                    format!(
+                                        "backend {} did not negotiate h2 via ALPN although service protocol is h2",
+                                        svc.backend
+                                    ),
+                                ))
+                            } else {
+                                forward_http_stream(
+                                    tls_stream,
+                                    req,
+                                    actual_use_h2,
+                                    is_upgrade,
+                                    true,
+                                    &svc.backend,
+                                    timeout,
+                                )
+                                .await
+                            }
                         }
                         Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
                         Err(_) => Err((
@@ -1003,7 +1013,16 @@ impl EgressHandler {
                 Err(e) => Err((StatusCode::BAD_GATEWAY, e)),
             }
         } else {
-            forward_http_stream(tcp, req, use_h2, is_upgrade, false, &svc.backend, timeout).await
+            forward_http_stream(
+                tcp,
+                req,
+                h2c_upstream,
+                is_upgrade,
+                false,
+                &svc.backend,
+                timeout,
+            )
+            .await
         };
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1058,11 +1077,14 @@ impl EgressHandler {
                         None,
                         None,
                         false,
-                        make_meta(if status >= 500 {
-                            "upstream_error"
-                        } else {
-                            "allow"
-                        }),
+                        make_meta(
+                            if status >= 500 {
+                                "upstream_error"
+                            } else {
+                                "allow"
+                            },
+                            upstream_proto,
+                        ),
                     )
                     .await;
                 final_resp
@@ -1092,7 +1114,7 @@ impl EgressHandler {
                         None,
                         None,
                         false,
-                        make_meta("upstream_error"),
+                        make_meta("upstream_error", upstream_proto),
                     )
                     .await;
                 let (title, detail) = status_title_and_detail(err_status);
@@ -1233,9 +1255,9 @@ pub(crate) fn normalize_request_for_http1<B>(req: &mut Request<B>) {
     }
 }
 
-async fn forward_http_stream<S>(
+async fn forward_http_stream<S, B>(
     stream: S,
-    mut req: Request<Incoming>,
+    mut req: Request<B>,
     use_h2: bool,
     is_upgrade: bool,
     use_tls: bool,
@@ -1244,30 +1266,37 @@ async fn forward_http_stream<S>(
 ) -> std::result::Result<Response<ProxyBody>, (StatusCode, String)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     if use_h2 {
         *req.version_mut() = http::Version::HTTP_2;
         strip_hop_by_hop_headers(req.headers_mut(), true, false);
-        // Ensure :scheme and :authority are populated when upgrading HTTP/1.1 -> H2, and strip Host header
-        // so HTTP/2 pseudo-header :authority is authoritative.
-        if req.uri().scheme().is_none() || req.uri().authority().is_none() {
-            let authority = req
-                .headers()
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(backend_addr)
-                .to_string();
-            let path_q = req
-                .uri()
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/");
-            let scheme = if use_tls { "https" } else { "http" };
-            if let Ok(new_uri) = format!("{scheme}://{authority}{path_q}").parse() {
-                *req.uri_mut() = new_uri;
-            }
+        // Build absolute-form with the scheme/authority actually used for this hop (hyper's H2
+        // client derives `:scheme`/`:authority` from the URI), then drop `Host` so the pseudo-header
+        // is authoritative. The client-facing authority (vhost) is preserved for the backend.
+        let authority = req
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .or_else(|| {
+                req.headers()
+                    .get(header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| backend_addr.to_string());
+        let path_q = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+        let scheme = if use_tls { "https" } else { "http" };
+        if let Ok(new_uri) = format!("{scheme}://{authority}{path_q}").parse() {
+            *req.uri_mut() = new_uri;
         }
         req.headers_mut().remove(header::HOST);
 
@@ -1296,6 +1325,13 @@ where
     } else {
         *req.version_mut() = http::Version::HTTP_11;
         normalize_request_for_http1(&mut req);
+        // `normalize_request_for_http1` derives Host from the URI authority (HTTP/2 :authority);
+        // only a request with no authority at all falls back to the backend address.
+        if !req.headers().contains_key(header::HOST) {
+            if let Ok(hv) = backend_addr.parse() {
+                req.headers_mut().insert(header::HOST, hv);
+            }
+        }
         strip_hop_by_hop_headers(req.headers_mut(), false, is_upgrade);
         let client_upgrade = if is_upgrade {
             Some(hyper::upgrade::on(&mut req))
@@ -1353,6 +1389,54 @@ where
                 "http1 handshake timeout".into(),
             )),
         }
+    }
+}
+
+/// One-shot backend health probe that honours the configured upstream protocol (`h2c`/`h2`/HTTP1).
+async fn health_probe<S>(
+    stream: S,
+    use_h2: bool,
+    scheme: &str,
+    authority: &str,
+    path: &str,
+) -> Option<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let uri = if use_h2 {
+        format!("{scheme}://{authority}{path}")
+    } else {
+        path.to_string()
+    };
+    let mut builder = Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .header(header::USER_AGENT, "Exposure-HealthCheck/1.0");
+    if !use_h2 {
+        builder = builder
+            .header(header::HOST, authority)
+            .header(header::CONNECTION, "close");
+    }
+    let req = builder.body(Empty::<Bytes>::new()).ok()?;
+    if use_h2 {
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(stream))
+                .await
+                .ok()?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let resp = sender.send_request(req).await.ok()?;
+        Some(resp.status().as_u16() < 500)
+    } else {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .ok()?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let resp = sender.send_request(req).await.ok()?;
+        Some(resp.status().as_u16() < 500)
     }
 }
 
@@ -1519,5 +1603,110 @@ mod tests {
         let body = rebuilt.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.len(), 6000);
         assert_eq!(body, payload.as_bytes());
+    }
+
+    /// Spawn a local echo backend. `h2` selects an h2c-capable (auto) server, otherwise an
+    /// HTTP/1.1-only server that fails every h2c prior-knowledge connection.
+    async fn spawn_echo_backend(h2: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let svc = service_fn(|req: Request<Incoming>| async move {
+                    let host = req
+                        .headers()
+                        .get(header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok::<_, std::convert::Infallible>(Response::new(full_body(format!(
+                        "{:?} {} host={host}",
+                        req.version(),
+                        req.uri()
+                    ))))
+                });
+                tokio::spawn(async move {
+                    if h2 {
+                        use hyper_util::server::conn::auto::Builder as Auto;
+                        let _ = Auto::new(TokioExecutor::new())
+                            .serve_connection(TokioIo::new(tcp), svc)
+                            .await;
+                    } else {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(tcp), svc)
+                            .await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Regression: an HTTP/2 client request must NOT force h2c to a plaintext `auto` backend —
+    /// the upstream hop has to be downgraded to HTTP/1.1 while preserving the client's
+    /// `:authority` as `Host` (previously this produced an `upstream error` for every request).
+    #[tokio::test]
+    async fn http2_client_request_is_forwarded_to_http1_only_backend() {
+        let addr = spawn_echo_backend(false).await;
+        let req = Request::builder()
+            .uri("http://vhost.test/from-h2-client")
+            .header(header::HOST, "vhost.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let resp = forward_http_stream(
+            tcp,
+            req,
+            false,
+            false,
+            false,
+            &addr.to_string(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("HTTP/1.1 upstream hop must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("HTTP/1.1"), "expected HTTP/1.1 upstream: {body}");
+        // Origin-form request-target for an HTTP/1.1 origin server.
+        assert!(
+            body.contains(" /from-h2-client host=vhost.test"),
+            "expected origin-form path and vhost Host: {body}"
+        );
+        // The backend address must not leak into Host.
+        assert!(!body.contains(&addr.to_string()), "backend addr leaked: {body}");
+    }
+
+    /// Explicit `protocol: h2` uses h2c prior-knowledge and advertises the client authority.
+    #[tokio::test]
+    async fn http1_client_request_is_forwarded_to_h2c_backend() {
+        let addr = spawn_echo_backend(true).await;
+        let req = Request::builder()
+            .uri("/to-h2c-backend")
+            .header(header::HOST, "vhost.test")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let resp = forward_http_stream(
+            tcp,
+            req,
+            true,
+            false,
+            false,
+            &addr.to_string(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("h2c upstream hop must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("HTTP/2.0"), "expected HTTP/2 upstream: {body}");
+        assert!(body.contains("/to-h2c-backend"), "{body}");
+        assert!(body.contains("vhost.test"), "expected :authority vhost: {body}");
     }
 }

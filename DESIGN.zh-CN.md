@@ -57,7 +57,7 @@ Exposure 将**数据面（Nodes）**与**控制面（Control）**分离，并通
 | :--- | :--- |
 | **Ingress** | 监听外部 HTTP/HTTPS 流量，终结 TLS（使用从 Maintainer 同步的证书），执行 Entry Guard 流水线，匹配规则（`host`、`source_cidrs`），并向 `next_peer` 打开携带 `ServiceTag` 的 `Service` 流。 |
 | **Relay** | 依据 `ServiceTag -> next_peer` 规则在多跳间转发 `Service` 流，并沿显式跳表转发 `SpecialFrame` 控制/遥测消息。 |
-| **Egress** | 终结 `Service` 流，基于 `origin_node_tag` 校验 `allow_from` ACL（除非设置 `allow_any_origin`，否则默认拒绝），向本地后端代理 HTTP/1.1、HTTP/2（`h2`/`h2c`）与 WebSocket 升级请求，并支持本地后端主动健康检查。 |
+| **Egress** | 终结 `Service` 流，基于 `origin_node_tag` 校验 `allow_from` ACL（除非设置 `allow_any_origin`，否则默认拒绝），向本地后端代理 HTTP/1.1、HTTP/2（`h2`/`h2c`）与 WebSocket 升级请求，并支持本地后端主动健康检查。上游协议由后端配置决定，与客户端请求版本无关：`http1` 强制 HTTP/1.1，`h2` 强制 `h2c` prior-knowledge（TLS 下要求 ALPN 协商为 `h2`），`auto` 在 TLS 后端上使用 ALPN 协商、在明文后端上默认 HTTP/1.1。 |
 | **Maintainer** | 管理 ACME DNS-01 证书申请与续期（支持 Cloudflare、阿里云 DNS、通用 Webhook、Exec Hook 或 `self-signed`），分发签名证书包，并聚合各节点的遥测摘要与告警。 |
 
 ---

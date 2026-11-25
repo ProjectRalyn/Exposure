@@ -242,7 +242,9 @@ async fn e2e_mesh_h2_guard_control_and_maintainer() {
         "web@remote".into(),
         EgressServiceConfig {
             backend: backend_addr.to_string(),
-            protocol: BackendProtocol::Auto,
+            // Explicit h2c prior-knowledge: plaintext `auto` backends are proxied as HTTP/1.1
+            // (bare TCP cannot negotiate h2), so pin h2 here to exercise the h2 upstream hop.
+            protocol: BackendProtocol::H2,
             tls: Some(false),
             ca_cert_path: None,
             insecure_skip_verify: Some(false),

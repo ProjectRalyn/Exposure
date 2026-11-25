@@ -57,7 +57,7 @@ Exposure separates the **Data Plane** (Nodes) from the **Control Plane** (Contro
 | :--- | :--- |
 | **Ingress** | Listens for external HTTP/HTTPS traffic, terminates TLS (using certs synced from Maintainer), runs the Entry Guard pipeline, matches rules (`host`, `source_cidrs`), and opens a `Service` stream toward `next_peer` tagged with `ServiceTag`. |
 | **Relay** | Forwards `Service` streams across hops according to `ServiceTag -> next_peer` rules and relays `SpecialFrame` control/telemetry messages along explicit hop tables. |
-| **Egress** | Terminates `Service` streams, enforces `allow_from` ACLs against `origin_node_tag` (default deny unless `allow_any_origin` is set), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSocket upgrades to local backends, and runs optional local backend health checks. |
+| **Egress** | Terminates `Service` streams, enforces `allow_from` ACLs against `origin_node_tag` (default deny unless `allow_any_origin` is set), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSocket upgrades to local backends, and runs optional local backend health checks. The upstream protocol is chosen by the service's backend config, never by the client request version: `http1` forces HTTP/1.1, `h2` forces `h2c` prior-knowledge (or requires ALPN `h2` over TLS), and `auto` uses ALPN negotiation on TLS backends while defaulting to HTTP/1.1 on plaintext backends. |
 | **Maintainer** | Manages ACME DNS-01 certificate orders and renewals (Cloudflare, Aliyun DNS, Webhook, Exec Hook, or `self-signed`), distributes signed certificate bundles, and aggregates node telemetry summaries/alerts. |
 
 ---

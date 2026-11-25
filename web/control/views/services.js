@@ -622,7 +622,7 @@ export function createServicesView({ store, navigate }) {
           <div class="inspector-row">
             <label><span>${esc(t("Backend Protocol"))}</span>
               <select id="sd-eg-proto">
-                <option value="auto" ${draft.egress.protocol === "auto" ? "selected" : ""}>auto (h2/h1)</option>
+                <option value="auto" ${draft.egress.protocol === "auto" ? "selected" : ""}>auto (TLS: ALPN h2/h1; plaintext: h1)</option>
                 <option value="http1" ${draft.egress.protocol === "http1" ? "selected" : ""}>http1</option>
                 <option value="h2" ${draft.egress.protocol === "h2" ? "selected" : ""}>h2</option>
               </select>

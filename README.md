@@ -107,7 +107,7 @@ Before applying a declarative topology (see [`examples/topology.yaml`](examples/
 - **Composable Node Roles (`exposure-node`)**
   - **Ingress**: Terminates HTTP/HTTPS (with SNI & dynamic TLS certs), enforces Entry Guard policies, and forwards matched traffic by `ServiceTag`.
   - **Relay**: Forwards streams across multi-hop paths with loop prevention (`TTL` & hop tracking) and health-aware peer selection.
-  - **Egress**: Enforces `allow_from` origin ACLs (default deny), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSockets to local backends, and runs local backend health checks.
+  - **Egress**: Enforces `allow_from` origin ACLs (default deny), proxies HTTP/1.1, HTTP/2 (`h2`/`h2c`), and WebSockets to local backends, and runs local backend health checks. Upstream protocol follows the backend config (`http1`/`h2`; `auto` = ALPN on TLS, HTTP/1.1 on plaintext).
   - **Maintainer**: Manages **ACME DNS-01** certificate issuance/renewal (Cloudflare, Aliyun DNS, Webhook, Exec Hook, or self-signed), aggregates node telemetry, and distributes signed config/cert bundles.
 - **Edge Entry Guard & Anti-Bot Protection**
   - CIDR allow/deny filtering and named **token-bucket rate limiting** (`429 Too Many Requests` + `Retry-After`).
