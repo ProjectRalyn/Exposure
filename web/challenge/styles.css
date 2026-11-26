@@ -158,6 +158,17 @@ h1 {
   opacity: 0.75;
 }
 
+/* The illustration intentionally bleeds past the page edge. An absolutely positioned box with a
+   negative `bottom` extends the document's scrollable area, so it must live in a clipping layer —
+   otherwise the whole page gains a few pixels of dead vertical scroll. */
+.art-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
 .art {
   position: absolute;
   right: 2vw;
