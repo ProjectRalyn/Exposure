@@ -138,6 +138,10 @@ export function defaultAbuseIpDbConfig() {
     high_risk_action: "block",
     cache_ttl_secs: 21600,
     max_daily_lookups: 900,
+    report_enabled: false,
+    report_daily_quota: 100,
+    report_min_offense_level: 1,
+    report_categories: [],
   };
 }
 
@@ -156,6 +160,12 @@ export function normalizeAbuseIpDbConfig(raw) {
     high_risk_action: act,
     cache_ttl_secs: Math.max(60, Number(s.cache_ttl_secs ?? b.cache_ttl_secs) || b.cache_ttl_secs),
     max_daily_lookups: Math.max(10, Number(s.max_daily_lookups ?? b.max_daily_lookups) || b.max_daily_lookups),
+    report_enabled: Boolean(s.report_enabled ?? b.report_enabled),
+    report_daily_quota: Math.max(1, Math.min(1000, Number(s.report_daily_quota ?? b.report_daily_quota) || b.report_daily_quota)),
+    report_min_offense_level: Math.max(1, Math.min(8, Number(s.report_min_offense_level ?? b.report_min_offense_level) || b.report_min_offense_level)),
+    report_categories: (Array.isArray(s.report_categories) ? s.report_categories : b.report_categories)
+      .map((v) => Number(v))
+      .filter((v) => Number.isInteger(v) && v >= 1 && v <= 23),
   };
 }
 
@@ -369,6 +379,7 @@ export function defaultTopologyDefaults() {
       evilpot: defaultEvilpotConfig(),
       auto_ban: defaultAutoBanConfig(),
       abuseipdb: defaultAbuseIpDbConfig(),
+      exempt_ips: [],
       crs: defaultCrsUpdateConfig(),
       geoip: defaultGeoIpConfig(),
     },

@@ -512,6 +512,12 @@ fn default_abuse_cache_ttl_secs() -> u64 {
 fn default_abuse_max_daily_lookups() -> u32 {
     900
 }
+fn default_abuse_report_daily_quota() -> u32 {
+    100
+}
+fn default_abuse_report_min_offense_level() -> u8 {
+    1
+}
 
 /// Optional AbuseIPDB IP reputation integration (uses the operator's own API key).
 /// AbuseIPDB returns `abuseConfidenceScore` in 0..=100 (higher = more abusive / lower reputation).
@@ -540,6 +546,23 @@ pub struct AbuseIpDbConfig {
     /// Hard daily API lookup budget per node (default 900, safe for 1000/day free keys).
     #[serde(default = "default_abuse_max_daily_lookups")]
     pub max_daily_lookups: u32,
+    /// Automatically report honeypot-confirmed attackers back to AbuseIPDB (default false).
+    /// Opt-in only: every submission publishes data about a third-party IP, and AbuseIPDB
+    /// forbids SYN-flood / unverifiable-UDP reports. Enabled here, reports are only emitted
+    /// after Evilpot has *verified* exploitation and the auto-ban actually fired.
+    #[serde(default)]
+    pub report_enabled: bool,
+    /// Maximum automated report submissions per UTC day per node (default 100).
+    /// Free API keys are limited to 1,000/day shared with `check`, so this stays well below it.
+    #[serde(default = "default_abuse_report_daily_quota")]
+    pub report_daily_quota: u32,
+    /// Only report once the ban escalation level reaches this value (1..=8, default 1).
+    #[serde(default = "default_abuse_report_min_offense_level")]
+    pub report_min_offense_level: u8,
+    /// Explicit AbuseIPDB category IDs to attach to auto-reports. Empty = derive from the
+    /// offense reason (always includes 21 "Web App Attack", plus SQLi / Hacking / Brute-Force).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub report_categories: Vec<u16>,
 }
 
 impl Default for AbuseIpDbConfig {
@@ -553,6 +576,10 @@ impl Default for AbuseIpDbConfig {
             high_risk_action: AbuseIpDbAction::Block,
             cache_ttl_secs: default_abuse_cache_ttl_secs(),
             max_daily_lookups: default_abuse_max_daily_lookups(),
+            report_enabled: false,
+            report_daily_quota: default_abuse_report_daily_quota(),
+            report_min_offense_level: default_abuse_report_min_offense_level(),
+            report_categories: Vec::new(),
         }
     }
 }
@@ -1166,6 +1193,15 @@ pub struct IngressConfig {
     /// Optional AbuseIPDB IP reputation integration.
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
+    /// Client IPs / CIDRs fully exempt from edge security (exact IP or CIDR, e.g. `203.0.113.7`,
+    /// `10.0.0.0/8`, `2001:db8::/32`). Exempt clients bypass WAF inspection, Evilpot diversion,
+    /// antibot challenge, rate limiting, GeoIP rules, auto-ban (including an already-active ban)
+    /// and AbuseIPDB lookup/reporting. Only ordinary traffic logging (access log + client
+    /// fingerprint) is kept — no WAF findings, no ban records, no Evilpot sessions, no threat-intel
+    /// lookups. Meant for your own NAT / office / monitoring ranges; adding a public range here
+    /// disables protection for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_ips: Vec<String>,
     /// Free CC0 GeoIP auto-sync and local country/continent database config.
     #[serde(default)]
     pub geoip: GeoIpConfig,
@@ -1212,6 +1248,7 @@ impl Default for IngressConfig {
             evilpot: EvilpotNodeConfig::default(),
             auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
+            exempt_ips: Vec::new(),
             geoip: GeoIpConfig::default(),
             crs: CrsUpdateConfig::default(),
             crs_rules: Vec::new(),
@@ -2130,6 +2167,9 @@ pub struct IngressDefaults {
     pub auto_ban: AutoBanConfig,
     #[serde(default)]
     pub abuseipdb: AbuseIpDbConfig,
+    /// Client IPs / CIDRs fully exempt from edge security (see `IngressConfig::exempt_ips`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_ips: Vec<String>,
     #[serde(default)]
     pub geoip: GeoIpConfig,
     #[serde(default)]
@@ -2153,6 +2193,7 @@ impl Default for IngressDefaults {
             evilpot: EvilpotNodeConfig::default(),
             auto_ban: AutoBanConfig::default(),
             abuseipdb: AbuseIpDbConfig::default(),
+            exempt_ips: Vec::new(),
             geoip: GeoIpConfig::default(),
             crs: CrsUpdateConfig::default(),
         }

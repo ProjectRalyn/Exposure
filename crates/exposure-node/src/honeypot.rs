@@ -24,6 +24,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::abuseipdb::{AbuseIpDbClient, AbuseReportFacts};
 use crate::ban::{AutoBanManager, OffenseContext, OffenseKind, evict_half};
 use crate::egress::ProxyBody;
 use crate::logger::NodeLogger;
@@ -66,6 +67,7 @@ const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
 pub struct TarpitBanHook {
     pub engine: Arc<EvilpotEngine>,
     pub auto_ban: Arc<AutoBanManager>,
+    pub abuseipdb: Arc<AbuseIpDbClient>,
     pub logger: Arc<NodeLogger>,
     pub node_tag: String,
     pub service_tag: String,
@@ -161,6 +163,14 @@ impl Drop for BoundedEvilpotBody {
                     }
                     let newly_banned = outcome.any_banned();
                     let created_bans = outcome.created_bans;
+                    // Only a brand-new IP ban is worth publishing: re-reporting every hit from an
+                    // already-banned IP would burn quota and trip AbuseIPDB's per-IP rate limit.
+                    let report_facts = outcome.newly_banned_ip.then(|| AbuseReportFacts {
+                        ip: hook.client_ip,
+                        reason: "evilpot:verified_exploit:tarpit".to_string(),
+                        offense_level: outcome.offense_level,
+                        ban_ttl_secs: outcome.ban_ttl_secs,
+                    });
                     let alert_msg = if newly_banned {
                         Some(format!(
                             "AutoBan triggered for {} on {} [service={}, reason=evilpot:verified_exploit:tarpit, ttl={}s, ip={}, js_fp={}, comp_fp={}]",
@@ -177,6 +187,7 @@ impl Drop for BoundedEvilpotBody {
                     };
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
                         let auto_ban = hook.auto_ban;
+                        let abuseipdb = Arc::clone(&hook.abuseipdb);
                         let logger = hook.logger;
                         let ban_file = hook.ban_file;
                         handle.spawn(async move {
@@ -192,6 +203,9 @@ impl Drop for BoundedEvilpotBody {
                             }
                             if let Some(msg) = alert_msg {
                                 logger.emit_alert("warning", msg).await;
+                            }
+                            if let Some(facts) = report_facts {
+                                let _ = abuseipdb.report(facts).await;
                             }
                         });
                     }

@@ -620,6 +620,9 @@ fn resolve_ingress_config(
     if out.abuseipdb == AbuseIpDbConfig::default() {
         out.abuseipdb = ingress_defs.abuseipdb.clone();
     }
+    if out.exempt_ips.is_empty() {
+        out.exempt_ips = ingress_defs.exempt_ips.clone();
+    }
     out
 }
 

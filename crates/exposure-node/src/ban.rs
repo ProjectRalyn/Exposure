@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -8,7 +9,7 @@ use dashmap::DashMap;
 use exposure_core::Result;
 use exposure_core::config::AutoBanConfig;
 use exposure_core::crypto::short_sha256_hex;
-use exposure_core::routing::canonical_ip;
+use exposure_core::routing::{IpMatcher, canonical_ip};
 use exposure_core::segment::{read_json_snapshot, write_json_snapshot_atomic};
 use exposure_core::telemetry::{ActiveBanInfo, BanRecord};
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,20 @@ pub enum OffenseKind {
     WafAttackProbe,
     /// Repeated PoW verification failures or tampered headless browser rejection.
     HeadlessOrVerifyAbuse,
+}
+
+impl OffenseKind {
+    /// True only when the honeypot (Evilpot) engine itself confirmed the abuse — a verified
+    /// exploit, multi-step exploitation, or exhaustion of the per-IP honeypot admission quota.
+    ///
+    /// Heuristic-only offenses (repeated WAF probes, scanner UA, PoW failures) are deliberately
+    /// excluded: they are far too weak an evidence base to publish against a third-party IP.
+    pub fn is_honeypot_confirmed(&self) -> bool {
+        matches!(
+            self,
+            Self::VerifiedExploit | Self::MultiStepExploitation { .. } | Self::EvilpotFlood
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +269,11 @@ pub struct AutoBanManager {
 
     total_auto_bans: AtomicU64,
     total_ban_drops: AtomicU64,
+
+    /// Fully exempt client addresses (`ingress.exempt_ips`). Shared with the Ingress server so a
+    /// single matcher drives both the TCP fast-drop path and every HTTP inspection gate.
+    exempt: StdRwLock<Arc<IpMatcher>>,
+    exempt_active: AtomicBool,
 }
 
 impl AutoBanManager {
@@ -278,8 +298,30 @@ impl AutoBanManager {
             benign_js_fps: DashMap::new(),
             total_auto_bans: AtomicU64::new(0),
             total_ban_drops: AtomicU64::new(0),
+            exempt: StdRwLock::new(Arc::new(IpMatcher::default())),
+            exempt_active: AtomicBool::new(false),
         };
         mgr
+    }
+
+    /// Replace the fully-exempt client address set (called whenever `ingress.exempt_ips` changes).
+    pub fn set_exempt_ips(&self, matcher: Arc<IpMatcher>) {
+        self.exempt_active
+            .store(!matcher.is_empty(), Ordering::Relaxed);
+        *self.exempt.write().unwrap_or_else(|e| e.into_inner()) = matcher;
+    }
+
+    /// True when the client address is fully exempt from edge security. Cheap when the list is
+    /// empty (single atomic load), which is the default configuration.
+    #[inline]
+    pub fn is_ip_exempt(&self, ip: IpAddr) -> bool {
+        if !self.exempt_active.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.exempt
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(ip)
     }
 
     pub fn reconfigure(&self, cfg: &AutoBanConfig) {
@@ -312,6 +354,11 @@ impl AutoBanManager {
         if !self.enabled.load(Ordering::Relaxed) || !self.drop_at_tcp.load(Ordering::Relaxed) {
             return false;
         }
+        // Exempt addresses are never dropped, even if they carry a ban from before they were
+        // exempted (otherwise adding an office NAT range would lock it out until ban expiry).
+        if self.is_ip_exempt(ip) {
+            return false;
+        }
         let canon = canonical_ip(ip);
         let now = Instant::now();
         let expired = match self.banned_ips.get(&canon) {
@@ -341,6 +388,9 @@ impl AutoBanManager {
         js_fp_hash: Option<&str>,
     ) -> Option<BanMatch> {
         if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        if self.is_ip_exempt(ip) {
             return None;
         }
         let canon = canonical_ip(ip);
@@ -493,6 +543,9 @@ impl AutoBanManager {
         if !self.enabled.load(Ordering::Relaxed) || !self.ban_fingerprints.load(Ordering::Relaxed) {
             return;
         }
+        if self.is_ip_exempt(ip) {
+            return;
+        }
         let canon = canonical_ip(ip);
         let now = Instant::now();
         if let Some(comp) = build_composite_fp(tls_ja3, ua) {
@@ -519,6 +572,11 @@ impl AutoBanManager {
     pub fn record_offense(&self, ctx: OffenseContext<'_>) -> OffenseOutcome {
         let mut outcome = OffenseOutcome::default();
         if !self.enabled.load(Ordering::Relaxed) {
+            return outcome;
+        }
+        // Exempt clients are never banned and never accumulate offense points, so a false
+        // positive from a WAF/scanner heuristic can never escalate against them.
+        if self.is_ip_exempt(ctx.client_ip) {
             return outcome;
         }
 
@@ -907,6 +965,74 @@ impl AutoBanManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exempt_ips_are_never_dropped_banned_or_scored() {
+        let mgr = AutoBanManager::new(&AutoBanConfig {
+            enabled: true,
+            ban_ttl_secs: 600,
+            max_ban_ttl_secs: 3600,
+            confirm_hits: 1,
+            ban_fingerprints: true,
+            drop_at_tcp: true,
+        });
+        let attacker: IpAddr = "198.51.100.77".parse().unwrap();
+        let ctx = |ip: IpAddr| OffenseContext {
+            client_ip: ip,
+            tls_ja3: Some("ja3bad"),
+            user_agent: "BadBot/1.0",
+            js_fp_hash: Some("jsfp-exempt-test"),
+            service_tag: None,
+            host: None,
+            kind: OffenseKind::VerifiedExploit,
+            reason: "evilpot:verified_exploit:canary",
+        };
+
+        // Ban first, exempt afterwards: an office NAT range must not stay locked out.
+        assert!(mgr.record_offense(ctx(attacker)).newly_banned_ip);
+        assert!(mgr.is_ip_banned_for_tcp(attacker));
+
+        mgr.set_exempt_ips(Arc::new(IpMatcher::parse(&["198.51.100.0/24".to_string()])));
+        assert!(mgr.is_ip_exempt(attacker));
+        assert!(!mgr.is_ip_banned_for_tcp(attacker));
+        assert!(
+            mgr.check_request(
+                attacker,
+                Some("ja3bad"),
+                "BadBot/1.0",
+                Some("jsfp-exempt-test")
+            )
+            .is_none()
+        );
+
+        // Further "offenses" from an exempt address never ban or accumulate points.
+        for _ in 0..5 {
+            let out = mgr.record_offense(ctx(attacker));
+            assert!(!out.any_banned());
+            assert!(out.created_bans.is_empty());
+        }
+        assert!(!mgr.is_ip_banned_for_tcp(attacker));
+
+        // Clearing the list restores normal behavior for the still-active ban record.
+        mgr.set_exempt_ips(Arc::new(IpMatcher::default()));
+        assert!(mgr.is_ip_banned_for_tcp(attacker));
+    }
+
+    #[test]
+    fn only_evilpot_verdicts_qualify_for_upstream_reporting() {
+        assert!(OffenseKind::VerifiedExploit.is_honeypot_confirmed());
+        assert!(
+            OffenseKind::MultiStepExploitation {
+                trapped_requests: 3
+            }
+            .is_honeypot_confirmed()
+        );
+        assert!(OffenseKind::EvilpotFlood.is_honeypot_confirmed());
+        // Heuristic signals must never be published against a third-party IP.
+        assert!(!OffenseKind::WafAttackProbe.is_honeypot_confirmed());
+        assert!(!OffenseKind::AttackScannerProbe.is_honeypot_confirmed());
+        assert!(!OffenseKind::HeadlessOrVerifyAbuse.is_honeypot_confirmed());
+    }
 
     #[test]
     fn confirms_before_banning_and_protects_benign_shared_fingerprints() {

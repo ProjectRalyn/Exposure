@@ -20,8 +20,8 @@ use exposure_core::crypto::{
 use exposure_core::geoip::{GeoDecision, evaluate_geo_policy};
 use exposure_core::protocol::{ServiceStreamHeader, ServiceStreamProtocol};
 use exposure_core::routing::{
-    any_rule_matches_host, canonical_ip, is_public_routable_ip, match_ingress_rule, normalize_host,
-    parse_valid_host,
+    IpMatcher, any_rule_matches_host, canonical_ip, is_public_routable_ip, match_ingress_rule,
+    normalize_host, parse_valid_host,
 };
 use exposure_core::telemetry::EvilpotNodeReport;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Version, header};
@@ -37,7 +37,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::abuseipdb::AbuseIpDbClient;
+use crate::abuseipdb::{AbuseIpDbClient, AbuseReportFacts, ReportOutcome};
 use crate::ban::{AutoBanManager, OffenseContext, OffenseKind};
 use crate::cache::{
     CacheLookup, CachedEntry, EdgeCache, EffectiveCachePolicy, build_response_from_cache,
@@ -82,7 +82,7 @@ const MAX_CONCURRENT_RESPONSE_BUFFERS: usize = 256;
 const MAX_CONCURRENT_WAF_BODY_BUFFERS: usize = 512;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
-pub fn node_bans_path(dir: &Path, node_tag: &str) -> PathBuf {
+fn safe_node_file_stem(node_tag: &str) -> String {
     let safe: String = node_tag
         .chars()
         .map(|c| {
@@ -94,12 +94,41 @@ pub fn node_bans_path(dir: &Path, node_tag: &str) -> PathBuf {
         })
         .take(64)
         .collect();
-    let tag = if safe.is_empty() || safe.contains("..") {
-        "node"
+    if safe.is_empty() || safe.contains("..") {
+        "node".to_string()
     } else {
-        &safe
-    };
-    dir.join(format!("node-bans-{tag}.json"))
+        safe
+    }
+}
+
+pub fn node_bans_path(dir: &Path, node_tag: &str) -> PathBuf {
+    dir.join(format!("node-bans-{}.json", safe_node_file_stem(node_tag)))
+}
+
+/// On-disk ledger of AbuseIPDB report submissions (`ip -> last reported at`).
+/// Persisted so a restart cannot re-report every currently banned attacker.
+pub fn node_reports_path(dir: &Path, node_tag: &str) -> PathBuf {
+    dir.join(format!(
+        "node-abuseipdb-reports-{}.json",
+        safe_node_file_stem(node_tag)
+    ))
+}
+
+/// Compile `ingress.exempt_ips` into a matcher and warn loudly when entries are malformed —
+/// a silently ignored entry means an operator believes an address is exempt when it is not
+/// (or vice versa, depending on which side of the list they were aiming for).
+fn build_exempt_matcher(node_tag: &str, entries: &[String]) -> Arc<IpMatcher> {
+    let matcher = IpMatcher::parse(entries);
+    let configured = entries.iter().filter(|e| !e.trim().is_empty()).count();
+    if matcher.len() < configured {
+        warn!(
+            node = %node_tag,
+            configured,
+            parsed = matcher.len(),
+            "ingress.exempt_ips contains invalid IP/CIDR entries; they were ignored"
+        );
+    }
+    Arc::new(matcher)
 }
 
 struct PerIpConnGuard {
@@ -268,6 +297,7 @@ impl IngressServer {
         ));
         let evilpot = Arc::new(EvilpotManager::new(tag.clone()));
         let auto_ban = Arc::new(AutoBanManager::new(&cfg.auto_ban));
+        auto_ban.set_exempt_ips(build_exempt_matcher(&tag, &cfg.exempt_ips));
         let bans_path = node_bans_path(&logger.segment_dir(), &tag);
         match auto_ban.load_from_file(&bans_path) {
             Ok(n) if n > 0 => {
@@ -278,6 +308,9 @@ impl IngressServer {
                 warn!(node = %tag, error = %e, path = %bans_path.display(), "failed to restore persisted auto-ban entries")
             }
         }
+        // Restore the AbuseIPDB report ledger unconditionally, so enabling reporting later via a
+        // hot config reload does not start with an empty dedupe window.
+        abuseipdb.attach_report_state_file(node_reports_path(&logger.segment_dir(), &tag));
         let geoip = GeoIpManager::new(cfg.geoip.clone(), logger.segment_dir().join("geoip"));
         let crs = Arc::new(CompiledCrsEngine::compile(
             &cfg.crs_rules,
@@ -393,6 +426,8 @@ impl IngressServer {
             .reconfigure(&cfg.evilpot, &cfg.server_header, any_evilpot_enabled)
             .await;
         self.auto_ban.reconfigure(&cfg.auto_ban);
+        self.auto_ban
+            .set_exempt_ips(build_exempt_matcher(&self.node_tag, &cfg.exempt_ips));
         self.abuseipdb.reconfigure(cfg.abuseipdb.clone()).await;
         self.geoip
             .update_config(cfg.geoip.clone(), self.logger.segment_dir().join("geoip"))
@@ -746,6 +781,51 @@ impl IngressServer {
                 )
                 .await;
         }
+
+        // Publish honeypot-confirmed attackers to AbuseIPDB. Opt-in (`report_enabled`, default
+        // off) and strictly limited to Evilpot-verified offenses that produced a *new* IP ban —
+        // never heuristic WAF probe counts, and never an IP that is already banned.
+        if any_banned
+            && out.newly_banned_ip
+            && kind.is_honeypot_confirmed()
+            && self.abuseipdb.is_report_active()
+        {
+            self.spawn_abuse_report(client_ip, reason, out.offense_level, out.ban_ttl_secs);
+        }
+    }
+
+    /// Fire-and-forget AbuseIPDB report so the attacker's request latency is never affected.
+    fn spawn_abuse_report(
+        &self,
+        client_ip: IpAddr,
+        reason: &str,
+        offense_level: u8,
+        ban_ttl_secs: u64,
+    ) {
+        // Belt-and-braces: exempt clients are never banned, so this should already be
+        // unreachable, but never publish an exempt address even if that invariant changes.
+        if self.auto_ban.is_ip_exempt(client_ip) {
+            return;
+        }
+        let client = Arc::clone(&self.abuseipdb);
+        let facts = AbuseReportFacts {
+            ip: client_ip,
+            reason: reason.to_string(),
+            offense_level,
+            ban_ttl_secs,
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            match client.report(facts).await {
+                // Common/expected outcomes are already logged by the client (or are silent).
+                ReportOutcome::Sent | ReportOutcome::Duplicate | ReportOutcome::Disabled => {}
+                outcome => {
+                    debug!(ip = %client_ip, outcome = ?outcome, "AbuseIPDB honeypot report skipped")
+                }
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -937,6 +1017,7 @@ impl IngressServer {
         let ban_hook = TarpitBanHook {
             engine: ep_engine,
             auto_ban: Arc::clone(&self.auto_ban),
+            abuseipdb: Arc::clone(&self.abuseipdb),
             logger: Arc::clone(&self.logger),
             node_tag: self.node_tag.clone(),
             service_tag: service_tag.to_string(),
@@ -1217,6 +1298,7 @@ impl IngressServer {
             Some(TarpitBanHook {
                 engine: ep_engine,
                 auto_ban: Arc::clone(&self.auto_ban),
+                abuseipdb: Arc::clone(&self.abuseipdb),
                 logger: Arc::clone(&self.logger),
                 node_tag: self.node_tag.clone(),
                 service_tag: service_tag.to_string(),
@@ -1275,6 +1357,10 @@ impl IngressServer {
         };
         let scheme_str = if is_tls { "https" } else { "http" };
         let client_ip = canonical_ip(peer_addr.ip());
+        // Fully exempt client (own NAT / office / monitoring range): bypass every edge security
+        // subsystem — WAF, Evilpot, antibot challenge, rate limiting, GeoIP, auto-ban and
+        // AbuseIPDB lookup/reporting. Ordinary access logging is still emitted.
+        let is_exempt = self.auto_ban.is_ip_exempt(client_ip);
         let tls_ja3 = tls_signal.and_then(|s| s.fingerprint.as_deref());
         // Captured once, before `req` is moved into a forwarder, so intercept pages can be gzipped.
         let accept_enc = req
@@ -1335,7 +1421,7 @@ impl IngressServer {
 
         // Zero-cost early rejection for confirmed-banned IPs, JS fingerprints, and attacker-exclusive
         // composite TLS+UA fingerprints (catches keep-alive connections and rotating-IP attackers).
-        if !is_api_bypassed && !is_allowlisted_cidr {
+        if !is_api_bypassed && !is_allowlisted_cidr && !is_exempt {
             if let Some(ban_hit) =
                 self.auto_ban
                     .check_request(client_ip, tls_ja3, &ua_str, req_js_fp_hash.as_deref())
@@ -1420,25 +1506,26 @@ impl IngressServer {
 
         // Proactively look up client IP reputation (cache hit -> immediate, miss -> AbuseIPDB v2 API)
         // for non-banned public IPs, with background backfill when upstream API exceeds REQUEST_WAIT_BUDGET.
-        let abuse_rep = if cfg.abuseipdb.enabled && !cfg.abuseipdb.api_key.trim().is_empty() {
-            let logger_bf = Arc::clone(&self.logger);
-            let ip_str_bf = client_ip.to_string();
-            self.abuseipdb
-                .lookup_with_backfill(client_ip, move |rep| async move {
-                    logger_bf
-                        .backfill_abuse_report(
-                            &ip_str_bf,
-                            rep.abuse_confidence_score,
-                            rep.country_code.as_deref(),
-                            rep.isp.as_deref(),
-                            rep.is_tor,
-                        )
-                        .await;
-                })
-                .await
-        } else {
-            None
-        };
+        let abuse_rep =
+            if !is_exempt && cfg.abuseipdb.enabled && !cfg.abuseipdb.api_key.trim().is_empty() {
+                let logger_bf = Arc::clone(&self.logger);
+                let ip_str_bf = client_ip.to_string();
+                self.abuseipdb
+                    .lookup_with_backfill(client_ip, move |rep| async move {
+                        logger_bf
+                            .backfill_abuse_report(
+                                &ip_str_bf,
+                                rep.abuse_confidence_score,
+                                rep.country_code.as_deref(),
+                                rep.isp.as_deref(),
+                                rep.is_tor,
+                            )
+                            .await;
+                    })
+                    .await
+            } else {
+                None
+            };
         let abuse_score = abuse_rep.as_ref().map(|r| r.abuse_confidence_score);
         let fp_extras = FpServerExtras {
             tls_ja3,
@@ -1451,8 +1538,9 @@ impl IngressServer {
             geo_continent: local_continent,
         };
 
-        // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`)
-        if is_cdn_cgi {
+        // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`).
+        // Exempt clients skip the challenge machinery entirely and are forwarded normally.
+        if is_cdn_cgi && !is_exempt {
             let method = req.method().clone();
             let headers = req.headers().clone();
             let query_redirect = req
@@ -1929,7 +2017,7 @@ impl IngressServer {
 
         // Phase A: Fast O(1) CIDR allow/deny + Token-Bucket Rate Limiting (stops volumetric floods
         // and denied CIDRs BEFORE WAF body buffering or honeypot slot allocation).
-        if let Some(profile) = active_profile {
+        if let Some(profile) = active_profile.filter(|_| !is_exempt) {
             match self.guard.evaluate_access_and_rate_limit(
                 profile,
                 &cfg.rate_limit_buckets,
@@ -2253,7 +2341,7 @@ impl IngressServer {
         // verify exploit intent, and auto-ban IP + fingerprints instead of getting an instant 403.
         if let Some(profile) = active_profile {
             if let Some(waf_cfg) = profile.effective_waf() {
-                if !is_api_bypassed {
+                if !is_api_bypassed && !is_exempt {
                     // 1. O(1) Canary Replay check (0-ns skip before any trap has fired)
                     if let Some(canary_resp) = self
                         .try_handle_evilpot_canary(
@@ -2597,7 +2685,7 @@ impl IngressServer {
         }
 
         // Phase C: Entry Guard Antibot / Suspicion Scoring (non-browser-safe unless `browser_only: true`).
-        if let Some(profile) = active_profile {
+        if let Some(profile) = active_profile.filter(|_| !is_exempt) {
             match self.guard.evaluate_antibot_only_with_boost(
                 profile,
                 &cfg.clearance_secret,
@@ -3102,7 +3190,8 @@ impl IngressServer {
                         if let Some(ref fp_token) = fp_inject_token {
                             resp = maybe_inject_fp_beacon(resp, fp_token, &self.buffer_sem).await;
                         }
-                        if !client_fp.is_scanner
+                        if !is_exempt
+                            && !client_fp.is_scanner
                             && suspicion_score < 50
                             && resp.status().as_u16() < 400
                         {
@@ -3682,6 +3771,9 @@ impl IngressServer {
                     Some((rid, cat)) => ("waf_monitor", rid, Some(cat)),
                     None if cache_hdr.as_deref() == Some("STALE") => ("cache_stale", None, None),
                     None if resp.status().is_server_error() => ("upstream_error", None, None),
+                    // Exempt clients are forwarded without any inspection; tag the log so the
+                    // absence of WAF/ban evidence is explainable during incident review.
+                    None if is_exempt => ("exempt", None, None),
                     None => ("allow", None, None),
                 };
                 self.logger
@@ -5102,6 +5194,7 @@ mod tests {
                 ban_fingerprints: true,
                 drop_at_tcp: true,
             },
+            exempt_ips: vec!["198.51.100.99".to_string()],
             ..Default::default()
         };
 
@@ -5247,6 +5340,35 @@ mod tests {
         assert!(report.active_fp_bans >= 1);
         assert!(report.total_ban_drops >= 3);
         assert!(!report.active_bans.is_empty());
+
+        // 8. Exempt IP bypasses everything: same banned TLS+UA fingerprint AND an attack payload,
+        //    yet the request is forwarded (502 missing peer) instead of 403 / Evilpot diversion.
+        let exempt_peer: SocketAddr = "198.51.100.99:40004".parse().unwrap();
+        let exempt_resp = send_raw(
+            Arc::clone(&server),
+            exempt_peer,
+            Some(attacker_tls.clone()),
+            "GET /download?file=../../../../.env HTTP/1.1\r\nHost: api.example.test\r\nUser-Agent: ExploitKit/9.0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert!(
+            exempt_resp.starts_with("HTTP/1.1 502"),
+            "exempt IP must bypass ban + WAF + Evilpot and reach the forwarder, got: {exempt_resp}"
+        );
+        assert!(
+            !server.auto_ban().is_ip_banned_for_tcp(exempt_peer.ip()),
+            "exempt IP must never be auto-banned"
+        );
+        assert!(
+            !server
+                .evilpot_report()
+                .await
+                .expect("report active")
+                .active_bans
+                .iter()
+                .any(|b| b.target == "198.51.100.99"),
+            "exempt IP must not appear in any ban record"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

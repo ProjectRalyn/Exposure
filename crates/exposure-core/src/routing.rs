@@ -90,6 +90,62 @@ pub fn ip_matches_cidrs(ip: IpAddr, cidrs: &[String]) -> bool {
     false
 }
 
+/// Upper bound on entries parsed into an [`IpMatcher`] so a malformed/hostile config can never
+/// turn the per-request exemption lookup into a memory or CPU hazard.
+pub const MAX_IP_MATCHER_ENTRIES: usize = 4_096;
+
+/// Pre-parsed CIDR / exact-IP matcher for fully exempted client addresses.
+///
+/// `ip_matches_cidrs` re-parses strings on every call, which is fine for rare guard decisions but
+/// not for the request hot path. This type parses once when the node config is applied and keeps
+/// the result as a compact `IpNet` list.
+#[derive(Debug, Clone, Default)]
+pub struct IpMatcher {
+    nets: Vec<IpNet>,
+    exact: Vec<IpAddr>,
+}
+
+impl IpMatcher {
+    pub fn parse(entries: &[String]) -> Self {
+        let mut nets = Vec::new();
+        let mut exact = Vec::new();
+        for raw in entries.iter().take(MAX_IP_MATCHER_ENTRIES) {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if let Ok(net) = raw.parse::<IpNet>() {
+                if !nets.contains(&net) {
+                    nets.push(net);
+                }
+            } else if let Ok(ip) = raw.parse::<IpAddr>() {
+                let ip = canonical_ip(ip);
+                if !exact.contains(&ip) {
+                    exact.push(ip);
+                }
+            }
+        }
+        Self { nets, exact }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty() && self.exact.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nets.len() + self.exact.len()
+    }
+
+    #[inline]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let ip = canonical_ip(ip);
+        self.exact.contains(&ip) || self.nets.iter().any(|net| net.contains(&ip))
+    }
+}
+
 fn has_forbidden_host_chars(s: &str) -> bool {
     s.is_empty()
         || s.bytes().any(|b| {
@@ -564,5 +620,34 @@ mod tests {
             select_endpoint(&eps, &health, 0).unwrap().address,
             "backup:1"
         );
+    }
+
+    #[test]
+    fn ip_matcher_handles_exact_cidr_and_v4_mapped_addresses() {
+        let m = IpMatcher::parse(&[
+            " 203.0.113.7 ".to_string(),
+            "10.0.0.0/8".to_string(),
+            "2001:db8::/32".to_string(),
+            "not-an-ip".to_string(),
+            "".to_string(),
+            "10.0.0.0/8".to_string(), // duplicate is collapsed
+        ]);
+        assert_eq!(m.len(), 3);
+        assert!(m.contains("203.0.113.7".parse().unwrap()));
+        assert!(!m.contains("203.0.113.8".parse().unwrap()));
+        assert!(m.contains("10.42.1.9".parse().unwrap()));
+        assert!(m.contains("2001:db8::5".parse().unwrap()));
+        assert!(!m.contains("2001:db9::5".parse().unwrap()));
+        // IPv4-mapped IPv6 peers must match their IPv4 entry.
+        assert!(m.contains("::ffff:203.0.113.7".parse().unwrap()));
+        assert!(m.contains("::ffff:10.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn empty_ip_matcher_never_matches() {
+        let m = IpMatcher::parse(&[]);
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert!(!m.contains("8.8.8.8".parse().unwrap()));
     }
 }

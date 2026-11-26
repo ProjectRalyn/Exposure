@@ -535,7 +535,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
       if (act === "evilpot" || act === "evilpot_canary" || act === "geo_evilpot") return "warn";
       if (status >= 500 || act === "upstream_error" || act === "config_error" || act === "waf_overload") return "err";
       if (act === "autoban" || act === "waf_block" || act === "guard_reject" || act === "abuseipdb" || act === "geo_block" || act === "rate_limit" || act === "challenge" || act === "geo_challenge" || act === "waf_monitor" || act === "unmatched" || status >= 400) return "warn";
-      if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass") return "info";
+      if (act === "cache_hit" || act === "cache_stale" || act === "challenge_pass" || act === "exempt") return "info";
       return "ok";
     };
 
@@ -564,7 +564,7 @@ export function createAnalyticsViews({ api, store, navigate, getTimeRangeParams 
             ${["all", "2xx", "3xx", "4xx", "5xx"].map((st) => `<button type="button" class="fp-chip ${logFilters.status === st ? "active" : ""}" data-log-st="${st}">${st.toUpperCase()}</button>`).join("")}
           </div>
           <div class="fp-chip-group">
-            ${["all", "allow", "blocked", "upstream_error", "waf_block", "waf_monitor", "evilpot", "evilpot_canary", "autoban", "guard_reject", "rate_limit", "challenge", "geo_block", "geo_challenge", "geo_evilpot", "cache_hit", "cache_stale", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
+            ${["all", "allow", "blocked", "upstream_error", "waf_block", "waf_monitor", "evilpot", "evilpot_canary", "autoban", "guard_reject", "rate_limit", "challenge", "geo_block", "geo_challenge", "geo_evilpot", "cache_hit", "cache_stale", "exempt", "unmatched"].map((a) => `<button type="button" class="fp-chip ${logFilters.action === a ? "active" : ""}" data-log-act="${a}">${esc(a)}</button>`).join("")}
           </div>
           <div class="btn-row">
             <select id="log-method-filter" class="select-sm">

@@ -1706,6 +1706,14 @@ export function createSecurityView({ api, store }) {
             <label><span>${esc(t("Cache TTL (s)"))}</span><input id="sd-ab-ttl" type="number" min="60" value="${ab.cache_ttl_secs ?? 21600}" /></label>
             <label><span>${esc(t("Daily Quota Cap / Node"))}</span><input id="sd-ab-cap" type="number" min="10" value="${ab.max_daily_lookups ?? 900}" /></label>
           </div>
+          <div class="tri-stack" style="margin-top:10px;">
+            ${renderBinSlider({ attrName: "data-sd-abrep-bin", attrVal: "report_enabled", label: t("Report Confirmed Attackers to AbuseIPDB"), sub: t("Off by default. Only honeypot-verified exploits that produced a new ban are submitted — at most one per IP per 24h, per AbuseIPDB's 15-minute per-IP rule"), val: ab.report_enabled })}
+          </div>
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("Daily Report Quota / Node"))}</span><input id="sd-abrep-q" type="number" min="1" max="1000" value="${ab.report_daily_quota ?? 100}" /></label>
+            <label><span>${esc(t("Min Ban Level (1-8)"))}</span><input id="sd-abrep-lvl" type="number" min="1" max="8" value="${ab.report_min_offense_level ?? 1}" /></label>
+            <label><span>${esc(t("Category IDs (blank = auto)"))}</span><input id="sd-abrep-cats" value="${esc((ab.report_categories || []).join(","))}" placeholder="21,15" /></label>
+          </div>
         </div>
 
         <div class="panel" style="margin-bottom:0;">
@@ -1724,6 +1732,17 @@ export function createSecurityView({ api, store }) {
             <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
           </label>
         </div>
+
+        <div class="panel" style="margin-bottom:0;grid-column:1 / -1;">
+          <div class="panel-header"><h3>${esc(t("IP Exemption List"))}</h3></div>
+          <p class="muted-sm" style="margin:0 0 8px;">
+            ${esc(t("Exact IPs or CIDRs, one per line. Exempt clients bypass WAF inspection, honeypot diversion, antibot challenge, rate limiting, GeoIP blocks, auto-ban and AbuseIPDB lookup/reporting — only ordinary traffic logs are kept."))}
+          </p>
+          <textarea id="sd-exempt-ips" rows="5" spellcheck="false" placeholder="203.0.113.7&#10;10.0.0.0/8&#10;2001:db8::/32">${esc((ig.exempt_ips || []).join("\n"))}</textarea>
+          <p class="muted-sm" style="margin:8px 0 0;">
+            ${esc(t("Warning: an address here is never intercepted, even if it is actively attacking. Only add ranges you control."))}
+          </p>
+        </div>
       </div>
     `;
 
@@ -1740,6 +1759,16 @@ export function createSecurityView({ api, store }) {
     el("sd-ab-age")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_age_days = parseNum(ev.target.value, 90, 1, 365); }, false));
     el("sd-ab-ttl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).cache_ttl_secs = parseNum(ev.target.value, 21600, 60); }, false));
     el("sd-ab-cap")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).max_daily_lookups = parseNum(ev.target.value, 900, 10); }, false));
+    wireBinSliders(container, "data-sd-abrep-bin", (f, v) => store.mutate((s) => { ensureAb(s)[f] = v; }, false));
+    el("sd-abrep-q")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).report_daily_quota = parseNum(ev.target.value, 100, 1, 1000); }, false));
+    el("sd-abrep-lvl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureAb(s).report_min_offense_level = parseNum(ev.target.value, 1, 1, 8); }, false));
+    el("sd-abrep-cats")?.addEventListener("input", (ev) => {
+      const ids = ev.target.value
+        .split(/[^0-9]+/)
+        .map((v) => Number(v))
+        .filter((v) => Number.isInteger(v) && v >= 1 && v <= 23);
+      store.mutate((s) => { ensureAb(s).report_categories = [...new Set(ids)]; }, false);
+    });
     el("sd-ab-test-btn")?.addEventListener("click", async () => {
       if (abuseTesting) return;
       abuseTesting = true;
@@ -1774,6 +1803,17 @@ export function createSecurityView({ api, store }) {
     el("sd-ep-sqli")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).sqli_time_delay_ms = parseNum(ev.target.value, 2500, 100, 5000); }, false));
     el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
     el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
+    el("sd-exempt-ips")?.addEventListener("input", (ev) => {
+      const list = ev.target.value
+        .split(/[\s,]+/)
+        .map((v) => v.trim())
+        .filter(Boolean)
+        .slice(0, 4096);
+      store.mutate((s) => {
+        if (!s.defaults.ingress) s.defaults.ingress = defaultTopologyDefaults().ingress;
+        s.defaults.ingress.exempt_ips = list;
+      }, false);
+    });
   }
 
   function render() {
