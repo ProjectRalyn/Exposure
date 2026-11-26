@@ -1915,7 +1915,7 @@ impl MaintainerDb {
                 Self::downsample_summaries(&raw_sums, from_sec, to_sec);
 
             let total_buckets = raw_sums.len();
-            let lim = bucket_limit.clamp(1, 200);
+            let lim = bucket_limit.clamp(1, 2000);
             let mut sorted_desc = raw_sums;
             sorted_desc.sort_by(|a, b| {
                 b.minute_epoch
@@ -2408,7 +2408,7 @@ impl MaintainerDb {
                 }
             }
 
-            let lim = limit.clamp(1, 200);
+            let lim = limit.clamp(1, 2000);
             let mut page_args = args;
             page_args.push(Value::Integer(lim as i64));
             page_args.push(Value::Integer(offset as i64));
@@ -2795,7 +2795,7 @@ impl MaintainerDb {
             }
 
             let total_matched = matched.len();
-            let lim = limit.clamp(1, 200);
+            let lim = limit.clamp(1, 2000);
             let page: Vec<FingerprintObservation> = matched.into_iter().skip(offset).take(lim).collect();
             let has_more = offset.saturating_add(page.len()) < total_matched;
 
@@ -2904,7 +2904,7 @@ impl MaintainerDb {
                 })
                 .unwrap_or((0, 0, 0, 0, 0, 0, 0));
 
-            let s_lim = sessions_limit.clamp(1, 200);
+            let s_lim = sessions_limit.clamp(1, 2000);
             let mut s_page_args = s_args;
             s_page_args.push(Value::Integer(s_lim as i64));
             s_page_args.push(Value::Integer(sessions_offset as i64));
@@ -2991,7 +2991,7 @@ impl MaintainerDb {
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
-            let e_lim = events_limit.clamp(1, 200);
+            let e_lim = events_limit.clamp(1, 2000);
             let mut e_page_args = e_args;
             e_page_args.push(Value::Integer(e_lim as i64));
             e_page_args.push(Value::Integer(events_offset as i64));
@@ -3149,7 +3149,7 @@ impl MaintainerDb {
                 )
                 .unwrap_or(0);
 
-            let lim = limit.clamp(1, 200);
+            let lim = limit.clamp(1, 2000);
             let mut page_args = Vec::with_capacity(list_args.len() + 3);
             page_args.push(Value::Integer(now_u));
             page_args.extend(list_args);
@@ -3283,7 +3283,7 @@ impl MaintainerDb {
                 )
                 .unwrap_or(0);
 
-            let lim = limit.clamp(1, 200);
+            let lim = limit.clamp(1, 2000);
             let mut page_args = args;
             page_args.push(Value::Integer(lim as i64));
             page_args.push(Value::Integer(offset as i64));

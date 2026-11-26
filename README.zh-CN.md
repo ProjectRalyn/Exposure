@@ -41,10 +41,11 @@ sudo ./install.sh --uninstall
 
 前置依赖：
 - Rust 工具链（`rustc` / `cargo`，2021 edition）
-- Node.js 与 `pnpm`（仅在需要重新构建 `web/` 内的前端资源时使用）
+- Node.js 与 `pnpm` —— release 构建会内嵌前端资源，并自己执行 `pnpm --dir web build`
+  （想复用已有的 `web/dist` 可设 `EXPOSURE_USE_PREBUILT_WEB=1`）
 
 ```bash
-# 可选：重新构建内嵌前端资源（Control 管理面板与 PoW 挑战页）
+# 可选：自行构建前端（例如想查看 web/dist）。release 构建本身也会跑一次
 cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
 
 # 构建 Release 二进制文件

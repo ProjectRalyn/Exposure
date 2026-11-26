@@ -41,10 +41,11 @@ sudo ./install.sh --uninstall
 
 Prerequisites:
 - Rust toolchain (`rustc` / `cargo`, 2021 edition)
-- Node.js & `pnpm` (only needed if rebuilding the embedded web UI in `web/`)
+- Node.js & `pnpm` — release builds embed the web UI and run `pnpm --dir web build` themselves
+  (set `EXPOSURE_USE_PREBUILT_WEB=1` to reuse an existing `web/dist` instead)
 
 ```bash
-# Optional: rebuild embedded web UI assets (Control Panel & PoW Challenge UI)
+# Optional: build the web UI yourself, e.g. to inspect web/dist. The release build does it anyway.
 cd web && pnpm install --frozen-lockfile && pnpm build && cd ..
 
 # Build the release binary

@@ -1197,13 +1197,7 @@ impl ControlClient {
     }
 
     /// Query all reachable Maintainer nodes concurrently using Control-signed `QueryMaintainerReq`.
-    pub async fn query_maintainers(
-        self: &Arc<Self>,
-        query: MaintainerQuery,
-    ) -> Vec<(String, Result<serde_json::Value>)> {
-        let Some(boot) = self.active_bootstrap_tag().await else {
-            return Vec::new();
-        };
+    async fn maintainer_tags(&self) -> BTreeSet<String> {
         let topo = self
             .cached_topology_spec()
             .await
@@ -1222,6 +1216,26 @@ impl ControlClient {
                 }
             }
         }
+        tags
+    }
+
+    pub async fn maintainer_count(&self) -> usize {
+        self.maintainer_tags().await.len()
+    }
+
+    pub async fn query_maintainers(
+        self: &Arc<Self>,
+        query: MaintainerQuery,
+    ) -> Vec<(String, Result<serde_json::Value>)> {
+        let Some(boot) = self.active_bootstrap_tag().await else {
+            return Vec::new();
+        };
+        let topo = self
+            .cached_topology_spec()
+            .await
+            .unwrap_or_else(|_| Arc::new(TopologySpec::default()));
+
+        let tags = self.maintainer_tags().await;
         if tags.is_empty() {
             return Vec::new();
         }

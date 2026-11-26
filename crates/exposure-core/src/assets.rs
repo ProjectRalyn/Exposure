@@ -1,5 +1,7 @@
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
+use std::sync::OnceLock;
 use std::path::{Component, Path};
 use std::borrow::Cow;
 
@@ -56,6 +58,11 @@ fn sanitize_rel_path(req_path: &str) -> Option<String> {
     Some(rel.to_string())
 }
 
+/// Directory the debug build serves web assets from: the Vite build output, exactly what a release
+/// build embeds. The frontend toolchain owns every byte of these files — assembling pages, splicing
+/// illustrations, inlining the stylesheet — so there is nothing left for the node to synthesise.
+///
+/// Release builds never reach this: they serve the compile-time embedded bytes.
 #[cfg(debug_assertions)]
 fn resolve_dev_web_dir(app: WebApp) -> PathBuf {
     if let Ok(custom) = std::env::var("EXPOSURE_WEB_DIR") {
@@ -65,14 +72,39 @@ fn resolve_dev_web_dir(app: WebApp) -> PathBuf {
     manifest
         .parent()
         .and_then(|p| p.parent())
-        .map(|root| root.join("web").join(app.name()))
-        .unwrap_or_else(|| PathBuf::from("web").join(app.name()))
+        .map(|root| root.join("web").join("dist").join(app.name()))
+        .unwrap_or_else(|| PathBuf::from("web/dist").join(app.name()))
 }
 
 /// CSP source hash (`sha256-<base64>`) of the script inlined into the built-in page for `app`,
-/// when the web build inlined one (release builds). Serving nodes must allow it in `script-src`.
-pub fn embedded_page_script_hash(app: &str) -> Option<&'static str> {
-    embedded_script_hash(app)
+/// when the web build inlined one. Serving nodes must allow it in `script-src`.
+pub fn embedded_page_script_hash(app: &str) -> Option<Cow<'static, str>> {
+    #[cfg(not(debug_assertions))]
+    {
+        embedded_script_hash(app).map(Cow::Borrowed)
+    }
+    #[cfg(debug_assertions)]
+    {
+        dev_script_hash(app).map(Cow::Owned)
+    }
+}
+
+/// Debug builds embed no hash table, so read the one the web build recorded next to the page.
+/// Reading directly from disk avoids stale `OnceLock` state if `pnpm --dir web build` is re-run
+/// while a debug node is running.
+#[cfg(debug_assertions)]
+fn dev_script_hash(app: &str) -> Option<String> {
+    if app != WebApp::Challenge.name() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(resolve_dev_web_dir(WebApp::Challenge).join(".script-hash"))
+        .ok()?;
+    let hash = raw.trim();
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash.to_owned())
+    }
 }
 
 /// A static web asset together with the content-coding it is stored in.
@@ -127,8 +159,9 @@ pub fn negotiate_encoding(accept_encoding: &str) -> Option<&'static str> {
 }
 
 /// Serve a web asset with the best content-coding the client accepts:
-/// - In debug mode: reads live source files directly from `web/{control,challenge}/` on disk
-///   (always identity — dev traffic is local and nothing is staged at build time).
+/// - In debug mode: reads the Vite build output from `web/dist/` on disk (always identity — nothing
+///   is staged at build time). The files are already complete documents: the frontend build inlined
+///   the stylesheet, the illustrations and the PoW script, so they are served verbatim.
 /// - In release mode: returns the compile-time embedded Vite-minified asset bytes, preferring the
 ///   pre-compressed `br`/`gzip` variant staged by `build.rs`.
 ///
@@ -145,15 +178,10 @@ pub fn load_web_asset_negotiated(
     {
         let _ = accept_encoding;
         let full = resolve_dev_web_dir(app).join(&rel);
-        let mut bytes = std::fs::read(&full).ok()?;
-        // Page stylesheets import the shared layout skeleton; inline it so the served CSS is
-        // already self-contained (see `inline_css_imports`).
-        if mime.starts_with("text/css") {
-            if let Ok(css) = std::str::from_utf8(&bytes) {
-                let resolved = inline_css_imports(css, full.parent().unwrap_or(&full));
-                bytes = resolved.into_bytes();
-            }
-        }
+        let Some(bytes) = std::fs::read(&full).ok() else {
+            warn_missing_dev_asset(&full);
+            return None;
+        };
         Some(WebAsset {
             bytes: Cow::Owned(bytes),
             mime,
@@ -193,55 +221,18 @@ pub fn load_web_asset_negotiated(
     }
 }
 
-/// Resolve `@import "relative.css";` inside a stylesheet for debug builds.
-///
-/// Release builds let Vite (or the esbuild fallback with `--bundle`) inline imports at build
-/// time. Debug builds instead splice the raw source CSS into a `<style>` block that is served
-/// from an arbitrary Host and path, where a relative `@import` would resolve against the *page*
-/// URL — fetching nothing in the best case, or hitting the customer's own backend in the worst.
+/// Say something useful once when a debug node is started before the web assets were built, instead
+/// of serving 404s that look like a routing bug.
 #[cfg(debug_assertions)]
-fn inline_css_imports(css: &str, base_dir: &Path) -> String {
-    fn walk(css: &str, dir: &Path, depth: u8, out: &mut String) {
-        // Depth cap: `@import` cycles are a config error, not a reason to hang a request.
-        if depth > 4 {
-            return;
-        }
-        let mut rest = css;
-        while let Some(pos) = rest.find("@import") {
-            out.push_str(&rest[..pos]);
-            let after = &rest[pos + "@import".len()..];
-            let Some(semi) = after.find(';') else {
-                out.push_str(&rest[pos..]);
-                return;
-            };
-            let spec = after[..semi].trim();
-            let path = spec
-                .strip_prefix("url(")
-                .map(|s| s.strip_suffix(')').unwrap_or(s))
-                .unwrap_or(spec)
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'');
-            if path.is_empty() || path.contains("://") {
-                // Remote imports are never used by the built-in pages; leave them untouched.
-                out.push_str(&rest[pos..pos + "@import".len() + semi + 1]);
-            } else if let Ok(inner) = std::fs::read_to_string(dir.join(path)) {
-                let inner_dir = dir.join(path);
-                walk(
-                    &inner,
-                    inner_dir.parent().unwrap_or(dir),
-                    depth + 1,
-                    out,
-                );
-            }
-            // A missing target is dropped rather than emitted as a dead request.
-            rest = &after[semi + 1..];
-        }
-        out.push_str(rest);
-    }
-
-    let mut out = String::with_capacity(css.len());
-    walk(css, base_dir, 0, &mut out);
-    out
+fn warn_missing_dev_asset(path: &Path) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "web asset not found: {} — run `pnpm --dir web build` (or point EXPOSURE_WEB_DIR at a \
+             built tree)",
+            path.display()
+        );
+    });
 }
 
 fn escape_html(s: &str) -> String {
@@ -280,9 +271,8 @@ fn fill_template(tpl: &str, pairs: &[(&str, &str)]) -> String {
 /// a valid release build (the web build embeds `error/index.html`).
 const FALLBACK_ERROR_PAGE: &str = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/><title>{{status}} {{title}}</title></head><body><h1>{{status}} {{title}}</h1><p>{{detail}}</p><p>Ray {{ray_id}}</p></body></html>";
 
-/// Built-in intercept page: one complete document, built from `web/error` by the web toolchain
-/// (stylesheet inlined) and embedded at compile time. Debug builds assemble the same document
-/// from the live source tree so the page stays editable during development.
+/// Built-in intercept page: one complete document, produced and inlined by the web toolchain and
+/// embedded at compile time. Debug builds read the same file from `web/dist/error`.
 fn builtin_error_page() -> Cow<'static, str> {
     #[cfg(not(debug_assertions))]
     {
@@ -304,41 +294,20 @@ fn builtin_error_page() -> Cow<'static, str> {
     Cow::Borrowed(FALLBACK_ERROR_PAGE)
 }
 
-/// Dev-mode equivalent of the build-time single-file assembly: `web/error/index.html` with
-/// `styles.css` inlined (the page is rendered into responses at arbitrary paths, so a relative
-/// stylesheet reference would not resolve).
+/// Dev-mode source of the intercept page: the single-file document the web build produced (already
+/// containing the stylesheet and the illustration). It is rendered into responses at arbitrary
+/// host/path combinations, so every external reference would resolve against the intercepted site —
+/// which is exactly why the frontend build inlines them.
 #[cfg(debug_assertions)]
 fn load_dev_error_page() -> Option<String> {
-    let dir = resolve_dev_web_dir(WebApp::Error);
-    let html = std::fs::read_to_string(dir.join("index.html")).ok()?;
-    match std::fs::read_to_string(dir.join("styles.css")) {
-        Ok(css) if !css.contains("</style") => {
-            let css = inline_css_imports(&css, &dir);
-            Some(splice_stylesheet(&html, &css))
+    let page = resolve_dev_web_dir(WebApp::Error).join("index.html");
+    match std::fs::read_to_string(&page) {
+        Ok(html) => Some(html),
+        Err(_) => {
+            warn_missing_dev_asset(&page);
+            None
         }
-        _ => Some(html),
     }
-}
-
-/// Replace the `<link rel="stylesheet">` tag with an inline `<style>` block.
-#[cfg(debug_assertions)]
-fn splice_stylesheet(html: &str, css: &str) -> String {
-    let Some(at) = html.find("rel=\"stylesheet\"") else {
-        return html.to_string();
-    };
-    let Some(start) = html[..at].rfind('<') else {
-        return html.to_string();
-    };
-    let Some(close) = html[at..].find('>') else {
-        return html.to_string();
-    };
-    let mut out = String::with_capacity(html.len() + css.len());
-    out.push_str(&html[..start]);
-    out.push_str("<style>");
-    out.push_str(css);
-    out.push_str("</style>");
-    out.push_str(&html[at + close + 1..]);
-    out
 }
 
 /// Status tone class for the built-in page: rate limiting (429) is amber, every other client
@@ -492,8 +461,22 @@ pub fn maybe_gzip_body(body: Vec<u8>, accept_encoding: &str) -> (Vec<u8>, Option
 mod tests {
     use super::render_exposure_error_html_with_template;
 
+    /// Debug builds serve the web build output, so page assertions need it to have been built.
+    #[cfg(debug_assertions)]
+    fn dev_web_build_ready(app: super::WebApp) -> bool {
+        let ready = super::resolve_dev_web_dir(app).join("index.html").is_file();
+        if !ready {
+            eprintln!("skipping: web/dist is not built (run `pnpm --dir web build`)");
+        }
+        ready
+    }
+
     #[test]
     fn builtin_error_page_is_a_complete_single_file_document() {
+        #[cfg(debug_assertions)]
+        if !dev_web_build_ready(super::WebApp::Error) {
+            return;
+        }
         let html = super::render_exposure_error_html(429, "Too Many Requests", "slow down", "ray-1", Some(3));
         assert!(html.starts_with("<!DOCTYPE html>"), "not a full document: {html:.80}");
         assert!(html.contains("<style>"), "stylesheet was not inlined");
@@ -508,20 +491,48 @@ mod tests {
         assert!(html.contains("setTimeout"));
     }
 
-    /// The page stylesheets pull the layout skeleton in through `@import "../shared/page.css"`.
-    /// Debug builds splice raw source CSS into the document, so the loader must resolve that
-    /// import itself — a leftover `@import` would be fetched relative to the intercepted site.
+    /// The debug node serves the web build verbatim. Everything the intercept page needs — the
+    /// shared layout skeleton pulled in through `@import "../shared/page.css"` and the standalone
+    /// illustration — has to have been inlined by the frontend build, because the document is
+    /// rendered at an arbitrary host/path where any external reference resolves against the
+    /// intercepted site instead of the edge.
     #[cfg(debug_assertions)]
     #[test]
-    fn dev_builtin_page_inlines_the_shared_stylesheet_import() {
+    fn dev_builtin_page_is_the_single_file_web_build_output() {
+        if !dev_web_build_ready(super::WebApp::Error) {
+            return;
+        }
         let html = super::render_exposure_error_html(403, "Forbidden", "nope", "ray-2", None);
         assert!(
             html.contains("grid-template-columns"),
-            "shared layout skeleton was not pulled in from web/shared/page.css"
+            "shared layout skeleton was not inlined into the built page"
+        );
+        assert!(!html.contains("@import"), "unresolved @import in the page");
+        assert!(
+            !html.contains("@inline"),
+            "unresolved @inline directive would ship the page without its illustration"
         );
         assert!(
-            !html.contains("@import"),
-            "unresolved @import would be fetched from the intercepted site's origin"
+            html.contains("var(--art-ink)"),
+            "the illustration must be inlined, not left as an external reference"
+        );
+    }
+
+    #[test]
+    fn dev_challenge_page_is_the_single_file_web_build_output() {
+        if !dev_web_build_ready(super::WebApp::Challenge) {
+            return;
+        }
+        let asset =
+            super::load_web_asset_negotiated(super::WebApp::Challenge, "/index.html", "identity")
+                .expect("dev-mode challenge page");
+
+        let html = std::str::from_utf8(&asset.bytes).unwrap();
+        assert!(!html.contains("@inline"), "unresolved @inline directive");
+        assert!(html.contains("var(--art-ink)"), "illustration missing");
+        assert!(
+            !html.contains("src=\"/cdn-cgi/assets/app.min.js\""),
+            "the PoW script must already be inlined by the web build"
         );
     }
 

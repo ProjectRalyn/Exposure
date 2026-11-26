@@ -2667,6 +2667,10 @@ async fn get_evilpot(
         }
     }
 
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (s_fetch_off, s_fetch_lim) = maintainer_page_window(single_maint, sess_off, sess_lim);
+    let (e_fetch_off, e_fetch_lim) = maintainer_page_window(single_maint, ev_off, ev_lim);
+
     let maint_replies: Vec<serde_json::Value> = state
         .client
         .query_maintainers(MaintainerQuery::Evilpot {
@@ -2676,10 +2680,10 @@ async fn get_evilpot(
             status: q.status.clone(),
             ip: q.ip.clone(),
             q: q.q.clone(),
-            sessions_offset: if sess_off > 0 { 0 } else { sess_off },
-            sessions_limit: (sess_off + sess_lim).min(200),
-            events_offset: if ev_off > 0 { 0 } else { ev_off },
-            events_limit: (ev_off + ev_lim).min(200),
+            sessions_offset: s_fetch_off,
+            sessions_limit: s_fetch_lim,
+            events_offset: e_fetch_off,
+            events_limit: e_fetch_lim,
         })
         .await
         .into_iter()
@@ -2768,7 +2772,12 @@ async fn get_evilpot(
         } else {
             sessions.len()
         };
-        let sess_page: Vec<_> = sessions.into_iter().skip(sess_off).take(sess_lim).collect();
+        let sess_skip = if s_fetch_off == sess_off { 0 } else { sess_off };
+        let sess_page: Vec<_> = sessions
+            .into_iter()
+            .skip(sess_skip)
+            .take(sess_lim)
+            .collect();
 
         let mut recent_events: Vec<EvilpotEventInfo> = ev_map.into_values().collect();
         recent_events.sort_by(|a, b| b.timestamp_unix.cmp(&a.timestamp_unix));
@@ -2777,9 +2786,10 @@ async fn get_evilpot(
         } else {
             recent_events.len()
         };
+        let ev_skip = if e_fetch_off == ev_off { 0 } else { ev_off };
         let ev_page: Vec<_> = recent_events
             .into_iter()
-            .skip(ev_off)
+            .skip(ev_skip)
             .take(ev_lim)
             .collect();
 
@@ -2952,6 +2962,14 @@ struct BansQuery {
     limit: Option<usize>,
 }
 
+fn maintainer_page_window(single_maint: bool, offset: usize, limit: usize) -> (usize, usize) {
+    if single_maint {
+        (offset, limit)
+    } else {
+        (0, offset.saturating_add(limit).min(2000))
+    }
+}
+
 async fn list_bans(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2964,6 +2982,8 @@ async fn list_bans(
     let (from_ms, to_ms) = resolve_time_window(q.from_ms, q.to_ms, q.window_secs);
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (fetch_off, fetch_lim) = maintainer_page_window(single_maint, offset, limit);
 
     let maint_replies: Vec<serde_json::Value> = state
         .client
@@ -2975,8 +2995,8 @@ async fn list_bans(
             kind: q.kind.clone(),
             target: q.target.clone(),
             q: q.q.clone(),
-            offset: 0,
-            limit: (offset + limit).min(200),
+            offset: fetch_off,
+            limit: fetch_lim,
         })
         .await
         .into_iter()
@@ -3076,7 +3096,8 @@ async fn list_bans(
         } else {
             items.len()
         };
-        let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+        let skip_off = if fetch_off == offset { 0 } else { offset };
+        let page: Vec<_> = items.into_iter().skip(skip_off).take(limit).collect();
         let has_more = offset.saturating_add(page.len()) < total_matched;
         return Json(serde_json::json!({
             "last_pulled_at": tel.last_pulled_at,
@@ -3206,6 +3227,9 @@ async fn list_alerts(
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
 
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (fetch_off, fetch_lim) = maintainer_page_window(single_maint, offset, limit);
+
     let maint_replies: Vec<serde_json::Value> = state
         .client
         .query_maintainers(MaintainerQuery::Alerts {
@@ -3214,8 +3238,8 @@ async fn list_alerts(
             node: q.node.clone(),
             severity: q.severity.clone(),
             q: q.q.clone(),
-            offset: 0,
-            limit: (offset + limit).min(200),
+            offset: fetch_off,
+            limit: fetch_lim,
         })
         .await
         .into_iter()
@@ -3268,7 +3292,8 @@ async fn list_alerts(
             }
             serde_json::to_value(m).unwrap_or_default()
         };
-        let page: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
+        let skip_off = if fetch_off == offset { 0 } else { offset };
+        let page: Vec<_> = items.into_iter().skip(skip_off).take(limit).collect();
         let has_more = offset.saturating_add(page.len()) < total_matched;
         return Json(serde_json::json!({
             "last_pulled_at": tel.last_pulled_at,
@@ -3342,6 +3367,9 @@ async fn get_telemetry(
     let b_off = q.bucket_offset.unwrap_or(0);
     let b_lim = q.bucket_limit.unwrap_or(100).clamp(1, 200);
 
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (b_fetch_off, b_fetch_lim) = maintainer_page_window(single_maint, b_off, b_lim);
+
     let maint_replies: Vec<serde_json::Value> = state
         .client
         .query_maintainers(MaintainerQuery::Telemetry {
@@ -3349,8 +3377,8 @@ async fn get_telemetry(
             to_ms,
             node: node_f.clone(),
             service: svc_f.clone(),
-            bucket_offset: if b_off > 0 { 0 } else { b_off },
-            bucket_limit: (b_off + b_lim).min(200),
+            bucket_offset: b_fetch_off,
+            bucket_limit: b_fetch_lim,
         })
         .await
         .into_iter()
@@ -3415,7 +3443,8 @@ async fn get_telemetry(
         } else {
             buckets.len()
         };
-        let summaries_page: Vec<_> = buckets.into_iter().skip(b_off).take(b_lim).collect();
+        let b_skip = if b_fetch_off == b_off { 0 } else { b_off };
+        let summaries_page: Vec<_> = buckets.into_iter().skip(b_skip).take(b_lim).collect();
         return Json(serde_json::json!({
             "last_pulled_at": tel.last_pulled_at,
             "traffic": agg.traffic_json,
@@ -3635,6 +3664,9 @@ async fn list_fingerprints(
         q.ip.as_deref().map(str::trim).filter(|s| !s.is_empty()),
     );
 
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (fetch_off, fetch_lim) = maintainer_page_window(single_maint, offset, limit);
+
     let maint_replies: Vec<serde_json::Value> = state
         .client
         .query_maintainers(MaintainerQuery::Fingerprints {
@@ -3650,8 +3682,8 @@ async fn list_fingerprints(
             fp: q.fp.clone(),
             q: q.q.clone(),
             q_ip_hmac: q_ip_hmac.clone(),
-            offset: 0,
-            limit: (offset + limit).min(200),
+            offset: fetch_off,
+            limit: fetch_lim,
         })
         .await
         .into_iter()
@@ -3660,7 +3692,24 @@ async fn list_fingerprints(
 
     if maint_replies.len() == 1 {
         let mut val = maint_replies[0].clone();
+        let total = val["total_matched"].as_u64().unwrap_or(0) as usize;
+        if fetch_off == 0 && offset > 0 {
+            if let Some(items) = val.get_mut("items").and_then(|v| v.as_array_mut()) {
+                let sliced: Vec<_> = std::mem::take(items)
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect();
+                *items = sliced;
+            }
+        }
         if let Some(obj) = val.as_object_mut() {
+            obj.insert("offset".into(), serde_json::json!(offset));
+            obj.insert("limit".into(), serde_json::json!(limit));
+            obj.insert(
+                "has_more".into(),
+                serde_json::json!(offset.saturating_add(limit) < total),
+            );
             obj.insert(
                 "last_pulled_at".into(),
                 serde_json::json!(tel.last_pulled_at),
@@ -4190,6 +4239,9 @@ async fn list_logs(
         clean_filter_opt(q.ip.as_deref()).as_deref(),
     );
 
+    let single_maint = state.client.maintainer_count().await <= 1;
+    let (fetch_off, fetch_lim) = maintainer_page_window(single_maint, offset, limit);
+
     let maint_replies: Vec<serde_json::Value> = state
         .client
         .query_maintainers(MaintainerQuery::AccessLogs {
@@ -4208,8 +4260,8 @@ async fn list_logs(
             ray_id: q.ray_id.clone(),
             q: q.q.clone(),
             q_ip_hmac,
-            offset: if offset > 0 { 0 } else { offset },
-            limit: (offset + limit).min(200),
+            offset: fetch_off,
+            limit: fetch_lim,
         })
         .await
         .into_iter()
@@ -4218,10 +4270,10 @@ async fn list_logs(
 
     if maint_replies.len() == 1 {
         let mut val = maint_replies[0].clone();
-        // The Maintainer was asked for rows [0, offset+limit) so a single request can serve
-        // the current page; slice locally here (it returns the requested window only).
+        // When querying a multi-maintainer cluster where only one replied, slice [0, offset+limit)
+        // locally; in single-maintainer mode the Maintainer already applied OFFSET/LIMIT.
         let total = val["total_matched"].as_u64().unwrap_or(0) as usize;
-        if offset > 0 {
+        if fetch_off == 0 && offset > 0 {
             if let Some(items) = val.get_mut("items").and_then(|v| v.as_array_mut()) {
                 let sliced: Vec<_> = std::mem::take(items)
                     .into_iter()

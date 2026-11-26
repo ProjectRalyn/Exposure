@@ -1,3 +1,11 @@
+//! Embed the web build output into the binary.
+//!
+//! Everything that shapes a byte of HTML/CSS/JS happens in `web/build.mjs` (Vite): page assembly,
+//! `<!-- @inline -->` splicing, minification, and the single-file packaging of the built-in pages,
+//! including the CSP hash of any script it inlined. This script only (a) asks the frontend build
+//! to run, (b) pre-compresses text assets, and (c) emits `include_bytes!` tables. It must never
+//! parse or rewrite a web asset.
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -29,6 +37,11 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
+            // Dot-files are build metadata the frontend build writes for us (`.script-hash`); they
+            // are neither served nor embedded.
+            if rel.rsplit('/').next().is_some_and(|n| n.starts_with('.')) {
+                continue;
+            }
             out.push((rel, path));
         }
     }
@@ -60,151 +73,8 @@ fn watch_dir(dir: &Path) {
     }
 }
 
-fn host_esbuild_pkg_dir() -> Option<&'static str> {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => Some("linux-x64"),
-        ("linux", "aarch64") => Some("linux-arm64"),
-        ("macos", "x86_64") => Some("darwin-x64"),
-        ("macos", "aarch64") => Some("darwin-arm64"),
-        ("windows", "x86_64") => Some("win32-x64"),
-        _ => None,
-    }
-}
-
-fn find_native_esbuild(node_modules: &Path) -> Option<PathBuf> {
-    let target_pkg = host_esbuild_pkg_dir()?;
-    let bin_name = if env::consts::OS == "windows" {
-        "esbuild.exe"
-    } else {
-        "esbuild"
-    };
-    let direct_pkg = node_modules.join("@esbuild").join(target_pkg);
-    for candidate in [
-        direct_pkg.join("bin").join(bin_name),
-        direct_pkg.join(bin_name),
-    ] {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    // pnpm store layout: node_modules/.pnpm/@esbuild+<target>@.../node_modules/@esbuild/<target>/{bin/,}esbuild
-    let pnpm_dir = node_modules.join(".pnpm");
-    let prefix = format!("@esbuild+{target_pkg}@");
-    if let Ok(entries) = fs::read_dir(&pnpm_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) {
-                let pkg_dir = entry
-                    .path()
-                    .join("node_modules")
-                    .join("@esbuild")
-                    .join(target_pkg);
-                for candidate in [pkg_dir.join("bin").join(bin_name), pkg_dir.join(bin_name)] {
-                    if candidate.is_file() {
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Fallback minifier using the host-matched native `esbuild` binary into OUT_DIR staging.
-fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
-    let Some(esbuild) = find_native_esbuild(&web_dir.join("node_modules")) else {
-        return false;
-    };
-
-    let apps = [
-        ("control", "app.js", "/"),
-        ("challenge", "pow.js", "/cdn-cgi/"),
-        // CSS-only intercept page: no JS entry.
-        ("error", "", "/"),
-    ];
-
-    for (app, entry_js, base) in apps {
-        let src = web_dir.join(app);
-        let dst = stage_dir.join(app);
-        let assets = dst.join("assets");
-        let _ = fs::remove_dir_all(&dst);
-        if fs::create_dir_all(&assets).is_err() {
-            return false;
-        }
-
-        let js_ok = entry_js.is_empty()
-            || Command::new(&esbuild)
-                .arg(src.join(entry_js))
-                .arg("--bundle")
-                .arg("--format=esm")
-                .arg("--minify")
-                .arg(format!("--outfile={}", assets.join("app.min.js").display()))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-
-        let css_ok = Command::new(&esbuild)
-            .arg(src.join("styles.css"))
-            // `--bundle` is required: the page stylesheets pull the shared layout skeleton in
-            // via `@import "../shared/page.css"`, which must be inlined here rather than left as
-            // a dead (and unreachable) external reference.
-            .arg("--bundle")
-            .arg("--minify")
-            .arg(format!(
-                "--outfile={}",
-                assets.join("styles.min.css").display()
-            ))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-        if !js_ok || !css_ok {
-            return false;
-        }
-
-        let Ok(html) = fs::read_to_string(src.join("index.html")) else {
-            return false;
-        };
-        let mut patched = html
-            .replace("./styles.css", &format!("{base}assets/styles.min.css"))
-            .replace(
-                "/cdn-cgi/styles.css",
-                &format!("{base}assets/styles.min.css"),
-            );
-        if !entry_js.is_empty() {
-            patched = patched
-                .replace(
-                    &format!("./{entry_js}"),
-                    &format!("{base}assets/app.min.js"),
-                )
-                .replace(
-                    &format!("/cdn-cgi/{entry_js}"),
-                    &format!("{base}assets/app.min.js"),
-                );
-        }
-        if fs::write(dst.join("index.html"), patched).is_err() {
-            return false;
-        }
-
-        // Also bundle standalone passive fingerprint beacon `/cdn-cgi/fp.js` into challenge dist
-        if app == "challenge" && src.join("fp.js").exists() {
-            let fp_ok = Command::new(&esbuild)
-                .arg(src.join("fp.js"))
-                .arg("--bundle")
-                .arg("--format=iife")
-                .arg("--minify")
-                .arg(format!("--outfile={}", dst.join("fp.js").display()))
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !fp_ok {
-                return false;
-            }
-        }
-    }
-    true
-}
-
+/// Run the frontend build (Vite, through `pnpm build`). Bundling, page assembly and minification
+/// all happen there; this is only the invocation.
 fn run_pnpm_build(web_dir: &Path, stage_dir: &Path) -> bool {
     let candidates: &[&str] = if cfg!(windows) {
         &["pnpm.cmd", "pnpm.exe", "pnpm"]
@@ -212,16 +82,15 @@ fn run_pnpm_build(web_dir: &Path, stage_dir: &Path) -> bool {
         &["pnpm"]
     };
     for bin in candidates {
-        if let Ok(status) = Command::new(bin)
+        if Command::new(bin)
             .arg("--dir")
             .arg(web_dir)
             .arg("build")
             .env("EXPOSURE_WEB_OUT_DIR", stage_dir)
             .status()
+            .is_ok_and(|status| status.success())
         {
-            if status.success() {
-                return true;
-            }
+            return true;
         }
     }
     false
@@ -239,6 +108,8 @@ fn main() {
 
     watch_dir(&web_dir.join("control"));
     watch_dir(&web_dir.join("challenge"));
+    watch_dir(&web_dir.join("error"));
+    watch_dir(&web_dir.join("shared"));
     println!(
         "cargo:rerun-if-changed={}",
         web_dir.join("build.mjs").display()
@@ -262,14 +133,12 @@ fn main() {
     }
 
     let stage_dir = out_dir.join("web_dist");
-    let vite_ok = run_pnpm_build(&web_dir, &stage_dir);
-
-    let effective_dist = if (vite_ok
+    let built = run_pnpm_build(&web_dir, &stage_dir)
         && stage_dir.join("control").exists()
         && stage_dir.join("challenge").exists()
-        && stage_dir.join("error").exists())
-        || build_with_native_esbuild(&web_dir, &stage_dir)
-    {
+        && stage_dir.join("error").exists();
+
+    let effective_dist = if built {
         stage_dir
     } else if env::var("EXPOSURE_USE_PREBUILT_WEB").ok().as_deref() == Some("1")
         && web_dir.join("dist").join("control").exists()
@@ -282,7 +151,8 @@ fn main() {
         web_dir.join("dist")
     } else {
         panic!(
-            "Release build failed to compile web assets via pnpm/esbuild (set EXPOSURE_USE_PREBUILT_WEB=1 to explicitly opt into prebuilt web/dist)"
+            "failed to run the web build (`pnpm --dir web build`); fix the frontend toolchain, or \
+             set EXPOSURE_USE_PREBUILT_WEB=1 to explicitly opt into an existing web/dist"
         );
     };
 
@@ -297,24 +167,16 @@ fn main() {
     collect_files(&dist_challenge, &dist_challenge, &mut challenge_files);
     collect_files(&dist_error, &dist_error, &mut error_files);
 
-    // The built-in PoW and intercept pages each ship as ONE self-contained document: the dist
-    // `index.html` with its CSS (and, for the PoW page, its JS) inlined. Only the PoW page also
-    // keeps its separate `assets/app.min.js` / `assets/styles.min.css` embedded, so
-    // operator-provisioned pages can still reference those stable paths under `/cdn-cgi/`. The
-    // built-in intercept page is always served as the single file, so its assets are dropped.
-    let single_dir = out_dir.join("web_single");
-    let mut single_pages: BTreeMap<&str, PathBuf> = BTreeMap::new();
-    let mut script_hashes: BTreeMap<&str, String> = BTreeMap::new();
-    for (app, dist, name) in [
-        ("challenge", &dist_challenge, "challenge-index.html"),
-        ("error", &dist_error, "error-index.html"),
-    ] {
-        let Some((page, hash)) = build_single_file_page(dist, &single_dir, name) else {
-            panic!("failed to assemble the built-in single-file `{app}` page from the web build");
+    // CSP source hash of the script the frontend build inlined into the built-in page, recorded
+    // next to that page. Only the PoW page inlines a script.
+    let mut script_hashes: BTreeMap<&'static str, String> = BTreeMap::new();
+    for (app, dist) in [("challenge", &dist_challenge), ("error", &dist_error)] {
+        let Ok(raw) = fs::read_to_string(dist.join(".script-hash")) else {
+            continue;
         };
-        single_pages.insert(app, page);
-        if let Some(hash) = hash {
-            script_hashes.insert(app, hash);
+        let hash = raw.trim();
+        if !hash.is_empty() {
+            script_hashes.insert(app, hash.to_string());
         }
     }
 
@@ -337,18 +199,14 @@ fn main() {
                 continue;
             }
             let abs = fs::canonicalize(&full).unwrap();
-            let served = match single_pages.get(app_name) {
-                Some(page) if rel == "index.html" => page.clone(),
-                _ => abs,
-            };
             code.push_str(&format!(
                 "        ({:?}, {:?}) => Some(include_bytes!({:?})),\n",
                 app_name,
                 rel,
-                served.to_string_lossy()
+                abs.to_string_lossy()
             ));
             for (coding, staged) in
-                stage_compressed_variants(&compressed_root, app_name, &rel, &served)
+                stage_compressed_variants(&compressed_root, app_name, &rel, &abs)
             {
                 encoded.push_str(&format!(
                     "        ({:?}, {:?}, {:?}) => Some(include_bytes!({:?})),\n",
@@ -363,76 +221,12 @@ fn main() {
     code.push_str("        _ => None,\n    }\n}\n");
     code.push_str(&encoded);
     code.push_str("        _ => None,\n    }\n}\n");
-    // CSP source hash for pages whose script was inlined (release builds only).
     code.push_str("pub fn embedded_script_hash(app: &str) -> Option<&'static str> {\n    match app {\n");
     for (app, hash) in &script_hashes {
         code.push_str(&format!("        {:?} => Some({:?}),\n", app, hash));
     }
     code.push_str("        _ => None,\n    }\n}\n");
     fs::write(&dest, code).unwrap();
-}
-
-/// Replace the HTML tag that references `needle` with `replacement`, leaving the document
-/// untouched when the tag cannot be located.
-fn splice_tag(html: &str, needle: &str, replacement: &str) -> String {
-    let Some(at) = html.find(needle) else {
-        return html.to_string();
-    };
-    let Some(start) = html[..at].rfind('<') else {
-        return html.to_string();
-    };
-    let Some(close) = html[at..].find('>') else {
-        return html.to_string();
-    };
-    let mut out = String::with_capacity(html.len() + replacement.len());
-    out.push_str(&html[..start]);
-    out.push_str(replacement);
-    out.push_str(&html[at + close + 1..]);
-    out
-}
-
-/// Assemble a built-in page as a single self-contained document (`styles.min.css` and, when
-/// present, `app.min.js` inlined).
-///
-/// Returns the assembled page plus — when a script was inlined — the CSP source hash
-/// (`sha256-<base64>`) the serving node must allow in order to run it.
-///
-/// The inline `<script>`/`<style>` bodies must not contain their own closing sequence; if the
-/// minified bundle ever does, that asset is left as an external reference instead of producing a
-/// broken inline page.
-fn build_single_file_page(
-    dist: &Path,
-    out_dir: &Path,
-    file_name: &str,
-) -> Option<(PathBuf, Option<String>)> {
-    use base64::Engine as _;
-    use sha2::Digest as _;
-
-    let mut html = fs::read_to_string(dist.join("index.html")).ok()?;
-    let css = fs::read_to_string(dist.join("assets").join("styles.min.css")).unwrap_or_default();
-    let js = fs::read_to_string(dist.join("assets").join("app.min.js")).unwrap_or_default();
-
-    if !css.is_empty() && !css.contains("</style") {
-        html = splice_tag(&html, "rel=\"stylesheet\"", &format!("<style>{css}</style>"));
-    }
-    let mut script_hash = None;
-    if !js.is_empty() && !js.contains("</script") {
-        html = splice_tag(
-            &html,
-            "app.min.js",
-            &format!("<script type=\"module\">{js}</script>"),
-        );
-        let digest = sha2::Sha256::digest(js.as_bytes());
-        script_hash = Some(format!(
-            "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(digest)
-        ));
-    }
-
-    fs::create_dir_all(out_dir).ok()?;
-    let dst = out_dir.join(file_name);
-    fs::write(&dst, html).ok()?;
-    Some((fs::canonicalize(&dst).ok()?, script_hash))
 }
 
 /// Payloads below this size are dominated by the coding's own framing overhead.
