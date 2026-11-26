@@ -145,6 +145,10 @@ fn build_with_native_esbuild(web_dir: &Path, stage_dir: &Path) -> bool {
 
         let css_ok = Command::new(&esbuild)
             .arg(src.join("styles.css"))
+            // `--bundle` is required: the page stylesheets pull the shared layout skeleton in
+            // via `@import "../shared/page.css"`, which must be inlined here rather than left as
+            // a dead (and unreachable) external reference.
+            .arg("--bundle")
             .arg("--minify")
             .arg(format!(
                 "--outfile={}",
@@ -294,9 +298,10 @@ fn main() {
     collect_files(&dist_error, &dist_error, &mut error_files);
 
     // The built-in PoW and intercept pages each ship as ONE self-contained document: the dist
-    // `index.html` with its CSS (and, for the PoW page, its JS) inlined. The separate
-    // `assets/app.min.js` / `assets/styles.min.css` stay embedded too, so operator-provisioned
-    // pages may still reference those stable paths.
+    // `index.html` with its CSS (and, for the PoW page, its JS) inlined. Only the PoW page also
+    // keeps its separate `assets/app.min.js` / `assets/styles.min.css` embedded, so
+    // operator-provisioned pages can still reference those stable paths under `/cdn-cgi/`. The
+    // built-in intercept page is always served as the single file, so its assets are dropped.
     let single_dir = out_dir.join("web_single");
     let mut single_pages: BTreeMap<&str, PathBuf> = BTreeMap::new();
     let mut script_hashes: BTreeMap<&str, String> = BTreeMap::new();
@@ -326,6 +331,11 @@ fn main() {
         ("error", error_files),
     ] {
         for (rel, full) in files {
+            // `error/assets/*` is unreachable at runtime: the intercept page is only ever served
+            // as the inlined single-file document, and nothing maps a URL onto this app's assets.
+            if app_name == "error" && rel.starts_with("assets/") {
+                continue;
+            }
             let abs = fs::canonicalize(&full).unwrap();
             let served = match single_pages.get(app_name) {
                 Some(page) if rel == "index.html" => page.clone(),

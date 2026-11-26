@@ -145,7 +145,15 @@ pub fn load_web_asset_negotiated(
     {
         let _ = accept_encoding;
         let full = resolve_dev_web_dir(app).join(&rel);
-        let bytes = std::fs::read(&full).ok()?;
+        let mut bytes = std::fs::read(&full).ok()?;
+        // Page stylesheets import the shared layout skeleton; inline it so the served CSS is
+        // already self-contained (see `inline_css_imports`).
+        if mime.starts_with("text/css") {
+            if let Ok(css) = std::str::from_utf8(&bytes) {
+                let resolved = inline_css_imports(css, full.parent().unwrap_or(&full));
+                bytes = resolved.into_bytes();
+            }
+        }
         Some(WebAsset {
             bytes: Cow::Owned(bytes),
             mime,
@@ -183,6 +191,57 @@ pub fn load_web_asset_negotiated(
             encoding: None,
         })
     }
+}
+
+/// Resolve `@import "relative.css";` inside a stylesheet for debug builds.
+///
+/// Release builds let Vite (or the esbuild fallback with `--bundle`) inline imports at build
+/// time. Debug builds instead splice the raw source CSS into a `<style>` block that is served
+/// from an arbitrary Host and path, where a relative `@import` would resolve against the *page*
+/// URL — fetching nothing in the best case, or hitting the customer's own backend in the worst.
+#[cfg(debug_assertions)]
+fn inline_css_imports(css: &str, base_dir: &Path) -> String {
+    fn walk(css: &str, dir: &Path, depth: u8, out: &mut String) {
+        // Depth cap: `@import` cycles are a config error, not a reason to hang a request.
+        if depth > 4 {
+            return;
+        }
+        let mut rest = css;
+        while let Some(pos) = rest.find("@import") {
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos + "@import".len()..];
+            let Some(semi) = after.find(';') else {
+                out.push_str(&rest[pos..]);
+                return;
+            };
+            let spec = after[..semi].trim();
+            let path = spec
+                .strip_prefix("url(")
+                .map(|s| s.strip_suffix(')').unwrap_or(s))
+                .unwrap_or(spec)
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+            if path.is_empty() || path.contains("://") {
+                // Remote imports are never used by the built-in pages; leave them untouched.
+                out.push_str(&rest[pos..pos + "@import".len() + semi + 1]);
+            } else if let Ok(inner) = std::fs::read_to_string(dir.join(path)) {
+                let inner_dir = dir.join(path);
+                walk(
+                    &inner,
+                    inner_dir.parent().unwrap_or(dir),
+                    depth + 1,
+                    out,
+                );
+            }
+            // A missing target is dropped rather than emitted as a dead request.
+            rest = &after[semi + 1..];
+        }
+        out.push_str(rest);
+    }
+
+    let mut out = String::with_capacity(css.len());
+    walk(css, base_dir, 0, &mut out);
+    out
 }
 
 fn escape_html(s: &str) -> String {
@@ -253,7 +312,10 @@ fn load_dev_error_page() -> Option<String> {
     let dir = resolve_dev_web_dir(WebApp::Error);
     let html = std::fs::read_to_string(dir.join("index.html")).ok()?;
     match std::fs::read_to_string(dir.join("styles.css")) {
-        Ok(css) if !css.contains("</style") => Some(splice_stylesheet(&html, &css)),
+        Ok(css) if !css.contains("</style") => {
+            let css = inline_css_imports(&css, &dir);
+            Some(splice_stylesheet(&html, &css))
+        }
         _ => Some(html),
     }
 }
@@ -444,6 +506,23 @@ mod tests {
         assert!(html.contains("exp") || html.contains("ray-1"));
         // Placeholders are HTML-escaped, and the retry note carries the auto-reload script.
         assert!(html.contains("setTimeout"));
+    }
+
+    /// The page stylesheets pull the layout skeleton in through `@import "../shared/page.css"`.
+    /// Debug builds splice raw source CSS into the document, so the loader must resolve that
+    /// import itself — a leftover `@import` would be fetched relative to the intercepted site.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn dev_builtin_page_inlines_the_shared_stylesheet_import() {
+        let html = super::render_exposure_error_html(403, "Forbidden", "nope", "ray-2", None);
+        assert!(
+            html.contains("grid-template-columns"),
+            "shared layout skeleton was not pulled in from web/shared/page.css"
+        );
+        assert!(
+            !html.contains("@import"),
+            "unresolved @import would be fetched from the intercepted site's origin"
+        );
     }
 
     #[test]
