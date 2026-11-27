@@ -60,15 +60,14 @@ const MAX_EVILPOT_STREAM_DURATION: Duration = Duration::from_secs(30);
 const ALERT_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
 
-/// Rolling window for returning a one-time 403 (with Ray ID) when a user repeatedly
-/// submits the exact same blocked payload in Evilpot mode.
+/// Rolling window for switching a client from the Evilpot decoy to a plain 403 (with Ray ID)
+/// once it keeps resubmitting the exact same blocked payload in Evilpot mode.
 const REPEAT_RAY_403_WINDOW: Duration = Duration::from_secs(300);
 const MAX_REPEAT_RAY_403_ENTRIES: usize = 8192;
 
 struct RepeatPayloadState {
-    window_start: Instant,
+    last_seen: Instant,
     count: u32,
-    ray_403_shown: bool,
 }
 
 /// Optional post-stream verification hook attached to `BoundedEvilpotBody`.
@@ -441,38 +440,47 @@ impl EvilpotManager {
         true
     }
 
-    /// Returns `true` at most once per `(client_ip, payload_sig)` within `REPEAT_RAY_403_WINDOW`
-    /// when a client submits the exact same blocked payload a second time in Evilpot mode,
-    /// allowing legitimate users hitting a WAF false positive to receive a 403 with their Ray ID.
-    pub fn should_return_one_time_ray_403(&self, client_ip: IpAddr, payload_sig: u64) -> bool {
+    /// Decides whether this identical blocked-payload submission should be answered with a plain
+    /// `403` (whose Ray ID the user can quote to an administrator) instead of the Evilpot decoy.
+    ///
+    /// Every `(client_ip, payload_sig)` pair owns its own counter: the first `decoy_hits`
+    /// identical submissions still receive the decoy, and every further identical submission gets
+    /// a 403 until the client has been idle for a whole `REPEAT_RAY_403_WINDOW`. `None` disables the
+    /// switch-over entirely (the decoy is always served). `Some(0)` answers even the very first
+    /// submission with a 403.
+    ///
+    /// Distinct payloads never share a counter, so a deliberate multi-vector attack (a different
+    /// payload each time) is unaffected and still reaches the honeypot / auto-ban path.
+    pub fn should_return_ray_403(
+        &self,
+        client_ip: IpAddr,
+        payload_sig: u64,
+        decoy_hits: Option<u32>,
+    ) -> bool {
+        let Some(decoy_hits) = decoy_hits else {
+            return false;
+        };
         let now = Instant::now();
         let key = (client_ip, payload_sig);
         if self.repeat_payloads.len() >= MAX_REPEAT_RAY_403_ENTRIES
             && !self.repeat_payloads.contains_key(&key)
         {
             self.repeat_payloads
-                .retain(|_, s| now.duration_since(s.window_start) < REPEAT_RAY_403_WINDOW);
+                .retain(|_, s| now.duration_since(s.last_seen) < REPEAT_RAY_403_WINDOW);
             if self.repeat_payloads.len() >= MAX_REPEAT_RAY_403_ENTRIES {
                 evict_half(&self.repeat_payloads);
             }
         }
         let mut entry = self.repeat_payloads.entry(key).or_insert(RepeatPayloadState {
-            window_start: now,
+            last_seen: now,
             count: 0,
-            ray_403_shown: false,
         });
-        if now.duration_since(entry.window_start) >= REPEAT_RAY_403_WINDOW {
-            entry.window_start = now;
-            entry.count = 1;
-            entry.ray_403_shown = false;
-            return false;
+        if now.duration_since(entry.last_seen) >= REPEAT_RAY_403_WINDOW {
+            entry.count = 0;
         }
+        entry.last_seen = now;
         entry.count = entry.count.saturating_add(1);
-        if !entry.ray_403_shown && entry.count >= 2 {
-            entry.ray_403_shown = true;
-            return true;
-        }
-        false
+        entry.count > decoy_hits
     }
 
     pub async fn build_report(&self) -> Option<EvilpotNodeReport> {
@@ -939,23 +947,37 @@ mod tests {
     }
 
     #[test]
-    fn repeated_identical_payload_returns_one_time_ray_403() {
+    fn repeated_identical_payload_switches_to_permanent_403_after_configurable_decoy_hits() {
         let mgr = EvilpotManager::new("ingress-ray");
         let ip: IpAddr = "198.51.100.55".parse().unwrap();
         let sig_a = 0xaaaa_bbbb_cccc_dddd_u64;
         let sig_b = 0x1111_2222_3333_4444_u64;
 
-        // 1st hit: decoy
-        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
-        // 2nd identical hit: returns 403 with Ray ID once
-        assert!(mgr.should_return_one_time_ray_403(ip, sig_a));
-        // 3rd+ identical hits: back to decoy (only returned 403 once)
-        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
-        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
+        // Default policy (1 decoy hit): 1st hit is the decoy, every later identical hit is a 403.
+        assert!(!mgr.should_return_ray_403(ip, sig_a, Some(1)));
+        assert!(mgr.should_return_ray_403(ip, sig_a, Some(1)));
+        assert!(mgr.should_return_ray_403(ip, sig_a, Some(1)));
+        assert!(mgr.should_return_ray_403(ip, sig_a, Some(1)));
 
-        // Different payload for same IP has independent state
-        assert!(!mgr.should_return_one_time_ray_403(ip, sig_b));
-        assert!(mgr.should_return_one_time_ray_403(ip, sig_b));
-        assert!(!mgr.should_return_one_time_ray_403(ip, sig_b));
+        // Different payload for the same IP keeps independent state.
+        assert!(!mgr.should_return_ray_403(ip, sig_b, Some(1)));
+        assert!(mgr.should_return_ray_403(ip, sig_b, Some(1)));
+
+        // A higher decoy budget keeps answering with the decoy for longer.
+        let sig_c = 0x7777_8888_9999_aaaa_u64;
+        for _ in 0..3 {
+            assert!(!mgr.should_return_ray_403(ip, sig_c, Some(3)));
+        }
+        assert!(mgr.should_return_ray_403(ip, sig_c, Some(3)));
+
+        // `Some(0)` answers the very first identical submission with a 403.
+        let sig_d = 0xdead_beef_dead_beef_u64;
+        assert!(mgr.should_return_ray_403(ip, sig_d, Some(0)));
+
+        // `None` disables the switch-over: the decoy is always served.
+        let sig_e = 0x0123_4567_89ab_cdef_u64;
+        for _ in 0..5 {
+            assert!(!mgr.should_return_ray_403(ip, sig_e, None));
+        }
     }
 }

@@ -1731,16 +1731,11 @@ export function createSecurityView({ api, store }) {
           <label style="margin-top:8px;"><span>${esc(t("Canary Webhook Base URL"))}</span>
             <input id="sd-ep-curl" value="${esc(ep.canary_webhook_url || "")}" placeholder="https://canary.internal.example.com/t" />
           </label>
-        </div>
-
-        <div class="panel" style="margin-bottom:0;grid-column:1 / -1;">
-          <div class="panel-header"><h3>${esc(t("IP Exemption List"))}</h3></div>
-          <p class="muted-sm" style="margin:0 0 8px;">
-            ${esc(t("Exact IPs or CIDRs, one per line. Exempt clients bypass WAF inspection, honeypot diversion, antibot challenge, rate limiting, GeoIP blocks, auto-ban and AbuseIPDB lookup/reporting — only ordinary traffic logs are kept."))}
-          </p>
-          <textarea id="sd-exempt-ips" rows="5" spellcheck="false" placeholder="203.0.113.7&#10;10.0.0.0/8&#10;2001:db8::/32">${esc((ig.exempt_ips || []).join("\n"))}</textarea>
-          <p class="muted-sm" style="margin:8px 0 0;">
-            ${esc(t("Warning: an address here is never intercepted, even if it is actively attacking. Only add ranges you control."))}
+          <div class="inspector-row" style="margin-top:6px;">
+            <label><span>${esc(t("Identical-Payload Decoy Hits"))}</span><input id="sd-ep-decoys" type="number" min="0" max="100" value="${ep.identical_payload_decoy_hits ?? 1}" /></label>
+          </div>
+          <p class="muted-sm" style="margin:6px 0 0;">
+            ${esc(t("How many times the exact same blocked payload (same IP + same signature) still gets the fake decoy. After that, every repeated submission returns a real 403 with the Ray ID, so a user who tripped a false positive can quote it to an administrator. Different payloads are unaffected and still reach the honeypot and auto-ban."))}
           </p>
         </div>
       </div>
@@ -1803,6 +1798,33 @@ export function createSecurityView({ api, store }) {
     el("sd-ep-sqli")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).sqli_time_delay_ms = parseNum(ev.target.value, 2500, 100, 5000); }, false));
     el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
     el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
+    el("sd-ep-decoys")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).identical_payload_decoy_hits = parseNum(ev.target.value, 1, 0, 100); }, false));
+  }
+
+  /* ---------- IP Exemption (cluster-wide ingress scope, not honeypot-only) ---------- */
+
+  function renderExemptSubTab(container) {
+    const defs = store.spec.defaults || defaultTopologyDefaults();
+    const ig = defs.ingress || (defs.ingress = defaultTopologyDefaults().ingress);
+
+    container.innerHTML = `
+      <div class="defaults-grid">
+        <div class="panel" style="margin-bottom:0;grid-column:1 / -1;">
+          <div class="panel-header"><h3>${esc(t("IP Exemption List"))}</h3></div>
+          <p class="muted-sm" style="margin:0 0 8px;">
+            ${esc(t("Exact IPs or CIDRs, one per line. This is not a honeypot-only setting: it applies to the whole ingress pipeline, so exempt clients skip WAF / OWASP CRS inspection, Evilpot honeypot diversion, antibot & GeoIP challenges, bucket rate limiting, auto-ban and AbuseIPDB lookup/reporting — only ordinary traffic logs are kept."))}
+          </p>
+          <textarea id="sd-exempt-ips" rows="8" spellcheck="false" placeholder="203.0.113.7&#10;10.0.0.0/8&#10;2001:db8::/32">${esc((ig.exempt_ips || []).join("\n"))}</textarea>
+          <p class="muted-sm" style="margin:8px 0 0;">
+            ${esc(t("Built-in /cdn-cgi/ endpoints (PoW page, fp.js beacon, fp-report) are still served to exempt clients — they are edge-only assets and are never proxied to an origin."))}
+          </p>
+          <p class="muted-sm" style="margin:8px 0 0;">
+            ${esc(t("Warning: an address here is never intercepted, even if it is actively attacking. Only add ranges you control."))}
+          </p>
+        </div>
+      </div>
+    `;
+
     el("sd-exempt-ips")?.addEventListener("input", (ev) => {
       const list = ev.target.value
         .split(/[\s,]+/)
@@ -1838,6 +1860,9 @@ export function createSecurityView({ api, store }) {
           </button>
           <button type="button" class="subtab-btn ${subTab === "intel" ? "active" : ""}" data-sec-sub="intel">
             ${esc(t("Threat Intel & Honeypot"))}
+          </button>
+          <button type="button" class="subtab-btn ${subTab === "exempt" ? "active" : ""}" data-sec-sub="exempt">
+            ${esc(t("IP Exemption List"))}
           </button>
           <button type="button" class="subtab-btn ${subTab === "geoip" ? "active" : ""}" data-sec-sub="geoip">
             ${esc(t("GeoIP DB"))}
@@ -1876,6 +1901,7 @@ export function createSecurityView({ api, store }) {
     else if (subTab === "antibot") renderAntibotSubTab(body);
     else if (subTab === "waf") renderWafSubTab(body);
     else if (subTab === "intel") renderThreatIntelSubTab(body);
+    else if (subTab === "exempt") renderExemptSubTab(body);
     else if (subTab === "geoip") renderGeoIpSubTab(body);
     else renderPagesSubTab(body);
   }
@@ -1884,7 +1910,7 @@ export function createSecurityView({ api, store }) {
     if (opts.subTab) {
       if (opts.subTab === "waf-rules") subTab = "waf";
       else if (opts.subTab === "guards") subTab = "antibot";
-      else if (["buckets", "antibot", "waf", "intel", "geoip", "pages"].includes(opts.subTab)) subTab = opts.subTab;
+      else if (["buckets", "antibot", "waf", "intel", "exempt", "geoip", "pages"].includes(opts.subTab)) subTab = opts.subTab;
     }
     if (!store.loaded) await store.loadTopology(false);
     if (subTab === "waf") {

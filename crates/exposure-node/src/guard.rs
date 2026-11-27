@@ -1051,9 +1051,12 @@ impl GuardEngine {
             clearance_secret,
             fp_ttl_secs,
             None,
+            false,
         )
     }
 
+    /// `exempt` suppresses every per-IP limiter / offense path for clients on the ingress
+    /// exemption list while still serving the built-in `/cdn-cgi/*` resources to them.
     #[allow(clippy::too_many_arguments)]
     pub fn handle_cdn_cgi_with_pages(
         &self,
@@ -1069,6 +1072,7 @@ impl GuardEngine {
         clearance_secret: &str,
         fp_ttl_secs: u64,
         custom_pages: Option<&ResolvedPages>,
+        exempt: bool,
     ) -> (GuardHttpResponse, Option<VerifiedFpSubmission>) {
         let client_ip = canonical_ip(client_ip);
         let host_clean = normalize_host(host);
@@ -1112,14 +1116,16 @@ impl GuardEngine {
             };
 
         if method == Method::GET && sub == "/challenge" {
-            if let Err(retry_after) = Self::consume_per_ip_limiter(
-                &self.cdn_cgi_challenge_limiter,
-                client_ip,
-                30.0,
-                1.0,
-                MAX_RATE_LIMIT_BUCKETS,
-            ) {
-                return rate_limit_resp(retry_after, b"challenge rate limited");
+            if !exempt {
+                if let Err(retry_after) = Self::consume_per_ip_limiter(
+                    &self.cdn_cgi_challenge_limiter,
+                    client_ip,
+                    30.0,
+                    1.0,
+                    MAX_RATE_LIMIT_BUCKETS,
+                ) {
+                    return rate_limit_resp(retry_after, b"challenge rate limited");
+                }
             }
             let base_difficulty = profile.map(|p| p.pow_difficulty).unwrap_or(16).clamp(1, 28);
             let difficulty = self.record_challenge_and_compute_difficulty(
@@ -1172,8 +1178,10 @@ impl GuardEngine {
                     None,
                 )
             };
-            if let Err(retry_after) = self.consume_fp_report_rate_limit(client_ip) {
-                return rate_limit_resp(retry_after, b"rate limited");
+            if !exempt {
+                if let Err(retry_after) = self.consume_fp_report_rate_limit(client_ip) {
+                    return rate_limit_resp(retry_after, b"rate limited");
+                }
             }
             if body.len() > 8192 {
                 return (
@@ -1548,14 +1556,16 @@ impl GuardEngine {
             );
         }
 
-        if let Err(retry_after) = Self::consume_per_ip_limiter(
-            &self.cdn_cgi_asset_limiter,
-            client_ip,
-            60.0,
-            5.0,
-            MAX_RATE_LIMIT_BUCKETS,
-        ) {
-            return rate_limit_resp(retry_after, b"too many requests");
+        if !exempt {
+            if let Err(retry_after) = Self::consume_per_ip_limiter(
+                &self.cdn_cgi_asset_limiter,
+                client_ip,
+                60.0,
+                5.0,
+                MAX_RATE_LIMIT_BUCKETS,
+            ) {
+                return rate_limit_resp(retry_after, b"too many requests");
+            }
         }
 
         let asset_path = sub.trim_start_matches('/');
@@ -2139,6 +2149,7 @@ mod tests {
             "sec",
             3600,
             Some(&pages),
+            false,
         );
         assert_eq!(html_resp.status, StatusCode::OK);
         assert_eq!(html_resp.content_type, "text/html; charset=utf-8");
@@ -2160,6 +2171,7 @@ mod tests {
             "sec",
             3600,
             Some(&pages),
+            false,
         );
         assert_eq!(gz_resp.status, StatusCode::OK);
         assert_eq!(

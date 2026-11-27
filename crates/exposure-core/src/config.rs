@@ -362,6 +362,9 @@ fn default_evilpot_canary_url() -> String {
 fn default_evilpot_max_sessions() -> usize {
     2048
 }
+fn default_evilpot_decoy_hits() -> Option<u32> {
+    Some(1)
+}
 
 /// Node-level configuration for the embedded `evilpot` deception, tarpit & exploit verification engine.
 /// Instantiated lazily only when at least one Ingress GuardProfile selects `waf.mode = evilpot`.
@@ -388,6 +391,19 @@ pub struct EvilpotNodeConfig {
     /// Maximum attacker verification sessions retained in RAM (LRU-bounded, default 2048).
     #[serde(default = "default_evilpot_max_sessions")]
     pub max_tracked_sessions: usize,
+    /// Number of identical blocked-payload submissions (same client IP + same WAF payload
+    /// signature) that are still answered with an Evilpot decoy. From the next identical
+    /// submission on, every request returns a plain `403` carrying the Ray ID instead, so a user
+    /// who tripped a WAF false positive can quote it to an administrator.
+    ///
+    /// `Some(0)` answers even the first submission with a `403`; `null` always serves the decoy.
+    /// Distinct payloads keep independent counters, so deliberate multi-vector attacks are still
+    /// diverted into the honeypot and banned as before.
+    #[serde(
+        default = "default_evilpot_decoy_hits",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub identical_payload_decoy_hits: Option<u32>,
 }
 
 impl Default for EvilpotNodeConfig {
@@ -400,6 +416,7 @@ impl Default for EvilpotNodeConfig {
             sqli_time_delay_ms: default_evilpot_sqli_delay_ms(),
             canary_webhook_url: default_evilpot_canary_url(),
             max_tracked_sessions: default_evilpot_max_sessions(),
+            identical_payload_decoy_hits: default_evilpot_decoy_hits(),
         }
     }
 }

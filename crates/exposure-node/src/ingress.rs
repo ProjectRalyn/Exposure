@@ -1069,9 +1069,11 @@ impl IngressServer {
         let payload_sig = waf_request_signature(method_str, path, query, &finding);
         if action == "evilpot"
             && finding.location != "abuseipdb"
-            && self
-                .evilpot
-                .should_return_one_time_ray_403(client_ip, payload_sig)
+            && self.evilpot.should_return_ray_403(
+                client_ip,
+                payload_sig,
+                cfg.evilpot.identical_payload_decoy_hits,
+            )
         {
             let reason = format!("evilpot:repeat_ray_403:{}", finding.category);
             if let Some(suppressed) = self
@@ -1087,7 +1089,7 @@ impl IngressServer {
                     category = finding.category,
                     location = finding.location,
                     suppressed,
-                    "repeated identical blocked payload in evilpot mode — returning one-time 403 with ray_id"
+                    "repeated identical blocked payload in evilpot mode — returning 403 with ray_id instead of the decoy"
                 );
             }
             self.logger
@@ -1602,8 +1604,11 @@ impl IngressServer {
         };
 
         // Built-in `/cdn-cgi` or `/cdn-cgi/*` PoW challenge endpoints (never matches `/cdn-cgi-foo`).
-        // Exempt clients skip the challenge machinery entirely and are forwarded normally.
-        if is_cdn_cgi && !is_exempt {
+        // ALWAYS handled locally, including for exempt clients: `/cdn-cgi/` is a reserved edge-only
+        // prefix that no origin implements, so forwarding it upstream (the previous behaviour for
+        // exempt IPs) returned 404 for `/cdn-cgi/fp.js` and silently disabled passive fingerprinting
+        // for exactly the networks we operate. Exemption only suppresses mitigation below.
+        if is_cdn_cgi {
             let method = req.method().clone();
             let headers = req.headers().clone();
             let query_redirect = req
@@ -1673,8 +1678,9 @@ impl IngressServer {
                 .map(|p| matches_api_bypass(p, &headers))
                 .unwrap_or(false);
 
-            // Enforce CIDR & Geo block policy on `/cdn-cgi/*`, and block PoW endpoints once the route bucket enters degraded mode
-            if let Some(profile) = guard_profile {
+            // Enforce CIDR & Geo block policy on `/cdn-cgi/*`, and block PoW endpoints once the route bucket enters degraded mode.
+            // Exempt clients are only ever served the built-in assets/PoW payloads here — never blocked, geo-fenced or throttled.
+            if let Some(profile) = guard_profile.filter(|_| !is_exempt) {
                 match self.guard.evaluate_access_cidrs(profile, client_ip) {
                     GuardDecision::Allow => {}
                     GuardDecision::RateLimited {
@@ -1743,6 +1749,7 @@ impl IngressServer {
                 &cfg.clearance_secret,
                 cfg.effective_js_fp_ttl_secs(),
                 Some(&cfg.resolved_pages),
+                is_exempt,
             );
 
             let passed = path == "/cdn-cgi/verify" && g_resp.status == StatusCode::OK;
@@ -1750,7 +1757,7 @@ impl IngressServer {
             let cfp_cls = crate::guard::classify_client(&headers);
             let score = compute_suspicion_score(&headers, tls_signal);
 
-            if verify_rejected {
+            if verify_rejected && !is_exempt {
                 let svc_tag = matched_rule
                     .map(|r| r.service_tag.as_str())
                     .unwrap_or("_cdn_cgi");
@@ -1774,7 +1781,7 @@ impl IngressServer {
                     .as_deref()
                     .or_else(|| matched_rule.map(|r| r.service_tag.as_str()))
                     .unwrap_or("_cdn_cgi");
-                if sub.is_headless {
+                if sub.is_headless && !is_exempt {
                     self.record_offense_and_maybe_alert(
                         svc_tag,
                         &host,
@@ -4638,6 +4645,148 @@ mod tests {
         assert_eq!(&inspected[..], b"hello-worl");
         let full = rebuilt.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&full[..], b"hello-world-1234567890");
+    }
+
+    /// Regression: an ingress-exempt IP (office NAT / our own monitoring range) must still be served
+    /// the built-in `/cdn-cgi/*` resources from the edge. These paths have no origin behind them, so
+    /// forwarding them upstream (the previous behaviour for exempt clients) turned `/cdn-cgi/fp.js`
+    /// into a 404 and silently disabled passive fingerprinting for exactly the networks we exempt.
+    #[tokio::test]
+    async fn exempt_client_gets_local_cdn_cgi_assets_and_is_never_challenged() {
+        use exposure_core::config::{
+            AntibotMode, EgressConfig, GuardProfile, IngressRule, LoggerConfig, NodeRoles,
+            RelayConfig, RuleMatch, SegmentConfig,
+        };
+        use exposure_link::LinkManager;
+        use std::collections::BTreeMap;
+
+        let tmp_dir = std::env::temp_dir().join(format!("exp-exempt-test-{}", Uuid::new_v4()));
+        let logger = NodeLogger::new(
+            "ing-exempt",
+            LoggerConfig {
+                hmac_key: generate_random_secret_hex(32),
+                sample_rate: 1.0,
+                segment: SegmentConfig {
+                    dir: tmp_dir.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let kp = NodeKeyPair::generate();
+        let lm = LinkManager::new("ing-exempt", kp.clone(), false, vec![], Default::default());
+        let egress = crate::egress::EgressHandler::new(
+            "ing-exempt",
+            EgressConfig::default(),
+            vec![],
+            Arc::clone(&logger),
+        );
+        let (fwd, _rx) = Forwarder::new(
+            "ing-exempt",
+            NodeRoles {
+                ingress: true,
+                egress: false,
+                relay: false,
+                maintainer: false,
+            },
+            RelayConfig::default(),
+            lm,
+            egress,
+            Arc::clone(&logger),
+        );
+
+        let mut guards = BTreeMap::new();
+        guards.insert(
+            "always-guard".to_string(),
+            GuardProfile {
+                antibot: AntibotMode::Always,
+                ..Default::default()
+            },
+        );
+        let cfg = IngressConfig {
+            rules: vec![IngressRule {
+                name: Some("main".into()),
+                r#match: RuleMatch {
+                    host: Some("exempt.test".into()),
+                    ..Default::default()
+                },
+                service_tag: "svc-web".into(),
+                next_peer: "missing-peer".into(),
+                guard: Some("always-guard".into()),
+                js_fp_beacon: Some(false),
+                intercept_errors: Some(false),
+                cache: None,
+                ..Default::default()
+            }],
+            guards,
+            // Test client is 127.0.0.1: exempting it must not strip edge-owned `/cdn-cgi/*` serving.
+            exempt_ips: vec!["127.0.0.1".into()],
+            ..Default::default()
+        };
+
+        let server = IngressServer::new(
+            "ing-exempt",
+            kp,
+            cfg,
+            8,
+            fwd,
+            DynamicCertResolver::new(),
+            Arc::clone(&logger),
+        );
+        let bound = server
+            .start_listener(IngressListener {
+                listen_addr: "127.0.0.1:0".into(),
+                tls: false,
+                redirect_https: false,
+            })
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{bound}");
+
+        // Passive FP beacon asset is served locally instead of 404'ing through a nonexistent origin.
+        let fpjs = client
+            .get(format!("{base}/cdn-cgi/fp.js"))
+            .header("Host", "exempt.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            fpjs.status(),
+            200,
+            "exempt client must receive /cdn-cgi/fp.js from the edge"
+        );
+        assert!(
+            fpjs.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("javascript"),
+            "fp.js must be served with a JS content type"
+        );
+        assert!(fpjs.text().await.unwrap().contains("/cdn-cgi/fp-report"));
+
+        // The PoW challenge page is edge-owned too and must resolve even for exempt clients.
+        let pow_page = client
+            .get(format!("{base}/cdn-cgi/"))
+            .header("Host", "exempt.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pow_page.status(), 200);
+
+        // Exempt clients bypass mitigation entirely: never redirected to /cdn-cgi/.
+        let home = client
+            .get(format!("{base}/"))
+            .header("Host", "exempt.test")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            home.headers().get(header::LOCATION).is_none(),
+            "exempt client must never be PoW-challenged"
+        );
     }
 
     #[tokio::test]

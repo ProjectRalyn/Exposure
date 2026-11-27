@@ -226,6 +226,7 @@ export function defaultEvilpotConfig() {
     sqli_time_delay_ms: 2500,
     canary_webhook_url: "https://canary.internal.example.com/t",
     max_tracked_sessions: 2048,
+    identical_payload_decoy_hits: 1,
   };
 }
 
@@ -240,6 +241,10 @@ export function normalizeEvilpotConfig(raw) {
     sqli_time_delay_ms: Math.min(5000, Math.max(100, Number(s.sqli_time_delay_ms ?? b.sqli_time_delay_ms) || b.sqli_time_delay_ms)),
     canary_webhook_url: String(s.canary_webhook_url ?? b.canary_webhook_url).trim().slice(0, 256) || b.canary_webhook_url,
     max_tracked_sessions: Math.min(4096, Math.max(16, Number(s.max_tracked_sessions ?? b.max_tracked_sessions) || b.max_tracked_sessions)),
+    identical_payload_decoy_hits:
+      s.identical_payload_decoy_hits === null
+        ? null
+        : Math.min(100, Math.max(0, Math.trunc(Number(s.identical_payload_decoy_hits ?? b.identical_payload_decoy_hits)) || 0)),
   };
 }
 
