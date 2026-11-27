@@ -1734,9 +1734,13 @@ export function createSecurityView({ api, store }) {
           </label>
           <div class="inspector-row" style="margin-top:6px;">
             <label><span>${esc(t("Identical-Payload Decoy Hits"))}</span><input id="sd-ep-decoys" type="number" min="0" max="100" value="${ep.identical_payload_decoy_hits ?? 1}" /></label>
+            <label><span>${esc(t("Distinct Attacks Before Escalation"))}</span><input id="sd-ep-distinct" type="number" min="2" max="64" value="${ep.multi_step_min_distinct_requests ?? 2}" /></label>
           </div>
           <p class="muted-sm" style="margin:6px 0 0;">
             ${esc(t("How many times the exact same blocked payload (same IP + same signature) still gets the fake decoy. After that, every repeated submission returns a real 403 with the Ray ID, so a user who tripped a false positive can quote it to an administrator. Different payloads are unaffected and still reach the honeypot and auto-ban."))}
+          </p>
+          <p class="muted-sm" style="margin:6px 0 0;">
+            ${esc(t("How many different attack requests (different payload, path or method) one client must submit before Evilpot escalates its session to multi-step exploitation and Exposure bans it. Identical retries never count; minimum 2."))}
           </p>
         </div>
       </div>
@@ -1800,6 +1804,7 @@ export function createSecurityView({ api, store }) {
     el("sd-ep-maxs")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).max_tracked_sessions = parseNum(ev.target.value, 2048, 16, 4096); }, false));
     el("sd-ep-curl")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).canary_webhook_url = ev.target.value.trim().slice(0, 256); }, false));
     el("sd-ep-decoys")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).identical_payload_decoy_hits = parseNum(ev.target.value, 1, 0, 100); }, false));
+    el("sd-ep-distinct")?.addEventListener("input", (ev) => store.mutate((s) => { ensureEp(s).multi_step_min_distinct_requests = parseNum(ev.target.value, 2, 2, 64); }, false));
   }
 
   /* ---------- IP Exemption (cluster-wide ingress scope, not honeypot-only) ---------- */

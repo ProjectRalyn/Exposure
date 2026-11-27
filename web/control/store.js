@@ -228,6 +228,7 @@ export function defaultEvilpotConfig() {
     canary_webhook_url: "https://canary.internal.example.com/t",
     max_tracked_sessions: 2048,
     identical_payload_decoy_hits: 1,
+    multi_step_min_distinct_requests: 2,
   };
 }
 
@@ -246,6 +247,14 @@ export function normalizeEvilpotConfig(raw) {
       s.identical_payload_decoy_hits === null
         ? null
         : Math.min(100, Math.max(0, Math.trunc(Number(s.identical_payload_decoy_hits ?? b.identical_payload_decoy_hits)) || 0)),
+    multi_step_min_distinct_requests: Math.min(
+      64,
+      Math.max(
+        2,
+        Math.trunc(Number(s.multi_step_min_distinct_requests ?? b.multi_step_min_distinct_requests)) ||
+          b.multi_step_min_distinct_requests,
+      ),
+    ),
   };
 }
 

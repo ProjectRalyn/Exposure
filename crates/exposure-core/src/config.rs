@@ -365,6 +365,9 @@ fn default_evilpot_max_sessions() -> usize {
 fn default_evilpot_decoy_hits() -> Option<u32> {
     Some(1)
 }
+fn default_evilpot_multi_step_min_distinct_requests() -> usize {
+    2
+}
 
 /// Node-level configuration for the embedded `evilpot` deception, tarpit & exploit verification engine.
 /// Instantiated lazily only when at least one Ingress GuardProfile selects `waf.mode = evilpot`.
@@ -404,6 +407,11 @@ pub struct EvilpotNodeConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub identical_payload_decoy_hits: Option<u32>,
+    /// How many *distinct* attack requests (different payload / path / method) one client must
+    /// submit before Evilpot escalates its session to multi-step exploitation and Exposure bans it.
+    /// Identical retries never count. Minimum 2 (default 2).
+    #[serde(default = "default_evilpot_multi_step_min_distinct_requests")]
+    pub multi_step_min_distinct_requests: usize,
 }
 
 impl Default for EvilpotNodeConfig {
@@ -417,6 +425,7 @@ impl Default for EvilpotNodeConfig {
             canary_webhook_url: default_evilpot_canary_url(),
             max_tracked_sessions: default_evilpot_max_sessions(),
             identical_payload_decoy_hits: default_evilpot_decoy_hits(),
+            multi_step_min_distinct_requests: default_evilpot_multi_step_min_distinct_requests(),
         }
     }
 }

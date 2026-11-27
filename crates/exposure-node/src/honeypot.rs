@@ -615,6 +615,7 @@ fn to_evilpot_config(cfg: &EvilpotNodeConfig, server_header: &str) -> EvilpotCon
         ep.canary_webhook_url = sanitized_url;
     }
     ep.max_tracked_sessions = cfg.max_tracked_sessions.clamp(16, 4096);
+    ep.multi_step_min_distinct_requests = cfg.multi_step_min_distinct_requests.clamp(2, 64);
     // Disable standalone HTTP admin routes on Ingress — Exposure exposes all behavior analysis
     // securely via the authenticated mesh telemetry & Control Plane UI.
     ep.admin = AdminPanelConfig {
