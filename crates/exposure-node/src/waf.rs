@@ -550,6 +550,7 @@ fn crs_category_enabled(rule_cat: &'static str, enabled: &[WafCategory]) -> bool
         WafCategory::CrlfInjection => rule_cat == "crlf-injection" || rule_cat == "protocol-attack",
         WafCategory::Deserialization => rule_cat == "deserialization",
         WafCategory::BufferOverflow => rule_cat == "buffer-overflow",
+        WafCategory::Scanner => rule_cat == "scanner",
     })
 }
 
@@ -1302,6 +1303,74 @@ mod tests {
                 &empty
             )
             .is_block()
+        );
+    }
+
+    #[test]
+    fn scanner_probe_paths_are_blocked_without_false_positives() {
+        let cfg = block_cfg();
+        let crs = builtin_engine();
+        let headers = HeaderMap::new();
+
+        // A live site never serves these to anonymous clients — classic scanner/CMS probes.
+        for p in [
+            "/wp-admin/install.php",
+            "/wp-admin/setup-config.php",
+            "/wp-config.php",
+            "/wp-config.php.bak",
+            "/phpmyadmin/index.php",
+            "/adminer.php",
+            "/backup.sql",
+            "/actuator/env",
+            "/manager/html",
+            "/.svn/entries",
+            "/server-status",
+            "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+        ] {
+            let verdict = crs.inspect_head(&cfg, p, Some("step=1"), &headers);
+            assert!(
+                verdict.is_block(),
+                "expected scanner probe to be blocked: {p}"
+            );
+            if let WafVerdict::Block(f) = verdict {
+                assert_eq!(f.category, "scanner");
+            }
+        }
+
+        // Normal front-end / API traffic (including a WordPress-backed site) must still pass.
+        for p in [
+            "/",
+            "/index.php",
+            "/wp-login.php",
+            "/wp-json/wp/v2/posts",
+            "/wp-content/uploads/2026/11/photo.jpg",
+            "/about",
+            "/.well-known/acme-challenge/some-token",
+            "/api/v1/users",
+        ] {
+            assert!(
+                matches!(
+                    crs.inspect_head(&cfg, p, None, &headers),
+                    WafVerdict::Allow
+                ),
+                "unexpected WAF block for benign path: {p}"
+            );
+        }
+
+        // The new category is opt-out: selecting only SQLi must stop CMS probing detection
+        // while SQLi stays enforced.
+        let sqli_only = WafConfig {
+            mode: WafMode::Block,
+            categories: vec![WafCategory::SqlInjection],
+            ..Default::default()
+        };
+        assert!(matches!(
+            crs.inspect_head(&sqli_only, "/wp-admin/install.php", Some("step=1"), &headers),
+            WafVerdict::Allow
+        ));
+        assert!(
+            crs.inspect_head(&sqli_only, "/search", Some("q=' OR '1'='1"), &headers)
+                .is_block()
         );
     }
 

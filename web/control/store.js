@@ -37,6 +37,7 @@ export const WAF_CATEGORIES = [
   "crlf-injection",
   "deserialization",
   "buffer-overflow",
+  "scanner",
 ];
 
 export const GEO_RULE_ACTIONS = ["allow", "off", "monitor", "challenge", "block", "evilpot"];

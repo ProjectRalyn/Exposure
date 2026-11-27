@@ -41,6 +41,7 @@ function wafCategoryLabel(cat) {
     case "crlf-injection": return t("CRLF");
     case "deserialization": return t("JNDI / Deser");
     case "buffer-overflow": return t("Overflow");
+    case "scanner": return t("Scanner / CMS Probes");
     default: return cat;
   }
 }
@@ -1054,7 +1055,7 @@ export function createSecurityView({ api, store }) {
               </label>
             </div>
             <div style="margin-top:6px;">
-              <div class="muted" style="font-size:11px;margin-bottom:5px;">${esc(activeCats.length ? t("Attack Categories (empty = all 12)") : t("All 12 OWASP CRS Categories"))}</div>
+              <div class="muted" style="font-size:11px;margin-bottom:5px;">${esc(activeCats.length ? t("Attack Categories (empty = all {count})", { count: WAF_CATEGORIES.length }) : t("All {count} OWASP CRS Categories", { count: WAF_CATEGORIES.length }))}</div>
               <div style="display:flex;flex-wrap:wrap;gap:4px;">
                 <button type="button" class="btn sm ${activeCats.length === 0 ? "primary" : "ghost"}" data-ws-cat-all="${esc(wName)}">${esc(t("All"))}</button>
                 ${WAF_CATEGORIES.map((c) => {

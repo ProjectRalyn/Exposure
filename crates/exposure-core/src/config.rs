@@ -485,6 +485,9 @@ pub enum WafCategory {
     CrlfInjection,
     Deserialization,
     BufferOverflow,
+    /// Known CMS / admin-tool probing (WordPress installer, `wp-config.php` backups,
+    /// phpMyAdmin, exposed SQL dumps, Spring `actuator/*`, Tomcat manager …).
+    Scanner,
 }
 
 pub fn default_waf_min_confidence() -> f32 {

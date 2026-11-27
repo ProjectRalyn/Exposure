@@ -82,6 +82,24 @@ pub fn builtin_crs_snapshot() -> CrsRulesetSnapshot {
             enabled: true,
         },
         WafRuleDescriptor {
+            id: 913120,
+            source: "owasp-crs".into(),
+            file: "REQUEST-913-SCANNER-DETECTION.conf".into(),
+            category: "scanner-detection".into(),
+            paranoia_level: 1,
+            severity: "CRITICAL".into(),
+            msg: "Found request path associated with CMS / admin-tool probing (scanner)".into(),
+            targets: vec!["REQUEST_URI".into()],
+            operator: "rx".into(),
+            // Deliberately limited to paths a live site never serves to anonymous clients:
+            // CMS install/setup scripts, exposed config/backup artifacts and admin DB tools.
+            // Legitimate endpoints (`/wp-login.php`, `/wp-json/…`, `/wp-content/uploads/…`)
+            // are intentionally NOT matched.
+            pattern: r"(?i)/(?:wp-admin/(?:install|setup-config)\.php|wp-config\.php(?:\.(?:bak|old|save|swp|swo|txt|zip|tar|gz|tgz|orig|tmp|backup|copy|dist))?(?:/|$)|(?:phpmyadmin|pma|myadmin|mysqladmin|sqladmin|dbadmin|adminer(?:\.php)?|mysqldumper|sqlyog)(?:/|$)|(?:backup|dump|db|database|data|site|www|wwwroot|web|htdocs)\.(?:sql|sql\.gz|zip|tar\.gz|tgz|rar|7z)(?:/|$)|actuator/(?:env|heapdump|mappings|configprops|trace)(?:/|$)|(?:manager|host-manager)/html(?:/|$)|vendor/phpunit/phpunit/src/Util/PHP/eval-stdin\.php(?:/|$)|\.(?:DS_Store|svn|hg|bzr)(?:/|$)|server-(?:status|info)(?:/|$))".into(),
+            tags: vec!["OWASP_CRS".into(), "attack-reputation-scanner".into(), "paranoia-level/1".into()],
+            enabled: true,
+        },
+        WafRuleDescriptor {
             id: 920270,
             source: "owasp-crs".into(),
             file: "REQUEST-920-PROTOCOL-ENFORCEMENT.conf".into(),
