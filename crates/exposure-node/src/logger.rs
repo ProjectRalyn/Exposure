@@ -236,6 +236,11 @@ impl LogDoSGuard {
         }
         entry.template.timestamp_ms = entry.last_ts_ms;
         entry.template.repeat_count = entry.suppressed_count;
+        // A folded row aggregates N *distinct* requests, so it must not keep the first request's
+        // Ray ID: sharing it made the analytics layer group the aggregate with that one request,
+        // which reported a phantom second proxy hop (`2 hops` on a single-hop request) and hid the
+        // repeat count from the request totals.
+        entry.template.ray_id = None;
         if is_wildcard {
             entry.template.path = Some("/* (folded flood)".to_string());
             entry.template.query = None;
@@ -2000,6 +2005,81 @@ mod tests {
         }
         assert_eq!(warn_emitted, 1);
         assert!(logger.protection_stats().warn_suppressed >= 19);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn folded_repeat_aggregate_does_not_inherit_a_request_ray_id() {
+        let dir = std::env::temp_dir().join(format!("exposure-nlog-ray-{}", uuid::Uuid::new_v4()));
+        let cfg = LoggerConfig {
+            hmac_key: "test-hmac-key-0123456789abcdef0123456789".into(),
+            segment: SegmentConfig {
+                dir: dir.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            protection: LogProtectionConfig {
+                enabled: true,
+                max_records_per_sec: 100_000,
+                max_per_ip_per_sec: 100_000,
+                max_bytes_per_min: 16 * 1024 * 1024,
+                dedup_window_secs: 30,
+                log_query_string: true,
+                access_log_stdout: false,
+                warn_rate_per_sec: 20,
+            },
+            ..Default::default()
+        };
+        let logger = NodeLogger::new("edge-rayfold", cfg).unwrap();
+        // Identical blocked payload replayed 5x: the folder keeps the first row and aggregates the rest.
+        for i in 0..5 {
+            let ray = format!("ray-{i}");
+            logger
+                .record_access_log(
+                    "ingress",
+                    "web",
+                    "198.51.100.9",
+                    403,
+                    0.7,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    AccessLogMeta {
+                        ray_id: Some(ray.as_str()),
+                        method: Some("GET"),
+                        host: Some("victim.test"),
+                        path: Some("/"),
+                        action: Some("waf_block"),
+                        waf_category: Some("sql-injection"),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+
+        logger.flush_all().await.unwrap();
+        let (recs, _sums, _) = logger.drain_for_maintainer().await;
+
+        let folded = recs
+            .iter()
+            .find(|r| r.repeat_count > 1)
+            .expect("expected a folded aggregate row");
+        assert!(
+            folded.ray_id.is_none(),
+            "folded aggregate spans several requests and must not reuse the first request's Ray ID"
+        );
+        let first = recs
+            .iter()
+            .find(|r| r.repeat_count == 1)
+            .expect("expected the first request to be emitted as-is");
+        assert_eq!(first.ray_id.as_deref(), Some("ray-0"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

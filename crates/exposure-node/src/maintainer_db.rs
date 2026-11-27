@@ -2467,7 +2467,7 @@ impl MaintainerDb {
                             suspicion_score: r.get::<_, Option<i64>>(33)?.map(|v| v.clamp(0, 255) as u8),
                             repeat_count: r.get::<_, i64>(34)?.clamp(1, u32::MAX as i64) as u32,
                         };
-                        let hops = r.get::<_, i64>(35)?.max(1) as u32;
+                        let hop_rows = r.get::<_, i64>(35)?.max(1) as u32;
                         let ingress_ts_ms: Option<i64> = r.get(36)?;
                         let first_ts_ms: Option<i64> = r.get(37)?;
                         let egress_node_tag: Option<String> = r.get(38)?;
@@ -2475,6 +2475,13 @@ impl MaintainerDb {
                         let egress_latency_ms: Option<f64> = r.get(40)?;
                         let egress_protocol: Option<String> = r.get(41)?;
 
+                        // Only a real egress row is a second proxy hop. Any other row sharing the
+                        // Ray ID (e.g. a folded repeat aggregate) must not inflate the hop count.
+                        let hops = if egress_node_tag.is_some() {
+                            hop_rows.max(2)
+                        } else {
+                            1
+                        };
                         let mut val = serde_json::to_value(&summary).unwrap_or_default();
                         if let Some(o) = val.as_object_mut() {
                             o.insert("hops".into(), serde_json::json!(hops));
@@ -3622,6 +3629,86 @@ mod tests {
         let r2 = items.iter().find(|i| i["ray_id"] == "r2").unwrap();
         assert_eq!(r2["hops"], 1);
         assert!(r2.get("egress").is_none(), "no egress hop to report");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn folded_repeat_aggregate_without_ray_id_does_not_inflate_hops() {
+        let dir = std::env::temp_dir().join(format!("exp-mdb-fold-{}", uuid::Uuid::new_v4()));
+        let dir_s = dir.to_string_lossy().to_string();
+        let db = MaintainerDb::open(&dir_s, "maint-1").unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        let base = SessionSummary {
+            timestamp_ms: now_ms - 30_000,
+            node_tag: "ing-1".into(),
+            role: "ingress".into(),
+            service_tag: "web".into(),
+            status: 403,
+            latency_ms: 0.7,
+            ip_hmac: "hmac".into(),
+            method: Some("GET".into()),
+            host: Some("app.test".into()),
+            path: Some("/".into()),
+            query: Some("query=%27%20or%201=1%20--".into()),
+            action: Some("waf_block".into()),
+            waf_category: Some("sql-injection".into()),
+            ray_id: Some("r1".into()),
+            repeat_count: 1,
+            ..Default::default()
+        };
+        // The DoS log folder emits an aggregate row for the suppressed identical repeats. It has no
+        // single Ray ID of its own, so it must stay a separate logical request (never a 2nd hop).
+        let mut aggregate = base.clone();
+        aggregate.ray_id = None;
+        aggregate.timestamp_ms = now_ms - 20_000;
+        aggregate.repeat_count = 5;
+
+        db.ingest_batch(
+            "ing-1",
+            true,
+            &MaintainerRetentionConfig::default(),
+            vec![base, aggregate],
+            Vec::<MinuteSummary>::new(),
+            Vec::<FingerprintObservation>::new(),
+            Vec::<EvilpotSessionInfo>::new(),
+            Vec::<EvilpotEventInfo>::new(),
+            Vec::<BanRecord>::new(),
+            Vec::<AlertRecord>::new(),
+        )
+        .await
+        .unwrap();
+
+        let res = db
+            .query_access_logs(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, 0, 50,
+            )
+            .await
+            .unwrap();
+
+        let items = res["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "aggregate must stay a separate logical request"
+        );
+        for it in items {
+            assert_eq!(
+                it["hops"], 1,
+                "a folded repeat aggregate must never look like a second proxy hop"
+            );
+            assert!(it.get("egress").is_none());
+        }
+        let ray_row = items.iter().find(|i| i["ray_id"] == "r1").unwrap();
+        assert_eq!(ray_row["repeat_count"].as_u64().unwrap_or(1), 1);
+        let agg_row = items.iter().find(|i| i["ray_id"].is_null()).unwrap();
+        assert_eq!(agg_row["repeat_count"], 5);
+        assert_eq!(
+            res["summary"]["total_requests"], 6,
+            "the folded repeats must be counted in totals, not silently dropped"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

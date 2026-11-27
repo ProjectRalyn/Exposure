@@ -4714,6 +4714,13 @@ fn build_logs_response_json(
                     "protocol": e.protocol,
                 })
             });
+        // Only a real egress row is a second proxy hop; any other row sharing the Ray ID
+        // (e.g. a folded repeat aggregate) must not inflate the hop count.
+        let hop_count = if egress.is_some() {
+            hop_count.max(2)
+        } else {
+            1
+        };
         let primary = hops.remove(0);
         logical.push(LogicalRequest {
             primary,
