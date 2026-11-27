@@ -60,6 +60,17 @@ const MAX_EVILPOT_STREAM_DURATION: Duration = Duration::from_secs(30);
 const ALERT_COOLDOWN: Duration = Duration::from_secs(300);
 const MAX_ALERT_COOLDOWN_ENTRIES: usize = 4096;
 
+/// Rolling window for returning a one-time 403 (with Ray ID) when a user repeatedly
+/// submits the exact same blocked payload in Evilpot mode.
+const REPEAT_RAY_403_WINDOW: Duration = Duration::from_secs(300);
+const MAX_REPEAT_RAY_403_ENTRIES: usize = 8192;
+
+struct RepeatPayloadState {
+    window_start: Instant,
+    count: u32,
+    ray_403_shown: bool,
+}
+
 /// Optional post-stream verification hook attached to `BoundedEvilpotBody`.
 /// When a slow-drip tarpit stream completes or hits its deadline, this checks whether
 /// `evilpot` upgraded the attacker to `VerifiedExploit` (`SustainedTarpitRead`) mid-stream
@@ -124,6 +135,7 @@ impl Drop for BoundedEvilpotBody {
                         host: Some(&hook.host),
                         kind: OffenseKind::VerifiedExploit,
                         reason: "evilpot:verified_exploit:tarpit",
+                        payload_hash: None,
                     });
                     if outcome.any_banned() {
                         warn!(
@@ -255,6 +267,7 @@ pub struct EvilpotManager {
     per_ip_inflight: Arc<DashMap<IpAddr, usize>>,
     per_ip_rate: DashMap<IpAddr, (Instant, u32)>,
     alert_cooldowns: DashMap<(IpAddr, u8), Instant>,
+    repeat_payloads: DashMap<(IpAddr, u64), RepeatPayloadState>,
 }
 
 impl EvilpotManager {
@@ -266,6 +279,7 @@ impl EvilpotManager {
             per_ip_inflight: Arc::new(DashMap::new()),
             per_ip_rate: DashMap::new(),
             alert_cooldowns: DashMap::new(),
+            repeat_payloads: DashMap::new(),
         }
     }
 
@@ -278,6 +292,7 @@ impl EvilpotManager {
             }
             self.per_ip_rate.clear();
             self.alert_cooldowns.clear();
+            self.repeat_payloads.clear();
             return;
         }
         if let Some(ref existing) = *guard {
@@ -424,6 +439,40 @@ impl EvilpotManager {
         }
         self.alert_cooldowns.insert(key, now);
         true
+    }
+
+    /// Returns `true` at most once per `(client_ip, payload_sig)` within `REPEAT_RAY_403_WINDOW`
+    /// when a client submits the exact same blocked payload a second time in Evilpot mode,
+    /// allowing legitimate users hitting a WAF false positive to receive a 403 with their Ray ID.
+    pub fn should_return_one_time_ray_403(&self, client_ip: IpAddr, payload_sig: u64) -> bool {
+        let now = Instant::now();
+        let key = (client_ip, payload_sig);
+        if self.repeat_payloads.len() >= MAX_REPEAT_RAY_403_ENTRIES
+            && !self.repeat_payloads.contains_key(&key)
+        {
+            self.repeat_payloads
+                .retain(|_, s| now.duration_since(s.window_start) < REPEAT_RAY_403_WINDOW);
+            if self.repeat_payloads.len() >= MAX_REPEAT_RAY_403_ENTRIES {
+                evict_half(&self.repeat_payloads);
+            }
+        }
+        let mut entry = self.repeat_payloads.entry(key).or_insert(RepeatPayloadState {
+            window_start: now,
+            count: 0,
+            ray_403_shown: false,
+        });
+        if now.duration_since(entry.window_start) >= REPEAT_RAY_403_WINDOW {
+            entry.window_start = now;
+            entry.count = 1;
+            entry.ray_403_shown = false;
+            return false;
+        }
+        entry.count = entry.count.saturating_add(1);
+        if !entry.ray_403_shown && entry.count >= 2 {
+            entry.ray_403_shown = true;
+            return true;
+        }
+        false
     }
 
     pub async fn build_report(&self) -> Option<EvilpotNodeReport> {
@@ -887,5 +936,26 @@ mod tests {
             }
         }
         assert_eq!(admitted_total, MAX_PER_IP_HITS_PER_WINDOW);
+    }
+
+    #[test]
+    fn repeated_identical_payload_returns_one_time_ray_403() {
+        let mgr = EvilpotManager::new("ingress-ray");
+        let ip: IpAddr = "198.51.100.55".parse().unwrap();
+        let sig_a = 0xaaaa_bbbb_cccc_dddd_u64;
+        let sig_b = 0x1111_2222_3333_4444_u64;
+
+        // 1st hit: decoy
+        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
+        // 2nd identical hit: returns 403 with Ray ID once
+        assert!(mgr.should_return_one_time_ray_403(ip, sig_a));
+        // 3rd+ identical hits: back to decoy (only returned 403 once)
+        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
+        assert!(!mgr.should_return_one_time_ray_403(ip, sig_a));
+
+        // Different payload for same IP has independent state
+        assert!(!mgr.should_return_one_time_ray_403(ip, sig_b));
+        assert!(mgr.should_return_one_time_ray_403(ip, sig_b));
+        assert!(!mgr.should_return_one_time_ray_403(ip, sig_b));
     }
 }

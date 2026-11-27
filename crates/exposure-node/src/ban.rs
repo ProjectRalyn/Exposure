@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 const MAX_BANNED_IPS: usize = 65_536;
 const MAX_BANNED_FPS: usize = 32_768;
 const MAX_OFFENSE_ENTRIES: usize = 32_768;
+const MAX_TRACKED_PAYLOAD_HASHES: usize = 32;
 const MAX_BENIGN_FPS: usize = 32_768;
 const MAX_REPORT_BANS: usize = 64;
 const OFFENSE_WINDOW: Duration = Duration::from_secs(300);
@@ -155,6 +156,9 @@ pub struct OffenseContext<'a> {
     pub host: Option<&'a str>,
     pub kind: OffenseKind,
     pub reason: &'a str,
+    /// Optional content signature for probe deduplication: repeated identical
+    /// payloads within `OFFENSE_WINDOW` do not accumulate offense points.
+    pub payload_hash: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +229,7 @@ fn ban_entry_to_record(node_tag: &str, kind: BanKind, target: String, e: &BanEnt
 struct OffenseTrackerEntry {
     window_start: Instant,
     points: u32,
+    seen_payload_hashes: Vec<u64>,
 }
 
 struct BenignFpEntry {
@@ -591,10 +596,10 @@ impl AutoBanManager {
                 trapped_requests >= 2.min(confirm_threshold as u64)
             }
             OffenseKind::AttackScannerProbe => {
-                self.add_offense_points(ip, 2, now) >= confirm_threshold
+                self.add_offense_points(ip, 2, ctx.payload_hash, now) >= confirm_threshold
             }
             OffenseKind::WafAttackProbe | OffenseKind::HeadlessOrVerifyAbuse => {
-                self.add_offense_points(ip, 1, now) >= confirm_threshold
+                self.add_offense_points(ip, 1, ctx.payload_hash, now) >= confirm_threshold
             }
         };
 
@@ -718,7 +723,13 @@ impl AutoBanManager {
         outcome
     }
 
-    fn add_offense_points(&self, ip: IpAddr, delta: u32, now: Instant) -> u32 {
+    fn add_offense_points(
+        &self,
+        ip: IpAddr,
+        delta: u32,
+        payload_hash: Option<u64>,
+        now: Instant,
+    ) -> u32 {
         if self.offenses.len() >= MAX_OFFENSE_ENTRIES && !self.offenses.contains_key(&ip) {
             self.offenses
                 .retain(|_, v| now.duration_since(v.window_start) < OFFENSE_WINDOW);
@@ -729,10 +740,22 @@ impl AutoBanManager {
         let mut entry = self.offenses.entry(ip).or_insert(OffenseTrackerEntry {
             window_start: now,
             points: 0,
+            seen_payload_hashes: Vec::new(),
         });
         if now.duration_since(entry.window_start) >= OFFENSE_WINDOW {
             entry.window_start = now;
             entry.points = delta;
+            entry.seen_payload_hashes.clear();
+            if let Some(h) = payload_hash {
+                entry.seen_payload_hashes.push(h);
+            }
+        } else if let Some(h) = payload_hash {
+            if !entry.seen_payload_hashes.contains(&h) {
+                if entry.seen_payload_hashes.len() < MAX_TRACKED_PAYLOAD_HASHES {
+                    entry.seen_payload_hashes.push(h);
+                }
+                entry.points = entry.points.saturating_add(delta);
+            }
         } else {
             entry.points = entry.points.saturating_add(delta);
         }
@@ -986,6 +1009,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:canary",
+            payload_hash: None,
         };
 
         // Ban first, exempt afterwards: an office NAT range must not stay locked out.
@@ -1064,6 +1088,7 @@ mod tests {
             host: None,
             kind: OffenseKind::WafAttackProbe,
             reason: "waf:sqli",
+            payload_hash: None,
         });
         assert!(!o1.any_banned());
         assert!(!mgr.is_ip_banned_for_tcp(attacker_ip));
@@ -1079,6 +1104,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:canary",
+            payload_hash: None,
         });
         assert!(o2.newly_banned_ip);
         assert!(o2.newly_banned_js_fp);
@@ -1131,6 +1157,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:rce",
+            payload_hash: None,
         });
         assert!(ob.newly_banned_ip);
         assert!(ob.newly_banned_composite_fp);
@@ -1166,6 +1193,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
+            payload_hash: None,
         });
         assert_eq!(o1.offense_level, 1);
         assert_eq!(o1.ban_ttl_secs, 300);
@@ -1179,6 +1207,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce-again",
+            payload_hash: None,
         });
         assert_eq!(o2.offense_level, 2);
         assert_eq!(o2.ban_ttl_secs, 600);
@@ -1204,6 +1233,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
+            payload_hash: None,
         });
         assert!(o1.newly_banned_ip);
         assert!(o1.newly_banned_js_fp);
@@ -1222,6 +1252,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce-2",
+            payload_hash: None,
         });
         assert_eq!(o2.offense_level, 1);
 
@@ -1275,6 +1306,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
+            payload_hash: None,
         });
         assert!(o1.newly_banned_ip);
         assert!(o1.newly_banned_composite_fp);
@@ -1293,6 +1325,7 @@ mod tests {
             host: None,
             kind: OffenseKind::VerifiedExploit,
             reason: "rce",
+            payload_hash: None,
         });
         assert!(o2.newly_banned_ip);
         assert!(!o2.newly_banned_js_fp);
@@ -1321,6 +1354,7 @@ mod tests {
             host: Some("jincaituanwei.com"),
             kind: OffenseKind::VerifiedExploit,
             reason: "evilpot:verified_exploit:rce",
+            payload_hash: None,
         });
         assert_eq!(out.created_bans.len(), 3);
         assert_eq!(
@@ -1342,5 +1376,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_identical_payload_does_not_confirm_ban_but_distinct_payloads_do() {
+        let mgr = AutoBanManager::new(&AutoBanConfig {
+            enabled: true,
+            ban_ttl_secs: 600,
+            max_ban_ttl_secs: 3600,
+            confirm_hits: 3,
+            ban_fingerprints: false,
+            drop_at_tcp: true,
+        });
+        let user_ip: IpAddr = "198.51.100.88".parse().unwrap();
+
+        // Retrying the exact same payload 6 times (e.g. legitimate user hitting a WAF false
+        // positive) must only count as 1 offense point and must NEVER ban the IP.
+        for _ in 0..6 {
+            let out = mgr.record_offense(OffenseContext {
+                client_ip: user_ip,
+                tls_ja3: None,
+                user_agent: "Mozilla/5.0",
+                js_fp_hash: None,
+                service_tag: None,
+                host: None,
+                kind: OffenseKind::WafAttackProbe,
+                reason: "waf:sqli:query",
+                payload_hash: Some(0x1111_2222_3333_4444),
+            });
+            assert!(!out.any_banned());
+        }
+        assert!(!mgr.is_ip_banned_for_tcp(user_ip));
+
+        // Sending 2 more DISTINCT payloads brings distinct count to 3 (confirm_hits = 3) -> banned!
+        let o2 = mgr.record_offense(OffenseContext {
+            client_ip: user_ip,
+            tls_ja3: None,
+            user_agent: "Mozilla/5.0",
+            js_fp_hash: None,
+            service_tag: None,
+            host: None,
+            kind: OffenseKind::WafAttackProbe,
+            reason: "waf:sqli:query",
+            payload_hash: Some(0x5555_6666_7777_8888),
+        });
+        assert!(!o2.any_banned());
+
+        let o3 = mgr.record_offense(OffenseContext {
+            client_ip: user_ip,
+            tls_ja3: None,
+            user_agent: "Mozilla/5.0",
+            js_fp_hash: None,
+            service_tag: None,
+            host: None,
+            kind: OffenseKind::WafAttackProbe,
+            reason: "waf:xss:query",
+            payload_hash: Some(0x9999_aaaa_bbbb_cccc),
+        });
+        assert!(o3.newly_banned_ip);
+        assert!(mgr.is_ip_banned_for_tcp(user_ip));
     }
 }

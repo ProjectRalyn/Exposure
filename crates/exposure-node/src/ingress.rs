@@ -728,6 +728,7 @@ impl IngressServer {
         js_fp_hash: Option<&str>,
         kind: OffenseKind,
         reason: &str,
+        payload_hash: Option<u64>,
     ) {
         let mut out = self.auto_ban.record_offense(OffenseContext {
             client_ip,
@@ -738,6 +739,7 @@ impl IngressServer {
             host: Some(host),
             kind,
             reason,
+            payload_hash,
         });
         let any_banned = out.any_banned();
         if !out.created_bans.is_empty() {
@@ -874,6 +876,7 @@ impl IngressServer {
                 req_js_fp_hash,
                 OffenseKind::VerifiedExploit,
                 "evilpot:canary_flood",
+                None,
             )
             .await;
             return Some(
@@ -938,6 +941,7 @@ impl IngressServer {
             req_js_fp_hash,
             OffenseKind::VerifiedExploit,
             "evilpot:verified_exploit:canary",
+            None,
         )
         .await;
         let resp_status = outcome.response.status().as_u16();
@@ -1059,7 +1063,62 @@ impl IngressServer {
         log_ctx: &RequestLogCtx<'_>,
         action: &'static str,
         finding: WafFinding,
+        intercept_errors: bool,
+        browser_nav: bool,
     ) -> Response<ProxyBody> {
+        let payload_sig = waf_request_signature(method_str, path, query, &finding);
+        if action == "evilpot"
+            && finding.location != "abuseipdb"
+            && self
+                .evilpot
+                .should_return_one_time_ray_403(client_ip, payload_sig)
+        {
+            let reason = format!("evilpot:repeat_ray_403:{}", finding.category);
+            if let Some(suppressed) = self
+                .logger
+                .should_log_warn(&format!("ep:ray403:{}:{}", client_ip, finding.category))
+            {
+                warn!(
+                    node = %self.node_tag,
+                    service = %service_tag,
+                    host = %host,
+                    client = %client_ip,
+                    ray_id = %ray_id,
+                    category = finding.category,
+                    location = finding.location,
+                    suppressed,
+                    "repeated identical blocked payload in evilpot mode — returning one-time 403 with ray_id"
+                );
+            }
+            self.logger
+                .record_access_log(
+                    "ingress",
+                    service_tag,
+                    &client_ip.to_string(),
+                    403,
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    Some(reason),
+                    Some(client_fp.device_type.to_string()),
+                    Some(client_fp.browser_family.to_string()),
+                    Some(client_fp.os_family.to_string()),
+                    false,
+                    log_ctx.meta("waf_block", None, finding.rule_id, Some(finding.category)),
+                )
+                .await;
+            return build_waf_block_response(
+                &finding,
+                intercept_errors,
+                browser_nav,
+                ray_id,
+                cfg.resolved_pages.error.as_deref(),
+                accept_encoding(headers),
+            );
+        }
         let Some(permit) = self.evilpot.try_admit(client_ip) else {
             let reason = format!("evilpot:flood:{}", finding.category);
             self.record_offense_and_maybe_alert(
@@ -1071,6 +1130,7 @@ impl IngressServer {
                 req_js_fp_hash,
                 OffenseKind::EvilpotFlood,
                 &reason,
+                None,
             )
             .await;
             self.logger
@@ -1209,19 +1269,21 @@ impl IngressServer {
                 ExploitVerificationStatus::Probing => {}
             }
         }
-        let offense_kind = match outcome.session.status {
-            ExploitVerificationStatus::VerifiedExploit => OffenseKind::VerifiedExploit,
-            ExploitVerificationStatus::MultiStepExploitation => {
+        let (offense_kind, offense_payload_hash) = match outcome.session.status {
+            ExploitVerificationStatus::VerifiedExploit => (OffenseKind::VerifiedExploit, None),
+            ExploitVerificationStatus::MultiStepExploitation => (
                 OffenseKind::MultiStepExploitation {
                     trapped_requests: outcome.session.total_trapped_requests,
-                }
-            }
+                },
+                None,
+            ),
             ExploitVerificationStatus::Probing => {
-                if finding.category == "scanner" || client_fp.is_scanner {
+                let kind = if finding.category == "scanner" || client_fp.is_scanner {
                     OffenseKind::AttackScannerProbe
                 } else {
                     OffenseKind::WafAttackProbe
-                }
+                };
+                (kind, Some(payload_sig))
             }
         };
         let ban_reason = format!("evilpot:{status_lbl}:{}", finding.category);
@@ -1234,6 +1296,7 @@ impl IngressServer {
             req_js_fp_hash,
             offense_kind,
             &ban_reason,
+            offense_payload_hash,
         )
         .await;
         let resp_status = outcome.response.status().as_u16();
@@ -1700,6 +1763,7 @@ impl IngressServer {
                     req_js_fp_hash.as_deref(),
                     OffenseKind::HeadlessOrVerifyAbuse,
                     "guard:pow_verify_rejected",
+                    None,
                 )
                 .await;
             }
@@ -1720,6 +1784,7 @@ impl IngressServer {
                         Some(&sub.fp_hash),
                         OffenseKind::HeadlessOrVerifyAbuse,
                         "guard:headless_fp_detected",
+                        None,
                     )
                     .await;
                 }
@@ -2324,6 +2389,8 @@ impl IngressServer {
                             &log_ctx,
                             "geo_evilpot",
                             finding,
+                            rule.effective_intercept_errors(),
+                            is_browser_navigation(req.method(), req.headers()),
                         )
                         .await;
                 }
@@ -2582,6 +2649,12 @@ impl IngressServer {
                                 } else {
                                     OffenseKind::WafAttackProbe
                                 };
+                            let payload_sig = waf_request_signature(
+                                &method_str,
+                                &path,
+                                query_opt.as_deref(),
+                                &finding,
+                            );
                             self.record_offense_and_maybe_alert(
                                 &rule.service_tag,
                                 &host,
@@ -2591,6 +2664,7 @@ impl IngressServer {
                                 req_js_fp_hash.as_deref(),
                                 offense_kind,
                                 &reason,
+                                Some(payload_sig),
                             )
                             .await;
                             self.logger
@@ -2676,6 +2750,8 @@ impl IngressServer {
                                     &log_ctx,
                                     "evilpot",
                                     finding,
+                                    rule.effective_intercept_errors(),
+                                    is_browser_navigation(req.method(), req.headers()),
                                 )
                                 .await;
                         }
@@ -2709,6 +2785,7 @@ impl IngressServer {
                             req_js_fp_hash.as_deref(),
                             OffenseKind::HeadlessOrVerifyAbuse,
                             "guard:headless_blocked",
+                            None,
                         )
                         .await;
                     }
@@ -3034,6 +3111,8 @@ impl IngressServer {
                                     &log_ctx,
                                     "evilpot",
                                     finding,
+                                    rule.effective_intercept_errors(),
+                                    is_browser_navigation(req.method(), req.headers()),
                                 )
                                 .await;
                         }
@@ -4282,6 +4361,23 @@ async fn buffer_prefix_for_waf(
         full_body(prefix)
     };
     Ok((Request::from_parts(parts, rebuilt_body), inspected))
+}
+
+fn waf_request_signature(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    finding: &WafFinding,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    method.hash(&mut h);
+    path.hash(&mut h);
+    query.hash(&mut h);
+    finding.category.hash(&mut h);
+    finding.location.hash(&mut h);
+    finding.matched_payload.as_deref().hash(&mut h);
+    h.finish()
 }
 
 fn build_waf_block_response(

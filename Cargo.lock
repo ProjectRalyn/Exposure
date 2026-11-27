@@ -683,9 +683,9 @@ dependencies = [
 
 [[package]]
 name = "evilpot"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "077d5a6d4fe31930f225019d1c8f3f2ed385742eef3b704237af16bf27b8013b"
+checksum = "387c138853c65be043cdf799e0719a70717819eb7f3bb55cd632499cf0637dfa"
 dependencies = [
  "base64 0.22.1",
  "bytes",
